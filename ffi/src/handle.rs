@@ -1,5 +1,5 @@
-//! [`Handle`] is an idiom for visibly transferring ownership of opaque rust objects across the FFI
-//! boundary.
+//! [`Handle`] is an idiom for visibly transferring ownership of (usually opaque) rust objects
+//! across the FFI boundary.
 //!
 //! Creating a [`Handle<T>`] always implies some kind of ownership transfer. A mutable handle takes
 //! ownership of the object itself (analagous to [`Box<T>`]), while a non-mutable (shared) handle
@@ -10,7 +10,7 @@
 //! last reference to that object.
 //!
 //! Because handles carry ownership semantics, and lifetime information is not preserved across the
-//! FFI boundary, handles are always opaque types to avoid confusiong them with normal references
+//! FFI boundary, handles are usually opaque types to avoid confusiong them with normal references
 //! and pointers (`&Foo`, `*const Foo`, etc) that are possibly only valid until the FFI call
 //! returns. For the same reason, mutable handles implement neither [`Copy`] nor [`Clone`]. However,
 //! this only helps on the Rust side, because handles appear as simple pointers in the FFI and are
@@ -29,10 +29,15 @@
 ///     x: usize,
 /// }
 ///
-/// #[handle_descriptor(target = "Foo", mutable = true, sized = true)]
+/// #[handle_descriptor(target = Foo, mutable = true, sized = true)]
 /// pub struct MutableFoo;
+///
+/// #[handle_descriptor(target = Self, mutable = true)]
+/// pub struct Baz {
+///     x: usize,
+/// }
 /// ```
-pub trait HandleDescriptor {
+pub trait HandleDescriptor : Sized {
     /// The true type of the handle's underlying object
     type Target: ?Sized + Send;
 
@@ -50,10 +55,18 @@ mod private {
     use std::ptr::NonNull;
     use std::sync::Arc;
 
-    use super::*;
+    use super::HandleDescriptor;
 
     /// Represents an object that crosses the FFI boundary and which outlives the scope that created
     /// it. It can be passed freely between rust code and external code.
+    ///
+    /// As a special case, `T: Sized` can impl its own mutable `HandleDescriptor`. In this case,
+    /// `Handle<T>` is guaranteed to be represented as `*mut T`, and is also ABI-compatible `&mut T`
+    /// or with C pointers (ie the C type `T*`). Thus, a rust function which accepts or returns a
+    /// self-handle for `T` can be treated as accepting or returning `T*` on the C/C++
+    /// side. However, all the usual [validity][#Validity] requirements still apply when rust code
+    /// receives a `T*` from C. In particular, the pointer must have been created by a call to
+    /// [`Handle::from`] and cannot be e.g. stack allocated.
     ///
     /// # Validity
     ///
@@ -230,6 +243,38 @@ mod private {
         }
     }
 
+    // This makes no sense, but:
+    //
+    // error[E0119]: conflicting implementations of trait `From<Box<_>>` for type `handle::private::Handle<Box<_>>`
+    //    --> ffi/src/handle.rs:246:5
+    //     |
+    // 222 | /     impl<T, S, H> From<Box<T>> for Handle<H>
+    // 223 | |     where
+    // 224 | |         T: ?Sized,
+    // 225 | |         H: HandleDescriptor<Target = T, Mutable = True, Sized = S>
+    // 226 | |             + MutableHandleOps<T, S, From = Box<T>>,
+    //     | |____________________________________________________- first implementation here
+    // ...
+    // 246 | /     impl<T> From<T> for Handle<T>
+    // 247 | |     where
+    // 248 | |         T: HandleDescriptor<Target = T, Mutable = True, Sized = True>
+    // 249 | |             + MutableHandleOps<T, True, From = Box<T>>,
+    //     | |_______________________________________________________^ conflicting implementation for `handle::private::Handle<Box<_>>`
+    //     |
+    //     = note: downstream crates may implement trait `handle::HandleDescriptor` for type `std::boxed::Box<_>`
+    /*
+    impl<T> From<T> for Handle<T>
+    where
+        T: HandleDescriptor<Target = T, Mutable = True, Sized = True>
+            + MutableHandleOps<T, True, From = Box<T>>,
+    {
+        fn from(val: T) -> Handle<T> {
+            Box::new(val).into()
+        }
+    }
+    */
+
+    #[doc(hidden)]
     pub trait MutableHandle {}
     impl<T, S, H> MutableHandle for H
     where
@@ -238,6 +283,7 @@ mod private {
     {
     }
 
+    #[doc(hidden)]
     pub trait SharedHandle {}
     impl<T, S, H> SharedHandle for H
     where
@@ -473,9 +519,15 @@ mod tests {
     use delta_kernel_ffi_macros::handle_descriptor;
 
     #[derive(Debug)]
+    //#[handle_descriptor(target=Self, mutable=true, sized=true)]
     pub struct Foo {
         pub x: usize,
         pub y: String,
+    }
+    impl HandleDescriptor for Foo {
+        type Target = Self;
+        type Mutable = False;
+        type Sized = True;
     }
 
     #[handle_descriptor(target=Foo, mutable=true, sized=true)]
@@ -517,6 +569,13 @@ mod tests {
 
     #[handle_descriptor(target=NotSync, mutable=true, sized=true)]
     pub struct MutNotSync;
+
+    // error[E0277]: the size for values of type `(dyn Baz + 'static)` cannot be known at compilation time
+    // impl HandleDescriptor for dyn Baz {
+    //     type Target = Self;
+    //     type Mutable = True;
+    //     type Sized = True;
+    // }
 
     #[test]
     fn test_handle_use_cases_compile() {
@@ -612,5 +671,16 @@ mod tests {
         let r = unsafe { h2.as_ref() };
         assert_eq!(r.squawk(), s2);
         unsafe { h2.drop_handle() };
+
+        let f = Foo {
+            x: rand::random::<usize>(),
+            y: rand::random::<usize>().to_string(),
+        };
+        let s = format!("{f:?}");
+        let h: Handle<Foo> = Arc::new(f).into();
+        let r = unsafe { h.as_ref() };
+        assert_eq!(format!("{r:?}"), s);
+
+        unsafe { h.drop_handle() };
     }
 }

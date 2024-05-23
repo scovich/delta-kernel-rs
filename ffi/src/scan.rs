@@ -95,9 +95,6 @@ unsafe fn get_raw_arrow_data_impl(data: Handle<EngineData>) -> DeltaResult<*mut 
     Ok(Box::leak(ret_data))
 }
 
-// TODO: Why do we even need to expose a scan, when the only thing an engine can do with it is
-// handit back to the kernel by calling `kernel_scan_data_init`? There isn't even an FFI method to
-// drop it!
 #[handle_descriptor(target=Scan, mutable=false, sized=true)]
 pub struct SharedScan;
 

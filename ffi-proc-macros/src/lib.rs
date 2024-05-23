@@ -1,6 +1,6 @@
-use proc_macro::TokenStream;
-use proc_macro2::TokenStream as TokenStream2;
-use quote::{quote, quote_spanned};
+use proc_macro::{TokenStream};
+use proc_macro2::{TokenStream as TokenStream2, TokenTree as TokenTree2};
+use quote::{quote, quote_spanned, ToTokens};
 use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned;
 use syn::{
@@ -12,6 +12,7 @@ struct HandleDescriptorParams {
     target: Type,
     mutable: bool,
     sized: bool,
+    is_self: bool,
 }
 
 impl Parse for HandleDescriptorParams {
@@ -24,8 +25,16 @@ impl Parse for HandleDescriptorParams {
             return Err(Error::new(key.span(), "expected `target` field"));
         }
         let target: Type = input.parse()?;
+        let mut is_self = false;
         let is_trait = match target {
-            Type::Path(_) => false,
+            Type::Path(ref path) => {
+                // Check whether the requested type is `Self`
+                let tokens: Vec<_> = path.to_token_stream().into_iter().collect();
+                if let [TokenTree2::Ident(ident)] = tokens.as_slice() {
+                    is_self = *ident == "Self";
+                }
+                false
+            }
             Type::TraitObject(_) => true,
             _ => {
                 return Err(Error::new(
@@ -45,6 +54,9 @@ impl Parse for HandleDescriptorParams {
             let value: LitBool = input.parse()?;
             match ident.to_string().as_str() {
                 "mutable" if mutable.is_none() => {
+                    if !value.value() && is_self {
+                        return Err(Error::new(value.span(), "self handles are always mutable"));
+                    }
                     mutable = Some(value.value());
                 }
                 "sized" if sized.is_none() => {
@@ -61,15 +73,24 @@ impl Parse for HandleDescriptorParams {
                 }
             }
         }
+        if mutable.is_none() && is_self {
+            mutable = Some(true);
+        }
         let mutable = mutable.ok_or_else(|| input.error("missing `mutable` field"))?;
-        if sized.is_none() && is_trait {
-            sized = Some(false);
+
+        if sized.is_none() {
+            if is_trait {
+                sized = Some(false);
+            } else if is_self {
+                sized = Some(true);
+            }
         }
         let sized = sized.ok_or_else(|| input.error("missing `sized` field"))?;
         Ok(Self {
             target,
             mutable,
             sized,
+            is_self,
         })
     }
 }
@@ -88,27 +109,29 @@ fn bool_to_boolean(b: bool) -> TokenStream2 {
 pub fn handle_descriptor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let descriptor_params = parse_macro_input!(attr as HandleDescriptorParams);
     let mut st = parse_macro_input!(item as ItemStruct);
-    match st.fields {
-        Fields::Named(FieldsNamed {
-            named: ref fields, ..
-        })
-        | Fields::Unnamed(FieldsUnnamed {
-            unnamed: ref fields,
-            ..
-        }) if !fields.is_empty() => {
-            return Error::new(fields.span(), "A handle struct must not define any fields")
-                .into_compile_error()
-                .into();
-        }
-        _ => {}
-    };
-
-    // Inject a single unconstructible member to produce a NZST
     let ident = &st.ident;
-    let new_struct = quote! { struct #ident(crate::handle::Unconstructable); };
-    let new_struct = new_struct.into();
-    let new_struct = parse_macro_input!(new_struct as ItemStruct);
-    st.fields = new_struct.fields;
+    if !descriptor_params.is_self {
+        match st.fields {
+            Fields::Named(FieldsNamed {
+                named: ref fields, ..
+            })
+                | Fields::Unnamed(FieldsUnnamed {
+                    unnamed: ref fields,
+                    ..
+                }) if !fields.is_empty() => {
+                    return Error::new(fields.span(), "A handle struct must not define any fields")
+                        .into_compile_error()
+                        .into();
+                }
+            _ => {}
+        };
+
+        // Inject a single unconstructible member to produce a NZST
+        let new_struct = quote! { struct #ident(crate::handle::Unconstructable); };
+        let new_struct = new_struct.into();
+        let new_struct = parse_macro_input!(new_struct as ItemStruct);
+        st.fields = new_struct.fields;
+    }
 
     // Emit the modified struct and also derive the impl HandleDescriptor for it.
     let mutable = bool_to_boolean(descriptor_params.mutable);

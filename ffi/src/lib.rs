@@ -438,6 +438,7 @@ unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> DeltaResult<U
 
 /// A builder that allows setting options on the `Engine` before actually building it
 #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
+#[handle_descriptor(target=Self, mutable=true)]
 pub struct EngineBuilder {
     url: Url,
     allocate_fn: AllocateErrorFn,
@@ -462,7 +463,7 @@ impl EngineBuilder {
 pub unsafe extern "C" fn get_engine_builder(
     path: KernelStringSlice,
     allocate_error: AllocateErrorFn,
-) -> ExternResult<*mut EngineBuilder> {
+) -> ExternResult<Handle<EngineBuilder>> {
     get_engine_builder_impl(path, allocate_error).into_extern_result(allocate_error)
 }
 
@@ -470,14 +471,14 @@ pub unsafe extern "C" fn get_engine_builder(
 unsafe fn get_engine_builder_impl(
     path: KernelStringSlice,
     allocate_fn: AllocateErrorFn,
-) -> DeltaResult<*mut EngineBuilder> {
+) -> DeltaResult<Handle<EngineBuilder>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) }?;
     let builder = Box::new(EngineBuilder {
         url,
         allocate_fn,
         options: HashMap::default(),
     });
-    Ok(Box::into_raw(builder))
+    Ok(builder.into())
 }
 
 /// Set an option on the builder
@@ -488,10 +489,11 @@ unsafe fn get_engine_builder_impl(
 #[cfg(feature = "default-engine")]
 #[no_mangle]
 pub unsafe extern "C" fn set_builder_option(
-    builder: &mut EngineBuilder,
+    mut builder: Handle<EngineBuilder>,
     key: KernelStringSlice,
     value: KernelStringSlice,
 ) {
+    let builder = unsafe { builder.as_mut() };
     let key = unsafe { String::try_from_slice(key) };
     let value = unsafe { String::try_from_slice(value) };
     builder.set_option(key, value);
