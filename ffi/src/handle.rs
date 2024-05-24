@@ -37,7 +37,7 @@
 ///     x: usize,
 /// }
 /// ```
-pub trait HandleDescriptor : Sized {
+pub trait HandleDescriptor: Sized {
     /// The true type of the handle's underlying object
     type Target: ?Sized + Send;
 
