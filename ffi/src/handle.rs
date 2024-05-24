@@ -274,6 +274,15 @@ mod private {
     }
     */
 
+    // Convenience trait for defining a self-handle, which must always be mutable.
+    #[doc(hidden)]
+    pub trait SelfHandle: Sized + Send {}
+    impl<T: SelfHandle> HandleDescriptor for T {
+        type Target = T;
+        type Mutable = True;
+        type Sized = True;
+    }
+
     #[doc(hidden)]
     pub trait MutableHandle {}
     impl<T, S, H> MutableHandle for H
@@ -509,7 +518,7 @@ mod private {
     impl Sealed for False {}
 }
 
-pub use private::{Boolean, False, Handle, True, Unconstructable};
+pub use private::{Boolean, False, Handle, SelfHandle, True, Unconstructable};
 
 #[cfg(test)]
 mod tests {
@@ -519,16 +528,19 @@ mod tests {
     use delta_kernel_ffi_macros::handle_descriptor;
 
     #[derive(Debug)]
-    //#[handle_descriptor(target=Self, mutable=true, sized=true)]
+    //#[handle_descriptor(target=Self)]
     pub struct Foo {
         pub x: usize,
         pub y: String,
     }
+    /*
     impl HandleDescriptor for Foo {
         type Target = Self;
         type Mutable = False;
         type Sized = True;
     }
+    */
+    impl SelfHandle for Foo {}
 
     #[handle_descriptor(target=Foo, mutable=true, sized=true)]
     pub struct MutableFoo;
@@ -677,7 +689,7 @@ mod tests {
             y: rand::random::<usize>().to_string(),
         };
         let s = format!("{f:?}");
-        let h: Handle<Foo> = Arc::new(f).into();
+        let h: Handle<Foo> = Box::new(f).into();
         let r = unsafe { h.as_ref() };
         assert_eq!(format!("{r:?}"), s);
 
