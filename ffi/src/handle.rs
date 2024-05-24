@@ -278,7 +278,7 @@ mod private {
     #[doc(hidden)]
     pub trait SelfHandle: Sized + Send {}
     impl<T: SelfHandle> HandleDescriptor for T {
-        type Target = T;
+        type Target = Self;
         type Mutable = True;
         type Sized = True;
     }

@@ -9,9 +9,9 @@ use syn::{
 };
 
 // target, mutable, sized
-struct Params(Type, Option<LitBool>, Option<LitBool>);
+struct Args(Type, Option<LitBool>, Option<LitBool>);
 
-impl Parse for Params {
+impl Parse for Args {
     fn parse(input: ParseStream) -> Result<Self> {
         // Parse the "target=..." field (always first)
         let key: Ident = input.parse()?;
@@ -105,19 +105,19 @@ fn emit_handle_descriptor(
 
 /// Macro for conveniently deriving a `delta_kernel_ffi::handle::HandleDescriptor`.
 #[proc_macro_attribute]
-pub fn handle_descriptor(attr: TokenStream, item: TokenStream) -> TokenStream {
-    handle_descriptor2(attr.into(), item.into())
+pub fn handle_descriptor(args: TokenStream, item: TokenStream) -> TokenStream {
+    handle_descriptor2(args.into(), item.into())
         .unwrap_or_else(Error::into_compile_error)
         .into()
 }
-fn handle_descriptor2(attr: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
-    let argspan = attr.span();
-    let params: Params = syn::parse2(attr)?;
+fn handle_descriptor2(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
+    let argspan = args.span();
+    let args: Args = syn::parse2(args)?;
     let mut st: ItemStruct = syn::parse2(item)?;
     let ident = &st.ident;
-    let descriptor_impl = match params {
+    let descriptor_impl = match args {
         // special case: target=Self
-        Params(Type::Path(ref path), mutable, sized) if is_self(path) => {
+        Args(Type::Path(ref path), mutable, sized) if is_self(path) => {
             if let Some(LitBool { value: false, span }) = mutable {
                 compile_error(span, "self handles are always mutable")?
             } else if let Some(LitBool { value: false, span }) = sized {
@@ -129,8 +129,7 @@ fn handle_descriptor2(attr: TokenStream2, item: TokenStream2) -> Result<TokenStr
                 }
             }
         }
-
-        Params(target @ Type::Path(_), mutable, sized) => {
+        Args(target @ Type::Path(_), mutable, sized) => {
             let mutable = match mutable {
                 Some(mutable) => mutable.value(),
                 _ => compile_error(argspan, "missing `mutable=<bool>` argument")?,
@@ -141,7 +140,7 @@ fn handle_descriptor2(attr: TokenStream2, item: TokenStream2) -> Result<TokenStr
             };
             emit_handle_descriptor(&mut st, target, mutable, sized)?
         }
-        Params(target @ Type::TraitObject(_), mutable, sized) => {
+        Args(target @ Type::TraitObject(_), mutable, sized) => {
             let mutable = match mutable {
                 Some(mutable) => mutable.value(),
                 _ => compile_error(argspan, "missing `mutable=<bool>` argument")?,
@@ -151,8 +150,7 @@ fn handle_descriptor2(attr: TokenStream2, item: TokenStream2) -> Result<TokenStr
             };
             emit_handle_descriptor(&mut st, target, mutable, false)?
         }
-
-        Params(target, _, _) => compile_error(target, "expected a type or a trait object")?,
+        Args(target, _, _) => compile_error(target, "expected a type or a trait object")?,
     };
 
     Ok(quote_spanned! { st.span() => #st #descriptor_impl })
