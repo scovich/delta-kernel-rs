@@ -9,11 +9,21 @@ This document analyzes Control Flow 1 (Snapshot Creation) in `delta-kernel-rs` a
 - **40% of code is already I/O-free** (computation on fetched data)
 - **30% is fundamental I/O** (file reads, directory listings)
 - **30% mixes I/O with computation** (choreography that needs refactoring)
-- **🔍 Control flow has 5+ levels of complexity** beneath `replay_for_metadata`
+- **🔍 Control flow has 9+ levels of complexity** beneath `replay_for_metadata`
+
+### Async Foundation
+
+The refactoring requires establishing a **parallel async trait hierarchy** alongside the existing sync traits:
+- **`AsyncEngine`** trait with async handler methods returning **Streams** (not Iterators)
+- Stream-based handlers: `AsyncJsonHandler`, `AsyncParquetHandler`, `AsyncStorageHandler`
+- **Key insight**: The `try_fold` pattern works for both `Iterator` (sync) and `Stream` (async) with minimal changes
+- **⚠️ Important**: `futures::TryStreamExt::try_fold` is hardwired to `Result` and cannot work with `ControlFlow`. We need a custom `ControlFlowStreamExt` trait (~70 lines) to enable `ControlFlow`-based folding for async streams.
+
+See **Section 3** for complete async trait specifications and the custom extension trait implementation.
 
 ### Pattern Refinement
 
-Analysis reveals **three core patterns** needed (Section 2.2):
+Analysis reveals **three core patterns** needed (Section 4):
 
 - **Pattern A (Helper Functions)**: One-shot operations ✅
 - **Pattern B (Processor + try_fold)**: Iterative processing with early exit ✅
@@ -21,30 +31,52 @@ Analysis reveals **three core patterns** needed (Section 2.2):
   - Phase 1 uses Pattern B (ControlFlow-based state machine)
   - Phase 2 uses nested Pattern B (files × batches)
 
-**Status**: All patterns designed and refined. Pattern C incorporates insights from [PR #1160](https://github.com/delta-io/delta-kernel-rs/pull/1160) with ControlFlow-based improvements (Section 10).
+**Status**: All patterns designed and refined. Pattern C incorporates insights from [PR #1160](https://github.com/delta-io/delta-kernel-rs/pull/1160) with ControlFlow-based improvements (Appendix B).
 
 ### Recommendations
 
-1. **Extract I/O-free processors** from mixed choreography code
-2. **Use pattern library** to match refactoring approach to problem structure:
+1. **Design async trait hierarchy first** (Phase 0) - foundation for all subsequent work
+2. **Extract I/O-free processors** from mixed choreography code
+3. **Use pattern library** to match refactoring approach to problem structure:
    - **Pattern A (Helper Functions)**: For one-shot operations (e.g., `LastCheckpointHint`) ✅
    - **Pattern B (Processor + try_fold)**: For iterative processing (e.g., `MetadataExtractor`) ✅
    - **Pattern C (Two-Phase + ControlFlow)**: For checkpoint processing with manifest + sidecars ✅
-3. **Minimal sync/async duplication**: `try_fold` + `ControlFlow` pattern reduces duplication to ~33 lines (mostly `.await`)
-4. **Async virality is contained**: Only 35% of functions need async variants; 65% of code is shared
-5. **Phased approach**: Start with Patterns A & B (proven), then implement C (design validated by PR #1160)
+4. **Minimal sync/async duplication**: `try_fold` + `ControlFlow` pattern reduces duplication to ~33 lines (mostly `.await`)
+5. **Async virality is contained**: Only 35% of functions need async variants; 65% of code is shared
+6. **Cooperative yielding**: Always `yield_now().await` after processing each batch (simple ~15 line helper)
+
+### Implementation Timeline
+
+**Realistic estimate: 10-12 weeks**
+
+Key phases:
+- **Weeks 1-2**: Async trait hierarchy design and foundation
+- **Weeks 3-5**: Extract processors and refactor sync choreography
+- **Weeks 6-8**: Implement Pattern C (most complex)
+- **Weeks 9-10**: Add async choreography
+- **Weeks 11-12**: Integration, testing, documentation
+
+See **Section 6** for detailed implementation roadmap.
 
 ### Navigation
 
-- **Section 2**: Current and refactored state analysis
-  - **2.1**: Current control flow (what we have now)
-  - **2.2**: I/O vs computation breakdown (categorizing the code)
-  - **2.3**: Refactored control flow (what it will look like after patterns applied)
-- **Section 3**: Foundation (principles + pattern library)
-- **Section 4**: Applying patterns (concrete refactoring examples)
-- **Section 5**: Implementation plan (phased rollout)
-- **Section 6-8**: Decisions, outcomes, open questions
-- **Section 9-10**: Appendices (learnings, comparisons)
+**Part I: Foundation & Analysis**
+- **Section 2**: Current state analysis (control flow, I/O breakdown, refactored vision)
+- **Section 3**: Async foundation (AsyncEngine traits, Streams, cooperative yielding)
+- **Section 4**: Refactoring principles & patterns (Pattern A, B, C)
+
+**Part II: Implementation**
+- **Section 5**: Pre-implementation analysis (complexity, phase boundaries, CPU strategy)
+- **Section 6**: Implementation roadmap (detailed 10-12 week timeline)
+- **Section 7**: Key architectural decisions
+- **Section 8**: Success criteria & expected outcomes
+- **Section 9**: Risk management & open questions
+
+**Part III: Appendices**
+- **Appendix A**: Applying patterns to Category 3 (concrete examples)
+- **Appendix B**: Key learnings & discovery process (PR #1160 analysis)
+- **Appendix C**: Phase 1 design evolution (Iterator to ControlFlow)
+- **Appendix D**: Evolution from initial approach
 
 ---
 
@@ -170,7 +202,7 @@ These operations mix I/O orchestration with computation logic:
 - Mixes:
   - `find_commit_cover()` - ✅ CPU: compute minimal file set (already I/O-free)
   - `json_handler.read_json_files()` - ❌ I/O: returns iterator hiding async
-  - `create_checkpoint_stream()` - ❌ I/O: see Problem 4 below
+  - `create_checkpoint_stream()` - ❌ I/O: Problem 4
   - `.chain()` - ❌ I/O: combines two lazy iterators
 - **Problem**: Orchestrates two independent sources (commits + checkpoints) with different schemas
 - **Cannot easily apply Pattern B**: Multi-source requires different approach
@@ -205,7 +237,7 @@ These operations mix I/O orchestration with computation logic:
 - **High** (1 operation): `read_actions` (multi-source)
 - **Very High** (1 operation): `create_checkpoint_stream` (nested conditional I/O)
 
-**Example**: Problem 2 (`protocol_and_metadata`) shows ~20 lines of extraction logic intertwined with I/O loop, making it untestable and unreusable for async. See Section 4.2 for detailed analysis and refactoring.
+**Example**: Problem 2 (`protocol_and_metadata`) shows ~20 lines of extraction logic intertwined with I/O loop, making it untestable and unreusable for async. The `MetadataExtractor` processor (Pattern B, Section 4.2) extracts this logic into a testable, reusable component.
 
 ### 2.3 Refactored Control Flow
 
@@ -249,11 +281,11 @@ Legend:
   func[_sync|async] - Explicitly different method names (not just suffix)
 ```
 
-**Key changes from Section 2.1**:
+**Refactoring Applied**:
 
-1. **Pattern A applied**: `LastCheckpointHint::from_file_result` extracted (I/O-free helper)
-2. **Pattern B applied**: `MetadataExtractor` processor extracted (I/O-free state machine)
-3. **Pattern C applied**: Two-phase processing with `phase1_*` and `process_sidecars_*`
+1. **Pattern A**: `LastCheckpointHint::from_file_result` extracted as I/O-free helper
+2. **Pattern B**: `MetadataExtractor` processor extracted as I/O-free state machine
+3. **Pattern C**: Two-phase processing with `phase1_*` and `process_sidecars_*`
 4. **Shared computation**: All processors and pure functions work for both sync and async
 
 #### Code Metrics After Refactoring
@@ -316,9 +348,562 @@ The other 65% of code is I/O-free and shared between sync and async paths!
 
 ---
 
-## 3. Foundation: Refactoring Principles & Patterns
+## 3. Async Foundation
 
-### 3.1 Core Principles
+This section specifies the async trait hierarchy that forms the foundation for all async snapshot building operations.
+
+### 3.1 Async Trait Hierarchy Design
+
+The async refactoring requires a **parallel trait hierarchy** alongside the existing sync traits. Async handlers return **Streams** instead of **Iterators**, enabling non-blocking I/O operations.
+
+#### Current Sync Traits (Existing)
+
+```rust
+// From kernel/src/lib.rs
+pub trait Engine: AsAny {
+    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler>;
+    fn storage_handler(&self) -> Arc<dyn StorageHandler>;
+    fn json_handler(&self) -> Arc<dyn JsonHandler>;
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler>;
+}
+
+pub trait JsonHandler: AsAny {
+    fn read_json_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<FileDataReadResultIterator>;
+    // where FileDataReadResultIterator = Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>>>
+}
+
+pub trait ParquetHandler: AsAny {
+    fn read_parquet_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<FileDataReadResultIterator>;
+}
+
+pub trait StorageHandler: AsAny {
+    fn list_from(&self, path: &Url) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>>;
+    fn read_files(&self, files: &[FileMeta]) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>>;
+}
+```
+
+#### Proposed Async Traits (New)
+
+```rust
+use futures::stream::Stream;
+use std::pin::Pin;
+
+/// Async version of Engine - returns async handlers
+pub trait AsyncEngine: AsAny {
+    /// EvaluationHandler is shared between sync and async (CPU-only, no I/O)
+    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler>;
+    
+    fn storage_handler(&self) -> Arc<dyn AsyncStorageHandler>;
+    fn json_handler(&self) -> Arc<dyn AsyncJsonHandler>;
+    fn parquet_handler(&self) -> Arc<dyn AsyncParquetHandler>;
+}
+
+/// Generic pinned, boxed, Send-able Stream for Delta operations
+pub type DeltaStream<T> = Pin<Box<dyn Stream<Item = DeltaResult<T>> + Send>>;
+
+/// Stream type for file data reads
+pub type FileDataReadResultStream = DeltaStream<Box<dyn EngineData>>;
+
+/// Stream type for file metadata
+pub type FileMetaStream = DeltaStream<FileMeta>;
+
+/// Stream type for raw bytes
+pub type BytesStream = DeltaStream<Bytes>;
+
+pub trait AsyncJsonHandler: AsAny {
+    /// Read JSON files asynchronously
+    /// 
+    /// Returns a Stream that yields batches of EngineData as they're read.
+    /// The Stream is Send to allow moving across await points.
+    fn read_json_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<FileDataReadResultStream>;
+}
+
+pub trait AsyncParquetHandler: AsAny {
+    /// Read Parquet files asynchronously
+    ///
+    /// Returns a Stream that yields batches of EngineData as they're read.
+    /// The Stream is Send to allow moving across await points.
+    fn read_parquet_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<FileDataReadResultStream>;
+}
+
+pub trait AsyncStorageHandler: AsAny {
+    /// List files from a path asynchronously
+    ///
+    /// Returns a Stream of FileMeta as files are discovered.
+    async fn list_from(&self, path: &Url) -> DeltaResult<FileMetaStream>;
+    
+    /// Read multiple files asynchronously
+    ///
+    /// Returns a Stream of file contents (Bytes) in the order requested.
+    async fn read_files(&self, files: &[FileMeta]) -> DeltaResult<BytesStream>;
+}
+```
+
+#### Key Design Decisions
+
+**1. Separate trait hierarchies** (not combined or generic):
+
+```rust
+// ✅ Recommended: Separate traits
+pub trait Engine { 
+    fn read_json_files(&self, ...) -> DeltaResult<Box<dyn Iterator<...>>>;
+}
+
+pub trait AsyncEngine { 
+    async fn read_json_files(&self, ...) -> DeltaResult<Pin<Box<dyn Stream<...>>>>;
+}
+
+// ❌ Alternative 1: Combined trait with async methods
+pub trait Engine {
+    fn read_file(&self, ...) -> Iterator<...>;
+    async fn read_file_async(&self, ...) -> Stream<...>;  // Complicates trait objects
+}
+
+// ❌ Alternative 2: Generic trait
+pub trait GenericEngine<OutputKind> {
+    type Output<T>;
+    fn read_json_files(&self, ...) -> Self::Output<EngineData>;
+    // Problem: Can't make this conditionally async based on OutputKind!
+}
+```
+
+**Why not generic?**
+
+While a generic trait like `GenericEngine<OutputKind>` seems appealing (methods have identical signatures except Iterator vs Stream), it's not feasible because:
+
+1. **Can't conditionally make methods `async`**: The method signature must be either `fn` or `async fn` - you can't make it conditional on a type parameter
+2. **Different return types are fundamentally different**: 
+   - Sync returns `T` immediately
+   - Async returns `impl Future<Output = T>`
+   - These aren't just different types, they have different evaluation semantics
+3. **Trait object complexity**: `dyn GenericEngine<Iterator>` vs `dyn GenericEngine<Stream>` would be awkward and lose the clarity of purpose
+
+**Rationale for separate traits**: 
+- Clear separation of sync vs async semantics
+- Methods can be truly `async fn` (not just returning futures)
+- Users can implement only sync, only async, or both
+- No runtime cost for sync-only users
+- Trait objects are straightforward: `&dyn Engine` vs `&dyn AsyncEngine`
+
+**Note on Arrow's generic approach**: 
+
+Arrow uses generic types like `GenericArray<OffsetSize>` with type aliases (`StringArray = GenericArray<i32>`, `LargeStringArray = GenericArray<i64>`). This works because:
+- The methods don't change (both use the same operations)
+- It's purely a difference in data representation (offset size)
+- No async vs sync distinction
+
+Our case is fundamentally different - we're not just changing a type parameter, we're changing the **execution model** (sync vs async).
+
+**2. Stream types are boxed and pinned**:
+```rust
+pub type DeltaStream<T> = Pin<Box<dyn Stream<Item = DeltaResult<T>> + Send>>;
+
+// Used as:
+pub type FileDataReadResultStream = DeltaStream<Box<dyn EngineData>>;
+pub type FileMetaStream = DeltaStream<FileMeta>;
+pub type BytesStream = DeltaStream<Bytes>;
+```
+
+**Rationale**:
+- `Pin` required for async trait methods (futures must be pinned)
+- `Box` for trait object (allows dynamic dispatch)
+- `Send` required to move across await points (multi-threaded executors)
+- `dyn Stream` allows different implementations
+- Generic `DeltaStream<T>` reduces redundancy in type definitions
+
+**Alternative considered**: `impl Stream` (static dispatch)
+- **Pro**: No boxing overhead, better performance
+- **Con**: Trait methods can't use `impl Trait` in return position (not object-safe)
+- **Verdict**: Boxed trait objects are necessary for engine abstraction
+
+**3. EvaluationHandler is shared**:
+```rust
+// Same for both sync and async!
+fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler>;
+```
+
+**Rationale**: EvaluationHandler is CPU-only (expression evaluation on in-memory data), no I/O, so it doesn't need async variants.
+
+**4. Dependencies and Cooperative Yielding**:
+
+The async implementation requires the `futures` crate, which provides:
+- `Stream` trait (async equivalent of `Iterator`)
+- `StreamExt` for stream combinators (`.chain()`, `.map()`, etc.)
+
+The `futures` crate is already an optional dependency in `kernel/Cargo.toml` (line 59), included in the `default-engine-base` feature.
+
+**Cooperative Yielding**: For executor-agnostic yielding, we need to implement a simple helper since the `futures` crate doesn't provide `yield_now()`:
+
+```rust
+/// Yields control back to the executor, allowing other tasks to run.
+/// This is executor-agnostic and works with any async runtime.
+#[inline]
+pub async fn yield_now() {
+    /// Yield implementation that wakes immediately and returns Pending once
+    struct YieldNow {
+        yielded: bool,
+    }
+    
+    impl Future for YieldNow {
+        type Output = ();
+        
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.yielded {
+                Poll::Ready(())
+            } else {
+                self.yielded = true;
+                cx.waker().wake_by_ref();  // Wake immediately
+                Poll::Pending
+            }
+        }
+    }
+    
+    YieldNow { yielded: false }.await
+}
+```
+
+**Note on `wake_by_ref()` vs tokio's `context::defer()`**: 
+
+[Tokio's `yield_now()`](https://docs.rs/tokio/latest/src/tokio/task/yield_now.rs.html#39-64) uses `context::defer(cx.waker())` which schedules the wake to happen *after* the current poll completes, potentially giving other tasks more opportunity to run before this task is re-polled. 
+
+Our simpler implementation using [`wake_by_ref()`](https://docs.rs/futures/latest/futures/task/struct.Waker.html#method.wake_by_ref) wakes the task immediately, which may lead to it being re-polled sooner. However:
+
+1. **Executor-agnostic**: `wake_by_ref()` works with any executor, while `context::defer()` is tokio-specific
+2. **Simpler**: No additional infrastructure needed
+3. **Still cooperative**: The task still yields (returns `Poll::Pending`), giving the executor the opportunity to run other tasks
+4. **Good enough**: For our use case (yielding between batches every 10-100ms of CPU work), the slight difference in scheduling fairness is negligible
+
+If tokio-specific optimizations become important, users can configure their async engine to use tokio's yield mechanism in their engine implementation, keeping the kernel executor-agnostic.
+
+This is ~15 lines of code and works with any executor (tokio, async-std, smol, etc.). No additional dependencies needed.
+
+### 3.2 Iterator vs Stream Compatibility
+
+**Critical insight**: The `try_fold` pattern used throughout this proposal works for **both** sync (`Iterator`) and async (`Stream`) with minimal changes.
+
+#### Standard Library: Iterator::try_fold
+
+```rust
+// From std::iter::Iterator
+pub trait Iterator {
+    fn try_fold<B, F, R>(&mut self, init: B, f: F) -> R
+    where
+        F: FnMut(B, Self::Item) -> R,
+        R: Try<Output = B>;
+}
+
+// Usage (sync):
+iterator.try_fold(processor, |p, item| {
+    p.process(item).transpose()  // Returns ControlFlow<Result<Output>, Processor>
+})
+```
+
+#### Futures Crate: TryStreamExt::try_fold
+
+```rust
+// From futures::stream::TryStreamExt
+pub trait TryStreamExt: Stream {
+    fn try_fold<B, F, Fut>(&mut self, init: B, f: F) -> TryFold<Self, Fut, F>
+    where
+        F: FnMut(B, Self::Ok) -> Fut,
+        Fut: TryFuture<Ok = B, Error = Self::Error>;
+}
+
+// Usage (async):
+stream.try_fold(processor, |p, item| async move {
+    p.process(item).transpose()  // Same return type as sync!
+})
+.await
+```
+
+**PROBLEM DISCOVERED**: `TryStreamExt::try_fold` is hardwired to `Result` via `TryFuture`, which means it **cannot** work with `ControlFlow` directly. The `Try` trait that enables `ControlFlow` with `Iterator::try_fold` is unstable and not available in async contexts.
+
+**Solution**: We need a custom stream extension trait for `ControlFlow`-based folding.
+
+#### Custom Extension Trait: ControlFlowStreamExt
+
+Since `futures::TryStreamExt::try_fold` is constrained to `Result` types (via `TryFuture`), we need our own extension trait that handles `ControlFlow`. The good news: **it's surprisingly simple** to implement!
+
+```rust
+use std::ops::ControlFlow;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use futures_core::{Future, Stream};
+use pin_project_lite::pin_project;
+
+/// Extension trait for `Stream` that provides `ControlFlow`-based folding.
+/// 
+/// This parallels `TryStreamExt::try_fold` but works with `ControlFlow` instead of `Result`.
+/// Needed because `TryStreamExt::try_fold` is hardwired to `Result` via `TryFuture`.
+/// 
+/// The method is named `try_fold` (same as `TryStreamExt`) since the compiler can
+/// disambiguate based on the `Future<Output = ControlFlow<>>` constraint vs `TryFuture`.
+pub trait ControlFlowStreamExt: Stream {
+    /// Folds the stream with early exit via `ControlFlow`.
+    /// 
+    /// Similar to `Iterator::try_fold`, but async. The closure should return:
+    /// - `ControlFlow::Continue(acc)` to continue folding with updated accumulator
+    /// - `ControlFlow::Break(value)` to stop early and return `value`
+    fn try_fold<B, C, F, Fut>(self, init: C, f: F) -> TryFoldControlFlow<Self, F, Fut, C>
+    where
+        Self: Sized,
+        F: FnMut(C, Self::Item) -> Fut,
+        Fut: Future<Output = ControlFlow<B, C>>;
+}
+
+impl<S: Stream> ControlFlowStreamExt for S {
+    fn try_fold<B, C, F, Fut>(self, init: C, f: F) -> TryFoldControlFlow<Self, F, Fut, C>
+    where
+        Self: Sized,
+        F: FnMut(C, Self::Item) -> Fut,
+        Fut: Future<Output = ControlFlow<B, C>>,
+    {
+        TryFoldControlFlow::new(self, f, init)
+    }
+}
+
+pin_project! {
+    /// Future for `try_fold_control_flow`.
+    /// 
+    /// Mirrors the structure of `futures_util::stream::TryFold`, but for `ControlFlow`.
+    #[must_use = "futures do nothing unless you `.await` or poll them"]
+    pub struct TryFoldControlFlow<St, F, Fut, C> {
+        #[pin]
+        stream: St,
+        f: F,
+        accum: Option<C>,
+        #[pin]
+        future: Option<Fut>,
+    }
+}
+
+impl<St, F, Fut, C> TryFoldControlFlow<St, F, Fut, C>
+where
+    St: Stream,
+    F: FnMut(C, St::Item) -> Fut,
+    Fut: Future,
+{
+    pub(crate) fn new(stream: St, f: F, init: C) -> Self {
+        Self {
+            stream,
+            f,
+            accum: Some(init),
+            future: None,
+        }
+    }
+}
+
+impl<St, F, Fut, B, C> Future for TryFoldControlFlow<St, F, Fut, C>
+where
+    St: Stream,
+    F: FnMut(C, St::Item) -> Fut,
+    Fut: Future<Output = ControlFlow<B, C>>,
+{
+    type Output = ControlFlow<B, C>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+        
+        Poll::Ready(loop {
+            if let Some(fut) = this.future.as_mut().as_pin_mut() {
+                // We're currently processing a future to produce a new accum value
+                match futures_core::ready!(fut.poll(cx)) {
+                    ControlFlow::Continue(c) => {
+                        *this.accum = Some(c);
+                        this.future.set(None);
+                    }
+                    ControlFlow::Break(b) => {
+                        break ControlFlow::Break(b);
+                    }
+                }
+            } else if this.accum.is_some() {
+                // We're waiting on a new item from the stream
+                match futures_core::ready!(this.stream.as_mut().poll_next(cx)) {
+                    Some(item) => {
+                        let acc = this.accum.take().unwrap();
+                        this.future.set(Some((this.f)(acc, item)));
+                    }
+                    None => {
+                        // Stream exhausted, return Continue with final accumulator
+                        let acc = this.accum.take().unwrap();
+                        break ControlFlow::Continue(acc);
+                    }
+                }
+            } else {
+                panic!("TryFoldControlFlow polled after completion")
+            }
+        })
+    }
+}
+```
+
+**Usage** (now works with `ControlFlow`):
+
+```rust
+use crate::ControlFlowStreamExt as _;
+
+// Async choreography with ControlFlow - same method name as Iterator::try_fold!
+stream
+    .try_fold(Processor::default(), |proc, item| async move {
+        proc.process(item).transpose()
+        // Returns ControlFlow<Result<Output>, Processor>
+    })
+    .await
+    .unwrap_break_or_else(Processor::try_finish)?
+```
+
+**Key Differences from `TryStreamExt::try_fold`**:
+
+1. **No `TryFuture` constraint**: We use `Future<Output = ControlFlow<B, C>>` directly
+2. **No error unwrapping**: We don't unwrap `Result` - the stream can be `Stream<Item = T>` or `Stream<Item = Result<T, E>>`
+3. **Simpler poll logic**: No error branching since `ControlFlow` is the only control flow mechanism
+4. **Stream exhaustion returns `Continue`**: When items run out, we return `Continue(accum)` instead of an error
+
+**Complexity Assessment**: ~70 lines of code. This is straightforward enough to include in `delta-kernel` rather than extracting to a separate crate.
+
+**Why Not Use Existing `TryStreamExt`?**: The futures crate's `TryStreamExt::try_fold` is hardwired to `Result` via the `TryFuture` trait ([source](https://docs.rs/futures-util/0.3.31/src/futures_util/stream/try_stream/try_fold.rs.html#9-20)). The stdlib's `Iterator::try_fold` can work with `ControlFlow` because it uses the unstable `Try` trait, but that's not available for async. Our custom trait bridges this gap by working directly with `ControlFlow<B, C>` instead of `Result<T, E>`.
+
+#### Key Insight: Minimal Differences
+
+The **only differences** between sync and async choreography:
+1. `async move` in the closure (async) vs bare closure (sync)
+2. `.await` after the fold (async) vs immediate result (sync)
+3. Import the right extension trait:
+   - Sync: `Iterator::try_fold` (stdlib, uses unstable `Try` trait)
+   - Async: `ControlFlowStreamExt::try_fold` (our custom trait, same method name!)
+
+**Everything else is identical**:
+- Processor interface (same `process` method)
+- `ControlFlow` return type (same early exit semantics)
+- `.transpose()` adaptor (same conversion)
+- `.unwrap_break_or_else()` helper (same exhaustion handling)
+
+This is why the pattern scales so well from sync to async!
+
+### 3.3 Cooperative Yielding for CPU-Intensive Operations
+
+Async operations must cooperate with the executor to avoid blocking other tasks. When processing multiple batches, always yield between batches.
+
+#### The Problem
+
+```rust
+// ❌ BAD: Can block executor for seconds
+stream.try_fold(processor, |p, batch| async move {
+    // If processing 1000 batches at 10ms each = 10 seconds blocking!
+    p.process_batch(&batch).transpose()
+    // No await points = executor can't switch to other tasks
+})
+```
+
+Even though the closure is `async move`, if there are no `.await` points inside, it runs synchronously and blocks the executor.
+
+#### The Solution: Batches Are Natural Cooperation Points
+
+**Key insight**: If an engine produces separate batches, it's for good reason (e.g., memory limits, streaming). Each batch boundary is a natural place to yield control back to the executor.
+
+**Simple rule**: Always `yield_now().await` before processing each batch.
+
+```rust
+// ✅ GOOD: Yields after each batch
+stream.try_fold(processor, |p, batch| async move {
+    yield_now().await;  // Natural cooperation point!
+    p.process_batch(&batch).transpose()
+})
+```
+
+#### Why This Works
+
+1. **Batches are already chunked work**: The engine splits data into batches, so each batch represents a reasonable quantum of work.
+
+2. **Minimal overhead**: `yield_now()` is cheap (~nanoseconds if no other tasks are ready).
+
+3. **Responsive**: Other tasks get a chance to run after each batch (typically every 10-100ms of CPU work).
+
+4. **Simple**: No complex heuristics about "how much CPU is too much" - just yield after each batch.
+
+5. **Composable**: Works at every level (batch processing, file processing, sidecar processing).
+
+#### When NOT to Yield
+
+Don't yield in I/O-free helpers or processors:
+```rust
+// Processor method (I/O-free, used by sync AND async)
+impl Processor {
+    pub fn process_batch(self, batch: &Batch) -> DeltaResult<ControlFlow<Output, Self>> {
+        // ✅ NO yielding here - this is pure computation
+        // ✅ Sync code can call this too
+        // ✅ Yielding happens in the choreography layer (async move closure)
+        ...
+    }
+}
+```
+
+**Rationale**: Processors are shared between sync and async. Yielding must happen in async choreography, not in shared I/O-free code.
+
+#### Complete Example
+
+```rust
+// Phase 2: Processing sidecars with cooperative yielding
+pub async fn process_sidecars_async(
+    self,
+    engine: &dyn AsyncEngine,
+) -> DeltaResult<Output> {
+    use crate::ControlFlowStreamExt as _;
+    
+    match self {
+        Phase1Result::Complete(output) => Ok(output),
+        Phase1Result::NeedPhase2 { processor, sidecar_files } => {
+            futures::stream::iter(sidecar_files)
+                .try_fold(processor, |proc, sidecar_file| async move {
+                    let batches = engine.read_parquet_file(&sidecar_file, ...).await?;
+                    
+                    batches.try_fold(proc, |p, batch| async move {
+                        yield_now().await;  // Yield after each batch!
+                        p.process_batch(&batch).transpose()
+                    }).await
+                })
+                .await
+                .unwrap_break_or_else(Processor::try_finish)?
+        }
+    }
+}
+```
+
+#### Summary
+
+**CPU-intensive operations in async**:
+- Always yield after processing each batch
+- Use `yield_now().await` (simple helper, ~15 lines, executor-agnostic)
+- Batches are natural cooperation points
+- Keep processors I/O-free (no yielding in shared code)
+
+This simple guideline ensures async operations remain responsive without complex heuristics or periodic yielding logic.
+
+---
+
+## 4. Foundation: Refactoring Principles & Patterns
+
+### 4.1 Core Principles
 
 These principles guide all refactoring decisions:
 
@@ -384,7 +969,7 @@ Different problems need different patterns:
 
 **Don't over-engineer**: Simple problems deserve simple solutions.
 
-### 3.2 Pattern Library
+### 4.2 Pattern Library
 
 #### Pattern A: Helper Functions (for one-shot operations)
 
@@ -439,7 +1024,7 @@ pub async fn read_async(storage: &dyn AsyncStorage, path: &Path)
 - ✅ Simple - no over-engineering
 - ✅ Testable with mock `Result<Data>`
 
-**Example**: `LastCheckpointHint::from_file_result` (see Section 4.1)
+**Example**: `LastCheckpointHint::from_file_result` (Pattern A, Section 4.1)
 
 #### Pattern B: Processor + try_fold (for iterative processing)
 
@@ -483,7 +1068,7 @@ Both [`Iterator::try_fold`](https://doc.rust-lang.org/std/iter/trait.Iterator.ht
 
 ```rust
 use std::ops::ControlFlow;
-// Uses extension traits (defined below) for .transpose() and .unwrap_break_or_else()
+// Uses extension traits for .transpose() and .unwrap_break_or_else()
 
 // 1. Processor: I/O-free state machine
 #[derive(Default)]
@@ -538,6 +1123,8 @@ pub fn operation(&self, engine: &dyn Engine) -> DeltaResult<Output> {
 
 // 3. Async choreography
 pub async fn operation_async(&self, engine: &dyn AsyncEngine) -> DeltaResult<Output> {
+    use crate::ControlFlowStreamExt as _;
+    
     self.get_data(engine).await?
         .try_fold(Processor::default(), |proc, item| async move {
             proc.process(item).transpose()
@@ -646,7 +1233,7 @@ where
     P: Processor,
     S: futures::Stream<Item = P::Item>,
 {
-    use futures::stream::TryStreamExt as _;
+    use crate::ControlFlowStreamExt as _;
     stream
         .try_fold(P::default(), |p, item| async move {
             p.process(&item).transpose()
@@ -695,7 +1282,7 @@ However, this abstraction may not be worth it:
 - ❌ Stateless transformation (use `map`/`filter`)
 - ❌ Infallible processing (use simpler types)
 
-**Example**: `MetadataExtractor::process_batch` (see Section 4.2)
+**Example**: `MetadataExtractor::process_batch` (Pattern B, Section 4.2)
 
 #### Pattern C: Two-Phase Checkpoint Processing (Refined based on PR #1160)
 
@@ -824,7 +1411,7 @@ impl LogSegment {
     where
         P: LogReplayProcessor,
     {
-        use futures::stream::TryStreamExt as _;
+        use crate::ControlFlowStreamExt as _;
         
         // Create streams (lazy, owned by this function)
         let commit_batches = engine.read_json_files(self.find_commit_cover(), ...).await?;
@@ -878,7 +1465,7 @@ impl<P: LogReplayProcessor> Phase1Result<P> {
         self,
         engine: &dyn AsyncEngine,
     ) -> DeltaResult<P::Output> {
-        use futures::stream::TryStreamExt as _;
+        use crate::ControlFlowStreamExt as _;
         
         match self {
             Phase1Result::Complete(output) => Ok(output),  // Early exit, no phase 2 needed
@@ -903,7 +1490,7 @@ impl<P: LogReplayProcessor> Phase1Result<P> {
 
 **Key Insight: Pattern C Uses Pattern B Internally!**
 
-Looking at the code above, Pattern B (`try_fold` with processor) appears **twice**:
+In this code, Pattern B (`try_fold` with processor) appears **twice**:
 
 1. **Outer loop**: Fold over sidecar **files**
    ```rust
@@ -992,7 +1579,7 @@ pub fn read_metadata_parallel(&self, engine: &dyn Engine)
 1. **Clean separation**: Phase 1 (manifest) is always sequential, Phase 2 (sidecars) is parallelizable
 2. **Natural for async**: Clear boundaries make async control flow straightforward
 3. **Supports all use cases**: Simple sequential, async, parallel, distributed - same pattern
-4. **Manifest is small**: Reading entire manifest first adds < 0.1% latency (see Section 9.6)
+4. **Manifest is small**: Reading entire manifest first adds < 0.1% latency (performance analysis in Section 9.6)
 5. **Better for parallelization**: Having all sidecar files up front enables load balancing, caching, progress tracking
 6. **Patterns compose**: Pattern C's phase 2 uses Pattern B (`try_fold`) internally - nested iteration benefits from same techniques!
 
@@ -1003,23 +1590,124 @@ pub fn read_metadata_parallel(&self, engine: &dyn Engine)
 - ✅ Sync and async differ only in choreography
 - ✅ Natural boundary for distributed processing
 
-**Why two-phase over incremental?** (See Section 9.6 for detailed analysis):
+**Why two-phase over incremental?** (detailed performance analysis in Section 9.6):
 - Checkpoint manifests are tiny (< 1MB, just metadata + paths)
 - Reading entire manifest adds negligible time (< 50ms vs minutes-hours for sidecars)
 - Two-phase is simpler and enables better parallelization
 - Incremental approach saves < 0.1% time while adding significant complexity
 
-**Status**: Design refined based on [PR #1160](https://github.com/delta-io/delta-kernel-rs/pull/1160). See Section 9.6 for detailed analysis and comparison.
+**Design evolution**: Refined based on insights from [PR #1160](https://github.com/delta-io/delta-kernel-rs/pull/1160), with detailed analysis in Section 9.6.
 
 **Note on Multi-Source Orchestration**: The challenge of orchestrating multiple sources (commits + checkpoints) with different schemas is naturally handled by Pattern C's phase 1. By chaining the commit and checkpoint iterators together, both sources are processed uniformly through the same `try_fold` loop. No separate pattern needed.
 
 ---
 
-## 4. Applying Patterns to Category 3
+## 5. Pre-Implementation Analysis
 
-This section shows concrete refactoring examples for the two problems identified in Category 3.
+Before diving into implementation, we need to assess the actual complexity and establish clear strategies for the challenges ahead.
 
-### 4.1 Problem 1: LastCheckpointHint (Simple case - Pattern A)
+### 5.1 Complexity Assessment
+
+The proposal initially estimated "5+ levels of complexity" beneath `replay_for_metadata`, but detailed code inspection reveals the actual nesting is **9+ levels deep**:
+
+```
+1. Snapshot::try_new_from_log_segment
+2.   └─ log_segment.read_metadata
+3.       └─ log_segment.protocol_and_metadata
+4.           └─ log_segment.replay_for_metadata
+5.               └─ log_segment.read_actions
+6.                   ├─ json_handler.read_json_files (iterator)
+7.                   └─ log_segment.create_checkpoint_stream
+8.                       ├─ Validation logic (schema checks)
+9.                       ├─ parquet/json_handler.read_*_files (iterator)
+10.                      └─ For each checkpoint batch:
+11.                          └─ log_segment.process_sidecars
+12.                              ├─ SidecarVisitor.visit_rows
+13.                              └─ parquet_handler.read_* (iterator)
+```
+
+**Key underestimation**: The original analysis missed:
+- Nested iterator consumption (checkpoints → sidecars)
+- Conditional paths (schema-dependent sidecar reading)
+- File format dispatch (JSON vs Parquet checkpoints)
+- Multiple error context layers
+
+**Impact**: This deeper nesting means Pattern C (two-phase) is more critical than initially apparent. Without it, async choreography would have 9+ levels of nested async blocks.
+
+### 5.2 Phase Boundary Details
+
+Pattern C's "phase 1 vs phase 2" boundary needs precise definition:
+
+**Phase 1 (Sequential - Must Process in Order)**:
+- All commit files (newest → oldest, for correct log replay semantics)
+- Checkpoint manifest file (single file, contains metadata + sidecar references)
+- **Output**: Accumulated state + list of all sidecar files
+
+**Why sequential**: Log replay semantics require processing commits in reverse chronological order. A newer commit can override actions from an older one.
+
+**Phase 2 (Parallelizable - Order Doesn't Matter)**:
+- All sidecar files (referenced by phase 1 manifest)
+- Can be distributed across workers
+- Can be processed in any order (just add actions)
+- **Output**: Combined state from all sidecars
+
+**Why parallelizable**: Sidecar files contain independent file actions (Add/Remove). No cross-file dependencies for log replay.
+
+**The boundary**:
+```rust
+// Phase 1 complete: we now know ALL the sidecar files
+pub enum Phase1Result<P> {
+    Complete(Output),              // Found metadata+protocol early, phase 2 not needed
+    NeedPhase2 {
+        processor: P,               // Accumulated state so far
+        sidecar_files: Vec<FileMeta>,  // Complete list for phase 2
+    }
+}
+```
+
+**Edge cases**:
+1. **Early exit**: If metadata + protocol found in commits (before checkpoint), return `Complete` and skip phase 2 entirely
+2. **No sidecars**: V1 checkpoints or V2 without file actions needed - phase 2 is empty but still goes through the same code path
+3. **Schema conditional**: Sidecars only read if `need_file_actions` is true - handled by phase 1 logic setting `sidecar_files` appropriately
+
+### 5.3 CPU-Intensive Operation Strategy
+
+The strategy is simple:
+
+**Rule**: Always `yield_now().await` after processing each batch.
+
+**Why this works**:
+- Batches are natural cooperation points (engine already chunked the work)
+- Minimal overhead (~nanoseconds when no other tasks ready)
+- Simple and composable (works at every nesting level)
+- No complex heuristics needed
+
+**Where to apply**:
+```rust
+// ✅ In async choreography closures
+stream.try_fold(processor, |p, batch| async move {
+    yield_now().await;  // After each batch!
+    p.process_batch(&batch).transpose()
+})
+
+// ❌ NOT in processors (I/O-free, shared with sync)
+impl Processor {
+    fn process_batch(self, batch: &Batch) -> DeltaResult<ControlFlow<...>> {
+        // No yielding here - keep this I/O-free
+        ...
+    }
+}
+```
+
+**Performance impact**: Negligible. Yielding adds microseconds, batch processing takes milliseconds. If it becomes a bottleneck (unlikely), we can make it configurable, but start with the simple rule.
+
+---
+
+## Appendix A: Applying Patterns to Category 3
+
+This appendix shows concrete refactoring examples for the problems identified in Category 3 (Section 2.2).
+
+### A.1 Problem 1: LastCheckpointHint (Simple case - Pattern A)
 
 The simpler case (Pattern A) is presented first, followed by the more complex iterative case (Pattern B).
 
@@ -1110,7 +1798,7 @@ impl LastCheckpointHint {
 
 **Duplication eliminated**: Was ~30 lines (15 sync + 15 async), now ~14 lines (8 helper + 3 sync + 3 async) ✅
 
-### 4.2 Problem 2: Protocol & Metadata Extraction (Complex case - Pattern B)
+### A.2 Problem 2: Protocol & Metadata Extraction (Complex case - Pattern B)
 
 Now we tackle the complex case with stateful processing and early exit.
 
@@ -1255,7 +1943,7 @@ impl LogSegment {
     /// Uses async try_fold with the SAME MetadataExtractor.
     pub async fn read_metadata_async(&self, engine: &dyn AsyncEngine)
         -> DeltaResult<(Metadata, Protocol)> {
-        use futures::stream::TryStreamExt as _;
+        use crate::ControlFlowStreamExt as _;
         
         self.replay_for_metadata_async(engine).await?
             .try_fold(MetadataExtractor::default(), |p, batch| async move {
@@ -1278,62 +1966,332 @@ impl LogSegment {
 
 ---
 
-## 5. Implementation Plan
+## 6. Implementation Roadmap
 
-### Phase 0: Foundation - Extension Traits (Day 1)
+**Total Timeline: 10-12 weeks** (realistic estimate based on complexity analysis)
 
-**Deliverables**:
-- [ ] Create `kernel/src/control_flow_ext.rs` with two extension traits:
-  - `ResultExt<T, E>` with `.transpose()` method (constrained to `Result<ControlFlow>`)
-  - `ControlFlowExt<B, C>` with `.unwrap_break_or_else()` and `.unwrap_break_or()` methods
+This roadmap provides granular, actionable tasks with dependencies and risk assessment.
+
+### Phase 0: Async Foundation (Weeks 1-2) - 10 days
+
+**Goal**: Design and document the complete async trait hierarchy before any refactoring begins.
+
+**Task 0.1: Design AsyncEngine Trait Hierarchy (3 days)**
+- [ ] Draft all async trait signatures (`AsyncEngine`, `AsyncJsonHandler`, `AsyncParquetHandler`, `AsyncStorageHandler`)
+- [ ] Define Stream type aliases (`FileDataReadResultStream`, `FileMetaStream`, `BytesStream`)
+- [ ] Document Send/Sync requirements and rationale
+- [ ] Review with team: trait design is hard to change later
+- **Output**: RFC or design document for async traits
+- **Risk**: May require iteration based on feedback
+
+**Task 0.2: Create Extension Traits (1 day)**
+- [ ] Create `kernel/src/control_flow_ext.rs` with `ResultExt` and `ControlFlowExt`
+- [ ] Implement `.transpose()` method (constrained to `Result<ControlFlow>`)
+- [ ] Implement `.unwrap_break_or_else()` and `.unwrap_break_or()` methods
 - [ ] Add comprehensive unit tests for both traits
 - [ ] Add module-level documentation with examples
-- **Effort**: 1 day
-- **Priority**: High - needed for all subsequent phases
+- **Output**: `control_flow_ext.rs` module
+- **Priority**: High - needed for all pattern implementations
 
-### Phase 1: Extract Processors (Week 1)
+**Task 0.3: Document Cooperative Yielding Pattern (1 day)**
+- [ ] Write guidelines for when/where to use `yield_now().await`
+- [ ] Create code examples showing correct usage
+- [ ] Document anti-patterns (yielding in processors, etc.)
+- **Output**: Module docs or guideline document
+- **Priority**: High - prevents executor starvation issues
 
-**Deliverables**:
-- [ ] Create `MetadataExtractor` struct (I/O-free processor using `Result<ControlFlow>`)
-- [ ] Add `LastCheckpointHint::from_file_result` helper (I/O-free parser)
-- [ ] Unit tests for both (with mock data, no I/O!)
-- **Effort**: 2-3 days
-- **Depends on**: Phase 0 (ControlFlowExt)
+**Task 0.4: Prototype Stream-based try_fold (2 days)**
+- [ ] Create minimal example using `TryStreamExt::try_fold`
+- [ ] Verify ControlFlow works correctly with async Streams
+- [ ] Test cooperative yielding behavior
+- [ ] Measure performance overhead
+- **Output**: Proof-of-concept code + performance data
+- **Priority**: Medium - validates core pattern assumption
 
-### Phase 2: Refactor Sync Choreography (Week 1-2)
+**Task 0.5: Review and Finalize (2 days)**
+- [ ] Internal review of async trait design
+- [ ] Address feedback and iterate
+- [ ] Finalize trait signatures and documentation
+- [ ] Get sign-off before proceeding
+- **Output**: Approved async trait design
+- **Risk**: May require additional iteration
 
-**Deliverables**:
-- [ ] Refactor `LogSegment::read_metadata()` to use `try_fold` + `MetadataExtractor`
-- [ ] Refactor `LastCheckpointHint::try_read()` to use `from_file_result` helper
-- [ ] Ensure existing tests pass (behavior unchanged)
-- [ ] Add tests showing processor reuse
-- **Effort**: 2-3 days
-- **Depends on**: Phase 1 (Processors)
+**Phase 0 Deliverables**:
+- ✅ Complete async trait hierarchy design (documented)
+- ✅ Extension traits implemented and tested
+- ✅ Cooperative yielding guidelines documented
+- ✅ Pattern validated with prototype
 
-### Phase 3: Add Async Choreography (Week 2-3)
-
-**Deliverables**:
-- [ ] Add `LogSegment::read_metadata_async()` using async `try_fold` + same processor
-- [ ] Add `LastCheckpointHint::try_read_async()` using same helper
-- [ ] Requires: `AsyncEngine` trait or feature-gated async
-- [ ] Tests for async variants
-- **Effort**: 3-4 days
-- **Depends on**: Phase 2 (Sync choreography as template)
-
-### Phase 4: Documentation & Examples (Week 3-4)
-
-**Deliverables**:
-- [ ] Document processor pattern in module docs
-- [ ] Document choreography pattern in module docs
-- [ ] Example: custom choreography (cached, distributed)
-- [ ] Example: testing processors without I/O
-- **Effort**: 2-3 days
-
-**Total**: 3 weeks for complete refactoring of Control Flow 1
+**Phase 0 Risks**:
+- Async trait design may require multiple rounds of feedback
+- Stream type choices may need adjustment based on implementation constraints
 
 ---
 
-## 6. Key Architectural Decisions
+### Phase 1: Extract I/O-Free Processors (Week 3) - 5 days
+
+**Goal**: Create reusable, testable processors for Pattern A and Pattern B.
+
+**Task 1.1: Create MetadataExtractor Processor (2 days)**
+- [ ] Implement `MetadataExtractor` struct with `process_batch` and `try_finish` methods
+- [ ] Use `Result<ControlFlow<(Metadata, Protocol), Self>>` signature
+- [ ] Implement `Default` trait
+- [ ] Handle all error cases (invalid data, missing fields)
+- **Output**: `MetadataExtractor` in `kernel/src/snapshot.rs` or new module
+- **Depends on**: Phase 0 Task 0.2 (extension traits)
+
+**Task 1.2: Create LastCheckpointHint Helper (1 day)**
+- [ ] Implement `LastCheckpointHint::from_file_result` helper function
+- [ ] Handle all cases: Ok(data), Err(NotFound), Err(other), empty file
+- [ ] Keep all error handling in one place
+- **Output**: Helper method in `kernel/src/last_checkpoint_hint.rs`
+
+**Task 1.3: Unit Tests (2 days)**
+- [ ] Test `MetadataExtractor` with mock `ActionsBatch` data
+- [ ] Test early exit when metadata+protocol found in first batch
+- [ ] Test exhaustion case (incomplete state after all batches)
+- [ ] Test error propagation from `process_batch`
+- [ ] Test `LastCheckpointHint::from_file_result` with all error cases
+- **Output**: Comprehensive test coverage without any I/O
+- **Priority**: High - validates I/O-free design
+
+**Phase 1 Deliverables**:
+- ✅ MetadataExtractor processor (I/O-free, tested)
+- ✅ LastCheckpointHint helper (I/O-free, tested)
+- ✅ Unit tests passing (no I/O mocks needed)
+
+---
+
+### Phase 2: Refactor Sync Choreography (Weeks 4-5) - 8 days
+
+**Goal**: Refactor existing sync code to use processors, maintaining existing behavior.
+
+**Task 2.1: Refactor LastCheckpointHint::try_read (2 days)**
+- [ ] Update `try_read` to use `from_file_result` helper
+- [ ] Handle `read_files` API mismatch (takes `&[FileMeta]`, not single path)
+- [ ] Ensure existing tests pass unchanged
+- **Output**: Refactored `LastCheckpointHint::try_read`
+- **Risk**: `read_files` API mismatch may require additional wrapper
+
+**Task 2.2: Refactor LogSegment::read_metadata (3 days)**
+- [ ] Update `protocol_and_metadata` to use `try_fold` + `MetadataExtractor`
+- [ ] Replace manual loop with processor pattern
+- [ ] Handle all error contexts (file paths, batch numbers)
+- [ ] Ensure existing tests pass unchanged
+- **Output**: Refactored `protocol_and_metadata` method
+- **Depends on**: Phase 1 Task 1.1 (MetadataExtractor)
+
+**Task 2.3: Error Context Preservation (2 days)**
+- [ ] Audit all error paths to ensure context is preserved
+- [ ] Add file paths to errors where missing
+- [ ] Add batch numbers for debugging
+- [ ] Verify error messages are actionable
+- **Output**: Improved error messages
+- **Priority**: Medium - important for debugging
+
+**Task 2.4: Integration Testing (1 day)**
+- [ ] Run full test suite
+- [ ] Verify no regressions in behavior
+- [ ] Add integration tests showing processor reuse
+- **Output**: All tests passing
+- **Priority**: High - must not break existing functionality
+
+**Phase 2 Deliverables**:
+- ✅ Sync choreography refactored to use processors
+- ✅ All existing tests passing
+- ✅ Error context preserved
+
+**Phase 2 Risks**:
+- `read_files` API mismatch may require more work than expected
+- Error context preservation may uncover edge cases
+
+---
+
+### Phase 3: Implement Pattern C - Two-Phase Processing (Weeks 6-8) - 15 days
+
+**Goal**: Implement the most complex pattern (two-phase checkpoint processing).
+
+**Task 3.1: Implement Phase1InProgress State Machine (3 days)**
+- [ ] Create `Phase1InProgress` struct
+- [ ] Implement `process_batch` method (I/O-free)
+- [ ] Create `Phase1Result` enum (`Complete` vs `NeedPhase2`)
+- [ ] Implement `From` conversions for ergonomic state transitions
+- [ ] Unit tests for state machine (mock data)
+- **Output**: Phase 1 state machine
+- **Complexity**: High - careful design needed
+
+**Task 3.2: Implement phase1_sync Choreography (4 days)**
+- [ ] Create `LogSegment::phase1_sync` method
+- [ ] Handle multi-source coordination (commits + checkpoints)
+- [ ] Chain commit and checkpoint iterators
+- [ ] Use `try_fold` with `Phase1InProgress`
+- [ ] Handle all conditional paths (early exit, no sidecars, etc.)
+- [ ] Handle all error contexts
+- **Output**: Working phase 1 sync choreography
+- **Depends on**: Task 3.1
+- **Complexity**: Very high - most complex choreography
+
+**Task 3.3: Implement process_sidecars_sync (3 days)**
+- [ ] Create `Phase1Result::process_sidecars_sync` method
+- [ ] Implement nested `try_fold` (files × batches)
+- [ ] Handle `Complete` early exit case
+- [ ] Handle `NeedPhase2` with sidecar processing
+- **Output**: Working phase 2 sync choreography
+- **Depends on**: Task 3.2
+
+**Task 3.4: Integration Testing (3 days)**
+- [ ] Test with V1 checkpoints (no sidecars)
+- [ ] Test with V2 checkpoints (with sidecars)
+- [ ] Test early exit cases (metadata in commits)
+- [ ] Test error cases (missing sidecars, corrupt data)
+- [ ] Verify performance is unchanged
+- **Output**: Comprehensive test coverage
+- **Priority**: Critical - most complex code path
+
+**Task 3.5: Documentation (2 days)**
+- [ ] Document two-phase pattern in module docs
+- [ ] Add examples showing simple and advanced usage
+- [ ] Document when each pattern should be used
+- **Output**: Clear documentation
+- **Priority**: High - complex pattern needs good docs
+
+**Phase 3 Deliverables**:
+- ✅ Pattern C fully implemented for sync
+- ✅ Two-phase processing working
+- ✅ Comprehensive test coverage
+- ✅ Clear documentation
+
+**Phase 3 Risks**:
+- Pattern C is most complex - may need buffer time
+- Multi-source coordination may reveal edge cases
+- Nested iteration complexity may require refactoring
+
+---
+
+### Phase 4: Add Async Choreography (Weeks 9-10) - 10 days
+
+**Goal**: Add async variants of all choreography methods, reusing processors.
+
+**Task 4.1: Implement LastCheckpointHint::try_read_async (1 day)**
+- [ ] Create async variant using same `from_file_result` helper
+- [ ] Add `.await` for `storage.read_files(...).await`
+- [ ] Verify same error handling as sync version
+- **Output**: `try_read_async` method
+- **Depends on**: Phase 0 (AsyncEngine traits), Phase 2 Task 2.1
+
+**Task 4.2: Implement LogSegment::read_metadata_async (2 days)**
+- [ ] Create async variant using same `MetadataExtractor`
+- [ ] Use `TryStreamExt::try_fold` with `async move` closure
+- [ ] Add cooperative yielding after each batch
+- [ ] Verify same behavior as sync version
+- **Output**: `read_metadata_async` method
+- **Depends on**: Phase 2 Task 2.2
+
+**Task 4.3: Implement phase1_async Choreography (3 days)**
+- [ ] Create async variant of `phase1_sync`
+- [ ] Use Stream variants of handlers
+- [ ] Add cooperative yielding
+- [ ] Handle same conditional paths as sync
+- **Output**: `phase1_async` method
+- **Depends on**: Phase 3 Task 3.2
+
+**Task 4.4: Implement process_sidecars_async (2 days)**
+- [ ] Create async variant with nested `try_fold`
+- [ ] Add cooperative yielding at both levels (files and batches)
+- [ ] Use `futures::stream::iter` for sidecar list
+- **Output**: `process_sidecars_async` method
+- **Depends on**: Phase 3 Task 3.3
+
+**Task 4.5: Async Tests (2 days)**
+- [ ] Test all async methods with mock AsyncEngine
+- [ ] Verify cooperative yielding behavior
+- [ ] Test cancellation safety
+- [ ] Compare behavior with sync versions
+- **Output**: Async test coverage
+- **Priority**: High - async has unique failure modes
+
+**Phase 4 Deliverables**:
+- ✅ All async choreography implemented
+- ✅ Cooperative yielding in place
+- ✅ Async tests passing
+- ✅ Same behavior as sync versions
+
+**Phase 4 Risks**:
+- Async timing issues may be hard to reproduce in tests
+- Cooperative yielding may need tuning based on performance
+
+---
+
+### Phase 5: Integration & Documentation (Weeks 11-12) - 10 days
+
+**Goal**: Ensure everything works together, document for users.
+
+**Task 5.1: End-to-End Testing (4 days)**
+- [ ] Test sync snapshot building with real data
+- [ ] Test async snapshot building with real data
+- [ ] Test mixed sync/async scenarios
+- [ ] Test all checkpoint formats (V1, V2, sidecars)
+- [ ] Test error cases end-to-end
+- **Output**: Confidence in full integration
+- **Priority**: Critical - final validation
+
+**Task 5.2: Performance Validation (2 days)**
+- [ ] Benchmark sync path (should be unchanged)
+- [ ] Benchmark async path
+- [ ] Verify cooperative yielding overhead is acceptable
+- [ ] Profile any regressions
+- **Output**: Performance report
+- **Priority**: High - must not regress sync performance
+
+**Task 5.3: Documentation (3 days)**
+- [ ] Write high-level overview of patterns
+- [ ] Document when to use each pattern
+- [ ] Write guide for custom engines (how to implement AsyncEngine)
+- [ ] Write guide for power users (using processors directly)
+- [ ] Add examples to docs
+- **Output**: Complete user-facing documentation
+- **Priority**: High - critical for adoption
+
+**Task 5.4: Buffer for Issues (1 day)**
+- [ ] Address any issues found in integration
+- [ ] Fix any performance problems
+- [ ] Improve documentation based on feedback
+- **Output**: Polish
+- **Priority**: Medium - inevitably something will need fixing
+
+**Phase 5 Deliverables**:
+- ✅ Full integration tested
+- ✅ Performance validated
+- ✅ Complete documentation
+- ✅ Ready to ship
+
+---
+
+### Summary
+
+**Total: 10-12 weeks**
+
+**Critical Path**:
+1. Async trait design (Phase 0) - must be right before proceeding
+2. Pattern C implementation (Phase 3) - most complex, longest
+3. Integration testing (Phase 5) - final validation
+
+**Key Milestones**:
+- **Week 2**: Async traits designed and approved ✅
+- **Week 5**: Sync path fully refactored ✅
+- **Week 8**: Pattern C complete (biggest risk addressed) ✅
+- **Week 10**: Async support complete ✅
+- **Week 12**: Ready to ship ✅
+
+**Risk Mitigation**:
+- Buffer time included in complex phases (Phase 3, Phase 5)
+- Early validation of core assumptions (Phase 0 prototype)
+- Incremental approach (sync first, then async)
+- Continuous testing (every phase has tests)
+
+---
+
+## 7. Key Architectural Decisions
 
 ### Decision 1: Processors Are Public API
 
@@ -1382,9 +2340,35 @@ impl LogSegment {
 
 Even though the operation is sequential, the separation has value.
 
+### Decision 5: Error Handling Strategy
+
+**Question**: Does the async refactor change error handling semantics?
+
+**Answer**: NO - preserve existing fail-fast semantics.
+
+**Current behavior**: Any error during log replay (I/O, parsing, validation) immediately terminates snapshot building with that error. No partial recovery or retry logic.
+
+**Async behavior**: SAME - fail-fast on any error.
+
+**Rationale**:
+- Error handling is orthogonal to sync/async
+- Existing semantics are correct for snapshot building
+- Adding retry/recovery logic is a separate feature (if ever needed)
+- Simpler implementation and testing
+
+**What the refactor DOES do**:
+- Preserve error context (file paths, batch numbers) for debugging
+- Ensure error messages are equally actionable in sync and async paths
+- No new error types, no changed error semantics
+
+**What the refactor does NOT do**:
+- Partial recovery from failures
+- Retry logic
+- Complex error strategies
+
 ---
 
-## 7. Success Criteria & Expected Outcomes
+## 8. Success Criteria & Expected Outcomes
 
 ### For Simple Users (Sync)
 
@@ -1457,7 +2441,7 @@ After refactoring Control Flow 1:
 
 ---
 
-## 8. Open Questions
+## 9. Risk Management & Open Questions
 
 ### Q1: AsyncEngine Trait Design
 
@@ -1514,11 +2498,36 @@ Should processors return `Result` or panic on invalid input?
 - Invalid data is possible (corrupted files)
 - Caller should decide how to handle errors
 
+### Q4: Custom Stream Extension Trait - Implementation Details
+
+**Issue Discovered**: The futures crate's `TryStreamExt::try_fold` cannot work with `ControlFlow` because it's hardwired to `Result` via `TryFuture` ([source](https://docs.rs/futures-util/0.3.31/src/futures_util/stream/try_stream/try_fold.rs.html#9-20)). The unstable `Try` trait that enables `Iterator::try_fold` to work with `ControlFlow` is not available for async contexts.
+
+**Solution**: Implement `ControlFlowStreamExt` with a `try_fold` method (~70 lines of code). The method uses the same name as `Iterator::try_fold` and `TryStreamExt::try_fold` - the compiler disambiguates based on the `Future<Output = ControlFlow<>>` constraint vs `TryFuture`.
+
+**Implementation Questions**:
+
+1. **Where to place it?**
+   - **Recommendation**: `kernel/src/engine/default/utils.rs` or similar utility module
+   - It's small enough (~70 lines) to keep in-tree
+   - Could be extracted to a separate crate later if other projects need it
+
+2. **Should we also support `TryStream<Item = Result<T, E>>`?**
+   - Current implementation works with any `Stream<Item = T>`
+   - When `T = Result<U, E>`, the processor handles unwrapping via `?`
+   - **Recommendation**: Keep simple for now, processors handle Result unwrapping
+
+3. **Testing strategy?**
+   - Unit tests for the extension trait itself
+   - Integration tests via existing processor tests
+   - Edge cases: empty streams, early break, errors
+
+**Solution**: Implement custom `ControlFlowStreamExt` trait with `try_fold` method (~70 lines, documented in Section 3.2).
+
 ---
 
-## 9. Appendix: Key Learnings & Discovery Process
+## Appendix B: Key Learnings & Discovery Process
 
-### 6. Analysis of PR #1160: Two-Phase Checkpoint Processing
+### Analysis of PR #1160: Two-Phase Checkpoint Processing
 
 [PR #1160](https://github.com/delta-io/delta-kernel-rs/pull/1160) explores distributed log replay with a two-phase approach that's highly relevant to Pattern C.
 
@@ -1661,7 +2670,7 @@ The PR author identifies several open questions:
    - ✅ Pattern applies to both! Phase 1 = log replay, Phase 2 = sidecars
    - ✅ Unified approach reduces code duplication
 
-**The synthesis**: Our refined Pattern C adopts PR #1160's fundamental two-phase insight while fixing its limitations (hidden I/O, async incompatibility, less type safety). See Section 10 for complete design.
+**The synthesis**: Pattern C adopts PR #1160's fundamental two-phase insight while fixing its limitations (hidden I/O, async incompatibility, less type safety). Complete design in Section 10.
 
 #### Key Realizations
 
@@ -1689,7 +2698,7 @@ The PR author identifies several open questions:
    - We should **incorporate good ideas** even if C & D change significantly
    - The processor/choreography foundation is sound; the details need work
 
-#### Revised Understanding (Incorporated into Document)
+#### Key Insights
 
 **What we initially got wrong**: Treating PR #1160 as "distributed only" and our initial patterns as "local only"
 
@@ -1703,9 +2712,7 @@ The PR author identifies several open questions:
 
 **Our refinement**: We adopted the two-phase structure but replaced the Iterator interface with ControlFlow-based state machines, fixing async compatibility issues and making I/O explicit.
 
-**Status**: ✅ These insights have been incorporated into:
-- **Section 3.2.2**: Pattern C now uses the refined two-phase + ControlFlow approach
-- **Section 10**: Complete design with `Phase1InProgress`, `Phase1Result`, and choreography examples
+This design is detailed in Pattern C (Section 4) with complete implementation in Section 10.
 
 ---
 
@@ -2047,7 +3054,7 @@ Hypothetical scenario where incremental would help:
 
 ---
 
-## 10. Appendix: Phase 1 Design Evolution - From Iterator to ControlFlow
+## Appendix C: Phase 1 Design Evolution - From Iterator to ControlFlow
 
 ### The Iterator Problem
 
@@ -2077,7 +3084,7 @@ impl<P> Iterator for Phase1LogReplay<P> {
 
 **Key insight**: Phase 1 has dual output (batches to user + internal state for phase 2). Solution: Make it explicit with `ControlFlow`-based state machine.
 
-**Complete design and code**: See Section 3.2.2 for full `Phase1InProgress`, `Phase1Result`, `From` impls, `phase1_sync`, `phase1_async`, and usage examples.
+**Complete design and code**: Section 4.3 provides full `Phase1InProgress`, `Phase1Result`, `From` impls, `phase1_sync`, `phase1_async`, and usage examples.
 
 ### Comparison to Iterator Approach (PR #1160)
 
@@ -2102,9 +3109,9 @@ impl<P> Iterator for Phase1LogReplay<P> {
 
 ---
 
-## 11. Appendix: Evolution from Initial Approach
+## Appendix D: Evolution from Initial Approach
 
-### What Changed
+### The Journey
 
 **Initial approach**: "Make APIs take Vec instead of Iterator"
 - **Problem**: Just shifts I/O to caller, wastes memory
