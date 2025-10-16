@@ -1,8 +1,25 @@
 # Async/Sync Pattern Generalizability Analysis
 
+## Table of Contents
+
+- [Overview](#overview)
+- [Terminology](#terminology)
+- [Methodology](#methodology)
+- [Pattern Summary](#pattern-summary) - All 5 patterns (A-E)
+- [Summary of Findings](#summary-of-findings) - Key results, dependencies, sequencing
+- [Main Kernel Entry Points](#main-kernel-entry-points) - Navigation to detailed analysis
+- [Entry Point #2: Scan Metadata](#entry-point-2-scan-metadata)
+- [Entry Point #3: Scan Execute](#entry-point-3-scan-execute)
+- [Entry Point #4: Table Changes (CDF)](#entry-point-4-table-changes-cdf)
+- [Entry Point #5: Transaction Commit](#entry-point-5-transaction-commit)
+- [Entry Point #6: Checkpoint Writing](#entry-point-6-checkpoint-writing)
+- [Entry Point #7: Log Compaction](#entry-point-7-log-compaction)
+
+---
+
 ## Overview
 
-This document analyzes the generalizability of the async/sync patterns proposed in `async-build-snapshot-proposal.md` by examining other major kernel entry points. The original proposal identified patterns A, B, and C for snapshot building. This analysis confirms those patterns generalize well, and identifies two additional patterns (D and E) needed for other operations.
+This document analyzes the generalizability of the async/sync patterns proposed in [`async-build-snapshot-proposal.md`](async-build-snapshot-proposal.md) by examining other major kernel entry points. The original proposal identified patterns A, B, and C for snapshot building. This analysis confirms those patterns generalize well, and identifies two additional patterns (D and E) needed for other operations.
 
 ## Terminology
 
@@ -15,7 +32,7 @@ This document analyzes the generalizability of the async/sync patterns proposed 
 ## Methodology
 
 For each entry point, we:
-1. Trace the current call graph (similar to Section 8.1 of the proposal)
+1. Trace the current call graph (similar to [§8.1 of the proposal](async-build-snapshot-proposal.md#81-before-mixed-io-and-computation))
 2. Identify functions involved, distinguishing previously-analyzed ones from new ones
 3. Categorize new functions according to Patterns A, B, or C
 4. Describe functions that don't fit any existing pattern and why
@@ -30,11 +47,11 @@ From the proposal and this analysis, we've identified **5 patterns** for async/s
 
 | Pattern | Description | When to Use | Key Tools | Details |
 |---------|-------------|-------------|-----------|---------|
-| **A: Helper Functions** | One-shot I/O operations | Read file → parse → done | `async fn` + `.await` | Proposal §4 |
-| **B: Processor + try_fold** | Stateful iteration with accumulation | Process batches, track state, may exit early | `try_fold`, `ControlFlow`, `.transpose()` | Proposal §5 |
-| **C: Two-Phase Processing** | Discovery then fetch | Can't know what to fetch until Phase 1 completes | `Phase1Result`, `process_sidecars` | Proposal §6 |
-| **D: Nested Stream Processing** 🆕 | Nested iteration with I/O in outer loop | Multiple levels of iteration, stateless | `Stream::then()`, `flatten()`, `yield_now()` | §3.6 below |
-| **E: Two-Pass Per-Item** 🆕 | Aggregate metadata, then reprocess same data | Can't rewind stream, need aggregated state | Pattern B (pass 1) + `then()` (pass 2) | §4.5 below |
+| **A: Helper Functions** | One-shot I/O operations | Read file → parse → done | `async fn` + `.await` | [Proposal §4](async-build-snapshot-proposal.md#4-pattern-a-helper-functions) |
+| **B: Processor + try_fold** | Stateful iteration with accumulation | Process batches, track state, may exit early | `try_fold`, `ControlFlow`, `.transpose()` | [Proposal §5](async-build-snapshot-proposal.md#5-pattern-b-processor--try_fold) |
+| **C: Two-Phase Processing** | Discovery then fetch | Can't know what to fetch until Phase 1 completes | `Phase1Result`, `process_sidecars` | [Proposal §6](async-build-snapshot-proposal.md#6-pattern-c-two-phase-processing) |
+| **D: Nested Stream Processing** 🆕 | Nested iteration with I/O in outer loop | Multiple levels of iteration, stateless | `Stream::then()`, `flatten()`, `yield_now()` | [§3.6](#36-functions-that-dont-fit-existing-patterns) |
+| **E: Two-Pass Per-Item** 🆕 | Aggregate metadata, then reprocess same data | Can't rewind stream, need aggregated state | Pattern B (pass 1) + `then()` (pass 2) | [§4.5](#45-functions-that-dont-fit-existing-patterns-1) |
 
 **Key**: Patterns A-C from proposal, D-E discovered in this analysis.
 
@@ -67,7 +84,7 @@ All 7 kernel entry points have been analyzed. Here are the key findings:
 ### Critical Dependencies
 
 **Pattern C is a hard dependency** for 5 out of 7 entry points:
-1. ✅ Snapshot Building (proposal doc)
+1. ✅ Snapshot Building ([proposal §8-10](async-build-snapshot-proposal.md#8-refactored-control-flow))
 2. ✅ Scan Metadata (via `read_actions`)
 3. ✅ Scan Execute (via Scan Metadata)
 4. ✅ Checkpoint Writing (via `read_actions`)
@@ -130,7 +147,7 @@ Based on dependencies, the recommended implementation order is:
 Based on the public API, delta-kernel-rs has **7 major entry points**:
 
 1. **[Snapshot Building](#entry-point-1-snapshot-building)** - Create snapshot at version
-   - Analyzed in `async-build-snapshot-proposal.md`
+   - Analyzed in [`async-build-snapshot-proposal.md`](async-build-snapshot-proposal.md#8-refactored-control-flow)
    - Patterns: A, B, C
 
 2. **[Scan Metadata](#entry-point-2-scan-metadata)** - Get file list for scan
@@ -160,7 +177,7 @@ Based on the public API, delta-kernel-rs has **7 major entry points**:
 - CPU ✅ = Pure computation, no I/O (shared between sync/async)
 - I/O ⚠️ = Contains or orchestrates I/O
 - I/O 💥 = Direct I/O operation
-- ✓ = Already analyzed in proposal doc
+- ✓ = Already analyzed in [proposal doc](async-build-snapshot-proposal.md)
 
 ---
 
@@ -333,7 +350,7 @@ fn create_checkpoint_stream(...) -> Iterator<ActionsBatch> {
 3. **Iterator-in-iterator pattern**: `.map().flatten_ok()` hides nested I/O
 4. **Discovery embedded in iteration**: Sidecar fetching happens lazily during iteration
 
-This is **exactly the complexity** the proposal doc encountered (see `async-build-snapshot-critique.md` Issue 4).
+This is **exactly the complexity** the [critique doc](async-build-snapshot-critique.md) encountered (Issue 4: nested I/O in `create_checkpoint_stream`).
 
 ---
 
@@ -411,7 +428,7 @@ Scan::execute [📍 Entry Point]
 
 ### 3.3 Focus: New Functions Only
 
-**Already analyzed**: Entry Point #2 (`Scan::scan_metadata`)
+**Already analyzed**: [Entry Point #2](#entry-point-2-scan-metadata) (`Scan::scan_metadata`)
 
 **New functions**:
 1. ✅ `Scan::execute` - Entry point orchestration
@@ -505,7 +522,7 @@ async fn execute_async() -> Stream<DeltaResult<ScanResult>> {
 - **Outer**: `.then()` because we need `.await` for I/O (DV read, file read)
 - **Inner**: `.then()` because we need `.await` for **cooperative yielding**, even though transform is CPU
 
-**This is NOT Pattern A/B/C** — it's **Pattern D: Nested Stream Processing** (see Pattern Summary above).
+**This is NOT Pattern A/B/C** — it's **Pattern D: Nested Stream Processing** (see [Pattern Summary](#pattern-summary) above).
 
 ---
 
@@ -587,7 +604,7 @@ TableChanges::try_new [📍 Entry Point #4a]
 ├─ LogSegment::for_table_changes [I/O ⚠️]
 │  └─ StorageHandler::list_from [I/O 💥]
 ├─ Snapshot::builder_for().at_version().build() [🔄 Entry Point #1 × 2]
-│  └─ ... (see proposal doc - builds start + end snapshots)
+│  └─ ... (see [proposal §8](async-build-snapshot-proposal.md#8-refactored-control-flow) - builds start + end snapshots)
 └─ Validation (CPU ✅)
    ├─ Check CDF enabled at start/end
    └─ Check schema compatibility
@@ -639,7 +656,7 @@ TableChangesScan::execute [📍 Entry Point #4b]
 
 ### 4.3 Focus: New Functions Only
 
-**Already analyzed**: Entry Points #1 (Snapshot), #2 (Scan Metadata), #3 (Scan Execute)
+**Already analyzed**: Entry Point #1 (Snapshot - [proposal §8](async-build-snapshot-proposal.md#8-refactored-control-flow)), [#2 (Scan Metadata)](#entry-point-2-scan-metadata), [#3 (Scan Execute)](#entry-point-3-scan-execute)
 
 **New functions**:
 1. ✅ `TableChanges::try_new` - Entry point, validation
@@ -665,7 +682,7 @@ TableChangesScan::execute [📍 Entry Point #4b]
 **NOT Pattern C** ❌: Two passes over same data (no manifest→sidecars discovery)
 **NOT Pattern D** ❌: Not nested streams with stateless transforms
 
-**It's a NEW pattern: Pattern E (Two-Pass Per-Item)** (see Pattern Summary above)
+**It's a NEW pattern: Pattern E (Two-Pass Per-Item)** (see [Pattern Summary](#pattern-summary) above)
 
 **CDF-specific application**:
 - Pass 1: `LogReplayScanner::try_new` - reads commit, aggregates metadata (has_cdc?, remove_dvs)
@@ -917,7 +934,7 @@ CheckpointWriter::checkpoint_path [📍 Entry Point #6b]
 CheckpointWriter::checkpoint_data [📍 Entry Point #6c]
 ├─ TableConfiguration::is_v2_checkpoint_write_supported [CPU ✅]
 ├─ LogSegment::read_actions [🔄 Pattern C - Entry Point #1]
-│  └─ ... (see Snapshot Building proposal)
+│  └─ ... (see [proposal §10](async-build-snapshot-proposal.md#10-complete-pattern-c-implementation))
 ├─ ActionReconciliationProcessor::new [🆕 CPU ✅]
 ├─ ActionReconciliationProcessor::process_actions_iter [🆕 Pattern B CPU ✅]
 │  └─ ActionReconciliationProcessor::process_actions_batch [🆕 CPU ✅]
@@ -954,9 +971,9 @@ Duplication: ~17% (95 async lines vs 470 shared lines)
 
 ### 6.2 Key Observations
 
-1. **Pattern B Confirmed**: Uses `ActionReconciliationProcessor` implementing `LogReplayProcessor` trait (predicted in §2.4)
+1. **Pattern B Confirmed**: Uses `ActionReconciliationProcessor` implementing `LogReplayProcessor` trait (predicted in [§2.4](#24-pattern-categorization))
 
-2. **Critical Dependency on Pattern C**: `checkpoint_data` calls `log_segment.read_actions()` which has nested I/O (§2.5). Checkpoint writing has the SAME dependency on Pattern C refactoring as scans.
+2. **Critical Dependency on Pattern C**: `checkpoint_data` calls `log_segment.read_actions()` which has nested I/O ([§2.5](#25-functions-that-dont-fit-patterns)). Checkpoint writing has the SAME dependency on Pattern C refactoring as scans.
 
 3. **Multi-phase API**: 
    - Phase 1: Create writer (`checkpoint()`)
@@ -972,7 +989,7 @@ Duplication: ~17% (95 async lines vs 470 shared lines)
 
 ### 6.3 Focus: New Functions Only
 
-**Already analyzed**: Entry Point #1 (`LogSegment::read_actions`), `LogReplayProcessor` trait
+**Already analyzed**: Entry Point #1 (`LogSegment::read_actions` - [proposal §10](async-build-snapshot-proposal.md#10-complete-pattern-c-implementation)), `LogReplayProcessor` trait
 
 **New functions**:
 1. ✅ `CheckpointWriter::try_new` - Constructor, validation
@@ -1001,7 +1018,7 @@ Duplication: ~17% (95 async lines vs 470 shared lines)
 
 #### Pattern B: Processor + try_fold ✅
 
-**Perfect Match**: `ActionReconciliationProcessor` implements `LogReplayProcessor` trait (identical to `ScanLogReplayProcessor` from Entry Point #2).
+**Perfect Match**: `ActionReconciliationProcessor` implements `LogReplayProcessor` trait (identical to `ScanLogReplayProcessor` from [Entry Point #2](#entry-point-2-scan-metadata)).
 
 Processes log in reverse chronological order, deduplicates actions, applies retention policies.
 
@@ -1020,7 +1037,7 @@ All are one-shot operations. Async variants just add `.await` to I/O calls.
 
 ### 6.6 Pattern C Dependency
 
-**Critical**: Checkpoint writing depends on Pattern C refactoring of `read_actions` (§2.5).
+**Critical**: Checkpoint writing depends on Pattern C refactoring of `read_actions` ([§2.5](#25-functions-that-dont-fit-patterns)).
 
 `checkpoint_data` currently calls monolithic `read_actions()`:
 ```rust
@@ -1032,7 +1049,7 @@ let actions = self.snapshot.log_segment().read_actions(
 )?;
 ```
 
-This has the nested I/O problem identified in §2.5. After Pattern C refactoring for snapshots/scans, checkpoint writing will need similar updates:
+This has the nested I/O problem identified in [§2.5](#25-functions-that-dont-fit-patterns). After Pattern C refactoring for snapshots/scans, checkpoint writing will need similar updates:
 
 **Pattern C Migration** (after snapshot/scan refactor):
 ```rust
@@ -1048,7 +1065,7 @@ let checkpoint_data = ActionReconciliationProcessor::new(...)
     .process_actions_iter(actions);
 ```
 
-**Cost**: ~25 lines of checkpoint-specific wrappers (same marginal cost as scans, §2.6)
+**Cost**: ~25 lines of checkpoint-specific wrappers (same marginal cost as scans, [§2.6](#26-metrics-summary))
 
 ---
 
@@ -1084,7 +1101,7 @@ let checkpoint_data = ActionReconciliationProcessor::new(...)
 - Vast majority of code is action reconciliation logic (I/O-free)
 - Very low duplication (17%)
 
-**Note**: Metrics assume Pattern C refactoring is done. Without it, checkpoint writing cannot be made async (same nested I/O issue as §2.5).
+**Note**: Metrics assume Pattern C refactoring is done. Without it, checkpoint writing cannot be made async (same nested I/O issue as [§2.5](#25-functions-that-dont-fit-patterns)).
 
 ---
 
@@ -1112,7 +1129,7 @@ LogCompactionWriter::compaction_data [📍 Entry Point #7c]
 ├─ Version range validation [CPU ✅]
 ├─ LogSegment::for_table_changes [I/O 💥]
 ├─ LogSegment::read_actions [🔄 Pattern C - Entry Point #1]
-│  └─ ... (see Snapshot Building proposal)
+│  └─ ... (see [proposal §10](async-build-snapshot-proposal.md#10-complete-pattern-c-implementation))
 ├─ ActionReconciliationProcessor::new [CPU ✅]
 └─ ActionReconciliationProcessor::process_actions_iter [Pattern B CPU ✅]
    └─ ... (see Entry Point #6)
@@ -1127,7 +1144,7 @@ LogCompactionWriter::compaction_data [📍 Entry Point #7c]
 🆕 should_compact                          Pattern A helper (~5 lines)
                                            (~135 lines: ~70 async + ~65 shared)
 
-Duplication: ~70 / (~70 + ~65 + ~470) ≈ 12% (shares ActionReconciliationProcessor with Entry Point #6)
+Duplication: ~70 / (~70 + ~65 + ~470) ≈ 12% (shares ActionReconciliationProcessor with [Entry Point #6](#entry-point-6-checkpoint-writing))
 ```
 
 ---
@@ -1136,7 +1153,7 @@ Duplication: ~70 / (~70 + ~65 + ~470) ≈ 12% (shares ActionReconciliationProces
 
 1. **Nearly Identical to Checkpoint Writing**: Uses same `ActionReconciliationProcessor` and Pattern B choreography
 
-2. **Critical Dependency on Pattern C**: `compaction_data` calls `log_segment.read_actions()` which has nested I/O (§2.5). Same dependency as checkpoint writing (§6.2).
+2. **Critical Dependency on Pattern C**: `compaction_data` calls `log_segment.read_actions()` which has nested I/O ([§2.5](#25-functions-that-dont-fit-patterns)). Same dependency as checkpoint writing ([§6.2](#62-key-observations)).
 
 3. **Multi-phase API**: 
    - Phase 1: Create writer (`log_compaction_writer`)
@@ -1151,7 +1168,7 @@ Duplication: ~70 / (~70 + ~65 + ~470) ≈ 12% (shares ActionReconciliationProces
 
 ### 7.3 Focus: New Functions Only
 
-All significant business logic is shared with Entry Point #6 (checkpoint writing):
+All significant business logic is shared with [Entry Point #6](#entry-point-6-checkpoint-writing) (checkpoint writing):
 - ✓ `ActionReconciliationProcessor` [shared with #6]
 - ✓ `ActionReconciliationVisitor` [shared with #6]
 
@@ -1180,7 +1197,7 @@ All are thin wrappers over shared Pattern B processor. Async variants add `.awai
 
 ### 7.5 Pattern C Dependency
 
-**Critical**: Log compaction depends on Pattern C refactoring of `read_actions` (§2.5), identical to checkpoint writing (§6.6).
+**Critical**: Log compaction depends on Pattern C refactoring of `read_actions` ([§2.5](#25-functions-that-dont-fit-patterns)), identical to checkpoint writing ([§6.6](#66-pattern-c-dependency)).
 
 `compaction_data` currently calls monolithic `read_actions()`:
 ```rust
@@ -1194,7 +1211,7 @@ let actions_iter = compaction_log_segment.read_actions(
 
 After Pattern C refactoring for snapshots/scans, log compaction will need similar updates (same as checkpoint writing).
 
-**Cost**: ~25 lines of compaction-specific wrappers (same marginal cost as scans §2.6 and checkpoints §6.6)
+**Cost**: ~25 lines of compaction-specific wrappers (same marginal cost as scans [§2.6](#26-metrics-summary) and checkpoints [§6.6](#66-pattern-c-dependency))
 
 ---
 
@@ -1230,7 +1247,7 @@ After Pattern C refactoring for snapshots/scans, log compaction will need simila
 - Shares all reconciliation logic with checkpoint writing
 - Very low duplication (12%)
 
-**Note**: Metrics assume Pattern C refactoring is done. Without it, log compaction cannot be made async (same nested I/O issue as §2.5 and §6.6).
+**Note**: Metrics assume Pattern C refactoring is done. Without it, log compaction cannot be made async (same nested I/O issue as [§2.5](#25-functions-that-dont-fit-patterns) and [§6.6](#66-pattern-c-dependency)).
 
 ---
 
