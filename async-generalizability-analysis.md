@@ -3,7 +3,6 @@
 ## Table of Contents
 
 - [Overview](#overview)
-- [Terminology](#terminology)
 - [Methodology](#methodology)
 - [Pattern Summary](#pattern-summary) - All 5 patterns (A-E)
 - [Summary of Findings](#summary-of-findings) - Key results, dependencies, sequencing
@@ -20,12 +19,6 @@
 ## Overview
 
 This document analyzes the generalizability of the async/sync patterns proposed in [`async-build-snapshot-proposal.md`](async-build-snapshot-proposal.md) by examining other major kernel entry points. The original proposal identified patterns A, B, and C for snapshot building. This analysis confirms those patterns generalize well, and identifies two additional patterns (D and E) needed for other operations.
-
-## Terminology
-
-**Important distinction**:
-- **"Phase"**: Pattern C has two **phases** where Phase 1 reads a manifest to discover what to fetch in Phase 2 (e.g., checkpoint→sidecars). Can't start Phase 2 until Phase 1 completes discovery.
-- **"Pass"**: Some operations make multiple **passes** over the same already-fetched data (e.g., CDF reads each commit twice to discover metadata then apply selection).
 
 ---
 
@@ -59,6 +52,10 @@ From the proposal and this analysis, we've identified **5 patterns** for async/s
 - Pattern C uses Pattern B for Phase 2 processing
 - Pattern E uses Pattern B for Pass 1 aggregation
 - Pattern D is stateless (no Pattern B)
+
+**Note on terminology**:
+- **"Phase"** (Pattern C): Discovery then fetch - Phase 1 reads a manifest to discover what to fetch in Phase 2 (e.g., checkpoint→sidecars). Can't start Phase 2 until Phase 1 completes.
+- **"Pass"** (Pattern E): Multiple passes over same data - reads an item twice because the stream can't rewind (e.g., CDF reads each commit twice: first to aggregate metadata, second to apply selection).
 
 ---
 
