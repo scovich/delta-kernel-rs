@@ -1098,7 +1098,7 @@ Err(Error::Incomplete)
 
 **The Solution**: Use `try_fold` + `ControlFlow`
 
-Both [`Iterator::try_fold`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.try_fold) and [`TryStreamExt::try_fold`](https://docs.rs/futures/latest/futures/stream/trait.TryStreamExt.html#method.try_fold) support early exit via `std::ops::ControlFlow`, which implements the `Try` trait.
+[`Iterator::try_fold`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.try_fold) supports early exit via `std::ops::ControlFlow`, which implements the `Try` trait. [`TryStreamExt::try_fold`](https://docs.rs/futures/latest/futures/stream/trait.TryStreamExt.html#method.try_fold) also supports early exit, but does not support `ControlFlow` because the `Try` trait is unstable rust. We provide a custom extension trait, [`ControlFlowStreamExt`](#custom-extension-trait-controlflowstreamext), to bridge the gap.
 
 **Complete Pattern**:
 
