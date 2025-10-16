@@ -2,13 +2,25 @@
 
 ## Overview
 
-This document analyzes the generalizability of the async/sync patterns proposed in `async-build-snapshot-proposal.md` by examining other major kernel entry points. The original proposal focused on snapshot building (Control Flow 1), and we now examine whether the patterns (A, B, and C) apply to other operations.
+This document analyzes the generalizability of the async/sync patterns proposed in `async-build-snapshot-proposal.md` by examining other major kernel entry points. The original proposal identified patterns A, B, and C for snapshot building. This analysis confirms those patterns generalize well, and identifies two additional patterns (D and E) needed for other operations.
 
 ## Terminology
 
 **Important distinction**:
 - **"Phase"**: Pattern C has two **phases** where Phase 1 reads a manifest to discover what to fetch in Phase 2 (e.g., checkpoint→sidecars). Can't start Phase 2 until Phase 1 completes discovery.
 - **"Pass"**: Some operations make multiple **passes** over the same already-fetched data (e.g., CDF reads each commit twice to discover metadata then apply selection).
+
+---
+
+## Methodology
+
+For each entry point, we:
+1. Trace the current call graph (similar to Section 8.1 of the proposal)
+2. Identify functions involved, distinguishing previously-analyzed ones from new ones
+3. Categorize new functions according to Patterns A, B, or C
+4. Describe functions that don't fit any existing pattern and why
+
+This process identified two new patterns (D and E) needed for operations not covered by the original proposal.
 
 ---
 
@@ -21,8 +33,8 @@ From the proposal and this analysis, we've identified **5 patterns** for async/s
 | **A: Helper Functions** | One-shot I/O operations | Read file → parse → done | `async fn` + `.await` | Proposal §4 |
 | **B: Processor + try_fold** | Stateful iteration with accumulation | Process batches, track state, may exit early | `try_fold`, `ControlFlow`, `.transpose()` | Proposal §5 |
 | **C: Two-Phase Processing** | Discovery then fetch | Can't know what to fetch until Phase 1 completes | `Phase1Result`, `process_sidecars` | Proposal §6 |
-| **D: Nested Stream Processing** 🆕 | Nested iteration with I/O in outer loop | Multiple levels of iteration, stateless | `Stream::then()`, `flatten()`, `yield_now()` | §6.8 below |
-| **E: Two-Pass Per-Item** 🆕 | Aggregate metadata, then reprocess same data | Can't rewind stream, need aggregated state | Pattern B (pass 1) + `then()` (pass 2) | §7.5 below |
+| **D: Nested Stream Processing** 🆕 | Nested iteration with I/O in outer loop | Multiple levels of iteration, stateless | `Stream::then()`, `flatten()`, `yield_now()` | §3.6 below |
+| **E: Two-Pass Per-Item** 🆕 | Aggregate metadata, then reprocess same data | Can't rewind stream, need aggregated state | Pattern B (pass 1) + `then()` (pass 2) | §4.5 below |
 
 **Key**: Patterns A-C from proposal, D-E discovered in this analysis.
 
@@ -33,29 +45,111 @@ From the proposal and this analysis, we've identified **5 patterns** for async/s
 
 ---
 
-## Methodology
+## Summary of Findings
 
-For each entry point, we:
-1. Trace the current call graph (similar to Section 8.1 of the proposal)
-2. Identify functions involved, distinguishing previously-analyzed ones from new ones
-3. Categorize new functions according to Patterns A, B, or C
-4. Describe functions that don't fit any pattern and why
+All 7 kernel entry points have been analyzed. Here are the key findings:
+
+### Pattern Applicability
+
+| Entry Point | Pattern A | Pattern B | Pattern C | Pattern D | Pattern E |
+|-------------|-----------|-----------|-----------|-----------|-----------|
+| 1. Snapshot Building | ✅ | ✅ | ✅ | ❌ | ❌ |
+| 2. Scan Metadata | ✅ | ✅ | ✅ * | ❌ | ❌ |
+| 3. Scan Execute | ✅ | ❌ | ❌ | ✅ | ❌ |
+| 4. Table Changes (CDF) | ✅ | Pattern E † | ❌ | ❌ | ✅ |
+| 5. Transaction Commit | ✅ | ❌ | ❌ | ❌ | ❌ |
+| 6. Checkpoint Writing | ✅ | ✅ | ✅ * | ❌ | ❌ |
+| 7. Log Compaction | ✅ | ✅ | ✅ * | ❌ | ❌ |
+
+\* Pattern C dependency (via `read_actions`)  
+† Pattern E's Pass 1 uses Pattern B
+
+### Critical Dependencies
+
+**Pattern C is a hard dependency** for 5 out of 7 entry points:
+1. ✅ Snapshot Building (proposal doc)
+2. ✅ Scan Metadata (via `read_actions`)
+3. ✅ Scan Execute (via Scan Metadata)
+4. ✅ Checkpoint Writing (via `read_actions`)
+5. ✅ Log Compaction (via `read_actions`)
+
+**Without Pattern C refactoring**, only Table Changes (#4) and Transaction Commit (#5) can be made async independently.
+
+### Pattern Generalizability
+
+1. **Pattern A (Helper Functions)**: Universal - applies to all 7 entry points
+2. **Pattern B (Processor + try_fold)**: Highly generalizable - applies to 4 entry points directly (#1, #2, #6, #7), plus Pattern E's Pass 1 (#4)
+3. **Pattern C (Two-Phase)**: Critical shared infrastructure - enables 5 entry points
+4. **Pattern D (Nested Streams)**: Specialized - applies to Scan Execute (#3) for stateless nested processing
+5. **Pattern E (Two-Pass)**: Specialized - applies to Table Changes (#4) for per-item aggregation + processing
+
+### Code Sharing Success
+
+The analysis confirms excellent code sharing:
+
+| Entry Point | Async LOC | I/O-Free LOC | Duplication |
+|-------------|-----------|--------------|-------------|
+| 2. Scan Metadata | ~115 | ~670 | ~15% |
+| 3. Scan Execute | ~60 | ~220 | ~21% |
+| 4. Table Changes | ~140 | ~500 | ~22% |
+| 5. Transaction Commit | ~25 | ~85 | ~23% |
+| 6. Checkpoint Writing | ~95 | ~470 | ~17% |
+| 7. Log Compaction | ~70 | ~505 | ~12% |
+
+**Average duplication**: ~18% (excellent, well below the 50% threshold)
+
+### Functions That Don't Fit Existing Patterns
+
+**None!** All functions across all 7 entry points fit into Patterns A, B, C, D, or E. This validates the comprehensiveness of the pattern set.
+
+### Implementation Sequencing
+
+Based on dependencies, the recommended implementation order is:
+
+1. **Phase 1**: Pattern C refactoring (`read_actions`)
+   - Enables: Snapshot Building, Scan Metadata, Checkpoint Writing, Log Compaction
+   - Marginal cost per entry point: ~25 lines
+
+2. **Phase 2**: Scan Execute (Pattern D)
+   - Depends on: Scan Metadata (Pattern C)
+   - Marginal cost: ~60 lines
+
+3. **Phase 3**: Independent entry points (Patterns A, E)
+   - Table Changes (Pattern E, which uses Pattern B)
+   - Transaction Commit (Pattern A only)
+   - Total marginal cost: ~165 lines
+
+**Total estimated async LOC across all entry points**: ~505 lines  
+**Total estimated I/O-free shared LOC**: ~2,450 lines  
+**Overall duplication**: ~17% (excellent)
 
 ---
 
-## Step 1: Identify Main Kernel Entry Points
+## Main Kernel Entry Points
 
 Based on the public API, delta-kernel-rs has **7 major entry points**:
 
-| # | Entry Point | Purpose | Status |
-|---|-------------|---------|--------|
-| 1 | **Snapshot Building** | Create snapshot at version | ✅ Analyzed in proposal |
-| 2 | **Scan Metadata** | Get file list for scan | ✅ Analyzed (Step 2-5) |
-| 3 | **Scan Execute** | Read actual parquet data | ✅ Analyzed (Entry Point #3) |
-| 4 | **Transaction Commit** | Write new commits | ❌ Not analyzed |
-| 5 | **Table Changes (CDF)** | Read change data feed | ❌ Not analyzed |
-| 6 | **Checkpoint Writing** | Write checkpoint file | ❌ Not analyzed |
-| 7 | **Log Compaction** | Compact commit range | ❌ Not analyzed |
+1. **[Snapshot Building](#entry-point-1-snapshot-building)** - Create snapshot at version
+   - Analyzed in `async-build-snapshot-proposal.md`
+   - Patterns: A, B, C
+
+2. **[Scan Metadata](#entry-point-2-scan-metadata)** - Get file list for scan
+   - Patterns: A, B, C (via `read_actions`)
+
+3. **[Scan Execute](#entry-point-3-scan-execute)** - Read actual parquet data
+   - Patterns: A, D (nested streams)
+
+4. **[Table Changes (CDF)](#entry-point-4-table-changes-cdf)** - Read change data feed
+   - Patterns: A, E (two-pass per-commit)
+
+5. **[Transaction Commit](#entry-point-5-transaction-commit)** - Write new commits
+   - Patterns: A only
+
+6. **[Checkpoint Writing](#entry-point-6-checkpoint-writing)** - Write checkpoint file
+   - Patterns: A, B, C (via `read_actions`)
+
+7. **[Log Compaction](#entry-point-7-log-compaction)** - Compact commit range
+   - Patterns: A, B, C (via `read_actions`)
 
 **Analysis Approach**: For each entry point, trace call graphs, identify new functions, categorize by pattern, and highlight functions that don't fit existing patterns.
 
@@ -474,7 +568,7 @@ Application to `Scan::execute`:
 
 **Total I/O-Free Logic**: ~138 LOC
 
-**Duplication**: ~108 / (~108 + ~138) ≈ **44% duplication**
+**Duplication**: ~60 / (~60 + ~220) ≈ **21% duplication**
 
 ---
 
@@ -489,7 +583,7 @@ Application to `Scan::execute`:
 ### 4.1 Call Graph
 
 ```
-TableChanges::try_new [📍 Entry Point #5a]
+TableChanges::try_new [📍 Entry Point #4a]
 ├─ LogSegment::for_table_changes [I/O ⚠️]
 │  └─ StorageHandler::list_from [I/O 💥]
 ├─ Snapshot::builder_for().at_version().build() [🔄 Entry Point #1 × 2]
@@ -498,7 +592,7 @@ TableChanges::try_new [📍 Entry Point #5a]
    ├─ Check CDF enabled at start/end
    └─ Check schema compatibility
 
-TableChangesScan::execute [📍 Entry Point #5b]
+TableChangesScan::execute [📍 Entry Point #4b]
 ├─ TableChangesScan::scan_metadata [I/O ⚠️]
 │  └─ table_changes_action_iter [🆕 creates scanner]
 │     └─ LogReplayScanner [🆕 CDF-specific, NOT LogReplayProcessor]
@@ -677,13 +771,12 @@ Application to CDF `LogReplayScanner`:
 
 **Total Shared Logic**: ~400 LOC
 
-**Duplication**: ~180 / (~180 + ~400) ≈ **31% duplication**
+**Duplication**: ~140 / (~140 + ~500) ≈ **22% duplication**
 
 **Why reasonable**:
-- Pattern E is novel but straightforward (just add `.await` in two places)
+- Pattern E is straightforward (just add `.await` in two places for two-pass)
 - Most complexity is in visitors and validation (I/O-free)
 - Execute pass reuses Pattern D from Scan Execute
-- Lower than Scan Execute due to less DV parsing complexity
 
 
 ---
@@ -793,15 +886,351 @@ Transaction commit is the simplest entry point analyzed so far:
 
 **Total Shared Logic**: ~365 LOC
 
-**Duplication**: ~115 / (~115 + ~365) ≈ **24% duplication**
+**Duplication**: ~25 / (~25 + ~85) ≈ **23% duplication**
 
 **Why reasonable**:
 - Pattern A applies perfectly (one-shot operation)
 - Vast majority of code is action generation (I/O-free)
-- ICT read functions are simple Pattern A wrappers (~35 LOC async)
-- Only I/O is ICT read + file write (trivial async)
-- Very low duplication (24%)
+- Only I/O is ICT read + file write
 
 ---
 
+## Entry Point #6: Checkpoint Writing
+
+**API**: `Snapshot::checkpoint() -> CheckpointWriter` + `CheckpointWriter::checkpoint_data(engine)` + `CheckpointWriter::finalize(engine, metadata, data)`
+
+**Purpose**: Write checkpoint file containing reconciled table state at a specific version.
+
+---
+
+### 6.1 Call Graph
+
+```
+Snapshot::checkpoint [📍 Entry Point #6a]
+├─ CheckpointWriter::try_new [🆕]
+│  ├─ Version conversion (CPU ✅)
+│  └─ LogSegment::validate_no_staged_commits [CPU ✅]
+
+CheckpointWriter::checkpoint_path [📍 Entry Point #6b]
+└─ ParsedLogPath::new_classic_parquet_checkpoint [CPU ✅]
+
+CheckpointWriter::checkpoint_data [📍 Entry Point #6c]
+├─ TableConfiguration::is_v2_checkpoint_write_supported [CPU ✅]
+├─ LogSegment::read_actions [🔄 Pattern C - Entry Point #1]
+│  └─ ... (see Snapshot Building proposal)
+├─ ActionReconciliationProcessor::new [🆕 CPU ✅]
+├─ ActionReconciliationProcessor::process_actions_iter [🆕 Pattern B CPU ✅]
+│  └─ ActionReconciliationProcessor::process_actions_batch [🆕 CPU ✅]
+│     └─ ActionReconciliationVisitor [🆕 CPU ✅]
+│        ├─ check_file_action [CPU ✅]
+│        ├─ check_protocol_action [CPU ✅]
+│        ├─ check_metadata_action [CPU ✅]
+│        └─ check_txn_action [CPU ✅]
+└─ CheckpointWriter::create_checkpoint_metadata_batch [🆕 CPU ✅]
+
+CheckpointWriter::finalize [📍 Entry Point #6d]
+├─ Iterator exhaustion validation (CPU ✅)
+├─ create_last_checkpoint_data [🆕 CPU ✅]
+│  └─ Build LastCheckpointHint JSON (CPU ✅)
+├─ LastCheckpointHint::path [CPU ✅]
+└─ JsonHandler::write_json_file [I/O 💥]
+```
+
+**Summary**:
+```
+🆕 CheckpointWriter::try_new            Pattern A wrapper (~20 lines)
+🆕 CheckpointWriter::checkpoint_path    Pattern A wrapper (~5 lines)
+🆕 CheckpointWriter::checkpoint_data    Pattern B wrapper (~30 lines)
+🆕 CheckpointWriter::finalize           Pattern A wrapper (~40 lines)
+🆕 ActionReconciliationProcessor        Pattern B processor (~150 lines CPU ✅)
+🆕 ActionReconciliationVisitor          Pattern B visitor (~290 lines CPU ✅)
+🆕 create_last_checkpoint_data          Pattern A helper (~30 lines CPU ✅)
+                                        (~565 lines: ~95 async + ~470 shared)
+
+Duplication: ~17% (95 async lines vs 470 shared lines)
+```
+
+---
+
+### 6.2 Key Observations
+
+1. **Pattern B Confirmed**: Uses `ActionReconciliationProcessor` implementing `LogReplayProcessor` trait (predicted in §2.4)
+
+2. **Critical Dependency on Pattern C**: `checkpoint_data` calls `log_segment.read_actions()` which has nested I/O (§2.5). Checkpoint writing has the SAME dependency on Pattern C refactoring as scans.
+
+3. **Multi-phase API**: 
+   - Phase 1: Create writer (`checkpoint()`)
+   - Phase 2: Get data iterator (`checkpoint_data()`) - **calls monolithic `read_actions`**
+   - Phase 3: Engine writes checkpoint file (user-provided)
+   - Phase 4: Finalize (`finalize()`)
+
+4. **Shared with Log Compaction**: `ActionReconciliationProcessor` is used by both checkpoint writing (#6) and log compaction (#7)
+
+5. **Minimal I/O (misleading)**: While checkpoint writer itself only calls `write_json_file`, `checkpoint_data` internally calls `read_actions` which has nested I/O complexity
+
+---
+
+### 6.3 Focus: New Functions Only
+
+**Already analyzed**: Entry Point #1 (`LogSegment::read_actions`), `LogReplayProcessor` trait
+
+**New functions**:
+1. ✅ `CheckpointWriter::try_new` - Constructor, validation
+2. ✅ `CheckpointWriter::checkpoint_path` - Path generation
+3. ✅ `CheckpointWriter::checkpoint_data` - Creates iterator
+4. ✅ `CheckpointWriter::finalize` - Writes `_last_checkpoint`
+5. ✅ `ActionReconciliationProcessor` - Pattern B processor
+6. ✅ `ActionReconciliationVisitor` - Row visitor for filtering
+7. ✅ `create_last_checkpoint_data` - Helper for LastCheckpointHint
+
+---
+
+### 6.4 Function Classification
+
+**I/O Functions (need async)**: 4 thin wrappers (~95 lines total)
+- `CheckpointWriter::try_new`, `checkpoint_path`, `checkpoint_data`, `finalize`
+
+**CPU Functions (shared)**: 3 functions (~470 lines total)
+- `ActionReconciliationProcessor` (Pattern B processor)
+- `ActionReconciliationVisitor` (action filtering logic)
+- `create_last_checkpoint_data` (helper)
+
+---
+
+### 6.5 Pattern Categorization
+
+#### Pattern B: Processor + try_fold ✅
+
+**Perfect Match**: `ActionReconciliationProcessor` implements `LogReplayProcessor` trait (identical to `ScanLogReplayProcessor` from Entry Point #2).
+
+Processes log in reverse chronological order, deduplicates actions, applies retention policies.
+
+#### Pattern A: Helper Functions ✅
+
+**Applies to**: All checkpoint writer methods
+
+- `try_new`: Validate + construct
+- `checkpoint_path`: Generate path
+- `checkpoint_data`: Create iterator (calls Pattern B)
+- `finalize`: Write `_last_checkpoint` file
+
+All are one-shot operations. Async variants just add `.await` to I/O calls.
+
+---
+
+### 6.6 Pattern C Dependency
+
+**Critical**: Checkpoint writing depends on Pattern C refactoring of `read_actions` (§2.5).
+
+`checkpoint_data` currently calls monolithic `read_actions()`:
+```rust
+let actions = self.snapshot.log_segment().read_actions(
+    engine,
+    CHECKPOINT_ACTIONS_SCHEMA.clone(),
+    CHECKPOINT_ACTIONS_SCHEMA.clone(),
+    None,
+)?;
+```
+
+This has the nested I/O problem identified in §2.5. After Pattern C refactoring for snapshots/scans, checkpoint writing will need similar updates:
+
+**Pattern C Migration** (after snapshot/scan refactor):
+```rust
+// Phase 1: Read manifest + collect sidecar refs
+let phase1_result = self.snapshot.log_segment()
+    .read_actions_phase1(engine, schema)?;
+
+// Phase 2: Process manifest + fetch sidecars
+let actions = phase1_result.process_sidecars(engine)?;
+
+// Then: Pattern B processing (unchanged)
+let checkpoint_data = ActionReconciliationProcessor::new(...)
+    .process_actions_iter(actions);
+```
+
+**Cost**: ~25 lines of checkpoint-specific wrappers (same marginal cost as scans, §2.6)
+
+---
+
+### 6.7 Metrics Summary
+
+#### Already Provided by Snapshot/Scan Refactor (Free):
+- ✓ `LogSegment::read_actions_phase1_async` (~20 lines) [shared]
+- ✓ `Phase1InProgress<P>` wrapper [shared]
+- ✓ `Phase1Result<P>` enum [shared]
+- ✓ `Phase1Result::process_sidecars_async` (~20 lines) [shared]
+- ✓ Pattern C infrastructure established
+
+#### Checkpoint-Specific Additions (Marginal Cost):
+1. `CheckpointWriter::try_new_async` - Add `.await` (~20 lines)
+2. `CheckpointWriter::checkpoint_path_async` - No changes needed (already sync) (~5 lines)
+3. `CheckpointWriter::checkpoint_data_async` - Pattern C choreography (~30 lines)
+4. `CheckpointWriter::finalize_async` - Add `.await` to write (~40 lines)
+
+**Async LOC**: ~95 lines (checkpoint-specific wrappers)
+
+#### Processor Logic (I/O-Free):
+- `ActionReconciliationProcessor` (~150 LOC) - Pattern B
+- `ActionReconciliationVisitor` (~290 LOC) - Row visitor
+- `create_last_checkpoint_data` (~30 LOC) - Helper
+
+**Total I/O-Free Logic**: ~470 LOC
+
+**Duplication**: ~95 / (~95 + ~470) ≈ **17% duplication**
+
+**Why reasonable**:
+- Pattern B applies perfectly (uses `LogReplayProcessor` trait)
+- Pattern C infrastructure shared with snapshots/scans (marginal cost)
+- Vast majority of code is action reconciliation logic (I/O-free)
+- Very low duplication (17%)
+
+**Note**: Metrics assume Pattern C refactoring is done. Without it, checkpoint writing cannot be made async (same nested I/O issue as §2.5).
+
+---
+
+## Entry Point #7: Log Compaction
+
+**API**: `Snapshot::log_compaction_writer(start, end) -> LogCompactionWriter`, then `LogCompactionWriter::compaction_data(engine) -> LogCompactionDataIterator`
+
+**Purpose**: Aggregate commit files in a version range into a single compacted file (similar to checkpoints but for a subset of versions).
+
+---
+
+### 7.1 Call Graph
+
+```
+Snapshot::log_compaction_writer [📍 Entry Point #7a]
+├─ LogCompactionWriter::try_new [🆕]
+│  ├─ Version validation (CPU ✅)
+│  ├─ LogSegment::validate_no_staged_commits [CPU ✅]
+│  └─ ParsedLogPath::new_log_compaction [CPU ✅]
+
+LogCompactionWriter::compaction_path [📍 Entry Point #7b]
+└─ Returns cached Url [CPU ✅]
+
+LogCompactionWriter::compaction_data [📍 Entry Point #7c]
+├─ Version range validation [CPU ✅]
+├─ LogSegment::for_table_changes [I/O 💥]
+├─ LogSegment::read_actions [🔄 Pattern C - Entry Point #1]
+│  └─ ... (see Snapshot Building proposal)
+├─ ActionReconciliationProcessor::new [CPU ✅]
+└─ ActionReconciliationProcessor::process_actions_iter [Pattern B CPU ✅]
+   └─ ... (see Entry Point #6)
+```
+
+**Functions Summary**:
+```
+🆕 LogCompactionWriter::try_new            Pattern A wrapper (~25 lines)
+🆕 LogCompactionWriter::compaction_path    Pattern A accessor (~5 lines)
+🆕 LogCompactionWriter::compaction_data    Pattern B wrapper (~40 lines)
+🆕 LogCompactionDataIterator               Pattern B iterator wrapper (~60 lines)
+🆕 should_compact                          Pattern A helper (~5 lines)
+                                           (~135 lines: ~70 async + ~65 shared)
+
+Duplication: ~70 / (~70 + ~65 + ~470) ≈ 12% (shares ActionReconciliationProcessor with Entry Point #6)
+```
+
+---
+
+### 7.2 Key Observations
+
+1. **Nearly Identical to Checkpoint Writing**: Uses same `ActionReconciliationProcessor` and Pattern B choreography
+
+2. **Critical Dependency on Pattern C**: `compaction_data` calls `log_segment.read_actions()` which has nested I/O (§2.5). Same dependency as checkpoint writing (§6.2).
+
+3. **Multi-phase API**: 
+   - Phase 1: Create writer (`log_compaction_writer`)
+   - Phase 2: Get data iterator (`compaction_data`) - **calls monolithic `read_actions`**
+   - Phase 3: Engine writes compaction file (user-provided)
+
+4. **Shares Processor**: Both checkpoint writing (#6) and log compaction (#7) use `ActionReconciliationProcessor`
+
+5. **Version Range Filtering**: Creates filtered `LogSegment` for specific version range (CPU operation)
+
+---
+
+### 7.3 Focus: New Functions Only
+
+All significant business logic is shared with Entry Point #6 (checkpoint writing):
+- ✓ `ActionReconciliationProcessor` [shared with #6]
+- ✓ `ActionReconciliationVisitor` [shared with #6]
+
+**New wrapper-specific code** (~135 lines):
+1. `LogCompactionWriter::try_new` - Validate version range, compute path (~25 lines)
+2. `LogCompactionWriter::compaction_path` - Return cached path (~5 lines)
+3. `LogCompactionWriter::compaction_data` - Create filtered log segment, call `read_actions`, wire up processor (~40 lines)
+4. `LogCompactionDataIterator` - Iterator wrapper with counters (~60 lines)
+5. `should_compact` - Utility to determine if compaction is needed (~5 lines)
+
+---
+
+### 7.4 Pattern Categorization
+
+**Pattern A** (one-shot I/O wrappers):
+- `LogCompactionWriter::try_new` - Create writer with validation
+- `LogCompactionWriter::compaction_path` - Return cached path
+- `should_compact` - Pure CPU helper
+
+**Pattern B** (iterative processing):
+- `LogCompactionWriter::compaction_data` - Calls `read_actions` then wires up `ActionReconciliationProcessor` (same as checkpoint writing)
+
+All are thin wrappers over shared Pattern B processor. Async variants add `.await` to I/O calls.
+
+---
+
+### 7.5 Pattern C Dependency
+
+**Critical**: Log compaction depends on Pattern C refactoring of `read_actions` (§2.5), identical to checkpoint writing (§6.6).
+
+`compaction_data` currently calls monolithic `read_actions()`:
+```rust
+let actions_iter = compaction_log_segment.read_actions(
+    engine,
+    COMPACTION_ACTIONS_SCHEMA.clone(),
+    COMPACTION_ACTIONS_SCHEMA.clone(),
+    None,
+)?;
+```
+
+After Pattern C refactoring for snapshots/scans, log compaction will need similar updates (same as checkpoint writing).
+
+**Cost**: ~25 lines of compaction-specific wrappers (same marginal cost as scans §2.6 and checkpoints §6.6)
+
+---
+
+### 7.6 Metrics Summary
+
+#### Already Provided by Snapshot/Scan/Checkpoint Refactor (Free):
+- ✓ `LogSegment::read_actions_phase1_async` [shared]
+- ✓ Pattern C infrastructure [shared]
+- ✓ `ActionReconciliationProcessor` (~150 LOC) [shared with #6]
+- ✓ `ActionReconciliationVisitor` (~290 LOC) [shared with #6]
+
+#### Compaction-Specific Additions (Marginal Cost):
+1. `LogCompactionWriter::try_new_async` - Add `.await` (~25 lines)
+2. `LogCompactionWriter::compaction_path_async` - Already sync (~5 lines)
+3. `LogCompactionWriter::compaction_data_async` - Pattern C choreography (~40 lines)
+4. `LogCompactionDataIterator` - Iterator wrapper (no async changes) (~60 lines)
+5. `should_compact` - Pure CPU helper (no async changes) (~5 lines)
+
+**Async LOC**: ~70 lines (compaction-specific wrappers)
+
+#### Shared I/O-Free Logic (with Checkpoint Writing):
+- `ActionReconciliationProcessor` (~150 LOC) [shared with #6]
+- `ActionReconciliationVisitor` (~290 LOC) [shared with #6]
+- Compaction-specific helpers (~65 LOC)
+
+**Total I/O-Free Logic**: ~505 LOC
+
+**Duplication**: ~70 / (~70 + ~505) ≈ **12% duplication**
+
+**Why reasonable**:
+- Pattern B applies perfectly (reuses `LogReplayProcessor` trait)
+- Pattern C infrastructure shared with snapshots/scans/checkpoints (marginal cost)
+- Shares all reconciliation logic with checkpoint writing
+- Very low duplication (12%)
+
+**Note**: Metrics assume Pattern C refactoring is done. Without it, log compaction cannot be made async (same nested I/O issue as §2.5 and §6.6).
+
+---
 
