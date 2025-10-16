@@ -129,50 +129,16 @@ Duplication: ~7% (19 async lines vs 385 shared lines)
 
 ---
 
-### 2.3 Focus: New Functions Only
-
-**Already-Analyzed Functions** (not re-analyzed here):
-- ✓ `log_segment.read_actions` - Analyzed in Snapshot Building (Pattern C, Sec 10)
-- ✓ All its callees (`find_commit_cover`, handler methods, etc.) - See proposal doc
-
-**New Functions** (analyzed in this section):
-
-| Function | Location | Type | Description |
-|----------|----------|------|-------------|
-| `Scan::scan_metadata` | `scan/mod.rs:443` | Mixed | Entry point (thin wrapper) |
-| `Scan::replay_for_scan_metadata` | `scan/mod.rs:596` | Mixed | Calls `read_actions` (thin) |
-| `Scan::scan_metadata_inner` | `scan/mod.rs:583` | Mixed | Orchestration (thin) |
-| `scan_action_iter` | `scan/log_replay.rs:367` | Mixed | Creates processor + returns iterator |
-| **`ScanLogReplayProcessor::new`** | `scan/log_replay.rs:55` | **CPU ✅** | **Constructor (I/O-free)** |
-| **`ScanLogReplayProcessor::process_actions_batch`** | `scan/log_replay.rs` | **CPU ✅** | **Pattern B processor** |
-| `DataSkippingFilter::apply` | `scan/data_skipping.rs` | CPU ✅ | Stats-based filtering |
-| `AddRemoveDedupVisitor::visit` | `scan/log_replay.rs:102` | CPU ✅ | File reconciliation |
-| `FileActionDeduplicator` | `log_replay.rs:42` | CPU ✅ | Deduplication logic |
-| `ScanMetadata::try_new` | `scan/mod.rs:346` | CPU ✅ | Result construction |
-
----
-
 ### 2.3 Function Classification
 
-| Function | Type | Need Async? | Notes |
-|----------|------|-------------|-------|
-| `Scan::scan_metadata` | Orchestration | Yes | Thin entry point |
-| `Scan::replay_for_scan_metadata` | Orchestration | Yes | Just calls `read_actions` |
-| `Scan::scan_metadata_inner` | Orchestration | Yes | Thin wrapper around `scan_action_iter` |
-| `scan_action_iter` | Orchestration | No | Just creates processor and returns iterator |
-| `ScanLogReplayProcessor::new` | CPU | No | Constructor - I/O-free |
-| `ScanLogReplayProcessor::process_actions_batch` | CPU | No | Pattern B processor - I/O-free |
-| `DataSkippingFilter::new` | CPU | No | Constructor |
-| `DataSkippingFilter::apply` | CPU | No | Stats-based filtering |
-| `AddRemoveDedupVisitor::visit` | CPU | No | File reconciliation |
-| `FileActionDeduplicator::*` | CPU | No | Deduplication helpers |
-| `ScanMetadata::try_new` | CPU | No | Result construction |
+**I/O Functions (need async)**: 3 thin orchestration wrappers (~19 lines total)
+- `Scan::scan_metadata`, `replay_for_scan_metadata`, `scan_metadata_inner`
 
-**Total**: 10 new functions
-- **3 need async variants** (thin choreography: ~19 lines)
-- **7 are I/O-free** (shared between sync and async: ~385 lines)
-
-**Note**: `log_segment.read_actions` and its callees are not included in counts above (see Snapshot Building analysis in proposal doc).
+**CPU Functions (shared)**: 7 functions (~385 lines total)
+- `ScanLogReplayProcessor` (Pattern B processor)
+- `DataSkippingFilter::apply` (stats filtering)
+- `AddRemoveDedupVisitor`, `FileActionDeduplicator` (deduplication)
+- Result construction helpers
 
 ---
 
@@ -180,50 +146,11 @@ Duplication: ~7% (19 async lines vs 385 shared lines)
 
 #### Pattern B: Processor + try_fold
 
-**Perfect Match**: `ScanLogReplayProcessor` 
+**Perfect Match**: `ScanLogReplayProcessor` implements the `LogReplayProcessor` trait (I/O-free state machine with stateful deduplication, no early exit).
 
-This is a textbook Pattern B processor that implements the `LogReplayProcessor` trait:
-
-```rust
-// ✅ Pattern B Processor (I/O-free)
-impl LogReplayProcessor for ScanLogReplayProcessor {
-    type Output = ScanMetadata;
-    
-    fn process_actions_batch(&mut self, batch: ActionsBatch) 
-        -> DeltaResult<Self::Output> {
-        // All business logic: data skipping, deduplication, transforms
-    }
-}
-
-// ✅ Pattern B Choreography (async would add .await)
-fn scan_metadata_inner(action_batch_iter) -> Iterator<ScanMetadata> {
-    ScanLogReplayProcessor::new(engine, state_info)
-        .process_actions_iter(action_batch_iter)
-}
-```
-
-**Key characteristics**:
-- ✅ I/O-free processor (takes `ActionsBatch`, not iterator/stream)
-- ✅ Stateful (tracks `seen_file_keys` for deduplication)
-- ✅ No early exit (processes all batches, unlike `MetadataExtractor`)
-- ✅ Already testable without I/O mocks
-
-**Key Discovery: `LogReplayProcessor` Trait = Generalized Pattern B**
-
-The codebase already has a trait that codifies Pattern B:
-
-```rust
-trait LogReplayProcessor {
-    type Output;
-    fn process_actions_batch(&mut self, batch: ActionsBatch) 
-        -> DeltaResult<Self::Output>;
-    fn process_actions_iter(self, iter) -> impl Iterator<Output>;
-}
-```
-
-**Current implementations**:
-- ✅ `ScanLogReplayProcessor` (scanning - this analysis)
-- ✅ `ActionReconciliationProcessor` (checkpoint/compaction - Entry Points #6, #7)
+**Key Discovery**: The `LogReplayProcessor` trait codifies Pattern B as a reusable abstraction. Current implementations:
+- `ScanLogReplayProcessor` (this entry point)
+- `ActionReconciliationProcessor` (checkpoint/compaction)
 
 **Implication**: Checkpoint writing and log compaction will likely show similar excellent metrics (~7% duplication) since they use the same trait-based Pattern B design.
 
@@ -316,76 +243,9 @@ This is **exactly the complexity** the proposal doc encountered (see `async-buil
 
 ---
 
-#### Two Refactoring Approaches
+#### Refactoring Approach
 
-#### Approach A: Single-Phase with Schema Context
-
-**Idea**: Keep current design, add async to `read_actions` with nested `.map(async).flatten()`.
-
-**Reality Check**: The critique doc (Issue 4) shows this is NOT simple:
-
-```rust
-// Current sync has nested I/O in .map() closure:
-checkpoint_batches.map(|batch| {
-    let sidecars = if need_sidecars {
-        process_sidecars(batch)?  // ← Nested I/O!
-    } else { None };
-    chain(batch, sidecars)
-}).flatten_ok()
-
-// Async requires complex Stream handling:
-checkpoint_batches.then(|batch| async move {
-    let sidecars = if need_sidecars {
-        process_sidecars_async(batch).await?  // ← Async nested I/O!
-    } else { stream::empty() };
-    Ok(stream::once(Ok(batch)).chain(sidecars))
-}).flatten()  // ← Flatten Stream<Stream<>>
-```
-
-**Problems**:
-- ❌ `.then()` with conditional nested streams is complex
-- ❌ Schema-dependent behavior makes testing harder
-- ❌ Can't parallelize sidecar reads
-- ❌ Same issues the critique doc identified (Issue 4)
-
-**Pros**: Scan code changes minimal (processor unchanged)
-**Cons**: Complex async in `read_actions`, technical debt, no parallelization
-
-**Estimated Complexity**: High
-
----
-
-#### Approach B: Pattern C (Matches Proposal)
-
-**Idea**: Split into manifest + sidecars, like snapshot building. First read commits + checkpoint manifest while accumulating sidecar references. Then fetch and process sidecars in parallel if needed.
-
-**Pros**: Clean separation, parallelizable, matches snapshot pattern, no nested iterator complexity
-**Cons** (marginal cost): Scan-specific wrappers for two-phase pattern (~25 lines)
-
-**Costs ALREADY paid by snapshot refactor**: `Phase1InProgress`, `Phase1Result`, `read_actions_phase1/phase2` all exist
-
----
-
-#### Recommendation & Migration Path
-
-**Clear Recommendation**: **Approach B (Pattern C)** is strongly recommended because:
-
-**Comparison**:
-- **Approach A**: "Simpler for scan code" but **complex in `read_actions`** (high cost, technical debt)
-- **Approach B**: "More work upfront" but **clean architecture** (marginal cost if snapshot refactored, no tech debt)
-
-**Why Approach B wins**:
-1. **IF doing Pattern C for snapshots**: Marginal cost is ~25 lines (essentially free)
-2. **IF NOT doing Pattern C**: Still better long-term (resolves nested I/O properly)
-3. **Benefits apply broadly**: `read_actions` used by snapshots, scans, checkpoints, CDF
-4. **Avoids critique Issue 4**: No complex nested `.then(async).flatten()` pattern
-
-**Migration path**:
-1. Implement Pattern C for snapshot building (proposal doc)
-2. Apply to `read_actions` (shared infrastructure for manifest→sidecar discovery)
-3. Update scan code to use two-phase pattern (~25 lines)
-
-**Bottom line**: Approach A looks "simpler" but pushes complexity into `read_actions` where it's harder to maintain. Approach B distributes work better and avoids the nested stream complexity the critique identified.
+**Pattern C applies to scans**: The critique (Issue 4) already identified nested I/O in `read_actions` as a critical problem requiring two-phase processing. Applying Pattern C to scans adds ~30 lines of scan-specific wrappers, while the Pattern C infrastructure (`Phase1InProgress`, `Phase1Result`, `read_actions_phase1/phase2`) is provided by the snapshot refactor.
 
 ---
 
@@ -403,20 +263,10 @@ checkpoint_batches.then(|batch| async move {
 2. `Scan::replay_for_scan_metadata_phase1_async` - calls shared `read_actions_phase1_async` (~10 lines)
 3. `Scan::scan_metadata_phase2_async` - calls shared `process_sidecars_async` (~15 lines)
 
-**Metrics** (scan-specific marginal cost):
-- **New scan async choreography: ~30 lines** (3 thin functions)
-- Scan processor logic: ~385 lines (7 functions, all I/O-free, shared)
-- **Marginal duplication: ~30 lines** (for async-specific choreography)
-- **Shared infrastructure from snapshot refactor: ~40 lines** (already paid for)
-
-**Total Approach B cost**:
-- If snapshot refactor NOT done: ~110 lines (30 scan + 40 shared + 40 sync versions)
-- If snapshot refactor IS done: **~30 lines** (just scan-specific wrappers)
-
-**Comparison**:
-- Approach A (single-pass): ~30 lines but doesn't solve nested I/O complexity
-- Approach B (Pattern C): ~30 lines AND gets clean architecture
-- **Conclusion**: If snapshot uses Pattern C, Approach B is essentially free!
+**Metrics**:
+- Scan async choreography: ~30 lines (3 thin wrappers)
+- Scan processor logic: ~385 lines (I/O-free, shared)
+- Marginal duplication: ~30 lines (~7%)
 
 ---
 
@@ -481,28 +331,15 @@ Scan::execute [📍 Entry Point]
 
 ### 3.4 Function Classification
 
-#### I/O Functions (Need Async Variants)
+**I/O Functions (need async)**: 4 functions (~193 lines)
+- `Scan::execute` (nested I/O, high complexity)
+- `DvInfo::get_selection_vector`, `get_treemap` (trivial I/O wrappers)
+- `DeletionVectorDescriptor::read` (storage I/O + parsing, medium complexity)
 
-| Function | LOC | I/O Operations | Complexity |
-|----------|-----|----------------|------------|
-| `Scan::execute` | ~105 | Nested: DV reads + parquet reads | High |
-| `DvInfo::get_selection_vector` | ~8 | Calls `get_treemap` | Trivial wrapper |
-| `DvInfo::get_treemap` | ~10 | Calls `DeletionVectorDescriptor::read` | Trivial wrapper |
-| `DeletionVectorDescriptor::read` | ~70 | Calls `storage.read_files` | Medium |
-
-**Subtotal**: 4 functions, ~193 LOC
-
-#### Pure Computation (I/O-Free, Shared)
-
-| Function | LOC | Purpose |
-|----------|-----|---------|
-| `ScanMetadata::visit_scan_files` | ~8 | Visitor pattern entry point |
-| `ScanFileVisitor::visit` | ~45 | Extract file metadata from engine data |
-| `state::transform_to_logical` | ~15 | Apply expression transforms |
-| `deletion_treemap_to_bools` | ~5 | Convert roaring bitmap to bool vector |
-| `split_vector` | ~15 | Split selection vector by batch size |
-
-**Subtotal**: 5 functions, ~88 LOC (100% shared)
+**CPU Functions (shared)**: 5 functions (~88 lines)
+- `ScanFileVisitor::visit` (metadata extraction)
+- `transform_to_logical` (expression evaluation)
+- DV/selection vector helpers
 
 ---
 
@@ -510,69 +347,9 @@ Scan::execute [📍 Entry Point]
 
 #### Pattern A: Helper Functions ✅ (Perfect Fit)
 
-**Applies to**: 
-- `DvInfo::get_selection_vector` / `get_treemap` / `DeletionVectorDescriptor::read`
+**Applies to**: `DvInfo::get_selection_vector` / `get_treemap` / `DeletionVectorDescriptor::read`
 
-**Characteristics**:
-- ✅ One-shot operation: read DV file → parse → return treemap
-- ✅ No state accumulation
-- ✅ Can wrap in simple `async fn`
-
-**Refactoring**:
-```rust
-// Sync (current):
-pub fn read(&self, storage: Arc<dyn StorageHandler>, parent: &Url) 
-    -> DeltaResult<RoaringTreemap> {
-    let dv_data = storage.read_files(vec![(path, None)])?...;
-    // ~50 lines of parsing logic
-}
-
-// Async (proposed):
-pub async fn read_async(&self, storage: Arc<dyn AsyncStorageHandler>, parent: &Url) 
-    -> DeltaResult<RoaringTreemap> {
-    let dv_data = storage.read_files(vec![(path, None)]).await?...;
-    // ~50 lines of SHARED parsing logic
-}
-```
-
-**Key insight**: Since `StorageHandler` will have an async variant after the snapshot refactor, and the parsing logic (~50 LOC) is pure CPU, **only the I/O call changes** (`.await` added). The parsing logic is 100% shared.
-
----
-
-#### Pattern B: NOT Applicable ❌
-
-`execute` doesn't fit Pattern B because:
-- ❌ No stateful accumulation (each file/batch processed independently)
-- ❌ No early exit logic (must process all files to completion)
-- ✅ Uses `.map()` (stateless transform) not `.try_fold()` (stateful accumulation)
-
-**Key difference**: Pattern B uses `try_fold` to **accumulate state** across batches (e.g., building up metadata). Scan Execute uses `map` to **transform** each batch independently with no cross-batch state.
-
----
-
-#### Pattern C: NOT Applicable ❌
-
-`execute` doesn't fit Pattern C because:
-- ❌ No manifest/detail split (scan metadata already has the file list)
-- ❌ Doesn't benefit from two-phase pattern (files are independent, no discovery needed)
-- ✅ Uses `.map()` (stateless) not `.try_fold()` (stateful)
-
-**Key difference**: Pattern C is for discovery where you read a manifest to find what detail files to fetch (e.g., checkpoint→sidecars). Scan Execute already knows all files up front from scan metadata.
-
----
-
-#### Why Pattern C ≠ Pattern D
-
-Pattern C is about **discovery** (manifest→sidecars), not nesting. Pattern D is about **nested iteration** without discovery:
-
-| Aspect | Pattern C | Pattern D |
-|--------|-----------|-----------|
-| **Structure** | Two phases: read manifest, then fetch sidecars | Nested loops: outer (files) × inner (batches) |
-| **Key feature** | Can't fetch Phase 2 until Phase 1 completes | All files known upfront, no discovery |
-| **State flow** | Accumulates sidecar refs in Phase 1 | Each file/batch independent |
-| **Parallelizable** | Phase 2 can parallelize fetches | Yes (no dependencies) |
-
-**Conclusion**: Pattern C is about **discovery**. Pattern D is about **nested stateless transforms**.
+One-shot operations (read DV file → parse → return treemap). Async variant just adds `.await` to storage call; ~50 LOC of parsing logic is I/O-free.
 
 ---
 
@@ -691,43 +468,13 @@ Application to `Scan::execute`:
 
 **Async LOC**: ~158 lines (choreography only, +10 for yielding logic)
 
-#### Processor Logic (Shared, 100%):
+#### Processor Logic (I/O-Free):
 - All 5 pure computation functions (~88 LOC)
-- DV parsing logic in `DeletionVectorDescriptor::read` (~50 LOC) - **SHARED between sync/async**
-- No changes needed, already I/O-free
+- DV parsing logic (~50 LOC)
 
-**Total Shared Logic**: ~138 LOC (88 + 50)
+**Total I/O-Free Logic**: ~138 LOC
 
-**Duplication**: ~158 / (~158 + ~193) ≈ **45% duplication**
-
-**But wait!** If we extract the DV parsing into a shared helper (like `parse_dv_bytes`):
-
-```rust
-// Shared helper (no duplication):
-fn parse_dv_bytes(bytes: Bytes, offset: Option<i32>, size: i32) 
-    -> DeltaResult<RoaringTreemap> {
-    // ~50 lines of parsing logic
-}
-
-// Sync:
-pub fn read(&self, storage: Arc<dyn StorageHandler>, ...) -> ... {
-    let bytes = storage.read_files(...)?;
-    parse_dv_bytes(bytes, self.offset, self.size_in_bytes)  // ← shared!
-}
-
-// Async:
-pub async fn read_async(&self, storage: Arc<dyn AsyncStorageHandler>, ...) -> ... {
-    let bytes = storage.read_files(...).await?;
-    parse_dv_bytes(bytes, self.offset, self.size_in_bytes)  // ← shared!
-}
-```
-
-**Revised Duplication** (with parsing extracted): ~108 / (~108 + ~193) ≈ **36% duplication**
-
-**Summary**:
-- Without extraction: ~45% duplication
-- With extraction: ~36% duplication (recommended)
-- Pattern A applies perfectly since `AsyncStorageHandler` will exist from snapshot refactor
+**Duplication**: ~108 / (~108 + ~138) ≈ **44% duplication**
 
 ---
 
@@ -785,15 +532,10 @@ TableChangesScan::execute [📍 Entry Point #5b]
 1. **Two Entry Points**: `try_new` (validation), `execute` (data reading)
 
 2. **Novel Pattern E: Two-Pass Per-Commit**:
-   - Pass 1: Read actions, detect CDC, build remove_dvs map → `LogReplayScanner`
-   - Pass 2: Re-read same commit, apply selection, transform → scan batches
-   - Why: Can't know selection logic until after reading entire commit
+   - Pass 1: Read actions, aggregate metadata (has_cdc?, remove_dvs) → `LogReplayScanner`
+   - Pass 2: Re-read same commit, apply selection based on Pass 1
    - Cost: Reads each commit twice (streams can't rewind)
-
-3. **Does NOT use `LogReplayProcessor`**:
-   - CDF needs forward iteration, two passes, per-commit scope, Remove output
-   - `LogReplayProcessor` does reverse iteration, single pass, cross-commit deduplication
-   - Unification would over-complicate both (keeping separate is simpler)
+   - Does NOT use `LogReplayProcessor` (fundamentally different: forward iteration, two-pass, per-commit scope vs. reverse, single-pass, cross-commit)
 
 4. **File-level**: Uses Pattern D (nested streams) like Scan Execute
 
@@ -804,8 +546,6 @@ TableChangesScan::execute [📍 Entry Point #5b]
 ### 4.3 Focus: New Functions Only
 
 **Already analyzed**: Entry Points #1 (Snapshot), #2 (Scan Metadata), #3 (Scan Execute)
-
-**Important**: `LogReplayScanner` is **NOT** an implementation of `LogReplayProcessor` (Pattern B). It's CDF-specific logic that should eventually be refactored (per code TODO).
 
 **New functions**:
 1. ✅ `TableChanges::try_new` - Entry point, validation
@@ -927,7 +667,7 @@ Application to CDF `LogReplayScanner`:
 
 **Async LOC**: ~180 lines
 
-#### Processor Logic (Shared, 100%):
+#### Processor Logic (I/O-Free):
 - `LogReplayScanner` state (~30 LOC) - I/O-free struct
 - `PreparePhaseVisitor` (~80 LOC) - Pure CPU visitor
 - `FileActionSelectionVisitor` (~50 LOC) - Pure CPU visitor  
@@ -941,14 +681,10 @@ Application to CDF `LogReplayScanner`:
 
 **Why reasonable**:
 - Pattern E is novel but straightforward (just add `.await` in two places)
-- Most complexity is in visitors and validation (100% shared)
+- Most complexity is in visitors and validation (I/O-free)
 - Execute pass reuses Pattern D from Scan Execute
 - Lower than Scan Execute due to less DV parsing complexity
 
-**Note on unification with `LogReplayProcessor`**: 
-CDF's requirements (forward iteration, two-pass per-commit, Remove output, per-commit scope) differ fundamentally from `LogReplayProcessor` (reverse iteration, single-pass, cross-commit deduplication). Keeping CDF separate is simpler for async refactor and avoids over-complicating the existing trait.
-
-**Pattern E uses Pattern B**: Pass 1 of Pattern E follows Pattern B's choreography (processor + try_fold) to **aggregate** control state across chunks from a single item. This aggregated control state then drives Pass 2's processing of the same item.
 
 ---
 
@@ -1016,57 +752,12 @@ Transaction::commit [📍 Entry Point]
 
 #### Pattern A: Helper Functions ✅ (Perfect Fit)
 
-All transaction commit functions fit Pattern A:
+All transaction commit functions fit Pattern A (one-shot operations):
 
-**1. Main entry point** - `Transaction::commit`:
+1. **`Transaction::commit`**: Generate actions (CPU) → write commit file (I/O)
+2. **`get_in_commit_timestamp`** / **`read_in_commit_timestamp`**: Read commit file (I/O) → parse CommitInfo (CPU)
 
-```rust
-// Sync (current):
-pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult> {
-    // Step 1-4: CPU-only action generation
-    let ict = snapshot.get_in_commit_timestamp(engine)?;  // Pattern A helper
-    let actions = self.generate_all_actions(engine)?;
-    
-    // Step 5: I/O - write commit file
-    engine.json_handler().write_json_file(&path, actions, false)?;
-    
-    Ok(CommitResult::...)
-}
-
-// Async (proposed):
-pub async fn commit_async(self, engine: &dyn AsyncEngine) -> DeltaResult<CommitResult> {
-    // Step 1-4: SAME CPU-only logic (100% shared)
-    let ict = snapshot.get_in_commit_timestamp_async(engine).await?;  // Pattern A
-    let actions = self.generate_all_actions(engine)?;
-    
-    // Step 5: I/O - write commit file (just add .await)
-    engine.json_handler().write_json_file(&path, actions, false).await?;
-    
-    Ok(CommitResult::...)
-}
-```
-
-**2. ICT helpers** - `get_in_commit_timestamp` and `read_in_commit_timestamp`:
-
-```rust
-// Sync:
-pub fn read_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
-    let actions = engine.json_handler().read_json_files(...)?;
-    // Parse CommitInfo to extract ICT (CPU)
-}
-
-// Async:
-pub async fn read_in_commit_timestamp_async(&self, engine: &dyn AsyncEngine) -> DeltaResult<i64> {
-    let actions = engine.json_handler().read_json_files(...).await?;
-    // SAME parsing logic (100% shared)
-}
-```
-
-**Key characteristics**:
-- ✅ One-shot operations (no iteration/accumulation)
-- ✅ Mostly CPU (action generation, ICT parsing)
-- ✅ Minimal I/O (read ICT + write file)
-- ✅ All business logic I/O-free and shared
+Async variants just add `.await` to I/O calls. All action generation and ICT parsing logic is I/O-free.
 
 ---
 
@@ -1091,7 +782,7 @@ Transaction commit is the simplest entry point analyzed so far:
 
 **Async LOC**: ~115 lines (3 thin Pattern A wrappers)
 
-#### Processor Logic (Shared, 100%):
+#### Processor Logic (I/O-Free):
 - `Transaction::generate_adds` (~110 LOC) - Pure CPU
 - `Transaction::generate_domain_metadata_actions` (~40 LOC) - Pure CPU
 - `build_add_actions` (~50 LOC) - Pure CPU transformation
@@ -1106,10 +797,10 @@ Transaction commit is the simplest entry point analyzed so far:
 
 **Why reasonable**:
 - Pattern A applies perfectly (one-shot operation)
-- Vast majority of code is action generation (100% shared)
+- Vast majority of code is action generation (I/O-free)
 - ICT read functions are simple Pattern A wrappers (~35 LOC async)
 - Only I/O is ICT read + file write (trivial async)
-- Still very low duplication (24%)
+- Very low duplication (24%)
 
 ---
 
