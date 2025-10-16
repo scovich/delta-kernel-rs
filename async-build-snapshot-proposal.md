@@ -1,5 +1,41 @@
 # Control Flow 1: Snapshot Creation - Refactoring Guide
 
+## Table of Contents
+
+### Core Sections
+- [1. Executive Summary](#1-executive-summary)
+- [2. Current State Analysis](#2-current-state-analysis)
+  - [2.1 Current Control Flow](#21-current-control-flow)
+  - [2.2 Code Organization Problems](#22-code-organization-problems)
+  - [2.3 Refactored Control Flow](#23-refactored-control-flow)
+- [3. Async Foundation](#3-async-foundation)
+  - [3.1 Async Trait Hierarchy Design](#31-async-trait-hierarchy-design)
+  - [3.2 Iterator vs Stream Compatibility](#32-iterator-vs-stream-compatibility)
+  - [3.3 Cooperative Yielding for CPU-Intensive Operations](#33-cooperative-yielding-for-cpu-intensive-operations)
+- [4. Pattern Library](#4-pattern-library)
+  - [4.1 Pattern A: Helper Functions](#41-pattern-a-helper-functions)
+  - [4.2 Pattern B: Processor + try_fold](#42-pattern-b-processor--try_fold)
+  - [4.3 Pattern C: Two-Phase Checkpoint Processing](#43-pattern-c-two-phase-checkpoint-processing)
+- [5. Implementation Strategy](#5-implementation-strategy)
+  - [5.1 Concrete Refactoring Examples](#51-concrete-refactoring-examples)
+  - [5.2 Edge Cases & Conditional Logic](#52-edge-cases--conditional-logic)
+  - [5.3 CPU-Intensive Operation Strategy](#53-cpu-intensive-operation-strategy)
+- [6. Implementation Phases](#6-implementation-phases)
+- [7. Deep Dive: Streaming vs Batched Sidecar Processing](#7-deep-dive-streaming-vs-batched-sidecar-processing)
+- [8. Implementation Details](#8-implementation-details)
+- [9. Risk Management & Open Questions](#9-risk-management--open-questions)
+- [10. Complete Pattern C Design](#10-complete-pattern-c-design)
+
+### Appendices
+- [Appendix A: Refactoring Steps by Problem](#appendix-a-refactoring-steps-by-problem)
+- [Appendix B: Key Learnings & Discovery Process](#appendix-b-key-learnings--discovery-process)
+- [Appendix C: Pattern C Deep Dive](#appendix-c-pattern-c-deep-dive)
+- [Appendix D: Evolution from Initial Approach](#appendix-d-evolution-from-initial-approach)
+
+💡 **Tip**: Use your browser's back button to return after clicking links.
+
+---
+
 ## 1. Executive Summary
 
 This document analyzes Control Flow 1 (Snapshot Creation) in `delta-kernel-rs` and provides a concrete refactoring plan to support async operations while maintaining sync compatibility.
@@ -19,11 +55,11 @@ The refactoring requires establishing a **parallel async trait hierarchy** along
 - **Key insight**: The `try_fold` pattern works for both `Iterator` (sync) and `Stream` (async) with minimal changes
 - **⚠️ Important**: `futures::TryStreamExt::try_fold` is hardwired to `Result` and cannot work with `ControlFlow`. We need a custom `ControlFlowStreamExt` trait (~70 lines) to enable `ControlFlow`-based folding for async streams.
 
-See **Section 3** for complete async trait specifications and the custom extension trait implementation.
+See **[Section 3: Async Foundation](#3-async-foundation)** for complete async trait specifications and the custom extension trait implementation.
 
 ### Pattern Refinement
 
-Analysis reveals **three core patterns** needed (Section 4):
+Analysis reveals **three core patterns** needed ([Section 4: Pattern Library](#4-pattern-library)):
 
 - **Pattern A (Helper Functions)**: One-shot operations ✅
 - **Pattern B (Processor + try_fold)**: Iterative processing with early exit ✅
@@ -31,7 +67,7 @@ Analysis reveals **three core patterns** needed (Section 4):
   - Phase 1 uses Pattern B (ControlFlow-based state machine)
   - Phase 2 uses nested Pattern B (files × batches)
 
-**Status**: All patterns designed and refined. Pattern C incorporates insights from [PR #1160](https://github.com/delta-io/delta-kernel-rs/pull/1160) with ControlFlow-based improvements (Appendix B).
+**Status**: All patterns designed and refined. Pattern C incorporates insights from [PR #1160](https://github.com/delta-io/delta-kernel-rs/pull/1160) with ControlFlow-based improvements ([Appendix B](#appendix-b-key-learnings--discovery-process)).
 
 ### Recommendations
 
@@ -237,7 +273,7 @@ These operations mix I/O orchestration with computation logic:
 - **High** (1 operation): `read_actions` (multi-source)
 - **Very High** (1 operation): `create_checkpoint_stream` (nested conditional I/O)
 
-**Example**: Problem 2 (`protocol_and_metadata`) shows ~20 lines of extraction logic intertwined with I/O loop, making it untestable and unreusable for async. The `MetadataExtractor` processor (Pattern B, Section 4.2) extracts this logic into a testable, reusable component.
+**Example**: Problem 2 (`protocol_and_metadata`) shows ~20 lines of extraction logic intertwined with I/O loop, making it untestable and unreusable for async. The `MetadataExtractor` processor ([Pattern B, Section 4.2](#42-pattern-b-processor--try_fold)) extracts this logic into a testable, reusable component.
 
 ### 2.3 Refactored Control Flow
 
@@ -1024,7 +1060,7 @@ pub async fn read_async(storage: &dyn AsyncStorage, path: &Path)
 - ✅ Simple - no over-engineering
 - ✅ Testable with mock `Result<Data>`
 
-**Example**: `LastCheckpointHint::from_file_result` (Pattern A, Section 4.1)
+**Example**: `LastCheckpointHint::from_file_result` ([Pattern A, Section 4.1](#41-pattern-a-helper-functions))
 
 #### Pattern B: Processor + try_fold (for iterative processing)
 
@@ -1282,7 +1318,7 @@ However, this abstraction may not be worth it:
 - ❌ Stateless transformation (use `map`/`filter`)
 - ❌ Infallible processing (use simpler types)
 
-**Example**: `MetadataExtractor::process_batch` (Pattern B, Section 4.2)
+**Example**: `MetadataExtractor::process_batch` ([Pattern B, Section 4.2](#42-pattern-b-processor--try_fold))
 
 #### Pattern C: Two-Phase Checkpoint Processing (Refined based on PR #1160)
 
@@ -1579,7 +1615,7 @@ pub fn read_metadata_parallel(&self, engine: &dyn Engine)
 1. **Clean separation**: Phase 1 (manifest) is always sequential, Phase 2 (sidecars) is parallelizable
 2. **Natural for async**: Clear boundaries make async control flow straightforward
 3. **Supports all use cases**: Simple sequential, async, parallel, distributed - same pattern
-4. **Manifest is small**: Reading entire manifest first adds < 0.1% latency (performance analysis in Section 9.6)
+4. **Manifest is small**: Reading entire manifest first adds < 0.1% latency (performance analysis in [Section 9.6](#96-two-phase-vs-incremental-performance-analysis))
 5. **Better for parallelization**: Having all sidecar files up front enables load balancing, caching, progress tracking
 6. **Patterns compose**: Pattern C's phase 2 uses Pattern B (`try_fold`) internally - nested iteration benefits from same techniques!
 
@@ -1590,13 +1626,13 @@ pub fn read_metadata_parallel(&self, engine: &dyn Engine)
 - ✅ Sync and async differ only in choreography
 - ✅ Natural boundary for distributed processing
 
-**Why two-phase over incremental?** (detailed performance analysis in Section 9.6):
+**Why two-phase over incremental?** (detailed performance analysis in [Section 9.6](#96-two-phase-vs-incremental-performance-analysis)):
 - Checkpoint manifests are tiny (< 1MB, just metadata + paths)
 - Reading entire manifest adds negligible time (< 50ms vs minutes-hours for sidecars)
 - Two-phase is simpler and enables better parallelization
 - Incremental approach saves < 0.1% time while adding significant complexity
 
-**Design evolution**: Refined based on insights from [PR #1160](https://github.com/delta-io/delta-kernel-rs/pull/1160), with detailed analysis in Section 9.6.
+**Design evolution**: Refined based on insights from [PR #1160](https://github.com/delta-io/delta-kernel-rs/pull/1160), with detailed analysis in [Section 9.6](#96-two-phase-vs-incremental-performance-analysis).
 
 **Note on Multi-Source Orchestration**: The challenge of orchestrating multiple sources (commits + checkpoints) with different schemas is naturally handled by Pattern C's phase 1. By chaining the commit and checkpoint iterators together, both sources are processed uniformly through the same `try_fold` loop. No separate pattern needed.
 
@@ -2521,7 +2557,7 @@ Should processors return `Result` or panic on invalid input?
    - Integration tests via existing processor tests
    - Edge cases: empty streams, early break, errors
 
-**Solution**: Implement custom `ControlFlowStreamExt` trait with `try_fold` method (~70 lines, documented in Section 3.2).
+**Solution**: Implement custom `ControlFlowStreamExt` trait with `try_fold` method (~70 lines, documented in [Section 3.2](#32-iterator-vs-stream-compatibility)).
 
 ---
 
@@ -2670,7 +2706,7 @@ The PR author identifies several open questions:
    - ✅ Pattern applies to both! Phase 1 = log replay, Phase 2 = sidecars
    - ✅ Unified approach reduces code duplication
 
-**The synthesis**: Pattern C adopts PR #1160's fundamental two-phase insight while fixing its limitations (hidden I/O, async incompatibility, less type safety). Complete design in Section 10.
+**The synthesis**: Pattern C adopts PR #1160's fundamental two-phase insight while fixing its limitations (hidden I/O, async incompatibility, less type safety). Complete design in [Section 10](#10-complete-pattern-c-design).
 
 #### Key Realizations
 
@@ -2712,7 +2748,7 @@ The PR author identifies several open questions:
 
 **Our refinement**: We adopted the two-phase structure but replaced the Iterator interface with ControlFlow-based state machines, fixing async compatibility issues and making I/O explicit.
 
-This design is detailed in Pattern C (Section 4) with complete implementation in Section 10.
+This design is detailed in [Pattern C (Section 4.3)](#43-pattern-c-two-phase-checkpoint-processing) with complete implementation in [Section 10](#10-complete-pattern-c-design).
 
 ---
 
@@ -3084,7 +3120,7 @@ impl<P> Iterator for Phase1LogReplay<P> {
 
 **Key insight**: Phase 1 has dual output (batches to user + internal state for phase 2). Solution: Make it explicit with `ControlFlow`-based state machine.
 
-**Complete design and code**: Section 4.3 provides full `Phase1InProgress`, `Phase1Result`, `From` impls, `phase1_sync`, `phase1_async`, and usage examples.
+**Complete design and code**: [Section 4.3](#43-pattern-c-two-phase-checkpoint-processing) provides full `Phase1InProgress`, `Phase1Result`, `From` impls, `phase1_sync`, `phase1_async`, and usage examples.
 
 ### Comparison to Iterator Approach (PR #1160)
 
