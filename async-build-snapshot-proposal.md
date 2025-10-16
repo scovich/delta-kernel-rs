@@ -13,7 +13,6 @@
 - [3. The Solution: Processors + Choreography](#3-the-solution-processors--choreography)
   - [3.1 Core Principle](#31-core-principle)
   - [3.2 Three Patterns for Three Problem Types](#32-three-patterns-for-three-problem-types)
-  - [3.3 Quick Example: Pattern B](#33-quick-example-pattern-b)
 
 ### Part II: Pattern Details (~30 min)
 - [4. Pattern A: Helper Functions](#4-pattern-a-helper-functions)
@@ -21,8 +20,7 @@
   - [4.2 Example: LastCheckpointHint](#42-example-lastcheckpointhint)
 - [5. Pattern B: Processor + try_fold](#5-pattern-b-processor--try_fold)
   - [5.1 The Pattern](#51-the-pattern)
-  - [5.2 Why This Works](#52-why-this-works)
-  - [5.3 Example: MetadataExtractor](#53-example-metadataextractor)
+  - [5.2 Example: MetadataExtractor](#52-example-metadataextractor)
 - [6. Pattern C: Two-Phase Processing](#6-pattern-c-two-phase-processing)
   - [6.1 Why Two-Phase?](#61-why-two-phase)
   - [6.2 The Pattern](#62-the-pattern)
@@ -31,29 +29,21 @@
 ### Part III: Implementation Guide (~20 min)
 - [7. Current State Analysis (Detailed)](#7-current-state-analysis-detailed)
 - [8. Refactored Control Flow](#8-refactored-control-flow)
+  - [8.1 Before: Mixed I/O and Computation](#81-before-mixed-io-and-computation)
+  - [8.2 After: Clean Separation](#82-after-clean-separation)
 - [9. Async Foundation Requirements](#9-async-foundation-requirements)
 - [10. Complete Pattern C Implementation](#10-complete-pattern-c-implementation)
 - [11. Implementation Roadmap](#11-implementation-roadmap)
-- [12. Success Criteria](#12-success-criteria)
+- [12. Summary](#12-summary)
 
 ### Part IV: Deep Dives & Reference (on-demand)
 - [Appendix A: Refactoring Principles](#appendix-a-refactoring-principles)
-- [Appendix B: Extension Traits](#appendix-b-extension-traits)
-- [Appendix C: Current State Deep Dive](#appendix-c-current-state-deep-dive)
-- [Appendix D: Refactored Control Flow (Detailed)](#appendix-d-refactored-control-flow-detailed)
-- [Appendix E: Async Trait Definitions](#appendix-e-async-trait-definitions)
-- [Appendix F: ControlFlowStreamExt Implementation](#appendix-f-controlflowstreamext-implementation)
-- [Appendix G: Pattern C Support Code](#appendix-g-pattern-c-support-code)
-- [Appendix H: Pre-Implementation Analysis](#appendix-h-pre-implementation-analysis)
-- [Appendix I: Cooperative Yielding](#appendix-i-cooperative-yielding)
-- [Appendix J: Pattern A Complete Example](#appendix-j-pattern-a-complete-example)
-- [Appendix K: Pattern B Complete Example](#appendix-k-pattern-b-complete-example)
-- [Appendix L: Two-Phase vs Incremental Analysis](#appendix-l-two-phase-vs-incremental-analysis)
-- [Appendix M: PR #1160 Analysis](#appendix-m-pr-1160-analysis)
-- [Appendix N: Key Architectural Decisions](#appendix-n-key-architectural-decisions)
-- [Appendix O: Risk Management & Open Questions](#appendix-o-risk-management--open-questions)
-- [Appendix P: Design Evolution](#appendix-p-design-evolution)
-- [Appendix Q: Phase 1 Design Evolution](#appendix-q-phase-1-design-evolution)
+- [Appendix B: Extension Traits for try_fold Integration](#appendix-b-extension-traits-for-try_fold-integration)
+- [Appendix C: Complete Pattern A Example - LastCheckpointHint](#appendix-c-complete-pattern-a-example---lastcheckpointhint)
+- [Appendix D: Complete Pattern B Example - MetadataExtractor](#appendix-d-complete-pattern-b-example---metadataextractor)
+- [Appendix E: Async Trait Hierarchy - Complete Definitions](#appendix-e-async-trait-hierarchy---complete-definitions)
+- [Appendix F: Detailed I/O vs Computation Analysis](#appendix-f-detailed-io-vs-computation-analysis)
+- [Appendix G: Code Metrics and Async Virality](#appendix-g-code-metrics-and-async-virality)
 
 💡 **Tip**: Use your browser's back button to return after clicking links.
 
@@ -74,9 +64,9 @@ Current snapshot building code mixes I/O orchestration with business logic, maki
 - **Choreography**: Thin wrappers that feed data to processors (sync or async)
 
 Three patterns handle different problem types:
-- **Pattern A**: Helper functions for one-shot operations
-- **Pattern B**: Processor + `try_fold` for iterative processing with early exit
-- **Pattern C**: Two-phase processing for manifest + detail files
+- **[Pattern A](#4-pattern-a-helper-functions)**: Helper functions for one-shot operations
+- **[Pattern B](#5-pattern-b-processor--try_fold)**: Processor + `try_fold` for iterative processing with early exit
+- **[Pattern C](#6-pattern-c-two-phase-processing)**: Two-phase processing for manifest + detail files
 
 ### Key Results
 
@@ -94,7 +84,7 @@ Three patterns handle different problem types:
 - Add async choreography
 - Integration and testing
 
-See [Section 6](#6-implementation-phases) for detailed roadmap.
+See [Section 11: Implementation Roadmap](#11-implementation-roadmap) for detailed timeline and phases.
 
 ### Document Structure
 
@@ -254,60 +244,6 @@ async fn read_metadata_async(&self, engine: &dyn AsyncEngine) -> Result<Output> 
 | **Iterative with early exit** | B: Processor + try_fold | Multi-batch, stateful, can complete early | `MetadataExtractor` |
 | **Manifest + details** | C: Two-Phase | Tiny manifest references large detail files | Checkpoint + sidecars |
 
-### 3.3 Quick Example: Pattern B
-
-Here's Pattern B (the most common) with concept code only:
-
-```rust
-// CONCEPT CODE: The processor (I/O-free, testable, reusable)
-#[derive(Default)]
-struct MetadataExtractor {
-    metadata: Option<Metadata>,
-    protocol: Option<Protocol>,
-}
-
-impl MetadataExtractor {
-    fn process(mut self, batch: &Batch) 
-        -> Result<ControlFlow<(Metadata, Protocol), Self>> 
-    {
-        // Can use ? for errors naturally
-        if self.metadata.is_none() {
-            self.metadata = Metadata::try_new_from_data(batch)?;
-        }
-        if self.protocol.is_none() {
-            self.protocol = Protocol::try_new_from_data(batch)?;
-        }
-        
-        // Signal completion or continuation
-        match (self.metadata, self.protocol) {
-            (Some(m), Some(p)) => Ok(ControlFlow::Break((m, p))),
-            _ => Ok(ControlFlow::Continue(self))
-        }
-    }
-}
-
-// CONCEPT CODE: Sync choreography (3 lines)
-iterator
-    .try_fold(MetadataExtractor::default(), |p, batch| {
-        p.process(batch).transpose()  // ¹
-    })
-    .unwrap_break_or_else(MetadataExtractor::try_finish)?  // ²
-
-// CONCEPT CODE: Async choreography (5 lines - only differs by async move + .await)
-stream
-    .try_fold(MetadataExtractor::default(), |p, batch| async move {
-        p.process(batch).transpose()  // ¹ same
-    })
-    .await  // ← only difference
-    .unwrap_break_or_else(MetadataExtractor::try_finish)?  // ² same
-```
-
-**Notes**:
-- ¹ `.transpose()` converts processor result type for try_fold (see [Appendix B](#appendix-b-extension-traits))
-- ² `.unwrap_break_or_else()` handles the "ran out of items" case (see [Appendix B](#appendix-b-extension-traits))
-
-**Key Insight**: All business logic is in the processor. Choreography is ~3-5 lines of boilerplate that's nearly identical for sync and async.
-
 ---
 
 # Part II: Pattern Details
@@ -366,12 +302,12 @@ pub async fn read_async(storage: &dyn AsyncStorage, path: &Path)
 
 ### 4.2 Example: LastCheckpointHint
 
-See [Appendix J](#appendix-j-pattern-a-complete-example) for complete before/after code with the `LastCheckpointHint` implementation.
+See [Appendix C: Complete Pattern A Example](#appendix-c-complete-pattern-a-example---lastcheckpointhint) for the complete `LastCheckpointHint` implementation.
 
 **When NOT to use**:
-- ❌ Multi-batch processing (use Pattern B)
-- ❌ Iteration with state (use Pattern B)
-- ❌ Complex conditional logic (consider Pattern B or C)
+- ❌ Multi-batch processing (use [Pattern B](#5-pattern-b-processor--try_fold))
+- ❌ Iteration with state (use [Pattern B](#5-pattern-b-processor--try_fold))
+- ❌ Complex conditional logic (consider [Pattern B](#5-pattern-b-processor--try_fold) or [Pattern C](#6-pattern-c-two-phase-processing))
 
 ---
 
@@ -400,10 +336,7 @@ impl MyProcessor {
         -> Result<ControlFlow<Output, Self>> 
     {
         // ✅ Can use ? for error handling naturally
-        let data = fallible_operation(item)?;
-        
-        // ✅ Update internal state
-        self.accumulate(data);
+        self.accumulate(item)?;
         
         // ✅ Decide: are we done or need more?
         if self.is_complete() {
@@ -412,103 +345,50 @@ impl MyProcessor {
             Ok(ControlFlow::Continue(self))
         }
     }
-    
-    /// Handle case where iterator/stream exhausts before completion
-    pub fn try_finish(self) -> Result<Output> {
-        if self.is_complete() {
-            Ok(self.into_output())
-        } else {
-            Err(Error::Incomplete)
-        }
-    }
 }
 
 // CONCEPT CODE: Sync choreography (3 lines)
 iterator
     .try_fold(MyProcessor::default(), |p, item| {
         p.process(item).transpose()  // ¹
-    })
-    .unwrap_break_or_else(MyProcessor::try_finish)?  // ²
+    })?
+    .unwrap_break_or_else(|p| Err(Error::Incomplete))?  // ²
 
-// CONCEPT CODE: Async choreography (5 lines - only differs by async move + .await)
+// CONCEPT CODE: Async choreography (only differs by async move + .await)
 stream
     .try_fold(MyProcessor::default(), |p, item| async move {
         p.process(item).transpose()  // ¹ same
     })
-    .await  // ← only difference
-    .unwrap_break_or_else(MyProcessor::try_finish)?  // ² same
+    .await?  // ← only difference
+    .unwrap_break_or_else(|p| Err(Error::Incomplete))?  // ² same
 ```
 
 **Notes**:
-- ¹ `.transpose()` converts `Result<ControlFlow<O, S>>` (what processor returns) to `ControlFlow<Result<O>, S>` (what try_fold needs). See [Appendix B](#appendix-b-extension-traits) for implementation.
-- ² `.unwrap_break_or_else()` handles the "ran out of items" case by calling `try_finish()`. See [Appendix B](#appendix-b-extension-traits) for implementation.
+- ¹ `.transpose()` converts processor result type (see [Appendix B](#appendix-b-extension-traits-for-try_fold-integration))
+- ² `.unwrap_break_or_else()` handles incomplete state (see [Appendix B](#appendix-b-extension-traits-for-try_fold-integration))
 
-### 5.2 Why This Works
-
-The processor signature `Result<ControlFlow<Output, Self>>` lets you:
-- Use `?` for error handling inside the processor (natural Rust)
-- Signal completion via `Break` or continuation via `Continue`
-- Take ownership of `self` (avoiding async borrow checker issues)
-
-The `try_fold` method works for both:
-- `Iterator::try_fold` (sync) - uses unstable `Try` trait
-- Custom `ControlFlowStreamExt::try_fold` (async) - see [Appendix F](#appendix-f-controlflowstreamext-implementation)
-
-**Key Insight**: Only ~1 line differs between sync and async choreography (`async move` + `.await`). All business logic is in the shared processor.
-
-### 5.3 Example: MetadataExtractor
-
-Here's a realistic example processing Delta log actions:
-
-```rust
-// CONCEPT CODE: Extract metadata and protocol from action batches
-#[derive(Default)]
-pub struct MetadataExtractor {
-    metadata: Option<Metadata>,
-    protocol: Option<Protocol>,
-}
-
-impl MetadataExtractor {
-    pub fn process(mut self, batch: &ActionsBatch) 
-        -> DeltaResult<ControlFlow<(Metadata, Protocol), Self>> 
-    {
-        // Extract metadata if not found yet
-        if self.metadata.is_none() {
-            self.metadata = Metadata::try_new_from_data(batch.actions.as_ref())?;
-        }
-        
-        // Extract protocol if not found yet
-        if self.protocol.is_none() {
-            self.protocol = Protocol::try_new_from_data(batch.actions.as_ref())?;
-        }
-        
-        // Check if we're done (found both)
-        match (self.metadata, self.protocol) {
-            (Some(m), Some(p)) => Ok(ControlFlow::Break((m, p))),
-            _ => Ok(ControlFlow::Continue(self))
-        }
-    }
-    
-    pub fn try_finish(self) -> DeltaResult<(Metadata, Protocol)> {
-        match (self.metadata, self.protocol) {
-            (Some(m), Some(p)) => Ok((m, p)),
-            _ => Err(Error::MissingMetadata),
-        }
-    }
-}
-```
-
-See [Appendix K](#appendix-k-pattern-b-complete-example) for complete before/after code comparison.
+**Key characteristics**:
+- Processor is a pure state machine (no I/O, no iterators/streams)
+- All business logic written once in processor
+- Choreography is 3-5 lines of boilerplate
+- Early exit via `ControlFlow::Break`
 
 **Benefits**:
-- ✅ Business logic written once (~25 lines)
-- ✅ Choreography is tiny (3 lines sync, 5 lines async)
+- ✅ Business logic written once (~10-30 lines)
+- ✅ Choreography is minimal (3 lines sync, 5 lines async)
 - ✅ Testable without I/O mocks
-- ✅ Power users can use processor directly with custom choreography
-- ✅ Only ~1 line differs between sync and async
+- ✅ Only `async move` + `.await` differs between sync and async
+
+### 5.2 Example: MetadataExtractor
+
+See [Appendix D: Complete Pattern B Example](#appendix-d-complete-pattern-b-example---metadataextractor) for the complete `MetadataExtractor` implementation showing:
+- Full processor code with state machine logic
+- Sync and async choreography
+- Comprehensive unit tests (no I/O mocks needed)
+- Integration tests with `try_fold`
 
 **When NOT to use**:
-- ❌ One-shot operations (use Pattern A)
+- ❌ One-shot operations (use [Pattern A](#4-pattern-a-helper-functions))
 - ❌ No early exit needed (use plain `fold`)
 - ❌ Stateless transformation (use `map`/`filter`)
 
@@ -530,7 +410,7 @@ Delta V2 checkpoints have this structure:
 - Caching (skip already-processed sidecars)
 - Load balancing (process large files first)
 
-See [Appendix L](#appendix-l-two-phase-vs-incremental-analysis) for detailed performance analysis showing two-phase wins across 1-256+ cores.
+*For detailed performance analysis of two-phase vs incremental approaches, see historical design documents.*
 
 ### 6.2 The Pattern
 
@@ -658,15 +538,15 @@ match phase1 {
 - ✅ Simple case is easy (method chaining)
 - ✅ Power users can fully customize phase 2
 - ✅ Sync and async versions nearly identical
-- ✅ Patterns compose (Pattern C = Pattern B × 2)
+- ✅ Patterns compose (Pattern C = [Pattern B](#5-pattern-b-processor--try_fold) × 2)
 
 **When NOT to use**:
-- ❌ No manifest/detail split (use Pattern B)
-- ❌ Details aren't parallelizable (use Pattern B)
+- ❌ No manifest/detail split (use [Pattern B](#5-pattern-b-processor--try_fold))
+- ❌ Details aren't parallelizable (use [Pattern B](#5-pattern-b-processor--try_fold))
 
 See [Section 10](#10-complete-pattern-c-implementation) for complete implementation details.
 
-See [Appendix G](#appendix-g-pattern-c-support-code) for `From` impl helpers that clean up the choreography.
+*Note: The `From` implementations shown in [Section 10](#10-complete-pattern-c-implementation) eliminate explicit state transitions, making choreography code cleaner.*
 
 ---
 
@@ -701,19 +581,67 @@ The 30% mixed choreography breaks down into 5 specific problems:
 
 | Problem | Function | Complexity | Pattern |
 |---------|----------|------------|---------|
-| 1 | `LastCheckpointHint::try_read` | Simple | A: Helper Function |
-| 2 | `LogSegment::protocol_and_metadata` | Medium | B: Processor + try_fold |
-| 3 | `LogSegment::read_actions` | High | C: Phase 1 (multi-source) |
-| 4 | `LogSegment::create_checkpoint_stream` | Very High | C: Phase 1 (manifest) |
-| 5 | `LogSegment::process_sidecars` | Medium | C: Phase 2 (sidecars) |
+| 1 | `LastCheckpointHint::try_read` | Simple | [A](#4-pattern-a-helper-functions): Helper Function |
+| 2 | `LogSegment::protocol_and_metadata` | Medium | [B](#5-pattern-b-processor--try_fold): Processor + try_fold |
+| 3 | `LogSegment::read_actions` | High | [C](#6-pattern-c-two-phase-processing): Phase 1 (multi-source) |
+| 4 | `LogSegment::create_checkpoint_stream` | Very High | [C](#6-pattern-c-two-phase-processing): Phase 1 (manifest) |
+| 5 | `LogSegment::process_sidecars` | Medium | [C](#6-pattern-c-two-phase-processing): Phase 2 (sidecars) |
 
-See [Appendix C](#appendix-c-current-state-deep-dive) for detailed analysis with line numbers, control flow diagrams, and specific code locations.
+See [Appendix F: Detailed I/O vs Computation Analysis](#appendix-f-detailed-io-vs-computation-analysis) for the complete function-by-function breakdown.
 
 ---
 
 ## 8. Refactored Control Flow
 
-After applying the three patterns, the control flow becomes much cleaner:
+This section shows the control flow transformation: before (mixed I/O + computation) and after (clean separation).
+
+### 8.1 Before: Mixed I/O and Computation
+
+Current code mixes I/O orchestration with business logic, making async support impossible without duplication:
+
+```
+User: Snapshot::builder_for(url).build(engine)
+    ↓
+SnapshotBuilder::build(engine)
+    ├─ LogSegment::for_snapshot(storage, log_root, ...)
+    │   ├─ LastCheckpointHint::try_read(storage, log_root)     ← I/O #1: Read _last_checkpoint
+    │   │   └─ storage.read_files([_last_checkpoint])
+    │   ├─ ListedLogFiles::list(storage, log_root, ...)
+    │   │   └─ storage.list_from(log_root)                     ← I/O #2: List directory
+    │   └─ LogSegment::try_new(listed_files)                   ← CPU only ✅
+    │
+    ├─ Snapshot::try_new_from_log_segment(log_segment, engine)
+    │   ├─ log_segment.read_metadata(engine)                   ← Thin wrapper (error handling)
+    │   │   └─ log_segment.protocol_and_metadata(engine)       ← I/O #3: Mixed (extraction loop) ⚠️
+    │   │       ├─ log_segment.replay_for_metadata(engine)     ← Thin wrapper (schema selection)
+    │   │       │   └─ log_segment.read_actions(engine, ...)   ← I/O #4: Multi-source choreography ⚠️
+    │   │   │   │       ├─ find_commit_cover()                     ← CPU: compute file list ✅
+    │   │   │   │       └─ create_checkpoint_stream(...)           ← I/O #6: Complex nested choreography ⚠️
+    │   │   │   │           ├─ validation logic                    ← CPU: schema checks ✅
+    │   │   │   │           ├─ extract checkpoint files           ← CPU: list building ✅
+    │   │   │   │           ├─ parquet/json_handler.read_*_files  ← I/O #7: Returns Iterator (hides async)
+    │   │   │   │           └─ For each checkpoint batch:
+    │   │   │   │               └─ process_sidecars(...)           ← I/O #8: Conditional nested I/O ⚠️
+    │   │   │   │                   ├─ SidecarVisitor.visit_rows  ← CPU: extract sidecar refs ✅
+    │   │   │   │                   └─ parquet_handler.read_*     ← I/O #9: Returns Iterator (more async!)
+    │   │   │
+    │   │   └─ for actions_batch in actions_batches {          ← I/O #10: CONSUMING chained iterators!
+    │   │         ⮡ THIS IS WHERE ALL NESTED I/O HAPPENS ⮡
+    │   │         Metadata::try_new_from_data(actions)?       ← CPU (on fetched data)
+    │   │         Protocol::try_new_from_data(actions)?        ← CPU (on fetched data)
+    │   │       }
+    │   │
+    │   └─ TableConfiguration::try_new(metadata, protocol)      ← CPU only ✅
+    │
+    └─ wrap in Arc<Snapshot>
+
+Problem: Iterator consumption (I/O #10) is interleaved with business logic.
+The ~20 lines of extraction in the loop can't be shared between sync and async.
+```
+
+### 8.2 After: Clean Separation
+
+After applying the three patterns, I/O and computation are cleanly separated:
 
 ```
 SnapshotBuilder::build[_async](engine)                                [async: + .await]
@@ -755,9 +683,9 @@ Legend:
 
 **Refactoring Applied**:
 
-1. **Pattern A**: `LastCheckpointHint::from_file_result` extracted as I/O-free helper
-2. **Pattern B**: `MetadataExtractor` processor extracted as I/O-free state machine
-3. **Pattern C**: Two-phase processing with `phase1_*` and `process_sidecars_*`
+1. **[Pattern A](#4-pattern-a-helper-functions)**: `LastCheckpointHint::from_file_result` extracted as I/O-free helper
+2. **[Pattern B](#5-pattern-b-processor--try_fold)**: `MetadataExtractor` processor extracted as I/O-free state machine
+3. **[Pattern C](#6-pattern-c-two-phase-processing)**: Two-phase processing with `phase1_*` and `process_sidecars_*`
 4. **Shared computation**: All processors and pure functions work for both sync and async
 
 #### Code Metrics After Refactoring
@@ -818,7 +746,7 @@ The other 65% of code is I/O-free and shared between sync and async paths!
 - Bug fixes in processors fix both sync and async simultaneously
 - Most complexity (business logic) lives in shared code
 
-See [Appendix D](#appendix-d-refactored-control-flow-detailed) for complete metrics breakdown and virality analysis.
+See [Appendix G: Code Metrics and Async Virality](#appendix-g-code-metrics-and-async-virality) for detailed metrics breakdown.
 
 ---
 
@@ -862,9 +790,9 @@ To support async operations, we need a parallel trait hierarchy alongside the ex
 - ✅ CPU-only (expression evaluation on in-memory data)
 - ✅ No I/O, no blocking, works for both sync and async
 
-See [Appendix E](#appendix-e-async-trait-definitions) for complete trait definitions with all methods and type aliases.
+See [Appendix E: Async Trait Hierarchy](#appendix-e-async-trait-hierarchy---complete-definitions) for complete trait definitions with all methods and type aliases.
 
-See [Appendix I](#appendix-i-cooperative-yielding) for `yield_now()` implementation and usage guidelines.
+*Note: Cooperative yielding (`yield_now().await`) is shown in [Appendix E.9](#e9-cooperative-yielding-helper) with implementation details.*
 
 ---
 
@@ -1033,7 +961,7 @@ impl<P> From<Phase1InProgress<P>> for Phase1Result<P> {
 }
 ```
 
-See [Appendix G](#appendix-g-pattern-c-support-code) for explanation of these `From` impls and how they improve choreography code.
+**Note**: These `From` implementations eliminate explicit state transitions in the choreography code, making it more readable.
 
 ---
 
@@ -2083,7 +2011,7 @@ mod tests {
 
 ### C.1 The Data Structure
 
-```rust
+   ```rust
 /// Hint for finding the most recent checkpoint
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LastCheckpointHint {
