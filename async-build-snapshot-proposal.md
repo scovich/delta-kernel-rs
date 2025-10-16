@@ -88,26 +88,24 @@ See [Section 11: Implementation Roadmap](#11-implementation-roadmap) for detaile
 
 ### Document Structure
 
-**Part I: Understanding the Problem** (~15 min)
-- Why current code blocks async
-- The processor/choreography solution
-- Three pattern overview
+**[Part I: Understanding the Problem](#part-i-understanding-the-problem)** (~15 min)
+- [Why current code blocks async](#2-why-current-code-blocks-async)
+- [The processor/choreography solution](#3-the-solution-processors--choreography)
+- [Three pattern overview](#32-three-patterns-for-three-problem-types)
 
-**Part II: Pattern Details** (~30 min)
-- Pattern A, B, C with examples
+**[Part II: Pattern Details](#part-ii-pattern-details)** (~30 min)
+- [Pattern A](#4-pattern-a-helper-functions), [B](#5-pattern-b-processor--try_fold), [C](#6-pattern-c-two-phase-processing) with examples
 - When to use each pattern
 
-**Part III: Implementation Guide** (~20 min)
-- Refactored control flow
-- Async foundation requirements
-- Implementation roadmap
-- Success criteria
+**[Part III: Implementation Guide](#part-iii-implementation-guide)** (~20 min)
+- [Refactored control flow](#8-refactored-control-flow)
+- [Async foundation requirements](#9-async-foundation-requirements)
+- [Implementation roadmap](#11-implementation-roadmap)
 
-**Part IV: Deep Dives & Reference** (on-demand)
-- Complete code examples
-- Support code implementations
-- Performance analyses
-- Design evolution
+**[Part IV: Deep Dives & Reference](#part-iv-deep-dives--reference)** (on-demand)
+- [Complete code examples](#appendix-c-complete-pattern-a-example---lastcheckpointhint)
+- [Support code implementations](#appendix-b-extension-traits-for-try_fold-integration)
+- [Performance analyses](#appendix-g-code-metrics-and-async-virality)
 
 ---
 
@@ -133,7 +131,7 @@ for batch in iterator {  // ← But .next() triggers file reads!
 
 ### 2.2 Simplified Control Flow
 
-Current snapshot building has three levels of concern:
+Current snapshot building has four levels of concern:
 
 ```
 1. High-level API: Snapshot::builder_for(url).build(engine)
@@ -141,10 +139,13 @@ Current snapshot building has three levels of concern:
 2. Coordinator: Orchestrate commits + checkpoints + sidecars
    ↓  
 3. Business Logic: Extract metadata, protocol, validate, accumulate state
+   ↓
+4. I/O: Engine calls that trigger file reads (storage.read_file, engine.read_json_files, etc.)
 ```
 
-**The problem**: Level 2 and 3 are mixed together in methods like `protocol_and_metadata()`:
-- Iterator consumption (I/O) interleaved with extraction logic (computation)
+**The problem**: Levels 2, 3, and 4 are mixed together in methods like `protocol_and_metadata()`:
+- Iterator consumption (level 4: I/O) interleaved with extraction logic (level 3: computation)
+- Orchestration (level 2) calls I/O (level 4) which yields data processed by logic (level 3)
 - ~20 lines of stateful logic that would need duplication for async
 - Can't test extraction without I/O mocks
 
@@ -409,8 +410,6 @@ Delta V2 checkpoints have this structure:
 - Progress tracking (N of M complete)
 - Caching (skip already-processed sidecars)
 - Load balancing (process large files first)
-
-*For detailed performance analysis of two-phase vs incremental approaches, see historical design documents.*
 
 ### 6.2 The Pattern
 
