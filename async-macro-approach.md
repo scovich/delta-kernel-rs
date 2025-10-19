@@ -64,17 +64,9 @@ The approach minimizes duplication by separating concerns:
 
 **Note**: The `Engine` trait itself doesn't need modifications - it just returns `Arc<dyn Handler>`. Only the handler traits (like `ParquetHandler`) use `#[async_fn]` on their I/O methods. No separate `AsyncEngine` trait needed.
 
-### Comparison to Manual Approach
+### Why This Matters
 
-From [async-generalizability-analysis.md](async-generalizability-analysis.md):
-
-| Aspect | Manual Duplication | Macro Approach |
-|--------|-------------------|----------------|
-| **Duplication** | ~17% of code | ~0% (except I/O) |
-| **Infrastructure** | 0 lines | ~225 lines |
-| **Maintenance** | Fix/test twice | Fix/test once |
-| **Performance** | Optimal | Optimal (same) |
-| **Implementation** | Ready now | 4 weeks |
+Delta-kernel-rs needs to support both sync and async modes. Without this approach, async orchestration code must be duplicated - even when all I/O-free business logic is factored out into shared functions. Worse, some scenarios are **impossible to unify** without language-level support.
 
 ### Recommendation
 
@@ -88,9 +80,79 @@ From [async-generalizability-analysis.md](async-generalizability-analysis.md):
 
 ## The Approach
 
-### How It Works
+### The Challenge
 
-The `AsyncIterator` trait provides a unified interface for iterator operations that kernel relies on:
+Even with all I/O-free business logic factored into shared functions, we face three problems:
+
+**Problem 1: `async` and `.await` syntax**
+
+```rust
+// Sync version
+fn read_metadata(engine: &dyn Engine) -> DeltaResult<Metadata> {
+    let data = engine.json_handler().read_json_files(&[path])?;
+    parse_metadata(data)
+}
+
+// Async version  
+async fn read_metadata(engine: &dyn Engine) -> DeltaResult<Metadata> {
+    let data = engine.json_handler().read_json_files(&[path]).await?;
+    parse_metadata(data)
+}
+```
+
+Nearly identical, but two syntax differences:
+- `async fn` vs `fn` - async functions implicitly return `Future`s
+- `.await` is required in async mode and forbidden in sync mode
+
+**Problem 2: Iterator vs Stream methods**
+
+```rust
+// Sync version
+fn process_files(files: Vec<File>) -> impl Iterator<Item = Result> {
+    files.into_iter()
+        .filter(|f| f.is_valid())      // Iterator::filter takes a normal closure
+        .map(|f| process(f))           // Iterator::map takes a normal closure
+}
+
+// Async version
+fn process_files(files: Vec<File>) -> impl Stream<Item = Result> {
+    stream::iter(files)
+        .filter(|f| async move { f.is_valid() })  // Stream::filter takes an async closure
+        .then(|f| async move { process(f) })      // Stream calls it .then(), not .map()
+}
+```
+
+Different types (`Iterator` vs `Stream`) with incompatible methods:
+- `.map()` vs `.then()`
+- `.filter()` takes sync closures vs async closures
+- Can't write generic code that works with both
+
+**Problem 3: Returning iterators/streams** ⚠️
+
+```rust
+// This doesn't work - can't abstract over Iterator/Stream in return type
+fn get_scan_files(engine: &dyn Engine) -> ??? {
+    let files = discover_files(engine);  // I/O returns iterator/stream
+    files.map(|f| {
+        let data = read_file(engine, f);  // More I/O
+        transform(data)  // Business logic
+    })
+}
+```
+
+**Why you can't just write this code once**:
+- Return type must be either `impl Iterator` or `impl Stream` - no way to abstract
+- Can't use generics: `Iterator` and `Stream` are unrelated traits
+- Can't use a trait object: need concrete types for `impl Trait` returns
+- Business logic is interleaved with iteration, so can't factor it out
+
+Without our approach, you must duplicate this entire function for sync and async modes.
+
+This is common in delta-kernel-rs: functions that create and transform iterators/streams.
+
+### The Solution
+
+The `AsyncIterator` trait provides a unified interface for the iterator operations that kernel relies on:
 
 ```rust
 pub trait AsyncIterator: Sized {
@@ -122,7 +184,13 @@ impl<S: Stream> AsyncIterator for S {
 
 **Key point**: Only one implementation exists in any given build. The `#[cfg]` guards in separate module files ensure no conflicts.
 
-### Simple Example
+**How this solves the three problems**:
+
+1. **Problem 1 (`async` and `.await` syntax)**: Solved by `#[async_fn]` macro (adds `async` keyword) + `await_!()` macro (adds `.await`)
+2. **Problem 2 (Iterator vs Stream methods)**: Solved by `AsyncIterator` trait providing unified methods (`.async_map()`, `.async_filter()`, etc.) that delegate to the appropriate Iterator or Stream methods
+3. **Problem 3 (Returning iterators)**: Solved! Functions can return `impl AsyncIterator` and work in both modes
+
+### Putting It Together
 
 **Your code** (single source):
 ```rust
@@ -589,9 +657,9 @@ impl ParquetHandler for DefaultParquetHandler {
 
 ---
 
-### Example 1: Pattern A (One-Shot I/O)
+### Example 1: One-Shot I/O
 
-**Pattern**: Helper function that performs I/O once and returns parsed data.
+**Scenario**: Helper function that performs I/O once and returns parsed data.
 
 **Single source code**:
 ```rust
@@ -606,9 +674,9 @@ fn read_metadata(engine: &dyn Engine, path: &Path) -> DeltaResult<Metadata> {
 
 ---
 
-### Example 2: Pattern B (Processor + try_fold)
+### Example 2: Stateful Processing
 
-**Pattern**: Stateful processor that accumulates results iteratively.
+**Scenario**: Stateful processor that accumulates results iteratively.
 
 **Single source code**:
 ```rust
@@ -632,9 +700,9 @@ fn process_log(engine: &dyn Engine) -> DeltaResult<Output> {
 
 ---
 
-### Example 3: Pattern C (Two-Phase Processing)
+### Example 3: Two-Phase Processing
 
-**Pattern**: Discover items, then fetch them in parallel.
+**Scenario**: Discover items, then fetch them.
 
 **Single source code**:
 ```rust
@@ -657,9 +725,9 @@ fn execute(engine: &dyn Engine) -> DeltaResult<impl AsyncIterator<Item = Data>> 
 
 ---
 
-### Example 4: Pattern D (Nested Streams)
+### Example 4: Nested Iteration with I/O
 
-**Pattern**: Outer loop performs I/O, inner loop processes results.
+**Scenario**: Outer loop performs I/O, inner loop processes results (the "impossible" case from earlier).
 
 **Single source code**:
 ```rust
@@ -682,9 +750,9 @@ fn execute(engine: &dyn Engine) -> DeltaResult<impl AsyncIterator<Item = ScanRes
 
 ---
 
-### Example 5: Pattern E (Two-Pass Per-Item)
+### Example 5: Two-Pass Processing
 
-**Pattern**: Aggregate metadata about items, then reprocess.
+**Scenario**: Aggregate metadata about items, then reprocess with that context.
 
 **Single source code**:
 ```rust
