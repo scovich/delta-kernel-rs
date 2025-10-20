@@ -2,6 +2,8 @@
 
 **Date**: October 20, 2025
 
+> **For the complete technical proposal**, see [async-macro-approach.md](async-macro-approach.md). This document provides an executive summary focused on consumer impact.
+
 ---
 
 ## TL;DR
@@ -21,49 +23,16 @@ The async macro approach would make kernel APIs conditionally async/sync based o
 
 ### 1. DefaultEngine Is Already Async Internally
 
-**Discovery**: DefaultEngine is **already async internally**!
-
-```rust
-// Today's architecture
-pub struct DefaultEngine<E: TaskExecutor> {
-    executor: Arc<E>,  // TokioBackgroundExecutor
-}
-
-impl JsonHandler for DefaultJsonHandler {
-    fn read_json_files(&self, ...) -> DeltaResult<Box<dyn EngineData>> {
-        // Async I/O happens here, but we block on it!
-        self.executor.block_on(async {
-            let store_get = object_store.get(path).await?;
-            // ... async parquet reading ...
-        })
-    }
-}
-```
-
-The kernel **already uses async I/O under the hood** and exposes a sync API by blocking on futures.
+**Discovery**: DefaultEngine is **already async internally**! The kernel already uses async I/O under the hood and exposes a sync API by blocking on futures.
 
 **The Implementation Pattern**: Engine handlers use a unified pattern:
 - **One native async impl method** - contains all the real logic
 - **One trait wrapper** - uses standard macros (`#[async_fn]` + `await_!`)
 - **One helper function** (`into_boxed_async_iterator`) - handles mode-specific conversion
 
-```rust
-impl DefaultParquetHandler {
-    async fn read_parquet_impl(&self, files: &[FileMeta]) 
-        -> DeltaResult<impl Stream<...>> {
-        // ALL the I/O logic here
-    }
-}
-
-impl ParquetHandler for DefaultParquetHandler {
-    #[async_fn]
-    fn read_parquet_files(&self, files: &[FileMeta]) -> DeltaResult<...> {
-        await_!(into_boxed_async_iterator(&self.executor, self.read_parquet_impl(files)))
-    }
-}
-```
-
 This achieves **zero logic duplication** and **single trait wrapper** per handler method.
+
+**For complete technical details**, see [async-macro-approach.md § Current State](async-macro-approach.md#current-state-the-hidden-async-architecture) and [§ Component 5](async-macro-approach.md#component-5-the-io-boundary-helper).
 
 ### 2. FFI Layer Can Stay Untouched
 
@@ -196,73 +165,6 @@ async fn main() {
 ```
 
 **Key difference**: OS threads vs async tasks. Fundamentally different concurrency models.
-
----
-
-## What the Macro Approach Does NOT Solve
-
-### 1. One Helper Function Needed for I/O Boundary
-
-A single helper function (`into_boxed_async_iterator`) handles Stream→Iterator conversion in sync mode:
-
-```rust
-// Sync mode: blocks on future, converts Stream to Iterator
-#[cfg(not(feature = "async"))]
-pub(crate) fn into_boxed_async_iterator<E, Fut, S, T>(
-    executor: &E,
-    stream_future: Fut,
-) -> DeltaResult<BoxedAsyncIterator<T>> {
-    let mut stream = Box::pin(executor.block_on(stream_future)?);
-    let executor = executor.clone();
-    let iter = std::iter::from_fn(move || {
-        executor.block_on(async { stream.next().await })
-    });
-    Ok(iter.into_boxed())
-}
-
-// Async mode: awaits future, boxes Stream
-#[cfg(feature = "async")]
-pub(crate) async fn into_boxed_async_iterator<E, Fut, S, T>(
-    _executor: &E,
-    stream_future: Fut,
-) -> DeltaResult<BoxedAsyncIterator<T>> {
-    let stream = stream_future.await?;
-    Ok(stream.into_boxed())
-}
-```
-
-**Why?** Because:
-- Native async I/O produces `Stream`
-- Sync mode needs `Iterator` (requires blocking on each item)
-- This can't be unified at the Rust language level
-
-**Impact**: ~25 lines of one-time helper code, but **zero duplication** in handler wrappers.
-
-### 2. Runtime Management
-
-Async mode requires a tokio runtime. Questions:
-- Who creates it?
-- When is it created?
-- How is it shared?
-- What about multiple engines in one process?
-
-Today's `TokioBackgroundExecutor` solves this by spawning a background thread with its own runtime. But this means we're **blocking threads to bridge async to sync**.
-
-In true async mode, the runtime management becomes the application's responsibility.
-
-### 3. Testing Complexity
-
-Must test both modes:
-
-```yaml
-test-sync:
-  run: cargo test
-
-test-async:
-  run: cargo test --features async
-```
-
-Double the CI time, double the maintenance burden.
 
 ---
 

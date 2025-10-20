@@ -26,7 +26,7 @@ fn read_file(engine: &dyn Engine) -> DeltaResult<Data> {
 - **Sync mode** (feature off): Standard function, `await_!()` is no-op  
 - **Async mode** (feature on): Async function, `await_!()` adds `.await`
 
-### Infrastructure (~225 lines total)
+### Infrastructure (~250 lines total)
 
 | Component | Purpose |
 |-----------|---------|
@@ -34,25 +34,28 @@ fn read_file(engine: &dyn Engine) -> DeltaResult<Data> {
 | `await_!()` macro (~10 LOC) | Conditionally adds `.await` to expressions |
 | `AsyncIterator` trait (~200 LOC) | Unified trait implemented by `Iterator` (sync) or `Stream` (async) |
 | Type aliases (~10 LOC) | Boxed types for API boundaries |
+| AsyncIterator adapters (~30 LOC) | Convert concrete Iterator/Stream types to internal AsyncIterator abstraction |
 
 ### Three-Layer Architecture
 
 The approach minimizes duplication by separating concerns:
 
-1. **I/O Primitives** (bottom layer): Two `#[cfg]` methods for actual I/O
-   - Sync I/O and async I/O are fundamentally different operations
-   - This is the only layer with duplication
+1. **I/O Primitives** (bottom layer): Native async implementations
+   - One async implementation method per handler (all the real I/O logic)
+   - Uses `into_boxed_async_iterator` helper (Component 5) to bridge to appropriate mode
+   - **No logic duplication** - each handler has single implementation
 
 2. **Business Logic** (middle layer): Single implementation using `#[async_fn]`
    - Uses `impl AsyncIterator` for zero-cost abstraction
    - Kernel code that transforms/filters/processes data
    - **No duplication!**
 
-3. **Public API** (top layer): Thin wrapper using `.into_boxed()`
-   - Converts `impl AsyncIterator` to `BoxedAsyncIterator` for trait objects
+3. **Public API** (top layer): Thin wrapper using `#[async_fn]` + `await_!`
+   - Calls I/O primitive and uses helper to convert appropriately
+   - Single unified trait implementation per handler method
    - **No duplication!**
 
-**Key insight**: Duplication only exists at the I/O boundary. All higher layers are unified.
+**Key insight**: Zero logic duplication anywhere. All five infrastructure components work together to enable single-source implementations at every layer.
 
 ### Benefits
 
@@ -75,6 +78,35 @@ Delta-kernel-rs needs to support both sync and async modes. Without this approac
 1. Simple infrastructure (~225 lines)
 2. Eliminates duplication without compromising performance
 3. Low risk - prototype in Week 1-2, evaluate before full rollout
+
+---
+
+## Current State: The Hidden Async Architecture
+
+### DefaultEngine Is Already Async
+
+**Key Discovery**: DefaultEngine is **already doing async I/O internally**, just wrapped in blocking calls.
+
+```rust
+// Today's architecture
+pub struct DefaultEngine<E: TaskExecutor> {
+    executor: Arc<E>,  // TokioBackgroundExecutor
+}
+
+impl JsonHandler for DefaultJsonHandler {
+    fn read_json_files(&self, ...) -> DeltaResult<Box<dyn EngineData>> {
+        // Async I/O happens here, but we block on it!
+        self.executor.block_on(async {
+            let store_get = object_store.get(path).await?;
+            // ... async parquet reading ...
+        })
+    }
+}
+```
+
+The kernel **already uses async I/O under the hood** and exposes a sync API by blocking on futures.
+
+**What this means**: This macro approach doesn't fundamentally change the architecture - it just makes the async nature **optional and exposed** instead of **hidden and forced**. We're not adding async to the kernel; we're giving consumers a choice to use the async that's already there.
 
 ---
 
@@ -206,6 +238,7 @@ fn process_data(engine: &dyn Engine) -> DeltaResult<Vec<i32>> {
 
 **What the code becomes in sync mode**:
 ```rust
+// #[async_fn] is a no-op
 fn process_data(engine: &dyn Engine) -> DeltaResult<Vec<i32>> {
     let items = engine.get_items()?;  // await_!() is no-op
     let result = items
@@ -217,6 +250,7 @@ fn process_data(engine: &dyn Engine) -> DeltaResult<Vec<i32>> {
 
 **What the code becomes in async mode**:
 ```rust
+// #[async_fn] injects the `async` keyword
 async fn process_data(engine: &dyn Engine) -> DeltaResult<Vec<i32>> {
     let items = engine.get_items().await?;  // await_!() adds .await
     let result = items
@@ -235,6 +269,18 @@ async fn process_data(engine: &dyn Engine) -> DeltaResult<Vec<i32>> {
 ---
 
 ## Infrastructure Components
+
+The async macro approach requires five simple components working together (~250 lines total):
+
+1. **`#[async_fn]` macro** - Conditionally adds `async` keyword
+2. **`await_!()` macro** - Conditionally adds `.await`
+3. **Type aliases** - Boxed types for API boundaries
+4. **`AsyncIterator` trait** - Unified abstraction over Iterator/Stream
+5. **AsyncIterator adapters** - Convert concrete Iterator/Stream types to internal abstraction
+
+Components 1-4 enable unified business logic in kernel itself. Component 5 enables unified engine trait definitions as well (i.e. in the default engine).
+
+---
 
 ### Component 1: The `#[async_fn]` Proc Macro
 
@@ -297,7 +343,7 @@ let data = await_!(engine.read_file(path))?;
 
 ### Component 3: Type Aliases for API Boundaries
 
-**Purpose**: Provide concrete types for trait object returns
+**Purpose**: Provide concrete types for public API returns, exposing real `Iterator`/`Stream` types to consumers
 
 **Implementation** (~10 lines):
 ```rust
@@ -316,15 +362,17 @@ pub type FileDataReadResultIterator = BoxedAsyncIterator<DeltaResult<Box<dyn Eng
 ```
 
 **Key points**:
-- Only used for API boundaries (trait object methods)
+- **`BoxedAsyncIterator` exposes real types**: `Box<dyn Iterator>` in sync mode, `Pin<Box<dyn Stream>>` in async mode
+- **`AsyncIterator` is internal only**: Used inside kernel for unified code, never exposed in public API
+- **Consumers get full Iterator/Stream APIs**: No limitations from internal trait design choices
 - Internal code uses `impl AsyncIterator` (unboxed, zero-cost)
-- `into_boxed()` method converts between them
+- `into_boxed()` method converts from internal `impl AsyncIterator` to public boxed types
 
 ---
 
 ### Component 4: The `AsyncIterator` Trait
 
-**Purpose**: Unified trait for iterator operations that works in both modes
+**Purpose**: Internal unified trait for iterator operations that works in both modes
 
 **Implementation** (~200 lines):
 
@@ -340,6 +388,7 @@ pub type FileDataReadResultIterator = BoxedAsyncIterator<DeltaResult<Box<dyn Eng
 /// build up lazy transformation chains. Both Iterator and Stream have non-async
 /// transformation methods, so our trait methods can be simple non-async delegates.
 /// The async only matters when consuming the iterator/stream (e.g., collect, fold).
+#[internal_api]
 pub trait AsyncIterator: Sized {
     type Item;
     
@@ -384,28 +433,7 @@ pub trait AsyncIterator: Sized {
     fn into_boxed(self) -> BoxedAsyncIterator<Self::Item>;
 }
 
-/// Helper function to convert IntoIterator types into AsyncIterator
-/// 
-/// Use this when you have types like `Option<T>` or `Vec<T>` that implement
-/// `IntoIterator` but not `Stream`. This provides a uniform API in both modes.
-/// 
-/// # Examples
-/// ```rust
-/// // Works in both sync and async modes
-/// option.into_async_iter().async_flatten()
-/// vec.into_async_iter().async_map(|x| x + 1)
-/// ```
-pub fn into_async_iter<I: IntoIterator>(i: I) -> impl AsyncIterator<Item = I::Item>
-where
-    I::Item: Send,
-    I::IntoIter: Send + 'static,
-{
-    #[cfg(not(feature = "async"))]
-    { i.into_iter() }
-    
-    #[cfg(feature = "async")]
-    { futures::stream::iter(i) }
-}
+// Note: Helper functions like into_async_iter() are documented in Component 5
 
 // Re-export the appropriate implementation based on feature flag
 #[cfg(not(feature = "async"))]
@@ -564,18 +592,115 @@ impl<S: Stream + Send + 'static> AsyncIterator for S {
 ```
 
 **Module structure**:
-- `kernel/src/async_iterator/mod.rs` - trait definition + `into_async_iter()` helper + conditional module imports
+- `kernel/src/async_iterator/mod.rs` - trait definition + helper functions (see Component 5) + conditional module imports
 - `kernel/src/async_iterator/sync_impl.rs` - sync implementation (delegates to `Iterator`)
 - `kernel/src/async_iterator/async_impl.rs` - async implementation (delegates to `Stream`)
 
 **Key points**:
-- `AsyncIterator` is a trait implemented by both `Iterator` (sync) and `Stream` (async)
+- Marked `#[internal_api]` - never exposed to consumers
+- Implemented by either `Iterator` (sync) or `Stream` (async), depending on the selected mode.
 - Trait methods return `impl AsyncIterator` (which compiles to `impl Iterator` or `impl Stream`)
-- `BoxedAsyncIterator<T>` type alias is only for API boundaries (trait object methods)
+- `BoxedAsyncIterator<T>` type alias exposes real boxed `Iterator`/`Stream` at API boundaries
 - Most internal code uses `impl AsyncIterator` and never needs boxing
-- `into_boxed()` method recovers the concrete type and boxes appropriately (`Box::new` in sync, `Box::pin` in async)
+- `into_boxed()` method converts from internal trait to public API types
 - Modular structure: main trait in `mod.rs`, implementations in separate `sync_impl` and `async_impl` modules
-- Users only see the unified `AsyncIterator` trait via conditional `use` statements
+
+---
+
+### Component 5: AsyncIterator Adapters
+
+**Purpose**: Convert concrete Iterator/Stream types to internal AsyncIterator abstraction
+
+Two adapter functions bridge from different sources:
+
+#### 5a. `into_boxed_async_iterator` - For Streams (Critical Path)
+
+Converts a **Stream** (from async I/O) to work uniformly in both modes. This is the critical path for engine I/O:
+
+```rust
+// Sync mode: blocks on future, converts Stream to Iterator
+#[cfg(not(feature = "async"))]
+pub(crate) fn into_boxed_async_iterator<E, Fut, S, T>(
+    executor: &E,
+    stream_future: Fut,
+) -> DeltaResult<BoxedAsyncIterator<T>>
+where
+    E: TaskExecutor,
+    Fut: Future<Output = DeltaResult<S>>,
+    S: Stream<Item = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let mut stream = Box::pin(executor.block_on(stream_future)?);
+    let executor = executor.clone();
+    let iter = std::iter::from_fn(move || {
+        executor.block_on(async { stream.next().await })
+    });
+    Ok(iter.into_boxed())
+}
+
+// Async mode: awaits future, boxes Stream
+#[cfg(feature = "async")]
+pub(crate) async fn into_boxed_async_iterator<E, Fut, S, T>(
+    _executor: &E,
+    stream_future: Fut,
+) -> DeltaResult<BoxedAsyncIterator<T>>
+where
+    Fut: Future<Output = DeltaResult<S>>,
+    S: Stream<Item = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let stream = stream_future.await?;
+    Ok(stream.into_boxed())
+}
+```
+
+**Why is this needed?**
+
+The engine layer produces native async I/O that returns `Stream`s. In sync mode, we need `Iterator`s. This conversion requires:
+1. Blocking on the future that produces the Stream
+2. Wrapping the Stream to block on each item as it's pulled
+
+This can't be unified at the Rust language level - sync and async iteration are fundamentally different.
+
+**Usage in handler implementations**:
+
+```rust
+impl ParquetHandler for DefaultParquetHandler {
+    #[async_fn]
+    fn read_parquet_files(&self, files: &[FileMeta]) -> DeltaResult<FileDataReadResultIterator> {
+        // Calls async implementation, uses helper to convert appropriately
+        await_!(into_boxed_async_iterator(&self.executor, self.read_parquet_impl(files)))
+    }
+}
+```
+
+**Impact**: Enables zero duplication in handler wrappers. Each handler method gets a single unified trait implementation using the new sync/async infrastructure.
+
+---
+
+#### 5b. `into_async_iter` - For IntoIterator Types
+
+Converts types that produce **Iterators** (like `Vec`, `Option`) to work uniformly in both modes:
+
+```rust
+pub fn into_async_iter<I: IntoIterator>(i: I) -> impl AsyncIterator<Item = I::Item> {
+    #[cfg(not(feature = "async"))]
+    { i.into_iter() }
+    
+    #[cfg(feature = "async")]
+    { futures::stream::iter(i) }
+}
+```
+
+**Usage**: Allows collections to work with AsyncIterator methods in kernel code:
+
+```rust
+// Works in both modes
+option.into_async_iter().async_flatten()
+vec.into_async_iter().async_map(|x| x + 1)
+```
+
+**Note**: Both adapters serve the same conceptual purpose (converting to AsyncIterator), but `into_boxed_async_iterator` is on the critical path (engine I/O) while this handles less-critical cases (collections).
 
 ---
 
@@ -592,17 +717,13 @@ use crate::async_iterator::AsyncIterator;
 type FileDataResult = DeltaResult<Box<dyn EngineData>>;
 
 // ============= LAYER 1: I/O PRIMITIVES =============
-// Two separate implementations - sync I/O is fundamentally different from async I/O
+// One native async implementation - contains all the real I/O logic
 
 impl DefaultParquetHandler {
-    #[cfg(not(feature = "async"))]
-    fn read_impl(&self, files: &[FileMeta]) -> DeltaResult<impl AsyncIterator<Item = FileDataResult>> {
-        // ... create iterator that reads data from file ...
-    }
-    
-    #[cfg(feature = "async")]
-    async fn read_impl(&self, files: &[FileMeta]) -> DeltaResult<impl AsyncIterator<Item = FileDataResult>> {
-        // ... create stream that reads data from file ...
+    async fn read_parquet_impl(&self, files: &[FileMeta]) -> DeltaResult<impl Stream<Item = FileDataResult>> {
+        // ALL the I/O logic here - single source!
+        // Uses async I/O (object_store, parquet reader, etc.)
+        // Returns a Stream of results
     }
 }
 
@@ -639,21 +760,22 @@ pub trait ParquetHandler {
 impl ParquetHandler for DefaultParquetHandler {
     #[async_fn]
     fn read_parquet_files(&self, files: &[FileMeta]) -> DeltaResult<FileDataReadResultIterator> {
-        // Calls the I/O primitive, boxes the result for the trait object
-        // - await_!() handles .await in async mode
-        // - into_boxed() recovers concrete type (Iterator/Stream) and boxes appropriately
-        Ok(await_!(self.read_impl(files))?.into_boxed())
+        // Uses into_boxed_async_iterator helper (Component 5)
+        // - Sync mode: blocks on future, converts Stream→Iterator
+        // - Async mode: awaits future, boxes Stream
+        await_!(into_boxed_async_iterator(&self.executor, self.read_parquet_impl(files)))
     }
 }
 ```
 
 **Key insights**:
-- **I/O primitives need `#[cfg]`**: Two separate methods because sync/async I/O are fundamentally different
-- **Business logic uses `#[async_fn]`**: Single implementation returning `impl AsyncIterator` (a real trait, no macro rewriting!)
-- **Public API "just works"**: Thin wrapper using `await_!()` and `.into_boxed()`
-- **No boxing overhead**: `impl AsyncIterator` is unboxed; only box at API boundaries with `.into_boxed()`
+- **I/O layer**: One native async implementation containing all logic (Layer 1)
+- **Handler wrapper**: Uses `into_boxed_async_iterator` helper (Component 5) to bridge to both modes
+- **Business logic**: Single implementation using `#[async_fn]` and `impl AsyncIterator` (Layer 2)
+- **Public API**: Thin wrapper using `#[async_fn]` + `await_!` + helper (Layer 3)
+- **No boxing overhead**: `impl AsyncIterator` is unboxed internally; only box at API boundaries
 
-**Duplication**: Only at the I/O boundary (Layer 1). All higher layers are unified.
+**Result**: **Zero logic duplication**. Each handler method gets a single unified wrapper using all five infrastructure components.
 
 ---
 
@@ -798,9 +920,10 @@ fn execute(engine: &dyn Engine) -> DeltaResult<Vec<Output>> {
 - Implement for `Stream` (async_impl.rs)
 - Test all methods in both modes
 
-**Day 4: Type aliases + await macro**
+**Day 4: Type aliases + await macro + I/O helper**
 - Add `BoxedAsyncIterator<T>` type alias
 - Add `await_!()` macro
+- Add `into_boxed_async_iterator` helper (Component 5)
 - Test with engine trait examples
 
 **Day 5: Test infrastructure**
@@ -870,31 +993,42 @@ fn execute(engine: &dyn Engine) -> DeltaResult<Vec<Output>> {
 
 ## Appendix
 
-### Where Duplication Remains
 
-**I/O Primitives (Layer 1)**: Two separate implementations are required because sync and async I/O are fundamentally different:
+
+### Why futures (Not tokio) Dependency?
+
+The `AsyncIterator` trait uses `futures::stream::Stream`, not tokio-specific types. This is the correct choice because:
+
+**Why it works**:
+1. ✅ Kernel already depends on `futures` (in default-engine-base feature)
+2. ✅ `tokio` re-exports `futures::stream::Stream` - they're the same trait
+3. ✅ Current DefaultEngine already uses `futures::Stream` with tokio runtime successfully
+4. ✅ Keeps kernel runtime-agnostic (could work with async-std, smol, etc.)
+
+**The only friction**: StreamExt trait conflict
+
+Both `futures::StreamExt` and `tokio_stream::StreamExt` provide similar combinator methods.
+
+**Solution**: Use `futures::StreamExt` consistently throughout kernel code:
 
 ```rust
-#[cfg(not(feature = "async"))]
-fn read_impl() -> DeltaResult<impl AsyncIterator<...>> {
-    let data = self.storage.read_files(files)?;  // Blocking I/O
-    // ...
-}
+use futures::StreamExt;  // Always use this
 
-#[cfg(feature = "async")]
-async fn read_impl() -> DeltaResult<impl AsyncIterator<...>> {
-    let data = self.storage.read_files(files).await?;  // Async I/O
-    // ...
+impl<S: Stream> AsyncIterator for S {
+    fn async_map<F, R>(self, f: F) -> impl AsyncIterator<Item = R> {
+        self.then(|x| async move { f(x) })  // futures::StreamExt::then
+    }
 }
 ```
 
-This is **unavoidable** - sync and async I/O have different semantics and cannot be unified.
+This is already the pattern in DefaultEngine today (see `kernel/src/engine/default/*.rs`).
 
-However, this duplication is:
-- **Tightly scoped**: Methods do nothing except the I/O that is fundamentally different
-- **Isolated**: The differences don't leak into business logic that uses them
+**Architecture**:
+- **futures** provides traits and combinators (Stream, StreamExt, Future, etc.)
+- **tokio** provides the runtime (thread pools, scheduling, I/O drivers)
+- They work together seamlessly - this is the standard pattern in the Rust async ecosystem
 
-All higher layers (business logic, public API) are completely unified.
+**Bottom line**: Kernel depends on `futures` for traits/combinators, DefaultEngine depends on `tokio` for runtime. This separation keeps the kernel runtime-agnostic while allowing engine implementations to use any async runtime they prefer.
 
 ---
 
@@ -921,8 +1055,7 @@ All higher layers (business logic, public API) are completely unified.
 - ✅ Good IDE support
 
 **Cons**:
-- ⚠️ Learning curve (~30 min for macro usage)
-- ⚠️ I/O layer still requires duplication (unavoidable)
+- ⚠️ Learning curve (~30 min for understanding the five components)
 - ⚠️ Need to test both modes in CI (2x test time)
 - ⚠️ `+ 'static` bounds may be restrictive in some cases (but this is already true for async code)
 
@@ -969,12 +1102,14 @@ test-async:
 
 ## Conclusion
 
-This approach provides a clean, performant solution to eliminate sync/async code duplication in delta-kernel-rs. The infrastructure is simple (~225 lines), the performance overhead is zero, and the benefits (single source, easier maintenance) are substantial.
+This approach provides a clean, performant solution to eliminate sync/async code duplication in delta-kernel-rs. The infrastructure is simple (~250 lines), the performance overhead is zero, and the benefits (single source, easier maintenance) are substantial.
 
 The three-layer architecture clearly separates concerns:
-- **Layer 1 (I/O)**: Minimal unavoidable duplication
-- **Layer 2 (Business Logic)**: Zero duplication, single source
-- **Layer 3 (Public API)**: Zero duplication, thin wrapper
+- **Layer 1 (I/O)**: One async implementation per handler, using Component 5 to bridge modes
+- **Layer 2 (Business Logic)**: Zero duplication, single source using `#[async_fn]`
+- **Layer 3 (Public API)**: Zero duplication, thin unified wrapper per handler method
+
+**Result**: **Zero logic duplication** anywhere in the codebase. All five infrastructure components (~250 lines) enable single-source implementations everywhere.
 
 **Recommendation**: Proceed with prototype in Phase 1-2, then evaluate for full rollout.
 
