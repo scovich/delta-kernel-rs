@@ -26,13 +26,13 @@ fn read_file(engine: &dyn Engine) -> DeltaResult<Data> {
 - **Sync mode** (feature off): Standard function, `await_!()` is no-op  
 - **Async mode** (feature on): Async function, `await_!()` adds `.await`
 
-### Infrastructure (~250 lines total)
+### Infrastructure (~150 lines total)
 
 | Component | Purpose |
 |-----------|---------|
 | `#[async_fn]` macro (~15 LOC) | Conditionally adds `async` keyword to functions |
 | `await_!()` macro (~10 LOC) | Conditionally adds `.await` to expressions |
-| `AsyncIterator` trait (~200 LOC) | Unified trait implemented by `Iterator` (sync) or `Stream` (async) |
+| `AsyncIterator` trait (~100 LOC) | Minimal unified trait (6 methods) for I/O boundaries only |
 | Type aliases (~10 LOC) | Boxed types for API boundaries |
 | AsyncIterator adapters (~30 LOC) | Convert concrete Iterator/Stream types to internal AsyncIterator abstraction |
 
@@ -55,7 +55,7 @@ The approach minimizes duplication by separating concerns:
    - Single unified trait implementation per handler method
    - **No duplication!**
 
-**Key insight**: Zero logic duplication anywhere. All five infrastructure components work together to enable single-source implementations at every layer.
+**Key insight**: Zero logic duplication anywhere. All five infrastructure components work together to enable single-source implementations at every layer. Only ~10-12 call sites need `AsyncIterator` - the rest of the codebase (200+ iterator chains) continues using regular `Iterator`/`Stream` for pure business logic.
 
 ### Benefits
 
@@ -374,43 +374,47 @@ pub type FileDataReadResultIterator = BoxedAsyncIterator<DeltaResult<Box<dyn Eng
 
 **Purpose**: Internal unified trait for iterator operations that works in both modes
 
+**Scope**: Only used at engine I/O boundaries (~10-12 call sites). Business logic continues to use regular `Iterator`/`Stream`.
+
 **Implementation**:
 
 ```rust
 // In kernel/src/async_iterator/mod.rs
 
-/// Unified trait for async-style iterator operations
+/// Unified trait for async-style iterator operations at engine I/O boundaries
 /// 
 /// Implemented by Iterator (sync mode) and Stream (async mode).
 /// Provides a consistent API for working with sequences in both modes.
 /// 
-/// Note: These transformation methods (map, filter, etc.) are NOT async - they just
-/// build up lazy transformation chains. Both Iterator and Stream have non-async
-/// transformation methods, so our trait methods can be simple non-async delegates.
-/// The async only matters when consuming the iterator/stream (e.g., collect, fold).
+/// **Design Philosophy**: This trait intentionally provides a minimal set of methods
+/// needed at engine I/O boundaries. Most iterator operations in the kernel happen
+/// on regular Iterator/Stream types in pure business logic and don't need this trait.
+/// 
+/// See Appendix: Method Selection Rationale for details on which methods were included.
 #[internal_api]
 pub trait AsyncIterator: Sized {
     type Item;
     
-    /// Map each item
+    /// Map each item - the most common operation at I/O boundaries
     fn async_map<F, R>(self, f: F) -> impl AsyncIterator<Item = R>
     where
         F: FnMut(Self::Item) -> R + Send + 'static,
         R: Send + 'static;
     
-    /// Filter items
+    /// Filter items - used for data skipping and selection
     fn async_filter<F>(self, f: F) -> impl AsyncIterator<Item = Self::Item>
     where
         F: FnMut(&Self::Item) -> bool + Send + 'static;
     
-    /// Flatten nested iterators/streams
-    /// 
-    /// Note: The item must already be an AsyncIterator (e.g., an Iterator or Stream)
+    /// Flatten nested iterators/streams - needed for nested file operations
     fn async_flatten(self) -> impl AsyncIterator<Item = <Self::Item as AsyncIterator>::Item>
     where
         Self::Item: AsyncIterator + Send + 'static;
     
-    /// Try fold with early exit on error
+    /// Try fold with early exit on error - for stateful reducers (P&M, domain metadata)
+    /// 
+    /// Note: Will become more important with two-phase log replay where protocol,
+    /// metadata, app IDs, and domain metadata all become fold-based reducers.
     #[async_fn]
     fn async_try_fold<B, E, F>(self, init: B, f: F) -> Result<B, E>
     where
@@ -418,9 +422,7 @@ pub trait AsyncIterator: Sized {
         B: Send + 'static,
         E: Send + 'static;
     
-    /// Chain two iterators/streams
-    /// 
-    /// Note: The `other` parameter must already be an AsyncIterator (e.g., an Iterator or Stream)
+    /// Chain two iterators/streams - for composing multiple I/O sources
     fn async_chain<U>(self, other: U) -> impl AsyncIterator<Item = Self::Item>
     where
         U: AsyncIterator<Item = Self::Item> + Send + 'static;
@@ -1007,7 +1009,104 @@ The three-layer architecture clearly separates concerns:
 
 ## Appendix
 
+### AsyncIterator Method Selection
 
+**Question**: Why does `AsyncIterator` only have 6 methods when there are 100+ iterator usage sites in the codebase?
+
+**Answer**: Because only ~10-12 call sites actually cross the sync/async boundary. The rest are pure business logic.
+
+#### The Two Iterator Patterns
+
+**Pattern 1: Engine I/O Boundaries** (needs AsyncIterator):
+```rust
+// Public API that wraps engine calls
+pub fn execute(&self, engine: Arc<dyn Engine>) 
+    -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>>> 
+{
+    // THIS crosses the sync/async boundary
+    let read_iter = engine.parquet_handler().read_parquet_files(...)?;
+    
+    // Wrap with transform logic (needs AsyncIterator methods)
+    Ok(read_iter.async_map(|data| transform(data)))
+}
+```
+
+**Call sites**: 
+- 3 public APIs (`Scan::execute`, `Scan::scan_metadata`, `TableChangesScan::execute`)
+- 4 engine trait methods (`read_json_files`, `read_parquet_files`, `list_from`, `read_files`)
+- 3-5 internal wrappers
+
+**Total**: ~10-12 sites
+
+---
+
+**Pattern 2: Pure Business Logic** (uses regular Iterator/Stream):
+```rust
+// Transform already-loaded data - no engine calls
+fn scan_metadata_to_scan_file(
+    metadata: impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>,
+) -> impl Iterator<Item = DeltaResult<CdfScanFile>> {
+    metadata.map(|m| transform(m?))  // Regular Iterator, no I/O
+}
+```
+
+**Call sites**: 200+ throughout the codebase
+
+**Key insight**: These already work with regular `Iterator`/`Stream` - no need for `AsyncIterator`!
+
+---
+
+#### Method Selection Criteria
+
+We analyzed all iterator method usage and categorized by whether it's used at I/O boundaries:
+
+| Method | I/O Boundary Uses | Business Logic Uses | Included? |
+|--------|-------------------|---------------------|-----------|
+| `map` | 8+ | 100+ | ✅ Yes - core |
+| `filter` | 2-3 | 30+ | ✅ Yes - data skipping |
+| `flatten` | 3-4 | 10+ | ✅ Yes - nested files |
+| `try_fold` | 0 (future) | 5+ | ✅ Yes - reducers* |
+| `chain` | 2-3 | 15+ | ✅ Yes - composing I/O |
+| `into_boxed` | 10-12 | 0 | ✅ Yes - API conversion |
+| **`try_collect`** | **0** | **55** | ❌ No - use itertools |
+| **`map_ok`** | **0** | **50+** | ❌ No - use itertools |
+| **`flatten_ok`** | **0** | **9** | ❌ No - use itertools |
+| **`enumerate`** | **0** | **30+** | ❌ No - pure logic |
+| **`zip`** | **0** | **30+** | ❌ No - pure logic |
+
+\* `try_fold` is included because it will be critical for two-phase log replay where protocol, metadata, app IDs, and domain metadata extraction all become fold-based reducers over action streams.
+
+---
+
+#### Why This Matters
+
+**Before analysis**: Thought we needed 15+ methods to handle 200+ iterator usage sites.
+
+**After analysis**: Only need 6 methods for the 10-12 I/O boundary sites.
+
+**Impact**:
+- ✅ Smaller API surface
+- ✅ Less implementation complexity
+- ✅ Most code continues using familiar Iterator/Stream APIs
+- ✅ Can add more methods later if needed
+
+---
+
+#### Future Extensions
+
+Methods we may add later:
+
+- `async_filter_map` - if combined filter+map becomes common at I/O boundaries
+- `async_inspect` - for debugging I/O operations
+- `async_take` / `async_skip` - for pagination/limits
+- `async_buffered` - for parallel I/O (Stream-specific)
+
+But for MVP, the 6 core methods handle all current use cases.
+
+**Detailed Analysis**: See [ASYNC-ITERATOR-ANALYSIS.md](ASYNC-ITERATOR-ANALYSIS.md) for complete call chain tracing and categorization by module (core kernel vs. engine vs. tests).
+
+
+---
 
 ### Why futures (Not tokio) Dependency?
 
