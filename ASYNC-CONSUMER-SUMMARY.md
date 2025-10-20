@@ -26,13 +26,13 @@ The async macro approach would make kernel APIs conditionally async/sync based o
 **Discovery**: DefaultEngine is **already async internally**! The kernel already uses async I/O under the hood and exposes a sync API by blocking on futures.
 
 **The Implementation Pattern**: Engine handlers use a unified pattern:
+- **Challenge 1 solution** (Components 1-3): `#[async_trait]`, `#[async_fn]`, `await_!()` handle conditional syntax
+- **Challenge 2 solution** (Components 4-6): `AsyncIterator` trait, `BoxedAsyncIterator` alias, adapters handle type incompatibility
 - **One native async impl method** - contains all the real logic
-- **One trait wrapper** - uses standard macros (`#[async_fn]` + `await_!`)
-- **One helper function** (`into_boxed_async_iterator`) - handles mode-specific conversion
 
-This achieves **zero logic duplication** and **single trait wrapper** per handler method.
+This achieves **zero logic duplication** across both challenges.
 
-**For complete technical details**, see [async-macro-approach.md § Current State](async-macro-approach.md#current-state-the-hidden-async-architecture) and [§ Component 5 (AsyncIterator Adapters)](async-macro-approach.md#component-5-asynciterator-adapters).
+**For complete technical details**, see [async-macro-approach.md § The Approach](async-macro-approach.md#the-approach) for the two challenges and their solutions.
 
 ### 2. FFI Layer Can Stay Untouched
 

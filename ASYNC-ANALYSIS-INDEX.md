@@ -34,7 +34,8 @@ This is the complete, self-contained technical proposal:
 4. **[async-macro-approach.md](async-macro-approach.md)** (35 min read)
    - **The complete technical proposal** (read this for full understanding)
    - Current state analysis (DefaultEngine is already async)
-   - Five infrastructure components (macros, trait, adapters)
+   - Two fundamental challenges (conditional syntax, type incompatibility)
+   - Six infrastructure components solving the two challenges
    - Complete examples and implementation plan
    - Dependency rationale (futures vs tokio)
 
@@ -96,7 +97,7 @@ This is the complete, self-contained technical proposal:
 #### Q: Does the macro approach eliminate ALL duplication?
 **A**: Yes - zero logic duplication. Only simple infrastructure components needed.
 
-**See**: [async-macro-approach.md § Component 5 (AsyncIterator Adapters)](async-macro-approach.md#component-5-asynciterator-adapters)
+**See**: [async-macro-approach.md § Component 6 (AsyncIterator Adapters)](async-macro-approach.md#component-6-asynciterator-adapters)
 
 ---
 
