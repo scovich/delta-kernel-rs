@@ -75,7 +75,7 @@ Delta-kernel-rs needs to support both sync and async modes. Without this approac
 
 **✅ PROCEED WITH PROTOTYPE**
 
-1. Simple infrastructure (~225 lines)
+1. Simple, straightforward infrastructure
 2. Eliminates duplication without compromising performance
 3. Low risk - prototype in Week 1-2, evaluate before full rollout
 
@@ -270,7 +270,7 @@ async fn process_data(engine: &dyn Engine) -> DeltaResult<Vec<i32>> {
 
 ## Infrastructure Components
 
-The async macro approach requires five simple components working together (~250 lines total):
+The async macro approach requires five simple components working together:
 
 1. **`#[async_fn]` macro** - Conditionally adds `async` keyword
 2. **`await_!()` macro** - Conditionally adds `.await`
@@ -374,7 +374,7 @@ pub type FileDataReadResultIterator = BoxedAsyncIterator<DeltaResult<Box<dyn Eng
 
 **Purpose**: Internal unified trait for iterator operations that works in both modes
 
-**Implementation** (~200 lines):
+**Implementation**:
 
 ```rust
 // In kernel/src/async_iterator/mod.rs
@@ -991,6 +991,20 @@ fn execute(engine: &dyn Engine) -> DeltaResult<Vec<Output>> {
 
 ---
 
+## Conclusion
+
+This approach provides a clean, performant solution to eliminate sync/async code duplication in delta-kernel-rs. The infrastructure is simple and straightforward, the performance overhead is zero, and the benefits (single source, easier maintenance) are substantial.
+
+The three-layer architecture clearly separates concerns:
+- **Layer 1 (I/O)**: One async implementation per handler, using Component 5 to bridge modes
+- **Layer 2 (Business Logic)**: Zero duplication, single source using `#[async_fn]`
+- **Layer 3 (Public API)**: Zero duplication, thin unified wrapper per handler method
+
+**Result**: **Zero logic duplication** anywhere in the codebase. All five infrastructure components enable single-source implementations everywhere.
+
+**Recommendation**: Proceed with prototype in Phase 1-2, then evaluate for full rollout.
+---
+
 ## Appendix
 
 
@@ -1098,18 +1112,4 @@ test-async:
 - Can remove `#[async_fn]` and `await_!()` and go back to manual duplication
 - Low risk, easy to revert
 
----
-
-## Conclusion
-
-This approach provides a clean, performant solution to eliminate sync/async code duplication in delta-kernel-rs. The infrastructure is simple (~250 lines), the performance overhead is zero, and the benefits (single source, easier maintenance) are substantial.
-
-The three-layer architecture clearly separates concerns:
-- **Layer 1 (I/O)**: One async implementation per handler, using Component 5 to bridge modes
-- **Layer 2 (Business Logic)**: Zero duplication, single source using `#[async_fn]`
-- **Layer 3 (Public API)**: Zero duplication, thin unified wrapper per handler method
-
-**Result**: **Zero logic duplication** anywhere in the codebase. All five infrastructure components (~250 lines) enable single-source implementations everywhere.
-
-**Recommendation**: Proceed with prototype in Phase 1-2, then evaluate for full rollout.
 

@@ -394,9 +394,11 @@
 
 ---
 
-## The I/O Boundary Pattern
+## Engine Implementation Pattern
 
-### Engine Implementation Strategy
+### Three-Part Strategy
+
+See [async-macro-approach.md § Component 5](async-macro-approach.md#component-5-asynciterator-adapters) for complete details. Summary:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -453,15 +455,14 @@
 │       }                                                             │
 │   }                                                                 │
 │                                                                     │
-│   ✅ ONE HELPER FUNCTION (conditional compilation)                  │
+│   ✅ ASYNCITERATOR ADAPTERS (Component 5)                           │
 │                                                                     │
-│   // Sync: block + convert Stream→Iterator + box                    │
+│   // Converts Stream to work in both modes                          │
 │   #[cfg(not(feature = "async"))]                                    │
-│   fn into_boxed_async_iterator(...) { ... }                         │
+│   fn into_boxed_async_iterator(...) { ... }  // blocks on stream    │
 │                                                                     │
-│   // Async: await + box Stream                                      │
 │   #[cfg(feature = "async")]                                         │
-│   async fn into_boxed_async_iterator(...) { ... }                   │
+│   async fn into_boxed_async_iterator(...) { ... }  // boxes stream  │
 │                                                                     │
 │   ✅ Zero logic duplication!                                        │
 │   ✅ Single wrapper per handler method                              │
@@ -482,21 +483,15 @@
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-**The Pattern**:
+**The Pattern** (see Component 5 in main doc for details):
 1. **One native async impl method** - contains all the real logic
-2. **One unified trait wrapper** - uses `#[async_fn]` + `await_!` macros
-3. **One helper function** - handles Stream→Iterator conversion in sync mode
+2. **One unified trait wrapper** - uses `#[async_fn]` + `await_!` + adapters
+3. **AsyncIterator adapters** - convert Stream/Iterator to internal abstraction
 
-**What this achieves**:
-- ✅ Eliminates duplication in all **business logic** (100% of code)
-- ✅ Zero logic duplication at **I/O boundary**
-- ✅ Single trait wrapper per handler method (no `#[cfg]` blocks)
-- ✅ Consistent pattern across all handlers
-
-**Is it worth it?** 
-- **Absolutely YES** - no logic duplication anywhere
-- Single trait wrapper per handler (maximum unification)
-- ~25 lines of one-time helper code
+**Result**:
+- ✅ Zero logic duplication anywhere
+- ✅ Single trait wrapper per handler method
+- ✅ Simple infrastructure enables everything
 
 ---
 

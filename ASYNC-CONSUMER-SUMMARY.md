@@ -13,7 +13,7 @@ The async macro approach would make kernel APIs conditionally async/sync based o
 | Consumer Type | Impact | Recommended Action |
 |---------------|--------|-------------------|
 | **FFI Layer** | ✅ No changes needed | Keep using sync mode |
-| **Example Programs** | ⚠️ Require async runtime setup | Can stay sync or migrate to async |
+| **Example Programs** | ✅ No changes needed (sync default) | Can stay sync or opt into async |
 | **Test Suite** | ⚠️ Minor changes | Already using `#[tokio::test]`, add `.await` calls |
 | **Library Consumers** | ✅ Opt-in choice | Choose sync (default) or async (opt-in) |
 
@@ -32,7 +32,7 @@ The async macro approach would make kernel APIs conditionally async/sync based o
 
 This achieves **zero logic duplication** and **single trait wrapper** per handler method.
 
-**For complete technical details**, see [async-macro-approach.md § Current State](async-macro-approach.md#current-state-the-hidden-async-architecture) and [§ Component 5](async-macro-approach.md#component-5-the-io-boundary-helper).
+**For complete technical details**, see [async-macro-approach.md § Current State](async-macro-approach.md#current-state-the-hidden-async-architecture) and [§ Component 5 (AsyncIterator Adapters)](async-macro-approach.md#component-5-asynciterator-adapters).
 
 ### 2. FFI Layer Can Stay Untouched
 
