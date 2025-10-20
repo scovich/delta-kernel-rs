@@ -405,7 +405,7 @@ fn process_delta_table(path: &str) -> Result<Vec<Data>> {
 
 This works from:
 - Synchronous CLI applications
-- Blocking web servers
+- Traditional blocking applications
 - Data processing pipelines
 - Anywhere that doesn't have an async runtime
 
@@ -499,7 +499,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ---
 
-## Critical Architecture Question: The DefaultEngine Paradox
+## DefaultEngine Implementation Pattern
 
 ### The Current Situation
 
@@ -527,111 +527,148 @@ The `TaskExecutor::block_on()` method bridges async to sync by:
 2. Blocking the current thread until complete
 3. Returning the result
 
-### The Question
+### The Implementation Pattern
 
-**If we make kernel APIs async, what happens to `DefaultEngine`?**
+The engine I/O layer uses a unified pattern with a helper function that eliminates wrapper duplication:
 
-**Option A: DefaultEngine stays sync internally (feature-dependent)**
-
-```rust
-// With async feature DISABLED
-impl JsonHandler for DefaultJsonHandler<E> {
-    fn read_json_files(&self, /* ... */) -> DeltaResult<Box<dyn EngineData>> {
-        self.executor.block_on(async {
-            // async I/O
-        })
-    }
-}
-
-// With async feature ENABLED
-impl JsonHandler for DefaultJsonHandler<E> {
-    async fn read_json_files(&self, /* ... */) -> DeltaResult<Box<dyn EngineData>> {
-        // Direct async I/O, no blocking!
-        // ...
-    }
-}
-```
-
-**Pros**:
-- True async in async mode (no blocking thread overhead)
-- Sync mode still works
-
-**Cons**:
-- Duplication at the engine implementation layer (the proposed approach was meant to avoid this!)
-- Engine implementors need to maintain two versions
-
-**Option B: DefaultEngine ALWAYS blocks, even in async mode**
+#### Mode-specific helper function for converting a Stream to a BoxedAsyncIterator 
 
 ```rust
-// Even with async feature enabled, engine still blocks
-impl JsonHandler for DefaultJsonHandler<E> {
-    async fn read_json_files(&self, /* ... */) -> DeltaResult<Box<dyn EngineData>> {
-        // Block on async work, then return
-        let result = self.executor.block_on(async {
-            // async I/O
-        });
-        result
-    }
-}
-```
+// Helper to convert async stream-producing future into boxed AsyncIterator
+// This handles all the mode-specific complexity
 
-**Pros**:
-- No duplication in engine implementation
-- Single code path
-
-**Cons**:
-- **Defeats the purpose of async!** We'd be blocking threads in async contexts
-- Poor async performance (blocking threads in tokio runtime is bad)
-- Async ecosystem would consider this an anti-pattern
-
-**Option C: Two DefaultEngine implementations**
-
-```rust
-// Sync version
-pub struct SyncDefaultEngine<E: TaskExecutor> { /* ... */ }
-
-// Async version  
-pub struct AsyncDefaultEngine { /* uses tokio directly */ }
-```
-
-**Pros**:
-- Clean separation
-- Each optimized for its context
-
-**Cons**:
-- Essentially what we have today (async internally, sync wrapper)
-- More code to maintain
-
-### The Real Question
-
-**Does the async macro approach actually help DefaultEngine implementation?**
-
-Looking at the code:
-- The I/O layer (object_store, parquet readers) is **already async**
-- DefaultEngine handlers **already** use async code internally
-- The blocking happens at the engine trait boundary
-
-**The macro approach helps kernel business logic**, but the **engine implementation** may still need platform-specific logic:
-
-```rust
-// This is at the I/O boundary - fundamentally different
 #[cfg(not(feature = "async"))]
-fn read_impl(&self, files: &[FileMeta]) -> DeltaResult<impl AsyncIterator<...>> {
-    let data = self.executor.block_on(async {
-        // async I/O but blocked
+pub(crate) fn into_boxed_async_iterator<E, Fut, S, T>(
+    executor: &E,
+    stream_future: Fut,
+) -> DeltaResult<BoxedAsyncIterator<T>>
+where
+    E: TaskExecutor,
+    Fut: Future<Output = DeltaResult<S>>,
+    S: Stream<Item = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let mut stream = Box::pin(executor.block_on(stream_future)?);
+    let executor = executor.clone();
+    
+    // Create an iterator that blocks on each stream item
+    let iter = std::iter::from_fn(move || {
+        executor.block_on(async { stream.next().await })
     });
-    // return iterator
+    
+    Ok(iter.into_boxed())
 }
 
 #[cfg(feature = "async")]
-async fn read_impl(&self, files: &[FileMeta]) -> DeltaResult<impl AsyncIterator<...>> {
-    // Direct async I/O
-    let data = /* async read */;
-    // return stream
+pub(crate) async fn into_boxed_async_iterator<E, Fut, S, T>(
+    _executor: &E,
+    stream_future: Fut,
+) -> DeltaResult<BoxedAsyncIterator<T>>
+where
+    E: TaskExecutor,
+    Fut: Future<Output = DeltaResult<S>>,
+    S: Stream<Item = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let stream = stream_future.await?;
+    Ok(stream.into_boxed())
 }
 ```
 
-**Conclusion**: The macro approach **does not eliminate** the need for conditional code at the engine I/O layer. This is inherent to the sync/async boundary.
+#### Handler Implementation (Repeated Pattern)
+
+```rust
+impl DefaultParquetHandler {
+    // Single native async implementation - ALL the logic
+    async fn read_parquet_impl(&self, files: &[FileMeta]) 
+        -> DeltaResult<impl Stream<Item = DeltaResult<Box<dyn EngineData>>>> 
+    {
+        // ALL the actual I/O logic here
+        // object_store calls, parquet reading, etc.
+        // SINGLE SOURCE OF TRUTH
+    }
+}
+
+// Single trait wrapper using standard macros
+impl ParquetHandler for DefaultParquetHandler {
+    #[async_fn]
+    fn read_parquet_files(&self, files: &[FileMeta]) 
+        -> DeltaResult<FileDataReadResultIterator> 
+    {
+        await_!(into_boxed_async_iterator(
+            &self.executor,
+            self.read_parquet_impl(files)
+        ))
+    }
+}
+```
+
+### What This Achieves
+
+✅ **Zero logic duplication** - all real code is in `xxx_impl` methods  
+✅ **Single trait wrapper** - uses standard `#[async_fn]` and `await_!` macros  
+✅ **Consistent pattern** - every handler wrapper looks identical  
+✅ **Clear intent** - "convert this async stream into our API boundary type"
+
+### This Pattern Works Everywhere
+
+Every handler follows the exact same pattern:
+
+```rust
+// JsonHandler
+impl DefaultJsonHandler {
+    async fn read_json_impl(&self, paths: &[Path]) 
+        -> DeltaResult<impl Stream<...>> 
+    {
+        // Real JSON reading logic
+    }
+}
+
+impl JsonHandler for DefaultJsonHandler {
+    #[async_fn]
+    fn read_json_files(&self, paths: &[Path]) 
+        -> DeltaResult<FileDataReadResultIterator> 
+    {
+        await_!(into_boxed_async_iterator(
+            &self.executor,
+            self.read_json_impl(paths)
+        ))
+    }
+}
+
+// StorageHandler
+impl ObjectStoreStorageHandler {
+    async fn list_impl(&self, ...) 
+        -> DeltaResult<impl Stream<...>> 
+    {
+        // Real object store listing logic
+    }
+}
+
+impl StorageHandler for ObjectStoreStorageHandler {
+    #[async_fn]
+    fn list_from(&self, ...) 
+        -> DeltaResult<BoxedAsyncIterator<...>> 
+    {
+        await_!(into_boxed_async_iterator(
+            &self.executor,
+            self.list_impl(...)
+        ))
+    }
+}
+```
+
+### Key Insight
+
+The `into_boxed_async_iterator` helper does all the mode-specific work:
+- **Sync mode**: Block on future → convert Stream to Iterator → box
+- **Async mode**: Await future → box Stream
+
+This allows trait wrappers to be unified using the standard macro approach.
+
+**Context**: DefaultEngine already does async I/O internally today, so:
+- **Sync mode**: Keep blocking on it (via helper)
+- **Async mode**: Expose it directly (via helper)
 
 ---
 
@@ -768,7 +805,7 @@ async fn main() {
 
 3. **Offer async mode** for:
    - Performance-critical applications
-   - Async ecosystems (web servers, etc.)
+   - Async Rust projects (delta-rs, async services, etc.)
    - Users who want cutting edge
 
 ### For Consumers
@@ -780,10 +817,10 @@ async fn main() {
 - You're using FFI
 
 **Choose Async Mode if**:
-- You're already in an async ecosystem
+- Your application is already async (like delta-rs)
 - You need maximum I/O concurrency
 - You're willing to manage tokio runtime
-- You want to contribute to async development
+- You want natural integration with async Rust ecosystem
 
 ---
 
@@ -800,19 +837,28 @@ fn main() {
 }
 ```
 
-### Example 2: Web Server (Goes Async)
+### Example 2: Async Rust Consumer like delta-rs (Goes Async)
 
 ```rust
-// Was sync:
-fn get_table_data(path: &str) -> Result<Vec<Row>> {
+// Was sync (forced blocking in async context):
+async fn read_table_data(path: &str) -> Result<impl Stream<Item = Result<RecordBatch>>> {
+    // Blocking a tokio thread - not ideal!
     let snapshot = Snapshot::build(&engine)?;
-    // ...
+    let scan = snapshot.scan_builder().build()?;
+    
+    // Must manually wrap Iterator as Stream
+    let iter = scan.execute(engine)?;
+    Ok(futures::stream::iter(iter))
 }
 
-// Becomes async:
-async fn get_table_data(path: &str) -> Result<Vec<Row>> {
+// Becomes naturally async:
+async fn read_table_data(path: &str) -> Result<impl Stream<Item = Result<RecordBatch>>> {
+    // Properly yields control
     let snapshot = Snapshot::build(&engine).await?;
-    // ...
+    let scan = snapshot.scan_builder().build()?;
+    
+    // Returns Stream directly
+    scan.execute(engine).await
 }
 ```
 
