@@ -1,6 +1,13 @@
 //! FFI interface for the delta kernel
 //!
 //! Exposes that an engine needs to call from C/C++ to interface with kernel
+//!
+//! # Note on async mode
+//!
+//! This FFI layer does not support the kernel's `async` feature. FFI requires synchronous
+//! function calls, but the async feature changes kernel APIs to return futures. If you
+//! accidentally enable the async feature when building the FFI, you'll get clear compiler
+//! errors about type mismatches.
 
 #[cfg(feature = "default-engine-base")]
 use std::collections::HashMap;

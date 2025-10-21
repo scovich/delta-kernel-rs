@@ -15,7 +15,7 @@ use crate::schema::SchemaRef;
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, EngineData, Error, Expression, FileMeta, ParquetHandler, Predicate,
-    PredicateRef, RowVisitor, StorageHandler, Version,
+    PredicateRef, RowVisitor, StorageHandler, Version, AsyncIterator as _,
 };
 use delta_kernel_derive::internal_api;
 
@@ -301,12 +301,12 @@ impl LogSegment {
                 commit_read_schema,
                 meta_predicate.clone(),
             )?
-            .map_ok(|batch| ActionsBatch::new(batch, true));
+            .async_map_ok(|batch| ActionsBatch::new(batch, true));
 
         let checkpoint_stream =
             self.create_checkpoint_stream(engine, checkpoint_read_schema, meta_predicate)?;
 
-        Ok(commit_stream.chain(checkpoint_stream))
+        Ok(commit_stream.async_chain(checkpoint_stream))
     }
 
     /// find a minimal set to cover the range of commits we want. This is greedy so not always

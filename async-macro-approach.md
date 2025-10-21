@@ -684,14 +684,20 @@ impl<S: Stream + Send + 'static> AsyncIterator for S {
         }).flatten()
     }
     
-    async fn async_try_fold<B, E, F>(self, init: B, mut f: F) -> Result<B, E>
+    async fn async_try_fold<B, E, F>(mut self, init: B, mut f: F) -> Result<B, E>
     where
         F: FnMut(B, Self::Item) -> Result<B, E> + Send + 'static,
         B: Send + 'static,
         E: Send + 'static,
     {
-        // Async: StreamExt::try_fold returns a future, await it
-        self.try_fold(init, |acc, item| async move { f(acc, item) }).await
+        // Async: Manual loop with ? for early termination
+        // Note: StreamExt::fold can't express early exit, and TryStreamExt::try_fold
+        // has incompatible types (works with Self::Ok, not Self::Item)
+        let mut acc = init;
+        while let Some(item) = self.next().await {
+            acc = f(acc, item)?;
+        }
+        Ok(acc)
     }
     
     fn async_chain<U>(self, other: U) -> impl AsyncIterator<Item = Self::Item>
@@ -1154,9 +1160,215 @@ This approach eliminates sync/async duplication using six simple components (~16
 
 ## Appendix
 
+### Implementation Note: Closure Wrapping in AsyncIterator
+
+**Discovery during implementation (2025-10-21):**
+
+The AsyncIterator trait methods in async mode initially had a double-move bug:
+
+```rust
+// WRONG - double move of f:
+self.then(move |item| async move { f(item) })
+//        ^^^^^       ^^^^^^^^^^
+//        outer move  inner move - ERROR!
+```
+
+**Root cause:** The closure `f` is synchronous (`FnMut(Item) -> R`), not async. We were trying to:
+1. Move `f` into the outer closure
+2. Move `f` again into the inner async block
+
+**Solution:** Use `future::ready()` to wrap the synchronous result:
+
+```rust
+// CORRECT - single move:
+self.then(move |item| future::ready(f(item)))
+//        ^^^^^                      ^^^^^^
+//        outer move captures f,     calls f synchronously,
+//        returns ready future       wraps result
+```
+
+This applies to both `async_map` and `async_filter`. The closures are synchronous transformations - we just need to satisfy Stream combinators that expect futures.
+
+**Key insight:** Our AsyncIterator abstraction is for sync transformations at async boundaries, not for async transformations. If users need async closures, they should use Stream::then/filter_map directly.
+
+**Update (2025-10-21):** Added support for async transformations via `async_then` method and `async_closure!` macro.
+
+### Supporting Async Closures: The `async_closure!` Macro
+
+**Problem:** Users sometimes need to perform I/O within stream transformations (e.g., reading sidecar files). This requires async closures in async mode, but regular closures in sync mode. We can't conditionally add the `async` keyword to closures with `#[async_fn]` (only works on named functions).
+
+**Solution:** The `async_closure!` macro creates mode-appropriate closures:
+
+```rust
+// In sync_mode.rs
+#[macro_export]
+macro_rules! async_closure {
+    (| $($arg:tt),* | $body:expr) => {
+        |$($arg),*| $body
+    };
+    (move | $($arg:tt),* | $body:expr) => {
+        move |$($arg),*| $body
+    };
+}
+
+// In async_mode.rs  
+#[macro_export]
+macro_rules! async_closure {
+    (| $($arg:tt),* | $body:expr) => {
+        async |$($arg),*| $body
+    };
+    (move | $($arg:tt),* | $body:expr) => {
+        async move |$($arg),*| $body
+    };
+}
+```
+
+**Usage with `async_then`:**
+
+```rust
+#[async_fn]
+fn process_sidecars(
+    actions: impl AsyncIterator<Item = SidecarAction>
+) -> impl AsyncIterator<Item = DeltaResult<Data>> {
+    actions.async_then(async_closure!(|action| {
+        let data = await_!(read_sidecar(action.path))?;
+        Ok(process(data))
+    }))
+}
+```
+
+**Trait signatures differ between modes:**
+
+```rust
+// sync_mode.rs - closure returns R directly
+fn async_then<F, R>(self, f: F) -> impl AsyncIterator<Item = R>
+where
+    F: FnMut(Self::Item) -> R + Send + 'static
+
+// async_mode.rs - closure returns Future<Output = R>
+fn async_then<F, Fut, R>(self, f: F) -> impl AsyncIterator<Item = R>
+where
+    F: FnMut(Self::Item) -> Fut + Send + 'static,
+    Fut: Future<Output = R> + Send + 'static
+```
+
+This works because we define separate traits in separate files - they just happen to have the same name.
+
+**Complete unification stack:**
+1. `#[async_fn]` - makes containing function async
+2. `async_closure!` - makes closure async
+3. `await_!` - makes calls async
+4. Mode-specific trait signatures - accept appropriate closure types
+
+---
+
+### Working with Result-Yielding Streams: `async_try_fold` and `async_map_ok`
+
+**The Challenge:** Operations like `try_fold` and `map_ok` need to work with streams/iterators that yield `Result` types, but they need different type signatures than regular operations.
+
+#### Understanding TryStream
+
+**TryStream vs Stream type systems:**
+- `Stream` has: `type Item` (any type)
+- `TryStream` is: `Stream<Item = Result<Ok, Error>>` with `type Ok` and `type Error` associated types
+
+**Key operations need to work with the unwrapped `Ok` value:**
+- `try_fold`: Closure receives `Self::Ok`, not `Self::Item` (which would be `Result<Ok, Error>`)
+- `map_ok`: Closure receives `Self::Ok`, transforms it, returns wrapped `Result<R, Error>`
+
+#### The Solution: Conditional Trait Bounds
+
+We add methods to `AsyncIterator` with `where Self: TryStream` bounds (sync mode uses `Iterator<Item = Result<T, E>>`):
+
+**`async_try_fold` - Updated signature:**
+```rust
+// Sync mode (sync_mode.rs)
+fn async_try_fold<T, E, B, F>(self, init: B, f: F) -> Result<B, E>
+where
+    F: FnMut(B, T) -> Result<B, E> + Send + 'static,
+    Self: Sized + Iterator<Item = Result<T, E>>,
+{
+    let mut acc = init;
+    for item in self {
+        match item {
+            Ok(ok_val) => acc = f(acc, ok_val)?,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(acc)
+}
+
+// Async mode (async_mode.rs)
+async fn async_try_fold<B, F>(mut self, init: B, mut f: F) -> Result<B, Self::Error>
+where
+    F: FnMut(B, Self::Ok) -> Result<B, Self::Error> + Send + 'static,
+    Self: Unpin + Sized + TryStream,  // ← Requires TryStream
+{
+    let mut acc = init;
+    while let Some(item) = self.next().await {
+        match item.into_result() {
+            Ok(ok_val) => acc = f(acc, ok_val)?,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(acc)
+}
+```
+
+**`async_map_ok` - New method:**
+```rust
+// Sync mode (sync_mode.rs)
+fn async_map_ok<T, E, F, R>(self, f: F) -> impl AsyncIterator<Item = Result<R, E>>
+where
+    F: FnMut(T) -> R + Send + 'static,
+    Self: Sized + Iterator<Item = Result<T, E>>,
+{
+    self.map_ok(f)  // Delegate to itertools::Itertools::map_ok
+}
+
+// Async mode (async_mode.rs)
+fn async_map_ok<F, R>(self, f: F) -> impl AsyncIterator<Item = Result<R, Self::Error>>
+where
+    F: FnMut(Self::Ok) -> R + Send + 'static,
+    Self: Sized + TryStream,  // ← Requires TryStream
+{
+    self.map_ok(f)  // Delegate to TryStreamExt::map_ok
+}
+```
+
+**Why manual loops instead of native combinators?**
+
+For `try_fold`, we can't use the native combinators because:
+- `StreamExt::fold` doesn't support early termination
+- `TryStreamExt::try_fold` expects an async closure (`FnMut(T, Self::Ok) -> Fut where Fut: TryFuture`), but we want a synchronous closure for consistency
+
+For `map_ok`, we *can* use native combinators (`itertools::Itertools::map_ok` and `TryStreamExt::map_ok`) directly!
+
+**Trade-offs:**
+1. ✅ **Pro**: Unified API - same method names and behavior in both modes
+2. ✅ **Pro**: Type-safe - compiler ensures stream yields `Result` types
+3. ✅ **Pro**: Idiomatic - follows Rust patterns (similar to `Iterator::flatten`)
+4. ⚠️ **Con**: Additional trait bounds required at call sites
+5. ⚠️ **Con**: Manual loop for `try_fold` is slightly less efficient than native combinator
+
+**Usage example:**
+```rust
+let results: impl AsyncIterator<Item = DeltaResult<Data>> = get_data();
+
+// Transform successful values
+let processed = results.async_map_ok(|data| process(data));
+
+// Fold with early exit on error  
+let summary = await_!(processed.async_try_fold(Summary::new(), |acc, data| {
+    acc.update(data)
+}))?;
+```
+
+---
+
 ### AsyncIterator Method Selection
 
-**Question**: Why does `AsyncIterator` only have 6 methods when there are 100+ iterator usage sites in the codebase?
+**Question**: Why does `AsyncIterator` only have 8 methods when there are 100+ iterator usage sites in the codebase?
 
 **Answer**: Because only ~10-12 call sites actually cross the sync/async boundary. The rest are pure business logic.
 
@@ -1211,10 +1423,11 @@ We analyzed all iterator method usage and categorized by whether it's used at I/
 | `filter` | 2-3 | 30+ | ✅ Yes - data skipping |
 | `flatten` | 3-4 | 10+ | ✅ Yes - nested files |
 | `try_fold` | 0 (future) | 5+ | ✅ Yes - reducers* |
+| `map_ok` | 2-3 | 50+ | ✅ Yes - Result mapping |
 | `chain` | 2-3 | 15+ | ✅ Yes - composing I/O |
+| `then` | 2-3 | 10+ | ✅ Yes - async transforms |
 | `into_boxed` | 10-12 | 0 | ✅ Yes - API conversion |
 | **`try_collect`** | **0** | **55** | ❌ No - use itertools |
-| **`map_ok`** | **0** | **50+** | ❌ No - use itertools |
 | **`flatten_ok`** | **0** | **9** | ❌ No - use itertools |
 | **`enumerate`** | **0** | **30+** | ❌ No - pure logic |
 | **`zip`** | **0** | **30+** | ❌ No - pure logic |
@@ -1308,7 +1521,7 @@ This is already the pattern in DefaultEngine today (see `kernel/src/engine/defau
 
 **Pros**: Zero duplication, zero overhead, single source, full IDE support
 
-**Cons**: ~30 min learning curve, test both modes in CI, `+ 'static` bounds
+**Cons**: Learning curve, test both modes in CI, `+ 'static` bounds
 
 ---
 

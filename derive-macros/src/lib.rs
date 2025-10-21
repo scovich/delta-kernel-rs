@@ -3,7 +3,8 @@ use quote::{quote, quote_spanned, ToTokens};
 use syn::parse_macro_input;
 use syn::spanned::Spanned;
 use syn::{
-    Data, DataStruct, DeriveInput, Error, Fields, Item, Meta, PathArguments, Type, Visibility,
+    Data, DataStruct, DeriveInput, Error, Fields, Item, ItemFn, Meta, PathArguments, Type,
+    Visibility,
 };
 
 /// Parses a dot-delimited column name into an array of field names. See
@@ -252,5 +253,75 @@ fn make_public(mut item: Item) -> Item {
         return syn::parse_quote!(#tokens);
     }
 
+    item
+}
+
+/// Conditionally adds the `async` keyword to a function based on the `async` feature flag.
+///
+/// When the `async` feature is enabled, this macro transforms a function into an async function
+/// by adding the `async` keyword. When the feature is disabled, the function remains synchronous.
+///
+/// # Example
+///
+/// ```ignore
+/// #[async_fn]
+/// fn read_file(engine: &dyn Engine) -> DeltaResult<Data> {
+///     let data = await_!(engine.read_file(path))?;
+///     Ok(data)
+/// }
+/// ```
+///
+/// In sync mode, this expands to a regular function. In async mode, it becomes `async fn`.
+#[proc_macro_attribute]
+pub fn async_fn(
+    _attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    let mut input = parse_macro_input!(item as ItemFn);
+
+    // Conditionally add or clear the async keyword based on feature flag
+    #[cfg(feature = "async")]
+    {
+        input.sig.asyncness = Some(syn::token::Async::default());
+    }
+
+    #[cfg(not(feature = "async"))]
+    {
+        input.sig.asyncness = None;
+    }
+
+    quote! { #input }.into()
+}
+
+/// No-op proc macro that stands in for async-trait in sync mode.
+///
+/// In async mode, the kernel imports the real `async-trait` crate using this name,
+/// which boxes futures to make traits with async methods dyn-compatible.
+///
+/// This macro should be applied to both trait definitions AND implementations.
+///
+/// # Example
+///
+/// ```ignore
+/// #[async_trait]
+/// pub trait ParquetHandler {
+///     #[async_fn]
+///     fn read_files(...) -> DeltaResult<FileDataReadResultIterator>;
+/// }
+///
+/// #[async_trait]
+/// impl ParquetHandler for DefaultParquetHandler {
+///     #[async_fn]
+///     fn read_files(...) -> DeltaResult<FileDataReadResultIterator> {
+///         // implementation
+///     }
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn async_trait(
+    _attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    // Sync mode: no-op, return item unchanged
     item
 }

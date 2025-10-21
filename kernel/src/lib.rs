@@ -73,6 +73,17 @@
 #[allow(unused_extern_crates)]
 extern crate self as delta_kernel;
 
+// Sync/async mode split: conditionally compile and re-export one or the other
+#[cfg(not(feature = "async"))]
+mod sync_mode;
+#[cfg(not(feature = "async"))]
+pub use sync_mode::*;
+
+#[cfg(feature = "async")]
+mod async_mode;
+#[cfg(feature = "async")]
+pub use async_mode::*;
+
 use std::any::Any;
 use std::fs::DirEntry;
 use std::sync::Arc;
@@ -179,8 +190,10 @@ pub type FileSlice = (Url, Option<Range<FileIndex>>);
 pub type FileDataReadResult = (FileMeta, Box<dyn EngineData>);
 
 /// An iterator of data read from specified files
-pub type FileDataReadResultIterator =
-    Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>;
+///
+/// In sync mode, this is `Box<dyn Iterator<...>>`.
+/// In async mode, this is `Pin<Box<dyn Stream<...>>>`.
+pub type FileDataReadResultIterator = BoxedAsyncIterator<DeltaResult<Box<dyn EngineData>>>;
 
 /// The metadata that describes an object.
 #[derive(Debug, Clone, PartialEq, Eq)]
