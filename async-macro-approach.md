@@ -1325,4 +1325,97 @@ test-async:
 - Can remove `#[async_fn]` and `await_!()` and go back to manual duplication
 - Low risk, easy to revert
 
+---
+
+## Feature Flags and Build Configuration
+
+### Feature Hierarchy
+
+The implementation requires adding new feature flags to `kernel/Cargo.toml`:
+
+```toml
+[features]
+# Core async support - enables async/await mode
+async = ["futures"]
+
+# Default engine features (work in both sync and async modes)
+default-engine-base = [
+  "arrow-conversion",
+  "arrow-expression",
+  "futures",
+  "need-arrow",
+  "tokio",
+]
+default-engine-native-tls = ["default-engine-base", "reqwest/default"]
+default-engine-rustls = [
+  "default-engine-base",
+  "reqwest/rustls-tls-native-roots",
+  "reqwest/http2",
+]
+```
+
+**Key points**:
+- `async` feature is fully orthogonal to engine features
+- Engine features work identically in both sync and async modes
+- No need for separate `default-engine-async-*` variants
+
+### Choosing Features
+
+**For library consumers**:
+```toml
+# Sync mode (default, backward compatible)
+delta_kernel = { version = "0.17", features = ["default-engine-rustls"] }
+
+# Async mode (opt-in) - just add "async" to existing features
+delta_kernel = { version = "0.17", features = ["async", "default-engine-rustls"] }
+```
+
+**For FFI consumers**:
+```toml
+# FFI always uses sync mode (never enable "async")
+delta_kernel_ffi = { version = "0.17", features = ["default-engine-rustls"] }
+```
+
+### TLS Selection
+
+Choose ONE of:
+- `default-engine-native-tls` (uses system TLS)
+- `default-engine-rustls` (pure Rust TLS)
+
+Then optionally add `async` for async mode:
+- `features = ["default-engine-rustls"]` → sync mode
+- `features = ["async", "default-engine-rustls"]` → async mode
+
+**Recommendation**: Use `rustls` variant (pure Rust, no system dependencies, modern TLS 1.3 support).
+
+**Workspace limitation**: If different crates in your workspace request different TLS variants (e.g., one uses `native-tls`, another uses `rustls`), Cargo's feature unification will enable both. This is a known Cargo limitation. Best practice: align your entire workspace on one TLS choice.
+
+### FFI Considerations
+
+The FFI layer always operates in sync mode. Async mode is incompatible with C FFI because:
+- C code cannot `.await` Rust futures
+- FFI expects synchronous `next()`, not `async fn poll_next()`
+- Would require FFI to expose and manage a tokio runtime
+
+The FFI crate enforces this with compile guards:
+```rust
+#[cfg(feature = "async")]
+compile_error!("The FFI crate does not support async mode. FFI must use synchronous APIs.");
+```
+
+**Note**: The current `default-engine-rustls` uses async I/O internally (via tokio executor) but exposes a synchronous API. This works perfectly for FFI - the executor's `block_on()` bridges async internals to sync API.
+
+### Valid Feature Combinations
+
+| Mode | Arrow | TLS | Features | Valid? |
+|------|-------|-----|----------|--------|
+| Minimal | None | - | `[]` | ✅ |
+| Sync | 56 | Rustls | `["default-engine-rustls"]` | ✅ |
+| Sync | 56 | Native | `["default-engine-native-tls"]` | ✅ |
+| Async | 56 | Rustls | `["async", "default-engine-rustls"]` | ✅ |
+| Async | 56 | Native | `["async", "default-engine-native-tls"]` | ✅ |
+| Async-only | None | - | `["async"]` | ✅ (no engine) |
+
+---
+
 

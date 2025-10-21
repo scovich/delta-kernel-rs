@@ -168,6 +168,49 @@ async fn main() {
 
 ---
 
+## Test Suite Migration
+
+Tests already use `#[tokio::test]` but kernel APIs are currently sync. With async mode, add `.await` to kernel calls:
+
+### Today (Tests Already Async)
+
+```rust
+#[tokio::test]
+async fn test_snapshot() -> Result<()> {
+    let engine = get_test_engine();
+    let snapshot = Snapshot::builder_for(url).build(&engine)?;  // Sync call
+    let scan = snapshot.scan_builder().build()?;
+    
+    for item in scan.execute(Arc::new(engine))? {  // Iterator
+        let batch = item?;
+        // Process batch...
+    }
+    Ok(())
+}
+```
+
+### With Async Feature
+
+```rust
+#[tokio::test]
+async fn test_snapshot() -> Result<()> {
+    let engine = get_test_engine();
+    let snapshot = Snapshot::builder_for(url).build(&engine).await?;  // Add .await
+    let scan = snapshot.scan_builder().build()?;
+    
+    let mut stream = scan.execute(Arc::new(engine)).await?;  // Stream
+    while let Some(item) = stream.next().await {  // Stream iteration
+        let batch = item?;
+        // Process batch...
+    }
+    Ok(())
+}
+```
+
+**Impact**: Minimal - tests are already async, just add `.await` to kernel calls and change iteration pattern.
+
+---
+
 ## Real-World Migration Examples
 
 ### Case 1: DuckDB FFI Consumer (No Changes)
@@ -257,6 +300,66 @@ async fn read_delta_table(path: &str) -> Result<impl Stream<Item = Result<Record
 
 ---
 
+## Common Pitfalls and Gotchas
+
+### ⚠️ Cannot Mix Sync and Async Modes
+
+You must choose **one mode** for your entire application. You cannot have some dependencies using sync kernel and others using async kernel:
+
+```toml
+# ❌ This will fail:
+[dependencies]
+delta-kernel = { version = "0.17", features = ["async"] }
+some-other-crate = "1.0"  # If this crate depends on sync delta-kernel
+```
+
+**Why**: Cargo unifies features across the entire dependency tree. If any crate enables `async`, all get async mode.
+
+**Solution**: Align your entire workspace/dependency tree on one mode.
+
+### ⚠️ Async Mode Requires Runtime
+
+Enabling the `async` feature isn't enough - you need an async runtime:
+
+```rust
+// ❌ This won't work:
+async fn main() {
+    let snapshot = Snapshot::build(&engine).await?;  // No runtime!
+}
+
+// ✅ This works:
+#[tokio::main]
+async fn main() {
+    let snapshot = Snapshot::build(&engine).await?;  // Tokio runtime
+}
+```
+
+**Why**: Async functions need a runtime to execute futures.
+
+**Solution**: Use `#[tokio::main]`, create a runtime manually, or use another async runtime (async-std, smol, etc.)
+
+### ⚠️ Iterator vs Stream APIs Differ
+
+The combinator APIs are different between sync and async modes:
+
+```rust
+// Sync mode - Iterator API
+scan.execute()?
+    .filter(|x| x.is_valid())
+    .map(|x| process(x))
+
+// Async mode - Stream API  
+scan.execute().await?
+    .filter(|x| async { x.is_valid() })  // ← Needs async block!
+    .then(|x| async { process(x) })      // ← Different combinator!
+```
+
+**Why**: Streams use different combinators than Iterators (`.then()` instead of `.map()`, async closures)
+
+**Solution**: Consult futures/tokio-stream documentation for Stream combinators.
+
+---
+
 ## Decision Matrix for Consumers
 
 ### Choose Sync Mode If:
@@ -272,6 +375,68 @@ async fn read_delta_table(path: &str) -> Result<impl Stream<Item = Result<Record
 - ✅ You're willing to manage a tokio runtime
 - ✅ You want cutting-edge performance
 - ✅ You're okay with more complex code
+
+### Decision Flowchart
+
+```
+                      START: Choose Your Mode
+                              │
+                              ▼
+                    ┌──────────────────────┐
+                    │ Are you writing      │
+                    │ C/C++ FFI consumer?  │
+                    └──────────┬───────────┘
+                              │
+                 ┌────────────┴────────────┐
+                 │                         │
+                YES                        NO
+                 │                         │
+                 ▼                         ▼
+         ┌──────────────┐      ┌──────────────────┐
+         │  USE SYNC    │      │ Is your app      │
+         │   MODE       │      │ already async?   │
+         │              │      │ (using tokio,    │
+         │ (No choice!) │      │  actix, etc.)    │
+         └──────────────┘      └─────┬────────────┘
+                                     │
+                         ┌───────────┴───────────┐
+                         │                       │
+                        YES                      NO
+                         │                       │
+                         ▼                       ▼
+                ┌─────────────────┐    ┌────────────────────┐
+                │ Do you need     │    │ Is your app a      │
+                │ max performance │    │ simple CLI tool?   │
+                │ or composing    │    └─────┬──────────────┘
+                │ with other      │          │
+                │ async code?     │    ┌─────┴─────┐
+                └────┬────────────┘    │           │
+                     │                YES          NO
+              ┌──────┴──────┐          │           │
+              │             │          │           ▼
+             YES            NO         │    ┌───────────────┐
+              │             │          │    │ Do you need   │
+              │             │          │    │ complex       │
+              │             │          │    │ concurrency?  │
+              │             │          │    └───┬───────────┘
+              │             │          │        │
+              │             │          │  ┌─────┴─────┐
+              │             │          │  │           │
+              │             │          │ YES          NO
+              │             │          │  │           │
+              ▼             ▼          ▼  ▼           ▼
+        ┌──────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐
+        │   USE    │  │   USE   │  │   USE   │  │   USE   │
+        │  ASYNC   │  │  SYNC   │  │  SYNC   │  │  SYNC   │
+        │   MODE   │  │  MODE   │  │  MODE   │  │  MODE   │
+        │          │  │         │  │         │  │         │
+        │ Get max  │  │ Simpler │  │ Simpler │  │ Simpler │
+        │ perf!    │  │ mental  │  │ & proven│  │ & less  │
+        │          │  │ model   │  │         │  │ deps    │
+        └──────────┘  └─────────┘  └─────────┘  └─────────┘
+```
+
+**Rule of thumb**: Default to sync unless you have a specific reason for async.
 
 ---
 
