@@ -6,6 +6,22 @@
 
 ---
 
+## Table of Contents
+
+- [TL;DR](#tldr)
+- [Key Findings](#key-findings)
+- [The Multi-threaded Example: A Case Study](#the-multi-threaded-example-a-case-study)
+- [Test Suite Migration](#test-suite-migration)
+- [Real-World Migration Examples](#real-world-migration-examples)
+- [Performance Implications](#performance-implications)
+- [Common Pitfalls and Gotchas](#common-pitfalls-and-gotchas)
+- [Decision Matrix for Consumers](#decision-matrix-for-consumers)
+- [Migration Timeline Recommendation](#migration-timeline-recommendation)
+- [Open Questions](#open-questions)
+- [Conclusion](#conclusion)
+
+---
+
 ## TL;DR
 
 The async macro approach would make kernel APIs conditionally async/sync based on feature flags. Here's what happens to each consumer:
@@ -32,7 +48,11 @@ The async macro approach would make kernel APIs conditionally async/sync based o
 
 This achieves **zero logic duplication** across both challenges.
 
-**For complete technical details**, see [async-macro-approach.md § The Approach](async-macro-approach.md#the-approach) for the two challenges and their solutions.
+**For complete technical details**, see [async-macro-approach.md](async-macro-approach.md):
+- [The Two Challenges](async-macro-approach.md#the-two-challenges) - Why sync/async duplication is hard
+- [The Approach](async-macro-approach.md#the-approach) - How we solve it with 6 components
+- [Infrastructure Components](async-macro-approach.md#infrastructure-components) - Detailed implementations
+- [Feature Flags](async-macro-approach.md#feature-flags-and-build-configuration) - Build configuration guide
 
 ### 2. FFI Layer Can Stay Untouched
 
@@ -520,7 +540,6 @@ The async ecosystem would benefit significantly, and the backward compatibility 
 
 ## Further Reading
 
-- Full analysis: `async-consumer-impact-analysis.md`
-- Macro approach details: `async-macro-approach.md`
-- Control flow analysis: `CONTROL-FLOW-SUMMARY.md`
+- **Complete technical proposal**: [async-macro-approach.md](async-macro-approach.md)
+- **Entry point**: [README-ASYNC.md](README-ASYNC.md)
 

@@ -5,6 +5,28 @@
 
 ---
 
+## Table of Contents
+
+- [Executive Summary](#executive-summary)
+- [The Two Challenges](#the-two-challenges)
+- [The Approach](#the-approach)
+- [Infrastructure Components](#infrastructure-components)
+  - [1. `#[async_fn]` Macro](#1-async_fn-macro)
+  - [2. `await_!()` Macro](#2-await-macro)
+  - [3. `#[async_trait]` Macro](#3-async_trait-macro)
+  - [4. `AsyncIterator` Trait](#4-asynciterator-trait)
+  - [5. `BoxedAsyncIterator` Type Alias](#5-boxedasynciterator-type-alias)
+  - [6. Bridge Adapters](#6-bridge-adapters)
+- [Three-Layer Architecture](#three-layer-architecture)
+- [Feature Flags and Build Configuration](#feature-flags-and-build-configuration)
+- [Real Code Migration Examples](#real-code-migration-examples)
+- [Implementation Plan](#implementation-plan)
+- [Risk Assessment and Mitigation](#risk-assessment-and-mitigation)
+- [Open Questions](#open-questions)
+- [Next Steps](#next-steps)
+
+---
+
 ## Executive Summary
 
 **Can we eliminate sync/async code duplication using proc macros?**
@@ -108,7 +130,7 @@ The kernel **already uses async I/O under the hood** and exposes a sync API by b
 
 ---
 
-## The Approach
+## The Two Challenges
 
 Delta-kernel-rs faces two fundamental challenges when trying to eliminate sync/async duplication.
 
@@ -327,6 +349,8 @@ impl ParquetHandler for DefaultParquetHandler {
 **Result:** Single source using unified `.async_*()` methods, `impl AsyncIterator` returns, and `BoxedAsyncIterator` for trait boundaries.
 
 ---
+
+## The Approach
 
 ### Challenge-Solution Mapping
 
@@ -1224,7 +1248,7 @@ Methods we may add later:
 
 But for MVP, the 6 core methods handle all current use cases.
 
-**Detailed Analysis**: See [ASYNC-ITERATOR-ANALYSIS.md](ASYNC-ITERATOR-ANALYSIS.md) for complete call chain tracing and categorization by module (core kernel vs. engine vs. tests).
+**Note**: This analysis was conducted during the exploration phase to ensure all async callsites are properly handled.
 
 
 ---
@@ -1418,4 +1442,8 @@ compile_error!("The FFI crate does not support async mode. FFI must use synchron
 
 ---
 
+## Further Reading
+
+- **Consumer impact summary**: [ASYNC-CONSUMER-SUMMARY.md](ASYNC-CONSUMER-SUMMARY.md) - Migration examples, decision matrix, gotchas
+- **Entry point**: [README-ASYNC.md](README-ASYNC.md) - Quick overview and navigation
 
