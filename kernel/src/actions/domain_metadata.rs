@@ -12,7 +12,10 @@ use crate::actions::visitors::DomainMetadataVisitor;
 use crate::actions::{DomainMetadata, DOMAIN_METADATA_NAME};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
-use crate::{DeltaResult, Engine, Expression as Expr, PredicateRef, RowVisitor as _, async_fn, await_, AsyncIterator};
+use crate::{
+    async_fn, await_, AsyncIterator, DeltaResult, Engine, Expression as Expr, PredicateRef,
+    RowVisitor as _,
+};
 
 const DOMAIN_METADATA_DOMAIN_FIELD: &str = "domain";
 

@@ -14,8 +14,9 @@ use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::SchemaRef;
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, EngineData, Error, Expression, FileMeta, ParquetHandler, Predicate,
-    PredicateRef, RowVisitor, StorageHandler, Version, async_fn, await_, async_closure, AsyncIterator
+    async_closure, async_fn, await_, AsyncIterator, DeltaResult, Engine, EngineData, Error,
+    Expression, FileMeta, ParquetHandler, Predicate, PredicateRef, RowVisitor, StorageHandler,
+    Version,
 };
 use delta_kernel_derive::internal_api;
 
@@ -295,14 +296,12 @@ impl LogSegment {
     ) -> DeltaResult<impl AsyncIterator<Item = DeltaResult<ActionsBatch>>> {
         // `replay` expects commit files to be sorted in descending order, so the return value here is correct
         let commits_and_compactions = self.find_commit_cover();
-        let commit_stream = await_!(engine
-            .json_handler()
-            .read_json_files(
-                &commits_and_compactions,
-                commit_read_schema,
-                meta_predicate.clone(),
-            ))?
-            .async_map_ok(|batch| ActionsBatch::new(batch, true));
+        let commit_stream = await_!(engine.json_handler().read_json_files(
+            &commits_and_compactions,
+            commit_read_schema,
+            meta_predicate.clone(),
+        ))?
+        .async_map_ok(|batch| ActionsBatch::new(batch, true));
 
         let checkpoint_stream =
             await_!(self.create_checkpoint_stream(engine, checkpoint_read_schema, meta_predicate))?;
@@ -404,12 +403,13 @@ impl LogSegment {
                     meta_predicate.clone(),
                 ))?
             }
-            Some(parsed_log_path) if parsed_log_path.extension == "parquet" => await_!(parquet_handler
-                .read_parquet_files(
+            Some(parsed_log_path) if parsed_log_path.extension == "parquet" => {
+                await_!(parquet_handler.read_parquet_files(
                     &checkpoint_file_meta,
                     checkpoint_read_schema.clone(),
                     meta_predicate.clone(),
-                ))?,
+                ))?
+            }
             Some(parsed_log_path) => {
                 return Err(Error::generic(format!(
                     "Unsupported checkpoint file type: {}",
@@ -424,36 +424,38 @@ impl LogSegment {
         let log_root = self.log_root.clone();
 
         let actions_iter = actions
-            .async_then(async_closure!(move |checkpoint_batch_result| -> DeltaResult<_> {
-                let checkpoint_batch = checkpoint_batch_result?;
-                // This closure maps the checkpoint batch to an iterator of batches
-                // by chaining the checkpoint batch with sidecar batches if they exist.
+            .async_then(async_closure!(
+                move |checkpoint_batch_result| -> DeltaResult<_> {
+                    let checkpoint_batch = checkpoint_batch_result?;
+                    // This closure maps the checkpoint batch to an iterator of batches
+                    // by chaining the checkpoint batch with sidecar batches if they exist.
 
-                // 1. In the case where the schema does not contain file actions, we return the
-                //    checkpoint batch directly as sidecar files only have to be read when the
-                //    schema contains add/remove action.
-                // 2. Multi-part checkpoint batches never have sidecar actions, so the batch is
-                //    returned as-is.
-                let sidecar_content = if need_file_actions && checkpoint_file_meta.len() == 1 {
-                    await_!(Self::process_sidecars(
-                        parquet_handler.clone(), // cheap Arc clone
-                        log_root.clone(),
-                        checkpoint_batch.as_ref(),
-                        checkpoint_read_schema.clone(),
-                        meta_predicate.clone(),
-                    ))?
-                } else {
-                    None
-                };
+                    // 1. In the case where the schema does not contain file actions, we return the
+                    //    checkpoint batch directly as sidecar files only have to be read when the
+                    //    schema contains add/remove action.
+                    // 2. Multi-part checkpoint batches never have sidecar actions, so the batch is
+                    //    returned as-is.
+                    let sidecar_content = if need_file_actions && checkpoint_file_meta.len() == 1 {
+                        await_!(Self::process_sidecars(
+                            parquet_handler.clone(), // cheap Arc clone
+                            log_root.clone(),
+                            checkpoint_batch.as_ref(),
+                            checkpoint_read_schema.clone(),
+                            meta_predicate.clone(),
+                        ))?
+                    } else {
+                        None
+                    };
 
-                let combined_batches = std::iter::once(Ok(checkpoint_batch))
-                    .chain(sidecar_content.into_iter().flatten())
-                    // The boolean flag indicates whether the batch originated from a commit file
-                    // (true) or a checkpoint file (false).
-                    .map_ok(|sidecar_batch| ActionsBatch::new(sidecar_batch, false));
+                    let combined_batches = std::iter::once(Ok(checkpoint_batch))
+                        .chain(sidecar_content.into_iter().flatten())
+                        // The boolean flag indicates whether the batch originated from a commit file
+                        // (true) or a checkpoint file (false).
+                        .map_ok(|sidecar_batch| ActionsBatch::new(sidecar_batch, false));
 
-                Ok(combined_batches)
-            }))
+                    Ok(combined_batches)
+                }
+            ))
             .async_flatten_ok()
             .async_map(|x| x?);
 

@@ -10,7 +10,7 @@ use crate::log_replay::LogReplayProcessor;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::table_properties::TableProperties;
-use crate::{DeltaResult, Engine, Error, SnapshotRef, Version, async_fn, await_};
+use crate::{async_fn, await_, DeltaResult, Engine, Error, SnapshotRef, Version};
 
 /// Determine if log compaction should be performed based on the commit version and
 /// compaction interval.

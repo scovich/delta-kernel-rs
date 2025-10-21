@@ -30,7 +30,10 @@ use crate::schema::{
 use crate::snapshot::SnapshotRef;
 use crate::table_features::ColumnMappingMode;
 use crate::transforms::TransformSpec;
-use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Version, async_fn, await_, into_async_iter, async_closure, BoxedAsyncIterator, AsyncIterator};
+use crate::{
+    async_closure, async_fn, await_, into_async_iter, AsyncIterator, BoxedAsyncIterator,
+    DeltaResult, Engine, EngineData, Error, FileMeta, Version,
+};
 
 use self::log_replay::scan_action_iter;
 
@@ -573,14 +576,15 @@ impl Scan {
             Some(log_segment.end_version),
         )?;
 
-        let it = await_!(new_log_segment
-            .read_actions(
-                engine,
-                COMMIT_READ_SCHEMA.clone(),
-                CHECKPOINT_READ_SCHEMA.clone(),
-                None,
-            ))?
-            .async_chain(into_async_iter(existing_data.into_iter().map(apply_transform)));
+        let it = await_!(new_log_segment.read_actions(
+            engine,
+            COMMIT_READ_SCHEMA.clone(),
+            CHECKPOINT_READ_SCHEMA.clone(),
+            None,
+        ))?
+        .async_chain(into_async_iter(
+            existing_data.into_iter().map(apply_transform),
+        ));
 
         Ok(self.scan_metadata_inner(engine, it)?.into_boxed())
     }
@@ -590,7 +594,8 @@ impl Scan {
         engine: &dyn Engine,
         action_batch_iter: impl AsyncIterator<Item = DeltaResult<ActionsBatch>>,
     ) -> DeltaResult<impl AsyncIterator<Item = DeltaResult<ScanMetadata>>> {
-        let it = (!matches!(self.state_info.physical_predicate, PhysicalPredicate::StaticSkipAll))
+        let state = &self.state_info;
+        let it = (!matches!(state.physical_predicate, PhysicalPredicate::StaticSkipAll))
             .then(|| scan_action_iter(engine, action_batch_iter, self.state_info.clone()));
         Ok(into_async_iter(it).async_flatten())
     }
@@ -696,8 +701,7 @@ impl Scan {
                 let engine = engine.clone(); // Arc clone
                 let physical_schema = physical_schema.clone();
                 let logical_schema = logical_schema.clone();
-                Ok(read_result_iter.async_map(move |read_result| -> DeltaResult<_> {
-                    let read_result = read_result?;
+                Ok(read_result_iter.async_map_ok(move |read_result| {
                     // transform the physical data into the correct logical form
                     let logical = state::transform_to_logical(
                         engine.as_ref(),
@@ -718,7 +722,7 @@ impl Scan {
                         raw_mask: sv,
                     };
                     selection_vector = rest;
-                    Ok(result)
+                    result
                 }))
             }))
             // AsyncIterator<DeltaResult<AsyncIterator<DeltaResult<ScanResult>>>> to AsyncIterator<DeltaResult<ScanResult>>
@@ -1016,8 +1020,8 @@ pub(crate) mod test_utils {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use itertools::Itertools as _;
+    use std::path::PathBuf;
 
     use crate::arrow::array::BooleanArray;
     use crate::arrow::compute::filter_record_batch;

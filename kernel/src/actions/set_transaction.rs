@@ -5,7 +5,10 @@ use crate::actions::visitors::SetTransactionVisitor;
 use crate::actions::{SetTransaction, SET_TRANSACTION_NAME};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
-use crate::{DeltaResult, Engine, Expression as Expr, PredicateRef, RowVisitor as _, async_fn, await_, AsyncIterator};
+use crate::{
+    async_fn, await_, AsyncIterator, DeltaResult, Engine, Expression as Expr, PredicateRef,
+    RowVisitor as _,
+};
 
 pub(crate) use crate::actions::visitors::SetTransactionMap;
 
@@ -42,7 +45,12 @@ impl SetTransactionScanner {
         engine: &dyn Engine,
         expiration_timestamp: Option<i64>,
     ) -> DeltaResult<SetTransactionMap> {
-        await_!(scan_application_transactions(log_segment, None, engine, expiration_timestamp))
+        await_!(scan_application_transactions(
+            log_segment,
+            None,
+            engine,
+            expiration_timestamp
+        ))
     }
 }
 

@@ -23,7 +23,10 @@ use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_sche
 use crate::table_changes::{check_cdf_table_properties, ensure_cdf_read_supported};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, EngineData, Error, PredicateRef, RowVisitor, async_fn, await_, into_async_iter, async_closure, AsyncIterator};
+use crate::{
+    async_closure, async_fn, await_, into_async_iter, AsyncIterator, DeltaResult, Engine,
+    EngineData, Error, PredicateRef, RowVisitor,
+};
 
 #[cfg(test)]
 mod tests;
@@ -62,9 +65,13 @@ where
     let filter = DataSkippingFilter::new(engine.as_ref(), physical_predicate).map(Arc::new);
     let result = into_async_iter(commit_files)
         .async_then(async_closure!(move |commit_file| -> DeltaResult<_> {
-            let scanner = await_!(LogReplayScanner::try_new(engine.as_ref(), commit_file, &table_schema))?;
+            let scanner = await_!(LogReplayScanner::try_new(
+                engine.as_ref(),
+                commit_file,
+                &table_schema
+            ))?;
             await_!(scanner.into_scan_batches(engine.clone(), filter.clone()))
-        }))  //AsyncIterator-Result-Iterator-Result
+        })) //AsyncIterator-Result-Iterator-Result
         .async_flatten_ok() // AsyncIterator-Result-Result
         .async_map(|x| x?); // AsyncIterator-Result
     Ok(result)

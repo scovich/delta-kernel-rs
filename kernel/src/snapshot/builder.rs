@@ -2,7 +2,7 @@
 use crate::log_segment::LogSegment;
 use crate::snapshot::SnapshotRef;
 use crate::LogPath;
-use crate::{DeltaResult, Engine, Error, Snapshot, Version, async_fn, await_};
+use crate::{async_fn, await_, DeltaResult, Engine, Error, Snapshot, Version};
 
 use url::Url;
 
@@ -90,14 +90,24 @@ impl SnapshotBuilder {
                 log_tail,
                 self.version,
             )?;
-            Ok(await_!(Snapshot::try_new_from_log_segment(table_root, log_segment, engine))?.into())
+            Ok(await_!(Snapshot::try_new_from_log_segment(
+                table_root,
+                log_segment,
+                engine
+            ))?
+            .into())
         } else {
             let existing_snapshot = self.existing_snapshot.ok_or_else(|| {
                 Error::internal_error(
                     "SnapshotBuilder should have either table_root or existing_snapshot",
                 )
             })?;
-            await_!(Snapshot::try_new_from(existing_snapshot, log_tail, engine, self.version))
+            await_!(Snapshot::try_new_from(
+                existing_snapshot,
+                log_tail,
+                engine,
+                self.version
+            ))
         }
     }
 }

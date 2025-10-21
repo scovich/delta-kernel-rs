@@ -4,9 +4,9 @@
 //! When the async feature is disabled, this module is re-exported as the main kernel utilities.
 
 use crate::DeltaResult;
-use std::future::Future;
 use futures::stream::{Stream, StreamExt as _};
 use itertools::Itertools as _;
+use std::future::Future;
 
 // Re-export macros
 pub use delta_kernel_derive::{async_fn, async_trait};
@@ -14,7 +14,9 @@ pub use delta_kernel_derive::{async_fn, async_trait};
 /// Conditionally adds `.await` to an expression (no-op in sync mode)
 #[macro_export]
 macro_rules! await_ {
-    ($e:expr) => { $e };
+    ($e:expr) => {
+        $e
+    };
 }
 
 /// Cooperative yielding for long-running synchronous operations
@@ -73,7 +75,6 @@ pub trait AsyncIterator: Iterator + Send + 'static {
     ///
     /// In sync mode, this is just a wrapper around `Iterator::next()`.
     /// In async mode, this becomes `.await` on the stream's poll.
-    #[allow(clippy::should_implement_trait)]
     fn async_next(&mut self) -> Option<Self::Item> {
         self.next()
     }
@@ -226,9 +227,7 @@ where
     T: Send + 'static,
 {
     let mut stream = Box::pin(futures::executor::block_on(stream_future)?);
-    let iter = std::iter::from_fn(move || {
-        futures::executor::block_on(async { stream.next().await })
-    });
+    let iter =
+        std::iter::from_fn(move || futures::executor::block_on(async { stream.next().await }));
     Ok(iter.into_boxed())
 }
-

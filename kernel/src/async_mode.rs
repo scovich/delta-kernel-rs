@@ -17,7 +17,9 @@ pub use delta_kernel_derive::async_fn;
 /// Conditionally adds `.await` to an expression (adds .await in async mode)
 #[macro_export]
 macro_rules! await_ {
-    ($e:expr) => { $e.await };
+    ($e:expr) => {
+        $e.await
+    };
 }
 
 /// Cooperative yielding for long-running synchronous operations
@@ -159,7 +161,7 @@ pub trait AsyncIterator: Stream + Send + 'static {
     /// Try fold with early exit on error
     ///
     /// This method requires the stream to yield `Result` types.
-    /// The closure receives the unwrapped `Ok` value and is **synchronous** 
+    /// The closure receives the unwrapped `Ok` value and is **synchronous**
     /// (returns `Result<B, E>`, not `Future<Output = Result<B, E>>`).
     ///
     /// Note: Unlike `TryStreamExt::try_fold`, this takes a sync closure for consistency
@@ -172,7 +174,8 @@ pub trait AsyncIterator: Stream + Send + 'static {
         Self::Ok: Send + 'static,
         Self::Error: Send + 'static,
     {
-        self.try_fold(init, |acc, item| future::ready(f(acc, item))).await
+        self.try_fold(init, |acc, item| future::ready(f(acc, item)))
+            .await
     }
 
     /// Map over the successful values in a Result-yielding stream
@@ -258,4 +261,3 @@ where
     let stream = stream_future.await?;
     Ok(stream.into_boxed())
 }
-

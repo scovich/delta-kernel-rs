@@ -3,8 +3,8 @@ use quote::{quote, quote_spanned, ToTokens};
 use syn::parse_macro_input;
 use syn::spanned::Spanned;
 use syn::{
-    Data, DataStruct, DeriveInput, Error, Fields, Item, ItemFn, Meta, PathArguments, TraitItemFn, Type,
-    Visibility,
+    Data, DataStruct, DeriveInput, Error, Fields, Item, ItemFn, Meta, PathArguments, TraitItemFn,
+    Type, Visibility,
 };
 
 /// Parses a dot-delimited column name into an array of field names. See
@@ -291,8 +291,9 @@ pub fn async_fn(
     } else {
         Error::new(
             proc_macro2::Span::call_site(),
-            "#[async_fn] can only be applied to functions or trait methods"
-        ).to_compile_error()
+            "#[async_fn] can only be applied to functions or trait methods",
+        )
+        .to_compile_error()
     };
 
     item.into()

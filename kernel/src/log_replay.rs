@@ -16,7 +16,7 @@
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::scan::data_skipping::DataSkippingFilter;
-use crate::{DeltaResult, EngineData, AsyncIterator};
+use crate::{AsyncIterator, DeltaResult, EngineData};
 
 use delta_kernel_derive::internal_api;
 

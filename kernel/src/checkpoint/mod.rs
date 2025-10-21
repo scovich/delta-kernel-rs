@@ -102,7 +102,9 @@ use crate::path::ParsedLogPath;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::snapshot::SnapshotRef;
 use crate::table_properties::TableProperties;
-use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta, async_fn, await_};
+use crate::{
+    async_fn, await_, DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta,
+};
 
 use url::Url;
 

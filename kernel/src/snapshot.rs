@@ -17,7 +17,7 @@ use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration
 use crate::table_properties::TableProperties;
 use crate::transaction::Transaction;
 use crate::LogCompactionWriter;
-use crate::{DeltaResult, Engine, Error, Version, async_fn, await_};
+use crate::{async_fn, await_, DeltaResult, Engine, Error, Version};
 use delta_kernel_derive::internal_api;
 
 mod builder;

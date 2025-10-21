@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::engine_data::RowVisitor;
-use crate::{DeltaResult, Engine, Error, FileMeta, Version, async_fn, await_};
+use crate::{async_fn, await_, DeltaResult, Engine, Error, FileMeta, Version};
 use delta_kernel_derive::internal_api;
 
 use url::Url;

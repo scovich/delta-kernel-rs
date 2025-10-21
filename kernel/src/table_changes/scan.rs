@@ -8,7 +8,10 @@ use crate::actions::deletion_vector::split_vector;
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
 use crate::scan::{PhysicalPredicate, ScanResult, StateInfo};
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, Engine, FileMeta, PredicateRef, async_fn, await_, into_async_iter, AsyncIterator, async_closure};
+use crate::{
+    async_closure, async_fn, await_, into_async_iter, AsyncIterator, DeltaResult, Engine, FileMeta,
+    PredicateRef,
+};
 
 use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
 use super::physical_to_logical::{get_cdf_transform_expr, scan_file_physical_schema};
@@ -207,15 +210,17 @@ impl TableChangesScan {
                 resolve_scan_file_dv(dv_engine_ref.as_ref(), &table_root1, scan_file?)
             }) // AsyncIterator-Result-Iterator
             .async_flatten_ok() // AsyncIterator-Result
-            .async_then(async_closure!(move |resolved_scan_file| -> DeltaResult<_> {
-                await_!(read_scan_file(
-                    engine.as_ref(),
-                    resolved_scan_file?,
-                    &table_root2,
-                    state_info.as_ref(),
-                    physical_predicate.clone(),
-                ))
-            })) // AsyncIterator-Result-AsyncIterator-Result
+            .async_then(async_closure!(
+                move |resolved_scan_file| -> DeltaResult<_> {
+                    await_!(read_scan_file(
+                        engine.as_ref(),
+                        resolved_scan_file?,
+                        &table_root2,
+                        state_info.as_ref(),
+                        physical_predicate.clone(),
+                    ))
+                }
+            )) // AsyncIterator-Result-AsyncIterator-Result
             .async_flatten_ok() // AsyncIterator-Result-Result
             .async_map(|x| x?); // AsyncIterator-Result
 
