@@ -553,6 +553,7 @@ pub trait StorageHandler: AsAny {
 /// Delta Kernel can use this handler to parse JSON strings into Row or read content from JSON files.
 /// Connectors can leverage this trait to provide their best implementation of the JSON parsing
 /// capability to Delta Kernel.
+#[async_trait]
 pub trait JsonHandler: AsAny {
     /// Parse the given json strings and return the fields requested by output schema as columns in [`EngineData`].
     /// json_strings MUST be a single column batch of engine data, and the column type must be string
@@ -582,6 +583,7 @@ pub trait JsonHandler: AsAny {
     /// - `files` - File metadata for files to be read.
     /// - `physical_schema` - Select list of columns to read from the JSON file.
     /// - `predicate` - Optional push-down predicate hint (engine is free to ignore it).
+    #[async_fn]
     fn read_json_files(
         &self,
         files: &[FileMeta],
@@ -623,6 +625,7 @@ pub trait JsonHandler: AsAny {
 ///
 /// Connectors can leverage this trait to provide their own custom
 /// implementation of Parquet data file functionalities to Delta Kernel.
+#[async_trait]
 pub trait ParquetHandler: AsAny {
     /// Read and parse the Parquet file at given locations and return the data as EngineData with
     /// the columns requested by physical schema. The ParquetHandler _must_ return exactly the
@@ -692,6 +695,7 @@ pub trait ParquetHandler: AsAny {
     ///    iter: [EngineData(2, 1, 3)]
     ///
     /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey
+    #[async_fn]
     fn read_parquet_files(
         &self,
         files: &[FileMeta],

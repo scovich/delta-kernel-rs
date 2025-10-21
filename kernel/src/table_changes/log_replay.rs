@@ -23,9 +23,7 @@ use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_sche
 use crate::table_changes::{check_cdf_table_properties, ensure_cdf_read_supported};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, EngineData, Error, PredicateRef, RowVisitor};
-
-use itertools::Itertools;
+use crate::{DeltaResult, Engine, EngineData, Error, PredicateRef, RowVisitor, async_fn, await_, into_async_iter, async_closure, AsyncIterator};
 
 #[cfg(test)]
 mod tests;
@@ -50,21 +48,25 @@ pub(crate) struct TableChangesScanMetadata {
 ///
 /// Note: The [`ParsedLogPath`]s in the `commit_files` iterator must be ordered, contiguous
 /// (JSON) commit files.
-pub(crate) fn table_changes_action_iter(
+#[async_fn]
+pub(crate) fn table_changes_action_iter<I>(
     engine: Arc<dyn Engine>,
-    commit_files: impl IntoIterator<Item = ParsedLogPath>,
+    commit_files: I,
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
+) -> DeltaResult<impl AsyncIterator<Item = DeltaResult<TableChangesScanMetadata>>>
+where
+    I: IntoIterator<Item = ParsedLogPath>,
+    I::IntoIter: Send + 'static,
+{
     let filter = DataSkippingFilter::new(engine.as_ref(), physical_predicate).map(Arc::new);
-    let result = commit_files
-        .into_iter()
-        .map(move |commit_file| -> DeltaResult<_> {
-            let scanner = LogReplayScanner::try_new(engine.as_ref(), commit_file, &table_schema)?;
-            scanner.into_scan_batches(engine.clone(), filter.clone())
-        }) //Iterator-Result-Iterator-Result
-        .flatten_ok() // Iterator-Result-Result
-        .map(|x| x?); // Iterator-Result
+    let result = into_async_iter(commit_files)
+        .async_then(async_closure!(move |commit_file| -> DeltaResult<_> {
+            let scanner = await_!(LogReplayScanner::try_new(engine.as_ref(), commit_file, &table_schema))?;
+            await_!(scanner.into_scan_batches(engine.clone(), filter.clone()))
+        }))  //AsyncIterator-Result-Iterator-Result
+        .async_flatten_ok() // AsyncIterator-Result-Result
+        .async_map(|x| x?); // AsyncIterator-Result
     Ok(result)
 }
 
@@ -142,6 +144,7 @@ impl LogReplayScanner {
     /// 3. Perform validation on each protocol and metadata action in the commit.
     ///
     /// For more details, see the documentation for [`LogReplayScanner`].
+    #[async_fn]
     fn try_new(
         engine: &dyn Engine,
         commit_file: ParsedLogPath,
@@ -158,11 +161,11 @@ impl LogReplayScanner {
         // As a result, we would read the file path for the remove action, which is unnecessary because
         // all of the rows will be filtered by the predicate. Instead, we wait until deletion
         // vectors are resolved so that we can skip both actions in the pair.
-        let action_iter = engine.json_handler().read_json_files(
+        let action_iter = await_!(engine.json_handler().read_json_files(
             slice::from_ref(&commit_file.location),
             visitor_schema,
             None, // not safe to apply data skipping yet
-        )?;
+        ))?;
 
         let mut remove_dvs = HashMap::default();
         let mut add_paths = HashSet::default();
@@ -215,11 +218,12 @@ impl LogReplayScanner {
     /// Generates an iterator of [`TableChangesScanMetadata`] by iterating over each action of the
     /// commit, generating a selection vector, and transforming the engine data. This performs
     /// phase 2 of [`LogReplayScanner`].
+    #[async_fn]
     fn into_scan_batches(
         self,
         engine: Arc<dyn Engine>,
         filter: Option<Arc<DataSkippingFilter>>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
+    ) -> DeltaResult<impl AsyncIterator<Item = DeltaResult<TableChangesScanMetadata>>> {
         let Self {
             has_cdc_action,
             remove_dvs,
@@ -230,11 +234,11 @@ impl LogReplayScanner {
         let remove_dvs = Arc::new(remove_dvs);
 
         let schema = FileActionSelectionVisitor::schema();
-        let action_iter = engine.json_handler().read_json_files(
+        let action_iter = await_!(engine.json_handler().read_json_files(
             slice::from_ref(&commit_file.location),
             schema,
             None,
-        )?;
+        ))?;
         let commit_version = commit_file
             .version
             .try_into()
@@ -245,7 +249,7 @@ impl LogReplayScanner {
             cdf_scan_row_schema().into(),
         );
 
-        let result = action_iter.map(move |actions| -> DeltaResult<_> {
+        let result = action_iter.async_map(move |actions| -> DeltaResult<_> {
             let actions = actions?;
 
             // Apply data skipping to get back a selection vector for actions that passed skipping.

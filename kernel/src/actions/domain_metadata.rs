@@ -12,7 +12,7 @@ use crate::actions::visitors::DomainMetadataVisitor;
 use crate::actions::{DomainMetadata, DOMAIN_METADATA_NAME};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
-use crate::{DeltaResult, Engine, Expression as Expr, PredicateRef, RowVisitor as _};
+use crate::{DeltaResult, Engine, Expression as Expr, PredicateRef, RowVisitor as _, async_fn, await_, AsyncIterator};
 
 const DOMAIN_METADATA_DOMAIN_FIELD: &str = "domain";
 
@@ -24,12 +24,13 @@ pub(crate) type DomainMetadataMap = HashMap<String, DomainMetadata>;
 /// these before returning domains to the user.
 // TODO we should have some finer-grained unit tests here instead of relying on the top-level
 // snapshot tests.
+#[async_fn]
 pub(crate) fn domain_metadata_configuration(
     log_segment: &LogSegment,
     domain: &str,
     engine: &dyn Engine,
 ) -> DeltaResult<Option<String>> {
-    let mut domain_metadatas = scan_domain_metadatas(log_segment, Some(domain), engine)?;
+    let mut domain_metadatas = await_!(scan_domain_metadatas(log_segment, Some(domain), engine))?;
     Ok(domain_metadatas
         .remove(domain)
         .map(|domain_metadata| domain_metadata.configuration))
@@ -38,6 +39,7 @@ pub(crate) fn domain_metadata_configuration(
 /// Scan the entire log for all domain metadata actions but terminate early if a specific domain
 /// is provided. Note that this returns the latest domain metadata for each domain, accounting for
 /// tombstones (removed=true) - that is, removed domain metadatas will _never_ be returned.
+#[async_fn]
 fn scan_domain_metadatas(
     log_segment: &LogSegment,
     domain: Option<&str>,
@@ -46,7 +48,8 @@ fn scan_domain_metadatas(
     let mut visitor = DomainMetadataVisitor::new(domain.map(|s| s.to_owned()));
     // If a specific domain is requested then we can terminate log replay early as soon as it was
     // found. If all domains are requested then we are forced to replay the entire log.
-    for actions in replay_for_domain_metadatas(log_segment, engine)? {
+    let mut actions_iter = await_!(replay_for_domain_metadatas(log_segment, engine))?;
+    while let Some(actions) = await_!(actions_iter.async_next()) {
         // throw away is_log_batch since we don't care
         let domain_metadatas = actions?.actions;
         visitor.visit_rows_of(domain_metadatas.as_ref())?;
@@ -61,20 +64,21 @@ fn scan_domain_metadatas(
     Ok(visitor.into_domain_metadatas())
 }
 
+#[async_fn]
 fn replay_for_domain_metadatas(
     log_segment: &LogSegment,
     engine: &dyn Engine,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+) -> DeltaResult<impl AsyncIterator<Item = DeltaResult<ActionsBatch>>> {
     let schema = get_log_domain_metadata_schema();
     static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
         Some(Arc::new(
             Expr::column([DOMAIN_METADATA_NAME, DOMAIN_METADATA_DOMAIN_FIELD]).is_not_null(),
         ))
     });
-    log_segment.read_actions(
+    await_!(log_segment.read_actions(
         engine,
         schema.clone(), // Arc clone
         schema.clone(), // Arc clone
         META_PREDICATE.clone(),
-    )
+    ))
 }

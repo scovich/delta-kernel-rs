@@ -2,14 +2,13 @@
 
 use std::sync::Arc;
 
-use itertools::Itertools;
 use url::Url;
 
 use crate::actions::deletion_vector::split_vector;
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
 use crate::scan::{PhysicalPredicate, ScanResult, StateInfo};
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, Engine, FileMeta, PredicateRef};
+use crate::{DeltaResult, Engine, FileMeta, PredicateRef, async_fn, await_, into_async_iter, AsyncIterator, async_closure};
 
 use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
 use super::physical_to_logical::{get_cdf_transform_expr, scan_file_physical_schema};
@@ -189,33 +188,36 @@ impl TableChangesScan {
     /// to read and process all the data for the query. Each [`ScanResult`] in the resultant iterator
     /// encapsulates the raw data and an optional boolean vector built from the deletion vector if it
     /// was present. See the documentation for [`ScanResult`] for more details.
+    #[async_fn]
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>> + use<'_>> {
+    ) -> DeltaResult<impl AsyncIterator<Item = DeltaResult<ScanResult>>> {
         let scan_metadata = self.scan_metadata(engine.clone())?;
         let scan_files = scan_metadata_to_scan_file(scan_metadata);
 
-        let table_root = self.table_changes.table_root().clone();
+        let table_root1 = self.table_root().clone();
+        let table_root2 = table_root1.clone();
         let state_info = self.state_info.clone();
+        let physical_predicate = self.physical_predicate().clone();
         let dv_engine_ref = engine.clone();
 
-        let result = scan_files
-            .map(move |scan_file| {
-                resolve_scan_file_dv(dv_engine_ref.as_ref(), &table_root, scan_file?)
-            }) // Iterator-Result-Iterator
-            .flatten_ok() // Iterator-Result
-            .map(move |resolved_scan_file| -> DeltaResult<_> {
-                read_scan_file(
+        let result = into_async_iter(scan_files)
+            .async_map(move |scan_file| {
+                resolve_scan_file_dv(dv_engine_ref.as_ref(), &table_root1, scan_file?)
+            }) // AsyncIterator-Result-Iterator
+            .async_flatten_ok() // AsyncIterator-Result
+            .async_then(async_closure!(move |resolved_scan_file| -> DeltaResult<_> {
+                await_!(read_scan_file(
                     engine.as_ref(),
                     resolved_scan_file?,
-                    self.table_root(),
+                    &table_root2,
                     state_info.as_ref(),
-                    self.physical_predicate(),
-                )
-            }) // Iterator-Result-Iterator-Result
-            .flatten_ok() // Iterator-Result-Result
-            .map(|x| x?); // Iterator-Result
+                    physical_predicate.clone(),
+                ))
+            })) // AsyncIterator-Result-AsyncIterator-Result
+            .async_flatten_ok() // AsyncIterator-Result-Result
+            .async_map(|x| x?); // AsyncIterator-Result
 
         Ok(result)
     }
@@ -223,13 +225,14 @@ impl TableChangesScan {
 
 /// Reads the data at the `resolved_scan_file` and transforms the data from physical to logical.
 /// The result is a fallible iterator of [`ScanResult`] containing the logical data.
+#[async_fn]
 fn read_scan_file(
     engine: &dyn Engine,
     resolved_scan_file: ResolvedCdfScanFile,
     table_root: &Url,
     state_info: &StateInfo,
     _physical_predicate: Option<PredicateRef>,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>>> {
+) -> DeltaResult<impl AsyncIterator<Item = DeltaResult<ScanResult>>> {
     let ResolvedCdfScanFile {
         scan_file,
         mut selection_vector,
@@ -255,11 +258,11 @@ fn read_scan_file(
     };
     // TODO(#860): we disable predicate pushdown until we support row indexes.
     let read_result_iter =
-        engine
+        await_!(engine
             .parquet_handler()
-            .read_parquet_files(&[file], physical_schema, None)?;
+            .read_parquet_files(&[file], physical_schema, None))?;
 
-    let result = read_result_iter.map(move |batch| -> DeltaResult<_> {
+    let result = read_result_iter.async_map(move |batch| -> DeltaResult<_> {
         let batch = batch?;
         // to transform the physical data into the correct logical form
         let logical = phys_to_logical_eval.evaluate(batch.as_ref());

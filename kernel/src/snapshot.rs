@@ -17,7 +17,7 @@ use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration
 use crate::table_properties::TableProperties;
 use crate::transaction::Transaction;
 use crate::LogCompactionWriter;
-use crate::{DeltaResult, Engine, Error, Version};
+use crate::{DeltaResult, Engine, Error, Version, async_fn, await_};
 use delta_kernel_derive::internal_api;
 
 mod builder;
@@ -97,6 +97,7 @@ impl Snapshot {
     /// Create a new [`Snapshot`] instance from an existing [`Snapshot`]. This is useful when you
     /// already have a [`Snapshot`] lying around and want to do the minimal work to 'update' the
     /// snapshot to a later version.
+    #[async_fn]
     fn try_new_from(
         existing_snapshot: Arc<Snapshot>,
         log_tail: Vec<ParsedLogPath>,
@@ -201,7 +202,7 @@ impl Snapshot {
 
         // we have new commits and no new checkpoint: we replay new commits for P+M and then
         // create a new snapshot by combining LogSegments and building a new TableConfiguration
-        let (new_metadata, new_protocol) = new_log_segment.protocol_and_metadata(engine)?;
+        let (new_metadata, new_protocol) = await_!(new_log_segment.protocol_and_metadata(engine))?;
         let table_configuration = TableConfiguration::try_new_from(
             existing_snapshot.table_configuration(),
             new_metadata,
@@ -248,12 +249,13 @@ impl Snapshot {
     }
 
     /// Create a new [`Snapshot`] instance.
+    #[async_fn]
     pub(crate) fn try_new_from_log_segment(
         location: Url,
         log_segment: LogSegment,
         engine: &dyn Engine,
     ) -> DeltaResult<Self> {
-        let (metadata, protocol) = log_segment.read_metadata(engine)?;
+        let (metadata, protocol) = await_!(log_segment.read_metadata(engine))?;
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
         Ok(Self {

@@ -5,8 +5,8 @@
 
 use crate::DeltaResult;
 use std::future::Future;
-use futures::stream::{Stream, StreamExt, TryStream};
-use itertools::Itertools;
+use futures::stream::{Stream, StreamExt as _};
+use itertools::Itertools as _;
 
 // Re-export macros
 pub use delta_kernel_derive::{async_fn, async_trait};
@@ -54,11 +54,11 @@ macro_rules! yield_now {
 /// ```
 #[macro_export]
 macro_rules! async_closure {
-    (| $($arg:tt),* | $body:expr) => {
-        |$($arg),*| $body
+    (| $($arg:tt),* | $( -> $return:ty )? $body:block ) => {
+        |$($arg),*| $( -> $return )? { $body }
     };
-    (move | $($arg:tt),* | $body:expr) => {
-        move |$($arg),*| $body
+    (move | $($arg:tt),* | $( -> $return:ty )? $body:block ) => {
+        move |$($arg),*| $( -> $return )? { $body }
     };
 }
 
@@ -69,6 +69,15 @@ pub type BoxedAsyncIterator<T> = Box<dyn Iterator<Item = T> + Send>;
 ///
 /// In sync mode, this is implemented for all Iterator types.
 pub trait AsyncIterator: Iterator + Send + 'static {
+    /// Get the next item from the iterator
+    ///
+    /// In sync mode, this is just a wrapper around `Iterator::next()`.
+    /// In async mode, this becomes `.await` on the stream's poll.
+    #[allow(clippy::should_implement_trait)]
+    fn async_next(&mut self) -> Option<Self::Item> {
+        self.next()
+    }
+
     /// Map each item
     fn async_map<F, R>(self, f: F) -> impl AsyncIterator<Item = R>
     where
@@ -99,27 +108,35 @@ pub trait AsyncIterator: Iterator + Send + 'static {
         self.flatten()
     }
 
+    /// Flatten an iterator of Result<Iterator> into an iterator of Result
+    ///
+    /// This is equivalent to itertools::flatten_ok. It handles Iterator<Item = Result<I, E>>
+    /// where I: IntoIterator, and produces Iterator<Item = Result<I::Item, E>>.
+    fn async_flatten_ok<T, E, I>(self) -> impl AsyncIterator<Item = Result<T, E>>
+    where
+        Self: Iterator<Item = Result<I, E>> + Sized,
+        I: IntoIterator<Item = T> + 'static,
+        I::IntoIter: Send + 'static,
+        T: Send + 'static,
+        E: Send + 'static,
+    {
+        self.flatten_ok()
+    }
+
     /// Try fold with early exit on error
     ///
     /// This method requires the iterator to yield `Result` types.
-    /// The closure receives the unwrapped `Ok` value.
-    fn async_try_fold<T, E, B, F>(self, init: B, f: F) -> Result<B, E>
+    /// The closure receives the unwrapped `Ok` value and is synchronous
+    /// (returns `Result<B, E>`).
+    fn async_try_fold<T, E, B, F>(mut self, init: B, mut f: F) -> Result<B, E>
     where
         F: FnMut(B, T) -> Result<B, E> + Send + 'static,
         B: Send + 'static,
         T: Send + 'static,
         E: Send + 'static,
-        Self: Sized + Iterator<Item = Result<T, E>>,
+        Self: Iterator<Item = Result<T, E>> + Sized,
     {
-        // In sync mode: manually iterate since we need to unpack Result<T, E>
-        let mut acc = init;
-        for item in self {
-            match item {
-                Ok(ok_val) => acc = f(acc, ok_val)?,
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(acc)
+        self.try_fold(init, move |acc, item| f(acc, item?))
     }
 
     /// Map over the successful values in a Result-yielding iterator
@@ -133,7 +150,7 @@ pub trait AsyncIterator: Iterator + Send + 'static {
         T: Send + 'static,
         E: Send + 'static,
         R: Send + 'static,
-        Self: Sized + Iterator<Item = Result<T, E>>,
+        Self: Iterator<Item = Result<T, E>> + Sized,
     {
         self.map_ok(f)
     }
@@ -183,7 +200,7 @@ pub trait AsyncIterator: Iterator + Send + 'static {
 impl<I: Iterator + Send + 'static> AsyncIterator for I {}
 
 /// Helper to convert IntoIterator types to AsyncIterator
-pub fn into_async_iter<I: IntoIterator + Send>(i: I) -> impl AsyncIterator<Item = I::Item>
+pub fn into_async_iter<I: IntoIterator>(i: I) -> impl AsyncIterator<Item = I::Item>
 where
     I::IntoIter: Send + 'static,
     I::Item: Send + 'static,

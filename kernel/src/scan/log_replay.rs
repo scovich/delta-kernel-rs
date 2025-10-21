@@ -15,7 +15,7 @@ use crate::schema::ToSchema as _;
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
 use crate::transforms::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
+use crate::{DeltaResult, Engine, Error, ExpressionEvaluator, AsyncIterator, into_async_iter};
 
 /// [`ScanLogReplayProcessor`] performs log replay (processes actions) specifically for doing a table scan.
 ///
@@ -366,10 +366,10 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 /// the actions in the log from most recent to least recent.
 pub(crate) fn scan_action_iter(
     engine: &dyn Engine,
-    action_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
+    action_iter: impl AsyncIterator<Item = DeltaResult<ActionsBatch>>,
     state_info: Arc<StateInfo>,
-) -> impl Iterator<Item = DeltaResult<ScanMetadata>> {
-    ScanLogReplayProcessor::new(engine, state_info).process_actions_iter(action_iter)
+) -> impl AsyncIterator<Item = DeltaResult<ScanMetadata>> {
+    into_async_iter(ScanLogReplayProcessor::new(engine, state_info).process_actions_iter(action_iter))
 }
 
 #[cfg(test)]

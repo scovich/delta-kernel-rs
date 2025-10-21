@@ -58,11 +58,11 @@ macro_rules! yield_now {
 /// ```
 #[macro_export]
 macro_rules! async_closure {
-    (| $($arg:tt),* | $body:expr) => {
-        async |$($arg),*| $body
+    (| $($arg:tt),* | $( -> $return:ty )? $body:block ) => {
+        async |$($arg),*| $( -> $return )? { $body }
     };
-    (move | $($arg:tt),* | $body:expr) => {
-        async move |$($arg),*| $body
+    (move | $($arg:tt),* | $( -> $return:ty )? $body:block ) => {
+        async move |$($arg),*| $( -> $return )? { $body }
     };
 }
 
@@ -95,6 +95,17 @@ impl Future for YieldNow {
 ///
 /// In async mode, this is implemented for all Stream types.
 pub trait AsyncIterator: Stream + Send + 'static {
+    /// Get the next item from the stream
+    ///
+    /// In sync mode, this is just a wrapper around `Iterator::next()`.
+    /// In async mode, this polls the stream and must be awaited.
+    async fn async_next(&mut self) -> Option<Self::Item>
+    where
+        Self: Unpin,
+    {
+        self.next().await
+    }
+
     /// Map each item synchronously
     ///
     /// Note: The closure `f` is synchronous - it returns `R`, not `Future<Output = R>`.
@@ -132,10 +143,27 @@ pub trait AsyncIterator: Stream + Send + 'static {
         self.flatten()
     }
 
+    /// Flatten a stream of Result<Stream> into a stream of Result
+    ///
+    /// This is the async equivalent of itertools::flatten_ok. It handles Stream<Item = Result<S, E>>
+    /// where S: Stream, and produces Stream<Item = Result<S::Item, E>>.
+    fn async_flatten_ok<T>(self) -> impl AsyncIterator<Item = Result<T, Self::Error>>
+    where
+        Self: TryStream + Sized,
+        Self::Ok: TryStream<Ok = T, Error = Self::Error> + Send,
+        T: Send + 'static,
+    {
+        self.try_flatten()
+    }
+
     /// Try fold with early exit on error
     ///
     /// This method requires the stream to yield `Result` types.
-    /// The closure receives the unwrapped `Ok` value.
+    /// The closure receives the unwrapped `Ok` value and is **synchronous** 
+    /// (returns `Result<B, E>`, not `Future<Output = Result<B, E>>`).
+    ///
+    /// Note: Unlike `TryStreamExt::try_fold`, this takes a sync closure for consistency
+    /// with sync mode. The closure is wrapped in `future::ready` internally.
     async fn async_try_fold<B, F>(self, init: B, mut f: F) -> Result<B, Self::Error>
     where
         F: FnMut(B, Self::Ok) -> Result<B, Self::Error> + Send + 'static,

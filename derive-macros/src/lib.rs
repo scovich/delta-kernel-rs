@@ -3,7 +3,7 @@ use quote::{quote, quote_spanned, ToTokens};
 use syn::parse_macro_input;
 use syn::spanned::Spanned;
 use syn::{
-    Data, DataStruct, DeriveInput, Error, Fields, Item, ItemFn, Meta, PathArguments, Type,
+    Data, DataStruct, DeriveInput, Error, Fields, Item, ItemFn, Meta, PathArguments, TraitItemFn, Type,
     Visibility,
 };
 
@@ -277,20 +277,25 @@ pub fn async_fn(
     _attr: proc_macro::TokenStream,
     item: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
-    let mut input = parse_macro_input!(item as ItemFn);
+    // Add or remove `async` keyword based on feature flag
+    let asyncness = cfg!(feature = "async").then(syn::token::Async::default);
 
-    // Conditionally add or clear the async keyword based on feature flag
-    #[cfg(feature = "async")]
-    {
-        input.sig.asyncness = Some(syn::token::Async::default());
-    }
+    // Try parsing as a function with body first (more common) or as a trait method. Any other item
+    // type produces an error.
+    let item = if let Ok(mut item_fn) = syn::parse::<ItemFn>(item.clone()) {
+        item_fn.sig.asyncness = asyncness;
+        quote! { #item_fn }
+    } else if let Ok(mut trait_fn) = syn::parse::<TraitItemFn>(item.clone()) {
+        trait_fn.sig.asyncness = asyncness;
+        quote! { #trait_fn }
+    } else {
+        Error::new(
+            proc_macro2::Span::call_site(),
+            "#[async_fn] can only be applied to functions or trait methods"
+        ).to_compile_error()
+    };
 
-    #[cfg(not(feature = "async"))]
-    {
-        input.sig.asyncness = None;
-    }
-
-    quote! { #input }.into()
+    item.into()
 }
 
 /// No-op proc macro that stands in for async-trait in sync mode.

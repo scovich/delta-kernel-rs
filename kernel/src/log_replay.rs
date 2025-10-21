@@ -16,7 +16,7 @@
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::scan::data_skipping::DataSkippingFilter;
-use crate::{DeltaResult, EngineData};
+use crate::{DeltaResult, EngineData, AsyncIterator};
 
 use delta_kernel_derive::internal_api;
 
@@ -280,10 +280,10 @@ impl ActionsBatch {
 ///   filtered by the **selection vector** to determine which rows are included in the final checkpoint.
 ///
 /// TODO: Refactor the Change Data Feed (CDF) processor to use this trait.
-pub(crate) trait LogReplayProcessor: Sized {
+pub(crate) trait LogReplayProcessor: Send + Sized + 'static {
     /// The type of results produced by this processor must implement the
     /// [`HasSelectionVector`] trait to allow filtering out batches with no selected rows.
-    type Output: HasSelectionVector;
+    type Output: HasSelectionVector + Send;
 
     /// Processes a batch of actions and returns the filtered results.
     /// # Parameters
@@ -313,11 +313,11 @@ pub(crate) trait LogReplayProcessor: Sized {
     /// (batches where at least one row was selected).
     fn process_actions_iter(
         mut self,
-        action_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
-    ) -> impl Iterator<Item = DeltaResult<Self::Output>> {
+        action_iter: impl AsyncIterator<Item = DeltaResult<ActionsBatch>>,
+    ) -> impl AsyncIterator<Item = DeltaResult<Self::Output>> {
         action_iter
-            .map(move |actions_batch| self.process_actions_batch(actions_batch?))
-            .filter(|res| {
+            .async_map(move |actions_batch| self.process_actions_batch(actions_batch?))
+            .async_filter(|res| {
                 // TODO: Leverage .is_none_or() when msrv = 1.82
                 res.as_ref()
                     .map_or(true, |result| result.has_selected_rows())

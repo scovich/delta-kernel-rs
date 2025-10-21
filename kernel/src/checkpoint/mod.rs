@@ -102,7 +102,7 @@ use crate::path::ParsedLogPath;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::snapshot::SnapshotRef;
 use crate::table_properties::TableProperties;
-use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
+use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta, async_fn, await_};
 
 use url::Url;
 
@@ -262,18 +262,19 @@ impl CheckpointWriter {
     // 4. Chains the checkpoint metadata action if writing a V2 spec checkpoint
     //    (i.e., if `v2Checkpoints` feature is supported by table)
     // 5. Generates the appropriate checkpoint path
+    #[async_fn]
     pub fn checkpoint_data(&self, engine: &dyn Engine) -> DeltaResult<CheckpointDataIterator> {
         let is_v2_checkpoints_supported = self
             .snapshot
             .table_configuration()
             .is_v2_checkpoint_write_supported();
 
-        let actions = self.snapshot.log_segment().read_actions(
+        let actions = await_!(self.snapshot.log_segment().read_actions(
             engine,
             CHECKPOINT_ACTIONS_SCHEMA.clone(),
             CHECKPOINT_ACTIONS_SCHEMA.clone(),
             None,
-        )?;
+        ))?;
 
         // Create iterator over actions for checkpoint data
         let checkpoint_data = ActionReconciliationProcessor::new(
@@ -285,7 +286,7 @@ impl CheckpointWriter {
         let checkpoint_metadata =
             is_v2_checkpoints_supported.then(|| self.create_checkpoint_metadata_batch(engine));
 
-        // Wrap the iterator in a CheckpointDataIterator to track action counts
+        // Wrap the iterator in a CheckpointDataIterator to track action counts[
         Ok(CheckpointDataIterator {
             checkpoint_batch_iterator: Box::new(checkpoint_data.chain(checkpoint_metadata)),
             actions_count: 0,

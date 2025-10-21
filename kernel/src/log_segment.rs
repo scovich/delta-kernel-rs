@@ -15,7 +15,7 @@ use crate::schema::SchemaRef;
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, EngineData, Error, Expression, FileMeta, ParquetHandler, Predicate,
-    PredicateRef, RowVisitor, StorageHandler, Version, AsyncIterator as _,
+    PredicateRef, RowVisitor, StorageHandler, Version, async_fn, await_, async_closure, AsyncIterator
 };
 use delta_kernel_derive::internal_api;
 
@@ -285,26 +285,27 @@ impl LogSegment {
     /// `meta_predicate` is an optional expression to filter the log files with. It is _NOT_ the
     /// query's predicate, but rather a predicate for filtering log files themselves.
     #[internal_api]
+    #[async_fn]
     pub(crate) fn read_actions(
         &self,
         engine: &dyn Engine,
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+    ) -> DeltaResult<impl AsyncIterator<Item = DeltaResult<ActionsBatch>>> {
         // `replay` expects commit files to be sorted in descending order, so the return value here is correct
         let commits_and_compactions = self.find_commit_cover();
-        let commit_stream = engine
+        let commit_stream = await_!(engine
             .json_handler()
             .read_json_files(
                 &commits_and_compactions,
                 commit_read_schema,
                 meta_predicate.clone(),
-            )?
+            ))?
             .async_map_ok(|batch| ActionsBatch::new(batch, true));
 
         let checkpoint_stream =
-            self.create_checkpoint_stream(engine, checkpoint_read_schema, meta_predicate)?;
+            await_!(self.create_checkpoint_stream(engine, checkpoint_read_schema, meta_predicate))?;
 
         Ok(commit_stream.async_chain(checkpoint_stream))
     }
@@ -363,12 +364,13 @@ impl LogSegment {
     /// sidecar files contain the actual file actions that would otherwise be
     /// stored directly in the checkpoint. The sidecar file batches are chained to the
     /// checkpoint batch in the top level iterator to be returned.
+    #[async_fn]
     fn create_checkpoint_stream(
         &self,
         engine: &dyn Engine,
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+    ) -> DeltaResult<impl AsyncIterator<Item = DeltaResult<ActionsBatch>>> {
         let need_file_actions = checkpoint_read_schema.contains(ADD_NAME)
             || checkpoint_read_schema.contains(REMOVE_NAME);
 
@@ -396,18 +398,18 @@ impl LogSegment {
         // If similar patterns start appearing elsewhere, we should reconsider that decision.
         let actions = match self.checkpoint_parts.first() {
             Some(parsed_log_path) if parsed_log_path.extension == "json" => {
-                engine.json_handler().read_json_files(
+                await_!(engine.json_handler().read_json_files(
                     &checkpoint_file_meta,
                     checkpoint_read_schema.clone(),
                     meta_predicate.clone(),
-                )?
+                ))?
             }
-            Some(parsed_log_path) if parsed_log_path.extension == "parquet" => parquet_handler
+            Some(parsed_log_path) if parsed_log_path.extension == "parquet" => await_!(parquet_handler
                 .read_parquet_files(
                     &checkpoint_file_meta,
                     checkpoint_read_schema.clone(),
                     meta_predicate.clone(),
-                )?,
+                ))?,
             Some(parsed_log_path) => {
                 return Err(Error::generic(format!(
                     "Unsupported checkpoint file type: {}",
@@ -422,7 +424,7 @@ impl LogSegment {
         let log_root = self.log_root.clone();
 
         let actions_iter = actions
-            .map(move |checkpoint_batch_result| -> DeltaResult<_> {
+            .async_then(async_closure!(move |checkpoint_batch_result| -> DeltaResult<_> {
                 let checkpoint_batch = checkpoint_batch_result?;
                 // This closure maps the checkpoint batch to an iterator of batches
                 // by chaining the checkpoint batch with sidecar batches if they exist.
@@ -433,13 +435,13 @@ impl LogSegment {
                 // 2. Multi-part checkpoint batches never have sidecar actions, so the batch is
                 //    returned as-is.
                 let sidecar_content = if need_file_actions && checkpoint_file_meta.len() == 1 {
-                    Self::process_sidecars(
+                    await_!(Self::process_sidecars(
                         parquet_handler.clone(), // cheap Arc clone
                         log_root.clone(),
                         checkpoint_batch.as_ref(),
                         checkpoint_read_schema.clone(),
                         meta_predicate.clone(),
-                    )?
+                    ))?
                 } else {
                     None
                 };
@@ -451,9 +453,9 @@ impl LogSegment {
                     .map_ok(|sidecar_batch| ActionsBatch::new(sidecar_batch, false));
 
                 Ok(combined_batches)
-            })
-            .flatten_ok()
-            .map(|result| result?); // result-result to result
+            }))
+            .async_flatten_ok()
+            .async_map(|x| x?);
 
         Ok(actions_iter)
     }
@@ -462,13 +464,14 @@ impl LogSegment {
     ///
     /// This function extracts any sidecar file references from the provided batch.
     /// Each sidecar file is read and an iterator of file action batches is returned
+    #[async_fn]
     fn process_sidecars(
         parquet_handler: Arc<dyn ParquetHandler>,
         log_root: Url,
         batch: &dyn EngineData,
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
-    ) -> DeltaResult<Option<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>> {
+    ) -> DeltaResult<Option<impl AsyncIterator<Item = DeltaResult<Box<dyn EngineData>>>>> {
         // Visit the rows of the checkpoint batch to extract sidecar file references
         let mut visitor = SidecarVisitor::default();
         visitor.visit_rows_of(batch)?;
@@ -485,22 +488,23 @@ impl LogSegment {
             .try_collect()?;
 
         // Read the sidecar files and return an iterator of sidecar file batches
-        Ok(Some(parquet_handler.read_parquet_files(
+        Ok(Some(await_!(parquet_handler.read_parquet_files(
             &sidecar_files,
             checkpoint_read_schema,
             meta_predicate,
-        )?))
+        ))?))
     }
 
     // Do a lightweight protocol+metadata log replay to find the latest Protocol and Metadata in
     // the LogSegment
+    #[async_fn]
     pub(crate) fn protocol_and_metadata(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
-        let actions_batches = self.replay_for_metadata(engine)?;
+        let mut actions_batches = await_!(self.replay_for_metadata(engine))?;
         let (mut metadata_opt, mut protocol_opt) = (None, None);
-        for actions_batch in actions_batches {
+        while let Some(actions_batch) = await_!(actions_batches.async_next()) {
             let actions = actions_batch?.actions;
             if metadata_opt.is_none() {
                 metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
@@ -517,8 +521,9 @@ impl LogSegment {
     }
 
     // Get the most up-to-date Protocol and Metadata actions
+    #[async_fn]
     pub(crate) fn read_metadata(&self, engine: &dyn Engine) -> DeltaResult<(Metadata, Protocol)> {
-        match self.protocol_and_metadata(engine)? {
+        match await_!(self.protocol_and_metadata(engine))? {
             (Some(m), Some(p)) => Ok((m, p)),
             (None, Some(_)) => Err(Error::MissingMetadata),
             (Some(_), None) => Err(Error::MissingProtocol),
@@ -527,10 +532,11 @@ impl LogSegment {
     }
 
     // Replay the commit log, projecting rows to only contain Protocol and Metadata action columns.
+    #[async_fn]
     fn replay_for_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+    ) -> DeltaResult<impl AsyncIterator<Item = DeltaResult<ActionsBatch>>> {
         let schema = get_log_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?;
         // filter out log files that do not contain metadata or protocol information
         static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
@@ -540,7 +546,7 @@ impl LogSegment {
             )))
         });
         // read the same protocol and metadata schema for both commits and checkpoints
-        self.read_actions(engine, schema.clone(), schema, META_PREDICATE.clone())
+        await_!(self.read_actions(engine, schema.clone(), schema, META_PREDICATE.clone()))
     }
 
     /// How many commits since a checkpoint, according to this log segment

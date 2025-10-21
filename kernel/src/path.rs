@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::engine_data::RowVisitor;
-use crate::{DeltaResult, Engine, Error, FileMeta, Version};
+use crate::{DeltaResult, Engine, Error, FileMeta, Version, async_fn, await_};
 use delta_kernel_derive::internal_api;
 
 use url::Url;
@@ -227,6 +227,7 @@ impl ParsedLogPath<FileMeta> {
     ///
     /// Returns the inCommitTimestamp value, or an error if ICT is not found or cannot be read.
     /// Callers should handle enablement version checks before calling this method.
+    #[async_fn]
     pub(crate) fn read_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
         // Only works on commit files
         if !self.is_commit() {
@@ -236,11 +237,11 @@ impl ParsedLogPath<FileMeta> {
             )));
         }
 
-        let mut action_iter = engine.json_handler().read_json_files(
+        let mut action_iter = await_!(engine.json_handler().read_json_files(
             slice::from_ref(&self.location),
             InCommitTimestampVisitor::schema(),
             None,
-        )?;
+        ))?;
 
         // Process the actions to find inCommitTimestamp
         // According to protocol, CommitInfo MUST be the first action when ICT is enabled,

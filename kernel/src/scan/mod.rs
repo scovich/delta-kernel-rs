@@ -5,7 +5,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
-use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
@@ -31,7 +30,7 @@ use crate::schema::{
 use crate::snapshot::SnapshotRef;
 use crate::table_features::ColumnMappingMode;
 use crate::transforms::TransformSpec;
-use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Version};
+use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Version, async_fn, await_, into_async_iter, async_closure, BoxedAsyncIterator, AsyncIterator};
 
 use self::log_replay::scan_action_iter;
 
@@ -440,11 +439,12 @@ impl Scan {
     ///   the item at index `i` in this `Vec` is `None`, or if the `Vec` contains fewer than `i`
     ///   elements, no expression need be applied and the data read from disk is already in the
     ///   correct logical state.
+    #[async_fn]
     pub fn scan_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-        self.scan_metadata_inner(engine, self.replay_for_scan_metadata(engine)?)
+    ) -> DeltaResult<impl AsyncIterator<Item = DeltaResult<ScanMetadata>>> {
+        self.scan_metadata_inner(engine, await_!(self.replay_for_scan_metadata(engine))?)
     }
 
     /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of [`EngineData`]s.
@@ -490,13 +490,18 @@ impl Scan {
     /// * `existing_predicate` - The predicate used by the previous scan.
     #[allow(unused)]
     #[internal_api]
-    pub(crate) fn scan_metadata_from(
+    #[async_fn]
+    pub(crate) fn scan_metadata_from<I>(
         &self,
         engine: &dyn Engine,
         existing_version: Version,
-        existing_data: impl IntoIterator<Item = Box<dyn EngineData>> + 'static,
+        existing_data: I,
         _existing_predicate: Option<PredicateRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ScanMetadata>>>> {
+    ) -> DeltaResult<BoxedAsyncIterator<DeltaResult<ScanMetadata>>>
+    where
+        I: IntoIterator<Item = Box<dyn EngineData>>,
+        I::IntoIter: Send + 'static,
+    {
         static RESTORED_ADD_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
             let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
             DataType::struct_type_unchecked(vec![StructField::nullable(
@@ -538,7 +543,7 @@ impl Scan {
         // to apply file skipping and provide the required transformations.
         if existing_version == self.snapshot.version() {
             let scan = existing_data.into_iter().map(apply_transform);
-            return Ok(Box::new(self.scan_metadata_inner(engine, scan)?));
+            return Ok(self.scan_metadata_inner(engine, scan)?.into_boxed());
         }
 
         let log_segment = self.snapshot.log_segment();
@@ -568,43 +573,42 @@ impl Scan {
             Some(log_segment.end_version),
         )?;
 
-        let it = new_log_segment
+        let it = await_!(new_log_segment
             .read_actions(
                 engine,
                 COMMIT_READ_SCHEMA.clone(),
                 CHECKPOINT_READ_SCHEMA.clone(),
                 None,
-            )?
-            .chain(existing_data.into_iter().map(apply_transform));
+            ))?
+            .async_chain(into_async_iter(existing_data.into_iter().map(apply_transform)));
 
-        Ok(Box::new(self.scan_metadata_inner(engine, it)?))
+        Ok(self.scan_metadata_inner(engine, it)?.into_boxed())
     }
 
     fn scan_metadata_inner(
         &self,
         engine: &dyn Engine,
-        action_batch_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-        if let PhysicalPredicate::StaticSkipAll = self.state_info.physical_predicate {
-            return Ok(None.into_iter().flatten());
-        }
-        let it = scan_action_iter(engine, action_batch_iter, self.state_info.clone());
-        Ok(Some(it).into_iter().flatten())
+        action_batch_iter: impl AsyncIterator<Item = DeltaResult<ActionsBatch>>,
+    ) -> DeltaResult<impl AsyncIterator<Item = DeltaResult<ScanMetadata>>> {
+        let it = (!matches!(self.state_info.physical_predicate, PhysicalPredicate::StaticSkipAll))
+            .then(|| scan_action_iter(engine, action_batch_iter, self.state_info.clone()));
+        Ok(into_async_iter(it).async_flatten())
     }
 
     // Factored out to facilitate testing
+    #[async_fn]
     fn replay_for_scan_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+    ) -> DeltaResult<impl AsyncIterator<Item = DeltaResult<ActionsBatch>>> {
         // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
         // when ~every checkpoint file will contain the adds and removes we are looking for.
-        self.snapshot.log_segment().read_actions(
+        await_!(self.snapshot.log_segment().read_actions(
             engine,
             COMMIT_READ_SCHEMA.clone(),
             CHECKPOINT_READ_SCHEMA.clone(),
             None,
-        )
+        ))
     }
 
     /// Perform an "all in one" scan. This will use the provided `engine` to read and process all
@@ -615,10 +619,11 @@ impl Scan {
     /// scan.
     // This calls [`Scan::scan_metadata`] to get an iterator of `ScanMetadata` actions for the scan,
     // and then uses the `engine`'s [`crate::ParquetHandler`] to read the actual table data.
+    #[async_fn]
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>> + use<'_>> {
+    ) -> DeltaResult<impl AsyncIterator<Item = DeltaResult<ScanResult>>> {
         struct ScanFile {
             path: String,
             size: i64,
@@ -649,18 +654,20 @@ impl Scan {
 
         let table_root = self.snapshot.table_root().clone();
 
-        let scan_metadata_iter = self.scan_metadata(engine.as_ref())?;
+        let scan_metadata_iter = await_!(self.scan_metadata(engine.as_ref()))?;
         let scan_files_iter = scan_metadata_iter
-            .map(|res| {
+            .async_map(|res| {
                 let scan_metadata = res?;
                 let scan_files = vec![];
                 scan_metadata.visit_scan_files(scan_files, scan_metadata_callback)
             })
-            // Iterator<DeltaResult<Vec<ScanFile>>> to Iterator<DeltaResult<ScanFile>>
-            .flatten_ok();
+            // AsyncIterator<DeltaResult<Vec<ScanFile>>> to AsyncIterator<DeltaResult<ScanFile>>
+            .async_flatten_ok();
 
+        let physical_schema = self.physical_schema().clone();
+        let logical_schema = self.logical_schema().clone();
         let result = scan_files_iter
-            .map(move |scan_file| -> DeltaResult<_> {
+            .async_then(async_closure!(move |scan_file| -> DeltaResult<_> {
                 let scan_file = scan_file?;
                 let file_path = table_root.join(&scan_file.path)?;
                 let mut selection_vector = scan_file
@@ -680,21 +687,23 @@ impl Scan {
                 // https://github.com/delta-io/delta-kernel-rs/issues/434 for more details.
                 //
                 // TODO(#860): we disable predicate pushdown until we support row indexes.
-                let read_result_iter = engine.parquet_handler().read_parquet_files(
+                let read_result_iter = await_!(engine.parquet_handler().read_parquet_files(
                     &[meta],
-                    self.physical_schema().clone(),
+                    physical_schema.clone(),
                     None,
-                )?;
+                ))?;
 
                 let engine = engine.clone(); // Arc clone
-                Ok(read_result_iter.map(move |read_result| -> DeltaResult<_> {
+                let physical_schema = physical_schema.clone();
+                let logical_schema = logical_schema.clone();
+                Ok(read_result_iter.async_map(move |read_result| -> DeltaResult<_> {
                     let read_result = read_result?;
                     // transform the physical data into the correct logical form
                     let logical = state::transform_to_logical(
                         engine.as_ref(),
                         read_result,
-                        self.physical_schema(),
-                        self.logical_schema(),
+                        &physical_schema,
+                        &logical_schema,
                         scan_file.transform.clone(), // Arc clone
                     );
                     let len = logical.as_ref().map_or(0, |res| res.len());
@@ -711,11 +720,11 @@ impl Scan {
                     selection_vector = rest;
                     Ok(result)
                 }))
-            })
-            // Iterator<DeltaResult<Iterator<DeltaResult<ScanResult>>>> to Iterator<DeltaResult<DeltaResult<ScanResult>>>
-            .flatten_ok()
-            // Iterator<DeltaResult<DeltaResult<ScanResult>>> to Iterator<DeltaResult<ScanResult>>
-            .map(|x| x?);
+            }))
+            // AsyncIterator<DeltaResult<AsyncIterator<DeltaResult<ScanResult>>>> to AsyncIterator<DeltaResult<ScanResult>>
+            .async_flatten_ok()
+            // AsyncIterator<DeltaResult<DeltaResult<ScanResult>>> to AsyncIterator<DeltaResult<ScanResult>>
+            .async_map(|x| x?);
         Ok(result)
     }
 }
@@ -1008,6 +1017,7 @@ pub(crate) mod test_utils {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use itertools::Itertools as _;
 
     use crate::arrow::array::BooleanArray;
     use crate::arrow::compute::filter_record_batch;

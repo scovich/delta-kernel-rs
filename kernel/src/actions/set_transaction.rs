@@ -5,7 +5,7 @@ use crate::actions::visitors::SetTransactionVisitor;
 use crate::actions::{SetTransaction, SET_TRANSACTION_NAME};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
-use crate::{DeltaResult, Engine, Expression as Expr, PredicateRef, RowVisitor as _};
+use crate::{DeltaResult, Engine, Expression as Expr, PredicateRef, RowVisitor as _, async_fn, await_, AsyncIterator};
 
 pub(crate) use crate::actions::visitors::SetTransactionMap;
 
@@ -36,18 +36,20 @@ impl SetTransactionScanner {
     /// This performs log replay and populates the `SetTransactionMap` with the latest `txn` action
     /// found for each app_id.
     #[allow(unused)]
+    #[async_fn]
     pub(crate) fn get_all(
         log_segment: &LogSegment,
         engine: &dyn Engine,
         expiration_timestamp: Option<i64>,
     ) -> DeltaResult<SetTransactionMap> {
-        scan_application_transactions(log_segment, None, engine, expiration_timestamp)
+        await_!(scan_application_transactions(log_segment, None, engine, expiration_timestamp))
     }
 }
 
 /// Scan the entire log for all application ids but terminate early if a specific application id
 /// is provided
 // TODO: we could have this track _multiple_ application ids instead of only up to one.
+#[async_fn]
 fn scan_application_transactions(
     log_segment: &LogSegment,
     application_id: Option<&str>,
@@ -58,7 +60,8 @@ fn scan_application_transactions(
         SetTransactionVisitor::new(application_id.map(|s| s.to_owned()), expiration_timestamp);
     // If a specific id is requested then we can terminate log replay early as soon as it was
     // found. If all ids are requested then we are forced to replay the entire log.
-    for maybe_data in replay_for_app_ids(log_segment, engine)? {
+    let mut actions_iter = await_!(replay_for_app_ids(log_segment, engine))?;
+    while let Some(maybe_data) = await_!(actions_iter.async_next()) {
         let txns = maybe_data?.actions;
         visitor.visit_rows_of(txns.as_ref())?;
         // if a specific id is requested and a transaction was found, then return
@@ -71,10 +74,11 @@ fn scan_application_transactions(
 }
 
 // Factored out to facilitate testing
+#[async_fn]
 fn replay_for_app_ids(
     log_segment: &LogSegment,
     engine: &dyn Engine,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+) -> DeltaResult<impl AsyncIterator<Item = DeltaResult<ActionsBatch>>> {
     let txn_schema = get_log_txn_schema();
     // This meta-predicate should be effective because all the app ids end up in a single
     // checkpoint part when patitioned by `add.path` like the Delta spec requires. There's no
@@ -85,12 +89,12 @@ fn replay_for_app_ids(
             Expr::column([SET_TRANSACTION_NAME, "appId"]).is_not_null(),
         ))
     });
-    log_segment.read_actions(
+    await_!(log_segment.read_actions(
         engine,
         txn_schema.clone(), // Arc clone
         txn_schema.clone(), // Arc clone
         META_PREDICATE.clone(),
-    )
+    ))
 }
 
 #[cfg(test)]

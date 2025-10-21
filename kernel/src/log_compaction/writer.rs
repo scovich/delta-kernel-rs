@@ -10,7 +10,7 @@ use crate::log_replay::LogReplayProcessor;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::table_properties::TableProperties;
-use crate::{DeltaResult, Engine, Error, SnapshotRef, Version};
+use crate::{DeltaResult, Engine, Error, SnapshotRef, Version, async_fn, await_};
 
 /// Determine if log compaction should be performed based on the commit version and
 /// compaction interval.
@@ -77,6 +77,7 @@ impl LogCompactionWriter {
     /// Get an iterator over the compaction data to be written
     ///
     /// Performs action reconciliation for the version range specified in the constructor
+    #[async_fn]
     pub fn compaction_data(
         &mut self,
         engine: &dyn Engine,
@@ -100,12 +101,12 @@ impl LogCompactionWriter {
         )?;
 
         // Read actions from the version-filtered log segment
-        let actions_iter = compaction_log_segment.read_actions(
+        let actions_iter = await_!(compaction_log_segment.read_actions(
             engine,
             COMPACTION_ACTIONS_SCHEMA.clone(),
             COMPACTION_ACTIONS_SCHEMA.clone(),
             None, // No predicate - we want all actions in the version range
-        )?;
+        ))?;
 
         let min_file_retention_timestamp_millis = self.deleted_file_retention_timestamp()?;
 
