@@ -18,8 +18,8 @@ use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
 use crate::utils::current_time_ms;
 use crate::{
-    DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
-    RowVisitor, Version,
+    async_fn, await_, DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef,
+    IntoEngineData, RowVisitor, Version,
 };
 
 /// Type alias for an iterator of [`EngineData`] results.
@@ -174,6 +174,7 @@ impl Transaction {
     /// - Ok(CommitResult) for either success or a recoverable error (includes the failed
     ///   transaction in case of a conflict so the user can retry, etc.)
     /// - Err(Error) indicates a non-retryable error (e.g. logic/validation error).
+    #[async_fn]
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult> {
         // Step 1: Check for duplicate app_ids and generate set transactions (`txn`)
         // Note: The commit info must always be the first action in the commit but we generate it in
@@ -200,14 +201,12 @@ impl Transaction {
 
         // Step 2: Construct commit info with ICT if enabled
         let in_commit_timestamp =
-            self.read_snapshot
-                .get_in_commit_timestamp(engine)?
-                .map(|prev_ict| {
-                    // The Delta protocol requires the timestamp to be "the larger of two values":
-                    // - The time at which the writer attempted the commit (current_time)
-                    // - One millisecond later than the previous commit's inCommitTimestamp (last_commit_timestamp + 1)
-                    self.commit_timestamp.max(prev_ict + 1)
-                });
+            await_!(self.read_snapshot.get_in_commit_timestamp(engine))?.map(|prev_ict| {
+                // The Delta protocol requires the timestamp to be "the larger of two values":
+                // - The time at which the writer attempted the commit (current_time)
+                // - One millisecond later than the previous commit's inCommitTimestamp (last_commit_timestamp + 1)
+                self.commit_timestamp.max(prev_ict + 1)
+            });
         let commit_info = CommitInfo::new(
             self.commit_timestamp,
             in_commit_timestamp,
@@ -220,7 +219,7 @@ impl Transaction {
         // Step 3: Generate add actions and get data for domain metadata actions (e.g. row tracking high watermark)
         let commit_version = self.read_snapshot.version() + 1;
         let (add_actions, row_tracking_domain_metadata) =
-            self.generate_adds(engine, commit_version)?;
+            await_!(self.generate_adds(engine, commit_version))?;
 
         // Step 4: Generate all domain metadata actions (user and system domains)
         let domain_metadata_actions =
@@ -384,6 +383,7 @@ impl Transaction {
     }
 
     /// Generate add actions, handling row tracking internally if needed
+    #[async_fn]
     fn generate_adds<'a>(
         &'a self,
         engine: &dyn Engine,
@@ -435,8 +435,10 @@ impl Transaction {
 
         if needs_row_tracking {
             // Read the current rowIdHighWaterMark from the snapshot's row tracking domain metadata
-            let row_id_high_water_mark =
-                RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?;
+            let row_id_high_water_mark = await_!(RowTrackingDomainMetadata::get_high_water_mark(
+                &self.read_snapshot,
+                engine
+            ))?;
 
             // Create a row tracking visitor and visit all files to collect row tracking information
             let mut row_tracking_visitor = RowTrackingVisitor::new(

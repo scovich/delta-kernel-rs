@@ -64,16 +64,17 @@ where
 {
     let filter = DataSkippingFilter::new(engine.as_ref(), physical_predicate).map(Arc::new);
     let result = into_async_iter(commit_files)
-        .async_then(async_closure!(move |commit_file| -> DeltaResult<_> {
-            let scanner = await_!(LogReplayScanner::try_new(
-                engine.as_ref(),
-                commit_file,
-                &table_schema
-            ))?;
-            await_!(scanner.into_scan_batches(engine.clone(), filter.clone()))
-        })) //AsyncIterator-Result-Iterator-Result
-        .async_flatten_ok() // AsyncIterator-Result-Result
-        .async_map(|x| x?); // AsyncIterator-Result
+        .async_then(
+            async_closure!(move |commit_file| clone[engine, filter, table_schema] {
+                let scanner = await_!(LogReplayScanner::try_new(
+                    engine.as_ref(),
+                    commit_file,
+                    &table_schema
+                ))?;
+                await_!(scanner.into_scan_batches(engine.clone(), filter.clone()))
+            }),
+        ) //AsyncIterator-Result-AsyncIterator-Result
+        .async_try_flatten(); // AsyncIterator-Result
     Ok(result)
 }
 
@@ -168,16 +169,16 @@ impl LogReplayScanner {
         // As a result, we would read the file path for the remove action, which is unnecessary because
         // all of the rows will be filtered by the predicate. Instead, we wait until deletion
         // vectors are resolved so that we can skip both actions in the pair.
-        let action_iter = await_!(engine.json_handler().read_json_files(
+        let mut action_iter = std::pin::pin!(await_!(engine.json_handler().read_json_files(
             slice::from_ref(&commit_file.location),
             visitor_schema,
             None, // not safe to apply data skipping yet
-        ))?;
+        ))?);
 
         let mut remove_dvs = HashMap::default();
         let mut add_paths = HashSet::default();
         let mut has_cdc_action = false;
-        for actions in action_iter {
+        while let Some(actions) = await_!(action_iter.async_next()) {
             let actions = actions?;
 
             let mut visitor = PreparePhaseVisitor {

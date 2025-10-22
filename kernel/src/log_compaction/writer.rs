@@ -10,7 +10,10 @@ use crate::log_replay::LogReplayProcessor;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::table_properties::TableProperties;
-use crate::{async_fn, await_, DeltaResult, Engine, Error, SnapshotRef, Version};
+use crate::{
+    async_fn, await_, AsyncIterator as _, BoxedAsyncIterator, DeltaResult, Engine, Error,
+    SnapshotRef, Version,
+};
 
 /// Determine if log compaction should be performed based on the commit version and
 /// compaction interval.
@@ -122,7 +125,7 @@ impl LogCompactionWriter {
         let result_iter = processor.process_actions_iter(actions_iter);
 
         // Wrap the iterator in a LogCompactionDataIterator to track action counts lazily
-        Ok(LogCompactionDataIterator::new(Box::new(result_iter)))
+        Ok(LogCompactionDataIterator::new(result_iter.into_boxed()))
     }
 }
 
@@ -131,7 +134,7 @@ impl LogCompactionWriter {
 pub struct LogCompactionDataIterator {
     /// The nested iterator that yields compaction batches with action counts
     pub(crate) compaction_batch_iterator:
-        Box<dyn Iterator<Item = DeltaResult<ActionReconciliationBatch>> + Send>,
+        BoxedAsyncIterator<DeltaResult<ActionReconciliationBatch>>,
     /// Running total of actions included in the compaction
     pub(crate) actions_count: i64,
     /// Running total of add actions included in the compaction
@@ -141,9 +144,7 @@ pub struct LogCompactionDataIterator {
 impl LogCompactionDataIterator {
     /// Create a new LogCompactionDataIterator with counters initialized to 0
     pub(crate) fn new(
-        compaction_batch_iterator: Box<
-            dyn Iterator<Item = DeltaResult<ActionReconciliationBatch>> + Send,
-        >,
+        compaction_batch_iterator: BoxedAsyncIterator<DeltaResult<ActionReconciliationBatch>>,
     ) -> Self {
         Self {
             compaction_batch_iterator,
@@ -181,10 +182,12 @@ impl Iterator for LogCompactionDataIterator {
 
     /// Advances the iterator and returns the next value.
     fn next(&mut self) -> Option<Self::Item> {
-        Some(self.compaction_batch_iterator.next()?.map(|batch| {
-            self.actions_count += batch.actions_count;
-            self.add_actions_count += batch.add_actions_count;
-            batch.filtered_data
-        }))
+        Some(
+            await_!(self.compaction_batch_iterator.async_next())?.map(|batch| {
+                self.actions_count += batch.actions_count;
+                self.add_actions_count += batch.add_actions_count;
+                batch.filtered_data
+            }),
+        )
     }
 }

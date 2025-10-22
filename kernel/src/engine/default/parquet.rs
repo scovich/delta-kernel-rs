@@ -30,8 +30,8 @@ use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
 use crate::transaction::add_files_schema;
 use crate::{
-    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetHandler,
-    PredicateRef,
+    async_trait, async_trait_fn, into_async_iter, AsyncIterator, DeltaResult, EngineData, Error,
+    FileDataReadResultIterator, FileMeta, ParquetHandler, PredicateRef,
 };
 
 #[derive(Debug)]
@@ -205,15 +205,17 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     }
 }
 
+#[async_trait]
 impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
-    fn read_parquet_files(
+    #[async_trait_fn]
+    async fn read_parquet_files(
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         if files.is_empty() {
-            return Ok(Box::new(std::iter::empty()));
+            return Ok(into_async_iter(std::iter::empty()).into_boxed());
         }
 
         // get the first FileMeta to decide how to fetch the file.

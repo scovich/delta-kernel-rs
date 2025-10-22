@@ -8,7 +8,7 @@ use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::transaction::add_files_schema;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, Snapshot};
+use crate::{async_fn, await_, DeltaResult, Engine, Error, Snapshot};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,15 +42,16 @@ impl RowTrackingDomainMetadata {
     /// This method will return an error if:
     /// - The domain metadata configuration cannot be read from the log segment
     /// - The domain metadata JSON cannot be deserialized into `RowTrackingDomainMetadata`
+    #[async_fn]
     pub(crate) fn get_high_water_mark(
         snapshot: &Snapshot,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<i64>> {
-        Ok(domain_metadata_configuration(
+        Ok(await_!(domain_metadata_configuration(
             snapshot.log_segment(),
             Self::ROW_TRACKING_DOMAIN_NAME,
             engine,
-        )?
+        ))?
         .map(|domain_metadata| serde_json::from_str::<Self>(&domain_metadata))
         .transpose()?
         .map(|metadata| metadata.row_id_high_water_mark))

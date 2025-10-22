@@ -2,7 +2,6 @@
 //! metadata required to generate a change data feed. [`CdfScanFile`] can be constructed using
 //! [`CdfScanFileVisitor`]. The visitor reads from engine data with the schema [`cdf_scan_row_schema`].
 //! You can convert engine data to this schema using the [`cdf_scan_row_expression`].
-use itertools::Itertools;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
@@ -15,7 +14,7 @@ use crate::schema::{
     ColumnName, ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType,
 };
 use crate::utils::require;
-use crate::{DeltaResult, Error, RowVisitor};
+use crate::{into_async_iter, AsyncIterator, DeltaResult, Error, RowVisitor};
 
 // The type of action associated with a [`CdfScanFile`].
 #[derive(Debug, Clone, PartialEq)]
@@ -60,16 +59,20 @@ pub(crate) type CdfScanCallback<T> = fn(context: &mut T, scan_file: CdfScanFile)
 /// Transforms an iterator of [`TableChangesScanMetadata`] into an iterator of
 /// [`CdfScanFile`] by visiting the engine data.
 pub(crate) fn scan_metadata_to_scan_file(
-    scan_metadata: impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>,
-) -> impl Iterator<Item = DeltaResult<CdfScanFile>> {
+    scan_metadata: impl AsyncIterator<Item = DeltaResult<TableChangesScanMetadata>>,
+) -> impl AsyncIterator<Item = DeltaResult<CdfScanFile>> {
     scan_metadata
-        .map(|scan_metadata| -> DeltaResult<_> {
+        .async_map(|scan_metadata| -> DeltaResult<_> {
             let scan_metadata = scan_metadata?;
             let callback: CdfScanCallback<Vec<CdfScanFile>> =
                 |context, scan_file| context.push(scan_file);
-            Ok(visit_cdf_scan_files(&scan_metadata, vec![], callback)?.into_iter())
-        }) // Iterator-Result-Iterator
-        .flatten_ok() // Iterator-Result
+            Ok(into_async_iter(visit_cdf_scan_files(
+                &scan_metadata,
+                vec![],
+                callback,
+            )?))
+        }) // AsyncIterator-Result-AsyncIterator
+        .async_flatten_ok() // AsyncIterator-Result
 }
 
 /// Request that the kernel call a callback on each valid file that needs to be read for the

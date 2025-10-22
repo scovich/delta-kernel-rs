@@ -14,7 +14,7 @@ use tracing::error;
 
 use super::executor::TaskExecutor;
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::{DeltaResult, FileDataReadResultIterator, FileMeta};
+use crate::{into_async_iter, AsyncIterator, DeltaResult, FileDataReadResultIterator, FileMeta};
 
 /// A fallible future that resolves to a stream of [`RecordBatch`]
 /// cbindgen:ignore
@@ -102,6 +102,10 @@ impl FileStream {
     /// Creates a new `FileStream` from a given schema, `FileOpener`, and files list; the files are
     /// processed asynchronously by the provided `TaskExecutor`. Returns an `Iterator` that consumes
     /// the results.
+    // TODO(async): This method's whole approach should eventually change, because default engine
+    // I/O is changing to natively async with a thin sync wrapper (as per design doc). We most
+    // likely no longer need to mess with blocking tasks and sync queues - the method can directly
+    // return a Stream in async mode and use a simpler adapter in sync mode.
     pub fn new_async_read_iterator<E: TaskExecutor>(
         task_executor: Arc<E>,
         schema: ArrowSchemaRef,
@@ -140,9 +144,12 @@ impl FileStream {
             }
         });
 
-        Ok(Box::new(receiver.into_iter().map(|rbr| {
-            rbr.map(|rb| Box::new(ArrowEngineData::new(rb)) as _)
-        })))
+        Ok(into_async_iter(
+            receiver
+                .into_iter()
+                .map(|rbr| rbr.map(|rb| Box::new(ArrowEngineData::new(rb)) as _)),
+        )
+        .into_boxed())
     }
 
     /// Create a new `FileStream` using the given `FileOpener` to scan underlying files

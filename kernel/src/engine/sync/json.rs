@@ -12,7 +12,8 @@ use crate::engine::arrow_utils::to_json_bytes;
 use crate::engine_data::FilteredEngineData;
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
+    async_trait, async_trait_fn, DeltaResult, EngineData, Error, FileDataReadResultIterator,
+    FileMeta, JsonHandler, PredicateRef,
 };
 
 pub(crate) struct SyncJsonHandler;
@@ -29,8 +30,10 @@ fn try_create_from_json(
     Ok(json)
 }
 
+#[async_trait]
 impl JsonHandler for SyncJsonHandler {
-    fn read_json_files(
+    #[async_trait_fn]
+    async fn read_json_files(
         &self,
         files: &[FileMeta],
         schema: SchemaRef,

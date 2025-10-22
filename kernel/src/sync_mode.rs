@@ -9,7 +9,7 @@ use itertools::Itertools as _;
 use std::future::Future;
 
 // Re-export macros
-pub use delta_kernel_derive::{async_fn, async_trait};
+pub use delta_kernel_derive::{async_fn, async_trait, async_trait_fn};
 
 /// Conditionally adds `.await` to an expression (no-op in sync mode)
 #[macro_export]
@@ -46,20 +46,33 @@ macro_rules! yield_now {
 ///
 /// Use this with `async_then` to perform I/O operations on stream items.
 ///
-/// # Example
+/// # Clone Specification
+///
+/// Use `clone[var1, var2, ...]` to specify variables that need cloning for the
+/// inner async block. In sync mode, the clone specification is ignored (zero cost).
+///
+/// # Examples
 ///
 /// ```ignore
-/// items.async_then(async_closure!(|item| {
-///     let data = await_!(fetch_data(item))?;
-///     Ok(process(data))
+/// // With clones (common case) - clones ignored in sync mode!
+/// items.async_then(async_closure!(move |item| clone[engine, schema] {
+///     let data = await_!(fetch_data(item, engine))?;
+///     Ok(process(data, schema))
+/// }))
+///
+/// // Without clones (simple case)
+/// items.async_then(async_closure!(move |item| {
+///     Ok(process(item?))
+/// }))
+///
+/// // With explicit return type (rare)
+/// items.async_then(async_closure!(move |item| clone[ctx] -> DeltaResult<T> {
+///     await_!(fetch(item, ctx))
 /// }))
 /// ```
 #[macro_export]
 macro_rules! async_closure {
-    (| $($arg:tt),* | $( -> $return:ty )? $body:block ) => {
-        |$($arg),*| $( -> $return )? { $body }
-    };
-    (move | $($arg:tt),* | $( -> $return:ty )? $body:block ) => {
+    (move | $($arg:tt),* | $( clone[ $($var:ident),+ $(,)? ] )? $( -> $return:ty )? $body:block ) => {
         move |$($arg),*| $( -> $return )? { $body }
     };
 }
@@ -109,10 +122,14 @@ pub trait AsyncIterator: Iterator + Send + 'static {
         self.flatten()
     }
 
-    /// Flatten an iterator of Result<Iterator> into an iterator of Result
+    /// Flatten an iterator of Result<Iterator<T>> into an iterator of Result<T>
     ///
-    /// This is equivalent to itertools::flatten_ok. It handles Iterator<Item = Result<I, E>>
-    /// where I: IntoIterator, and produces Iterator<Item = Result<I::Item, E>>.
+    /// This is the traditional itertools `flatten_ok` semantics:
+    /// - Iterator<Item = Result<I, E>> where I: IntoIterator<Item = T>
+    /// - Produces: Iterator<Item = Result<T, E>>
+    ///
+    /// The inner iterator should yield plain values (not Results). Use [`Self::async_try_flatten`]
+    //  when both outer and inner iterators yield Results.
     fn async_flatten_ok<T, E, I>(self) -> impl AsyncIterator<Item = Result<T, E>>
     where
         Self: Iterator<Item = Result<I, E>> + Sized,
@@ -122,6 +139,27 @@ pub trait AsyncIterator: Iterator + Send + 'static {
         E: Send + 'static,
     {
         self.flatten_ok()
+    }
+
+    /// Flatten an iterator of Result<Iterator<Result<T>>> into an iterator of Result<T>
+    ///
+    /// This emulates TryStreamExt::try_flatten behavior:
+    /// - Iterator<Item = Result<I, E>> where I: IntoIterator<Item = Result<T, E>>
+    /// - Produces: Iterator<Item = Result<T, E>>
+    ///
+    /// Both the outer and inner iterators yield Results. Any error at either level
+    /// propagates through as Err.
+    fn async_try_flatten<T, E, I>(self) -> impl AsyncIterator<Item = Result<T, E>>
+    where
+        Self: Iterator<Item = Result<I, E>> + Sized,
+        I: IntoIterator<Item = Result<T, E>> + 'static,
+        I::IntoIter: Send + 'static,
+        T: Send + 'static,
+        E: Send + 'static,
+    {
+        // Use flatten_ok to flatten the iterator structure, producing Iterator<Item = Result<Result<T, E>, E>>
+        // Then map to flatten the nested Results: Result<Result<T, E>, E> -> Result<T, E>
+        self.flatten_ok().map(|result| result?)
     }
 
     /// Try fold with early exit on error

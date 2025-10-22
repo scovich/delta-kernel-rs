@@ -12,7 +12,7 @@ use std::task::{Context, Poll};
 
 // Re-export macros
 pub use async_trait::async_trait;
-pub use delta_kernel_derive::async_fn;
+pub use delta_kernel_derive::{async_fn, async_trait_fn};
 
 /// Conditionally adds `.await` to an expression (adds .await in async mode)
 #[macro_export]
@@ -45,26 +45,43 @@ macro_rules! yield_now {
 
 /// Create a closure that works uniformly in both sync and async modes
 ///
-/// In async mode, creates an async closure.
-/// In sync mode, creates a regular closure.
+/// In sync mode, produces `move |args| { body }` (no clones, no async).
+/// In async mode, produces `move |args| { create clones; async move { body } }`.
 ///
-/// Use this with `async_then` to perform I/O operations on stream items.
+/// This allows writing closures that work in both sync and async contexts
+/// with `async_then`, avoiding the FnMut incompatibility of async closures.
 ///
-/// # Example
+/// # Clone Specification
+///
+/// Use `clone[var1, var2, ...]` to specify variables that need cloning for the
+/// inner async block. In sync mode, the clone specification is ignored (zero cost).
+///
+/// # Examples
 ///
 /// ```ignore
-/// items.async_then(async_closure!(|item| {
-///     let data = await_!(fetch_data(item))?;
-///     Ok(process(data))
+/// // With clones (common case)
+/// items.async_then(async_closure!(move |item| clone[engine, schema] {
+///     let data = await_!(fetch_data(item, engine))?;
+///     Ok(process(data, schema))
+/// }))
+///
+/// // Without clones (simple case)
+/// items.async_then(async_closure!(move |item| {
+///     Ok(process(item?))
+/// }))
+///
+/// // With explicit return type (rare)
+/// items.async_then(async_closure!(move |item| clone[ctx] -> DeltaResult<T> {
+///     await_!(fetch(item, ctx))
 /// }))
 /// ```
 #[macro_export]
 macro_rules! async_closure {
-    (| $($arg:tt),* | $( -> $return:ty )? $body:block ) => {
-        async |$($arg),*| $( -> $return )? { $body }
-    };
-    (move | $($arg:tt),* | $( -> $return:ty )? $body:block ) => {
-        async move |$($arg),*| $( -> $return )? { $body }
+    (move | $($arg:tt),* | $( clone[ $($var:ident),+ $(,)? ] )? $( -> $return:ty )? $body:block ) => {
+        move |$($arg),*| {
+            $( $(let $var = $var.clone();)+ )?
+            async move $( -> $return )? $body
+        }
     };
 }
 
@@ -145,17 +162,39 @@ pub trait AsyncIterator: Stream + Send + 'static {
         self.flatten()
     }
 
-    /// Flatten a stream of Result<Stream> into a stream of Result
+    /// Flatten a stream of Result<Stream<T>> into a stream of Result<T>
     ///
-    /// This is the async equivalent of itertools::flatten_ok. It handles Stream<Item = Result<S, E>>
-    /// where S: Stream, and produces Stream<Item = Result<S::Item, E>>.
-    fn async_flatten_ok<T>(self) -> impl AsyncIterator<Item = Result<T, Self::Error>>
+    /// This is the traditional flatten_ok semantics for streams:
+    /// - Stream<Item = Result<S, E>> where S: Stream<Item = T>
+    /// - Produces: Stream<Item = Result<T, E>>
+    ///
+    /// The inner stream yields plain values (not Results). Any error in the outer
+    /// stream propagates through as Err.
+    fn async_flatten_ok<T, E>(self) -> impl AsyncIterator<Item = Result<T, E>>
+    where
+        Self: TryStream<Error = E> + Sized,
+        Self::Ok: Stream<Item = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        // Convert T to Result<T, E> so we can use try_flatten
+        self.map_ok(|inner| inner.map(Ok)).try_flatten()
+    }
+
+    /// Flatten a stream of Result<Stream<Result<T>>> into a stream of Result<T>
+    ///
+    /// This emulates TryStreamExt::try_flatten behavior:
+    /// - Stream<Item = Result<S, E>> where S: Stream<Item = Result<T, E>>
+    /// - Produces: Stream<Item = Result<T, E>>
+    ///
+    /// Both the outer and inner streams yield Results. Any error at either level
+    /// propagates through as Err.
+    fn async_try_flatten<T>(self) -> impl AsyncIterator<Item = Result<T, Self::Error>>
     where
         Self: TryStream + Sized,
         Self::Ok: TryStream<Ok = T, Error = Self::Error> + Send,
         T: Send + 'static,
     {
-        self.try_flatten()
+        self.try_flatten() // Direct delegation to futures-rs
     }
 
     /// Try fold with early exit on error

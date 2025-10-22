@@ -24,7 +24,8 @@ use crate::engine::arrow_utils::to_json_bytes;
 use crate::engine_data::FilteredEngineData;
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
+    async_trait, async_trait_fn, into_async_iter, AsyncIterator, DeltaResult, EngineData, Error,
+    FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
 };
 
 const DEFAULT_BUFFER_SIZE: usize = 1000;
@@ -84,6 +85,7 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
     }
 }
 
+#[async_trait]
 impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
     fn parse_json(
         &self,
@@ -93,14 +95,15 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         arrow_parse_json(json_strings, output_schema)
     }
 
-    fn read_json_files(
+    #[async_trait_fn]
+    async fn read_json_files(
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
         _predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         if files.is_empty() {
-            return Ok(Box::new(std::iter::empty()));
+            return Ok(into_async_iter(std::iter::empty()).into_boxed());
         }
 
         let schema = Arc::new(ArrowSchema::try_from_kernel(physical_schema.as_ref())?);
@@ -130,7 +133,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             }
         });
 
-        Ok(Box::new(rx.into_iter()))
+        Ok(into_async_iter(rx.into_iter()).into_boxed())
     }
 
     // note: for now we just buffer all the data and write it out all at once

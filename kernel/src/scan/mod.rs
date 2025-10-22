@@ -31,8 +31,8 @@ use crate::snapshot::SnapshotRef;
 use crate::table_features::ColumnMappingMode;
 use crate::transforms::TransformSpec;
 use crate::{
-    async_closure, async_fn, await_, into_async_iter, AsyncIterator, BoxedAsyncIterator,
-    DeltaResult, Engine, EngineData, Error, FileMeta, Version,
+    async_fn, await_, into_async_iter, AsyncIterator, BoxedAsyncIterator, DeltaResult, Engine,
+    EngineData, Error, FileMeta, Version,
 };
 
 use self::log_replay::scan_action_iter;
@@ -545,7 +545,7 @@ impl Scan {
         // If the snapshot version corresponds to the hint version, we process the existing data
         // to apply file skipping and provide the required transformations.
         if existing_version == self.snapshot.version() {
-            let scan = existing_data.into_iter().map(apply_transform);
+            let scan = into_async_iter(existing_data.into_iter().map(apply_transform));
             return Ok(self.scan_metadata_inner(engine, scan)?.into_boxed());
         }
 
@@ -557,7 +557,7 @@ impl Scan {
         // TODO: we may be able to apply heuristics or other logic to try and fetch missing deltas
         // from the log.
         if matches!(log_segment.checkpoint_version, Some(v) if v > existing_version) {
-            return Ok(Box::new(self.scan_metadata(engine)?));
+            return Ok(await_!(self.scan_metadata(engine))?.into_boxed());
         }
 
         // create a new log segment containing only the commits added after the version hint.
@@ -657,8 +657,6 @@ impl Scan {
             self.state_info.logical_schema, self.state_info.physical_schema
         );
 
-        let table_root = self.snapshot.table_root().clone();
-
         let scan_metadata_iter = await_!(self.scan_metadata(engine.as_ref()))?;
         let scan_files_iter = scan_metadata_iter
             .async_map(|res| {
@@ -666,69 +664,76 @@ impl Scan {
                 let scan_files = vec![];
                 scan_metadata.visit_scan_files(scan_files, scan_metadata_callback)
             })
-            // AsyncIterator<DeltaResult<Vec<ScanFile>>> to AsyncIterator<DeltaResult<ScanFile>>
+            // AsyncIterator<DeltaResult<Vec<ScanFile>>> to AsyncIterator<DeltaResult<AsyncIterator<ScanFile>>>
+            .async_map_ok(into_async_iter)
+            // AsyncIterator<DeltaResult<AsyncIterator>> to AsyncIterator<DeltaResult<ScanFile>>
             .async_flatten_ok();
 
+        let table_root = self.snapshot.table_root().clone();
         let physical_schema = self.physical_schema().clone();
         let logical_schema = self.logical_schema().clone();
-        let result = scan_files_iter
-            .async_then(async_closure!(move |scan_file| -> DeltaResult<_> {
-                let scan_file = scan_file?;
-                let file_path = table_root.join(&scan_file.path)?;
-                let mut selection_vector = scan_file
-                    .dv_info
-                    .get_selection_vector(engine.as_ref(), &table_root)?;
-                let meta = FileMeta {
-                    last_modified: 0,
-                    size: scan_file.size.try_into().map_err(|_| {
-                        Error::generic("Unable to convert scan file size into FileSize")
-                    })?,
-                    location: file_path,
-                };
+        let engine = engine.clone(); // Arc clone
+        let result =
+            scan_files_iter
+                .async_then(move |scan_file| {
+                    let table_root = table_root.clone();
+                    let physical_schema = physical_schema.clone();
+                    let logical_schema = logical_schema.clone();
+                    let engine = engine.clone(); // Arc clone
+                    async move {
+                        let scan_file = scan_file?;
+                        let file_path = table_root.join(&scan_file.path)?;
+                        let mut selection_vector = scan_file
+                            .dv_info
+                            .get_selection_vector(engine.as_ref(), &table_root)?;
+                        let meta = FileMeta {
+                            last_modified: 0,
+                            size: scan_file.size.try_into().map_err(|_| {
+                                Error::generic("Unable to convert scan file size into FileSize")
+                            })?,
+                            location: file_path,
+                        };
 
-                // WARNING: We validated the physical predicate against a schema that includes
-                // partition columns, but the read schema we use here does _NOT_ include partition
-                // columns. So we cannot safely assume that all column references are valid. See
-                // https://github.com/delta-io/delta-kernel-rs/issues/434 for more details.
-                //
-                // TODO(#860): we disable predicate pushdown until we support row indexes.
-                let read_result_iter = await_!(engine.parquet_handler().read_parquet_files(
-                    &[meta],
-                    physical_schema.clone(),
-                    None,
-                ))?;
+                        // WARNING: We validated the physical predicate against a schema that includes
+                        // partition columns, but the read schema we use here does _NOT_ include partition
+                        // columns. So we cannot safely assume that all column references are valid. See
+                        // https://github.com/delta-io/delta-kernel-rs/issues/434 for more details.
+                        //
+                        // TODO(#860): we disable predicate pushdown until we support row indexes.
+                        let read_result_iter = await_!(engine
+                            .parquet_handler()
+                            .read_parquet_files(&[meta], physical_schema.clone(), None,))?;
 
-                let engine = engine.clone(); // Arc clone
-                let physical_schema = physical_schema.clone();
-                let logical_schema = logical_schema.clone();
-                Ok(read_result_iter.async_map_ok(move |read_result| {
-                    // transform the physical data into the correct logical form
-                    let logical = state::transform_to_logical(
-                        engine.as_ref(),
-                        read_result,
-                        &physical_schema,
-                        &logical_schema,
-                        scan_file.transform.clone(), // Arc clone
-                    );
-                    let len = logical.as_ref().map_or(0, |res| res.len());
-                    // need to split the dv_mask. what's left in dv_mask covers this result, and rest
-                    // will cover the following results. we `take()` out of `selection_vector` to avoid
-                    // trying to return a captured variable. We're going to reassign `selection_vector`
-                    // to `rest` in a moment anyway
-                    let mut sv = selection_vector.take();
-                    let rest = split_vector(sv.as_mut(), len, None);
-                    let result = ScanResult {
-                        raw_data: logical,
-                        raw_mask: sv,
-                    };
-                    selection_vector = rest;
-                    result
-                }))
-            }))
-            // AsyncIterator<DeltaResult<AsyncIterator<DeltaResult<ScanResult>>>> to AsyncIterator<DeltaResult<ScanResult>>
-            .async_flatten_ok()
-            // AsyncIterator<DeltaResult<DeltaResult<ScanResult>>> to AsyncIterator<DeltaResult<ScanResult>>
-            .async_map(|x| x?);
+                        let engine = engine.clone(); // Arc clone
+                        let physical_schema = physical_schema.clone();
+                        let logical_schema = logical_schema.clone();
+                        Ok(read_result_iter.async_map_ok(move |read_result| {
+                            // transform the physical data into the correct logical form
+                            let logical = state::transform_to_logical(
+                                engine.as_ref(),
+                                read_result,
+                                &physical_schema,
+                                &logical_schema,
+                                scan_file.transform.clone(), // Arc clone
+                            );
+                            let len = logical.as_ref().map_or(0, |res| res.len());
+                            // need to split the dv_mask. what's left in dv_mask covers this result, and rest
+                            // will cover the following results. we `take()` out of `selection_vector` to avoid
+                            // trying to return a captured variable. We're going to reassign `selection_vector`
+                            // to `rest` in a moment anyway
+                            let mut sv = selection_vector.take();
+                            let rest = split_vector(sv.as_mut(), len, None);
+                            let result = ScanResult {
+                                raw_data: logical,
+                                raw_mask: sv,
+                            };
+                            selection_vector = rest;
+                            result
+                        }))
+                    }
+                })
+                // AsyncIterator<DeltaResult<AsyncIterator<DeltaResult<ScanResult>>>> to AsyncIterator<DeltaResult<ScanResult>>
+                .async_try_flatten();
         Ok(result)
     }
 }

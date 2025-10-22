@@ -12,7 +12,8 @@
 //! # let engine = DefaultEngine::new_local();
 //! let url = delta_kernel::try_parse_uri(path)?;
 //! // Get the table changes (change data feed) between version 0 and 1
-//! let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1))?;
+//! # use delta_kernel::await_;
+//! let table_changes = await_!(TableChanges::try_new(url, engine.as_ref(), 0, Some(1)))?;
 //!
 //! // Optionally specify a schema and predicate to apply to the table changes scan
 //! let schema = table_changes
@@ -44,7 +45,7 @@ use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_features::{ColumnMappingMode, ReaderFeature};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, Version};
+use crate::{async_fn, await_, DeltaResult, Engine, Error, Version};
 
 mod log_replay;
 mod physical_to_logical;
@@ -133,6 +134,7 @@ impl TableChanges {
     /// - `start_version`: The start version of the change data feed
     /// - `end_version`: The end version (inclusive) of the change data feed. If this is none, this
     ///   defaults to the newest table version.
+    #[async_fn]
     pub fn try_new(
         table_root: Url,
         engine: &dyn Engine,
@@ -150,14 +152,14 @@ impl TableChanges {
         // Both snapshots ensure that reading is supported at the start and end version using
         // `ensure_read_supported`. Note that we must still verify that reading is
         // supported for every protocol action in the CDF range.
-        let start_snapshot = Snapshot::builder_for(table_root.as_url().clone())
+        let start_snapshot = await_!(Snapshot::builder_for(table_root.as_url().clone())
             .at_version(start_version)
-            .build(engine)?;
+            .build(engine))?;
         let end_snapshot = match end_version {
-            Some(version) => Snapshot::builder_from(start_snapshot.clone())
+            Some(version) => await_!(Snapshot::builder_from(start_snapshot.clone())
                 .at_version(version)
-                .build(engine)?,
-            None => Snapshot::builder_from(start_snapshot.clone()).build(engine)?,
+                .build(engine))?,
+            None => await_!(Snapshot::builder_from(start_snapshot.clone()).build(engine))?,
         };
 
         // we block reading catalog-managed tables with CDF for now. note this is best-effort just

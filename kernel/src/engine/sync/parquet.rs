@@ -11,7 +11,10 @@ use crate::engine::arrow_utils::{
 };
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, FileDataReadResultIterator, FileMeta, ParquetHandler, PredicateRef};
+use crate::{
+    async_trait, async_trait_fn, DeltaResult, FileDataReadResultIterator, FileMeta,
+    ParquetHandler, PredicateRef,
+};
 
 pub(crate) struct SyncParquetHandler;
 
@@ -43,8 +46,10 @@ fn try_create_from_parquet(
     Ok(stream.map(move |rbr| fixup_parquet_read(rbr?, &requested_ordering, row_indexes.as_mut())))
 }
 
+#[async_trait]
 impl ParquetHandler for SyncParquetHandler {
-    fn read_parquet_files(
+    #[async_trait_fn]
+    async fn read_parquet_files(
         &self,
         files: &[FileMeta],
         schema: SchemaRef,

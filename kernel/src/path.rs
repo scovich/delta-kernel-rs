@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::engine_data::RowVisitor;
-use crate::{async_fn, await_, DeltaResult, Engine, Error, FileMeta, Version};
+use crate::{async_fn, await_, AsyncIterator as _, DeltaResult, Engine, Error, FileMeta, Version};
 use delta_kernel_derive::internal_api;
 
 use url::Url;
@@ -246,7 +246,7 @@ impl ParsedLogPath<FileMeta> {
         // Process the actions to find inCommitTimestamp
         // According to protocol, CommitInfo MUST be the first action when ICT is enabled,
         // so we can optimize by only reading the first batch
-        match action_iter.next() {
+        match await_!(action_iter.async_next()) {
             Some(Ok(actions)) => {
                 let mut visitor = InCommitTimestampVisitor::default();
                 visitor.visit_rows_of(actions.as_ref())?;

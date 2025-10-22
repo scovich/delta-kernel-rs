@@ -176,12 +176,12 @@ impl Snapshot {
 
         if new_log_segment.checkpoint_version.is_some() {
             // we have a checkpoint in the new LogSegment, just construct a new snapshot from that
-            let snapshot = Self::try_new_from_log_segment(
+            let snapshot = await_!(Self::try_new_from_log_segment(
                 existing_snapshot.table_root().clone(),
                 new_log_segment,
                 engine,
-            );
-            return Ok(Arc::new(snapshot?));
+            ))?;
+            return Ok(Arc::new(snapshot));
         }
 
         // after this point, we incrementally update the snapshot with the new log segment.
@@ -338,6 +338,7 @@ impl Snapshot {
     ///
     /// Note that this method performs log replay (fetches and processes metadata from storage).
     // TODO: add a get_app_id_versions to fetch all at once using SetTransactionScanner::get_all
+    #[async_fn]
     pub fn get_app_id_version(
         self: Arc<Self>,
         application_id: &str,
@@ -345,12 +346,12 @@ impl Snapshot {
     ) -> DeltaResult<Option<i64>> {
         let expiration_timestamp =
             calculate_transaction_expiration_timestamp(self.table_properties())?;
-        let txn = SetTransactionScanner::get_one(
+        let txn = await_!(SetTransactionScanner::get_one(
             self.log_segment(),
             application_id,
             engine,
             expiration_timestamp,
-        )?;
+        ))?;
         Ok(txn.map(|t| t.version))
     }
 
@@ -358,6 +359,7 @@ impl Snapshot {
     /// configuration for the domain, or None if the domain does not exist.
     ///
     /// Note that this method performs log replay (fetches and processes metadata from storage).
+    #[async_fn]
     pub fn get_domain_metadata(
         &self,
         domain: &str,
@@ -369,7 +371,11 @@ impl Snapshot {
             ));
         }
 
-        domain_metadata_configuration(self.log_segment(), domain, engine)
+        await_!(domain_metadata_configuration(
+            self.log_segment(),
+            domain,
+            engine
+        ))
     }
 
     /// Get the In-Commit Timestamp (ICT) for this snapshot.
@@ -380,6 +386,7 @@ impl Snapshot {
     /// - `Ok(Some(timestamp))` - ICT is enabled and available for this version
     /// - `Ok(None)` - ICT is not enabled
     /// - `Err(...)` - ICT is enabled but cannot be read, or enablement version is invalid
+    #[async_fn]
     pub(crate) fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
         // Get ICT enablement info and check if we should read ICT for this version
         let enablement = self
@@ -408,7 +415,7 @@ impl Snapshot {
         // Read the ICT from latest_commit_file
         match &self.log_segment.latest_commit_file {
             Some(commit_file_meta) => {
-                let ict = commit_file_meta.read_in_commit_timestamp(engine)?;
+                let ict = await_!(commit_file_meta.read_in_commit_timestamp(engine))?;
                 Ok(Some(ict))
             }
             None => Err(Error::generic("Last commit file not found in log segment")),

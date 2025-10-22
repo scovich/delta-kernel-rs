@@ -3,8 +3,8 @@ use quote::{quote, quote_spanned, ToTokens};
 use syn::parse_macro_input;
 use syn::spanned::Spanned;
 use syn::{
-    Data, DataStruct, DeriveInput, Error, Fields, Item, ItemFn, Meta, PathArguments, TraitItemFn,
-    Type, Visibility,
+    Data, DataStruct, DeriveInput, Error, Fields, ImplItemFn, Item, ItemFn, Meta, PathArguments,
+    TraitItemFn, Type, Visibility,
 };
 
 /// Parses a dot-delimited column name into an array of field names. See
@@ -256,47 +256,152 @@ fn make_public(mut item: Item) -> Item {
     item
 }
 
-/// Conditionally adds the `async` keyword to a function based on the `async` feature flag.
+/// Conditionally adds or removes the `async` keyword based on feature flag.
 ///
-/// When the `async` feature is enabled, this macro transforms a function into an async function
-/// by adding the `async` keyword. When the feature is disabled, the function remains synchronous.
+/// Use this for regular functions and struct impl methods (where there's no `#[async_trait]`).
+/// For trait definitions and trait impls, use `#[async_trait_fn]` instead.
 ///
-/// # Example
+/// # Convention
+///
+/// Write WITHOUT `async` in source. The macro adds it in async mode.
+///
+/// # Examples
 ///
 /// ```ignore
+/// // Regular function
 /// #[async_fn]
-/// fn read_file(engine: &dyn Engine) -> DeltaResult<Data> {
-///     let data = await_!(engine.read_file(path))?;
-///     Ok(data)
+/// fn helper() { await_!(operation())?; }
+///
+/// // Struct impl method
+/// impl MyStruct {
+///     #[async_fn]
+///     fn process(&self) { await_!(operation())?; }
 /// }
 /// ```
-///
-/// In sync mode, this expands to a regular function. In async mode, it becomes `async fn`.
 #[proc_macro_attribute]
 pub fn async_fn(
     _attr: proc_macro::TokenStream,
     item: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
-    // Add or remove `async` keyword based on feature flag
     let asyncness = cfg!(feature = "async").then(syn::token::Async::default);
 
-    // Try parsing as a function with body first (more common) or as a trait method. Any other item
-    // type produces an error.
-    let item = if let Ok(mut item_fn) = syn::parse::<ItemFn>(item.clone()) {
+    // Try regular function first (most common case)
+    if let Ok(mut item_fn) = syn::parse::<ItemFn>(item.clone()) {
         item_fn.sig.asyncness = asyncness;
-        quote! { #item_fn }
-    } else if let Ok(mut trait_fn) = syn::parse::<TraitItemFn>(item.clone()) {
-        trait_fn.sig.asyncness = asyncness;
-        quote! { #trait_fn }
-    } else {
-        Error::new(
-            proc_macro2::Span::call_site(),
-            "#[async_fn] can only be applied to functions or trait methods",
-        )
-        .to_compile_error()
-    };
+        return quote! { #item_fn }.into();
+    }
 
-    item.into()
+    // Try struct impl method (NOT trait impl - use #[async_trait_fn] for those)
+    if let Ok(mut impl_fn) = syn::parse::<ImplItemFn>(item.clone()) {
+        impl_fn.sig.asyncness = asyncness;
+        return quote! { #impl_fn }.into();
+    }
+
+    // Neither function nor impl method - emit item first, then diagnostic
+    let item: proc_macro2::TokenStream = item.into();
+    let diagnostic = Error::new(
+        proc_macro2::Span::call_site(),
+        "#[async_fn] could not parse this item as a function or impl method.\n\
+         \n\
+         This macro only works on:\n\
+         - Regular functions: `#[async_fn] fn foo() { ... }`\n\
+         - Struct impl methods: `impl Foo { #[async_fn] fn bar() { ... } }`\n\
+         \n\
+         For trait definitions and trait impls, use `#[async_trait_fn]` instead.\n\
+         \n\
+         If you believe you're using it correctly, check for syntax errors in the function body.",
+    )
+    .to_compile_error();
+
+    // Emit item FIRST (so syntax errors appear first), diagnostic SECOND
+    quote! {
+        #item
+        #diagnostic
+    }
+    .into()
+}
+
+/// Removes the `async` keyword from trait methods to enable dyn-compatibility.
+///
+/// This macro works in conjunction with `#[async_trait]` to handle trait methods correctly
+/// in both sync and async modes. Use this for trait definitions AND trait implementations.
+///
+/// **IMPORTANT**: This is specifically for trait-related code. For regular functions and
+/// struct impl methods, use `#[async_fn]` instead.
+///
+/// # Why Two Macros?
+///
+/// Trait impl methods (`ImplItemFn` in syn) need different behavior depending on context:
+/// - Trait impls (with `#[async_trait]`): Must clear `async` (this macro)
+/// - Struct impls (no `#[async_trait]`): Must use feature flag (`#[async_fn]`)
+///
+/// Since proc macros cannot see the parent `impl` block context, we need two separate macros
+/// where the user chooses based on whether they're implementing a trait or not.
+///
+/// # How It Works
+///
+/// - **Async mode**: `#[async_trait]` (from async-trait crate) processes the trait first,
+///   removing `async` and boxing the futures. This macro then has no effect since the
+///   `async` keyword is already gone.
+///
+/// - **Sync mode**: `#[async_trait]` (our no-op) does nothing, so this macro removes the
+///   `async` keyword to create a standard synchronous trait method.
+///
+/// # Examples
+///
+/// ```ignore
+/// #[async_trait]
+/// pub trait Handler {
+///     #[async_trait_fn]  // For trait definitions
+///     async fn handle(...) -> Result<()>;
+/// }
+///
+/// #[async_trait]
+/// impl Handler for MyHandler {
+///     #[async_trait_fn]  // For trait implementations
+///     async fn handle(...) -> Result<()> {
+///         // implementation
+///     }
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn async_trait_fn(
+    _attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    // Try trait method definition
+    if let Ok(mut trait_fn) = syn::parse::<TraitItemFn>(item.clone()) {
+        trait_fn.sig.asyncness = None;
+        return quote! { #trait_fn }.into();
+    }
+
+    // Try trait impl method
+    if let Ok(mut impl_fn) = syn::parse::<ImplItemFn>(item.clone()) {
+        impl_fn.sig.asyncness = None;
+        return quote! { #impl_fn }.into();
+    }
+
+    // Neither - emit item first, then diagnostic
+    let item: proc_macro2::TokenStream = item.into();
+    let diagnostic = Error::new(
+        proc_macro2::Span::call_site(),
+        "#[async_trait_fn] could not parse this item as a trait method.\n\
+         \n\
+         This macro only works on:\n\
+         - Trait method definitions: `trait Foo { #[async_trait_fn] async fn bar(); }`\n\
+         - Trait impl methods: `impl Foo for Bar { #[async_trait_fn] async fn bar() { ... } }`\n\
+         \n\
+         For regular functions and struct impls, use `#[async_fn]` instead.\n\
+         \n\
+         If you believe you're using it correctly, check for syntax errors in the function body.",
+    )
+    .to_compile_error();
+
+    quote! {
+        #item
+        #diagnostic
+    }
+    .into()
 }
 
 /// No-op proc macro that stands in for async-trait in sync mode.
@@ -312,13 +417,13 @@ pub fn async_fn(
 /// #[async_trait]
 /// pub trait ParquetHandler {
 ///     #[async_fn]
-///     fn read_files(...) -> DeltaResult<FileDataReadResultIterator>;
+///     async fn read_files(...) -> DeltaResult<FileDataReadResultIterator>;
 /// }
 ///
 /// #[async_trait]
 /// impl ParquetHandler for DefaultParquetHandler {
 ///     #[async_fn]
-///     fn read_files(...) -> DeltaResult<FileDataReadResultIterator> {
+///     async fn read_files(...) -> DeltaResult<FileDataReadResultIterator> {
 ///         // implementation
 ///     }
 /// }

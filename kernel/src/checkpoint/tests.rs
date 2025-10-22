@@ -12,7 +12,7 @@ use crate::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEn
 use crate::log_replay::HasSelectionVector;
 use crate::schema::{DataType as KernelDataType, StructField, StructType};
 use crate::utils::test_utils::Action;
-use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
+use crate::{await_, DeltaResult, FileMeta, LogPath, Snapshot};
 
 use arrow_56::{
     array::{create_array, RecordBatch},
@@ -330,7 +330,7 @@ fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
         last_modified: 0,
         size: size_in_bytes,
     };
-    writer.finalize(&engine, &metadata, data_iter)?;
+    await_!(writer.finalize(&engine, &metadata, data_iter))?;
     // Asserts the checkpoint file contents:
     // - version: latest version (2)
     // - size: 1 metadata + 1 protocol + 1 add action + 1 remove action
@@ -395,7 +395,7 @@ fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
         last_modified: 0,
         size: size_in_bytes,
     };
-    writer.finalize(&engine, &metadata, data_iter)?;
+    await_!(writer.finalize(&engine, &metadata, data_iter))?;
     // Asserts the checkpoint file contents:
     // - version: specified version (0)
     // - size: 1 metadata + 1 protocol
@@ -509,7 +509,7 @@ fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
         last_modified: 0,
         size: size_in_bytes,
     };
-    writer.finalize(&engine, &metadata, data_iter)?;
+    await_!(writer.finalize(&engine, &metadata, data_iter))?;
     // Asserts the checkpoint file contents:
     // - version: latest version (1)
     // - size: 1 metadata + 1 protocol + 1 add action + 1 remove action + 1 checkpointMetadata

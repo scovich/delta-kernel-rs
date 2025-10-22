@@ -583,8 +583,8 @@ pub trait JsonHandler: AsAny {
     /// - `files` - File metadata for files to be read.
     /// - `physical_schema` - Select list of columns to read from the JSON file.
     /// - `predicate` - Optional push-down predicate hint (engine is free to ignore it).
-    #[async_fn]
-    fn read_json_files(
+    #[async_trait_fn]
+    async fn read_json_files(
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
@@ -695,8 +695,8 @@ pub trait ParquetHandler: AsAny {
     ///    iter: [EngineData(2, 1, 3)]
     ///
     /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey
-    #[async_fn]
-    fn read_parquet_files(
+    #[async_trait_fn]
+    async fn read_parquet_files(
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,

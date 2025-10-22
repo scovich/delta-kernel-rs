@@ -19,18 +19,19 @@ impl SetTransactionScanner {
     ///
     /// Note that each call to this function repeats log replay. Thus, if callers are interested
     /// in multiple app ids, use `get_all` (once) instead and probe the map returned.
+    #[async_fn]
     pub(crate) fn get_one(
         log_segment: &LogSegment,
         application_id: &str,
         engine: &dyn Engine,
         expiration_timestamp: Option<i64>,
     ) -> DeltaResult<Option<SetTransaction>> {
-        let mut transactions = scan_application_transactions(
+        let mut transactions = await_!(scan_application_transactions(
             log_segment,
             Some(application_id),
             engine,
             expiration_timestamp,
-        )?;
+        ))?;
         Ok(transactions.remove(application_id))
     }
 
@@ -68,7 +69,7 @@ fn scan_application_transactions(
         SetTransactionVisitor::new(application_id.map(|s| s.to_owned()), expiration_timestamp);
     // If a specific id is requested then we can terminate log replay early as soon as it was
     // found. If all ids are requested then we are forced to replay the entire log.
-    let mut actions_iter = await_!(replay_for_app_ids(log_segment, engine))?;
+    let mut actions_iter = std::pin::pin!(await_!(replay_for_app_ids(log_segment, engine))?);
     while let Some(maybe_data) = await_!(actions_iter.async_next()) {
         let txns = maybe_data?.actions;
         visitor.visit_rows_of(txns.as_ref())?;

@@ -14,9 +14,9 @@ use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::SchemaRef;
 use crate::utils::require;
 use crate::{
-    async_closure, async_fn, await_, AsyncIterator, DeltaResult, Engine, EngineData, Error,
-    Expression, FileMeta, ParquetHandler, Predicate, PredicateRef, RowVisitor, StorageHandler,
-    Version,
+    async_closure, async_fn, await_, into_async_iter, AsyncIterator, DeltaResult, Engine,
+    EngineData, Error, Expression, FileMeta, ParquetHandler, Predicate, PredicateRef, RowVisitor,
+    StorageHandler, Version,
 };
 use delta_kernel_derive::internal_api;
 
@@ -418,15 +418,14 @@ impl LogSegment {
             }
             // This is the case when there are no checkpoints in the log segment
             // so we return an empty iterator
-            None => Box::new(std::iter::empty()),
+            None => into_async_iter(std::iter::empty()).into_boxed(),
         };
 
         let log_root = self.log_root.clone();
-
+        let should_process_sidecars = need_file_actions && checkpoint_file_meta.len() == 1;
         let actions_iter = actions
-            .async_then(async_closure!(
-                move |checkpoint_batch_result| -> DeltaResult<_> {
-                    let checkpoint_batch = checkpoint_batch_result?;
+            .async_then(async_closure!(move |checkpoint_batch_result| clone[log_root, checkpoint_read_schema, meta_predicate, parquet_handler] {
+                let checkpoint_batch = checkpoint_batch_result?;
                     // This closure maps the checkpoint batch to an iterator of batches
                     // by chaining the checkpoint batch with sidecar batches if they exist.
 
@@ -435,29 +434,27 @@ impl LogSegment {
                     //    schema contains add/remove action.
                     // 2. Multi-part checkpoint batches never have sidecar actions, so the batch is
                     //    returned as-is.
-                    let sidecar_content = if need_file_actions && checkpoint_file_meta.len() == 1 {
+                    let sidecar_content = if should_process_sidecars {
                         await_!(Self::process_sidecars(
-                            parquet_handler.clone(), // cheap Arc clone
-                            log_root.clone(),
+                            parquet_handler,
+                            log_root,
                             checkpoint_batch.as_ref(),
-                            checkpoint_read_schema.clone(),
-                            meta_predicate.clone(),
+                            checkpoint_read_schema,
+                            meta_predicate,
                         ))?
                     } else {
                         None
                     };
 
-                    let combined_batches = std::iter::once(Ok(checkpoint_batch))
-                        .chain(sidecar_content.into_iter().flatten())
+                    let combined_batches = into_async_iter(std::iter::once(Ok(checkpoint_batch)))
+                        .async_chain(into_async_iter(sidecar_content).async_flatten())
                         // The boolean flag indicates whether the batch originated from a commit file
                         // (true) or a checkpoint file (false).
-                        .map_ok(|sidecar_batch| ActionsBatch::new(sidecar_batch, false));
+                        .async_map_ok(|sidecar_batch| ActionsBatch::new(sidecar_batch, false));
 
-                    Ok(combined_batches)
-                }
-            ))
-            .async_flatten_ok()
-            .async_map(|x| x?);
+                Ok(combined_batches)
+            }))
+            .async_try_flatten();
 
         Ok(actions_iter)
     }
@@ -504,7 +501,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
-        let mut actions_batches = await_!(self.replay_for_metadata(engine))?;
+        let mut actions_batches = std::pin::pin!(await_!(self.replay_for_metadata(engine))?);
         let (mut metadata_opt, mut protocol_opt) = (None, None);
         while let Some(actions_batch) = await_!(actions_batches.async_next()) {
             let actions = actions_batch?.actions;

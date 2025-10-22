@@ -140,10 +140,11 @@ impl TableChangesScan {
     /// deletion vectors present in the commit. The engine data in each scan metadata is guaranteed
     /// to belong to the same commit. Several [`TableChangesScanMetadata`] may belong to the same
     /// commit.
+    #[async_fn]
     fn scan_metadata(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
+    ) -> DeltaResult<impl AsyncIterator<Item = DeltaResult<TableChangesScanMetadata>>> {
         let commits = self
             .table_changes
             .log_segment
@@ -151,13 +152,18 @@ impl TableChangesScan {
             .clone();
         // NOTE: This is a cheap arc clone
         let physical_predicate = match self.state_info.physical_predicate.clone() {
-            PhysicalPredicate::StaticSkipAll => return Ok(None.into_iter().flatten()),
+            PhysicalPredicate::StaticSkipAll => return Ok(into_async_iter(None).async_flatten()),
             PhysicalPredicate::Some(predicate, schema) => Some((predicate, schema)),
             PhysicalPredicate::None => None,
         };
         let schema = self.table_changes.end_snapshot.schema();
-        let it = table_changes_action_iter(engine, commits, schema, physical_predicate)?;
-        Ok(Some(it).into_iter().flatten())
+        let it = await_!(table_changes_action_iter(
+            engine,
+            commits,
+            schema,
+            physical_predicate
+        ))?;
+        Ok(into_async_iter(Some(it)).async_flatten())
     }
 
     /// Get a shared reference to the logical [`Schema`] of the table changes scan.
@@ -196,7 +202,7 @@ impl TableChangesScan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<impl AsyncIterator<Item = DeltaResult<ScanResult>>> {
-        let scan_metadata = self.scan_metadata(engine.clone())?;
+        let scan_metadata = await_!(self.scan_metadata(engine.clone()))?;
         let scan_files = scan_metadata_to_scan_file(scan_metadata);
 
         let table_root1 = self.table_root().clone();
@@ -205,24 +211,22 @@ impl TableChangesScan {
         let physical_predicate = self.physical_predicate().clone();
         let dv_engine_ref = engine.clone();
 
-        let result = into_async_iter(scan_files)
+        let result = scan_files
             .async_map(move |scan_file| {
                 resolve_scan_file_dv(dv_engine_ref.as_ref(), &table_root1, scan_file?)
             }) // AsyncIterator-Result-Iterator
+            .async_map_ok(into_async_iter) // AsyncIterator-Result-AsyncIterator
             .async_flatten_ok() // AsyncIterator-Result
-            .async_then(async_closure!(
-                move |resolved_scan_file| -> DeltaResult<_> {
-                    await_!(read_scan_file(
-                        engine.as_ref(),
-                        resolved_scan_file?,
-                        &table_root2,
-                        state_info.as_ref(),
-                        physical_predicate.clone(),
-                    ))
-                }
-            )) // AsyncIterator-Result-AsyncIterator-Result
-            .async_flatten_ok() // AsyncIterator-Result-Result
-            .async_map(|x| x?); // AsyncIterator-Result
+            .async_then(async_closure!(move |resolved_scan_file| clone[engine, state_info, table_root2, physical_predicate] {
+                await_!(read_scan_file(
+                    engine.as_ref(),
+                    resolved_scan_file?,
+                    &table_root2,
+                    state_info.as_ref(),
+                    physical_predicate,
+                ))
+            })) // AsyncIterator-Result-AsyncIterator-Result
+            .async_try_flatten(); // AsyncIterator-Result
 
         Ok(result)
     }

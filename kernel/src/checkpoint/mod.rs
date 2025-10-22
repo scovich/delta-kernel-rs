@@ -63,7 +63,8 @@
 //! /* IMPORTANT: All data must be written before finalizing the checkpoint */
 //!
 //! // Finalize the checkpoint by passing the metadata and exhausted data iterator
-//! writer.finalize(engine, &metadata, checkpoint_data)?;
+//! use delta_kernel::await_;
+//! await_!(writer.finalize(engine, &metadata, checkpoint_data))?;
 //!
 //! # Ok::<_, Error>(())
 //! ```
@@ -103,7 +104,8 @@ use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _}
 use crate::snapshot::SnapshotRef;
 use crate::table_properties::TableProperties;
 use crate::{
-    async_fn, await_, DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta,
+    async_fn, await_, into_async_iter, AsyncIterator as _, BoxedAsyncIterator, DeltaResult, Engine,
+    EngineData, Error, EvaluationHandlerExtension, FileMeta,
 };
 
 use url::Url;
@@ -158,8 +160,7 @@ static CHECKPOINT_METADATA_ACTION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(||
 /// [`CheckpointWriter::finalize`]. Failing to do so may result in data loss or corruption.
 pub struct CheckpointDataIterator {
     /// The nested iterator that yields checkpoint batches with action counts
-    checkpoint_batch_iterator:
-        Box<dyn Iterator<Item = DeltaResult<ActionReconciliationBatch>> + Send>,
+    checkpoint_batch_iterator: BoxedAsyncIterator<DeltaResult<ActionReconciliationBatch>>,
     /// Running total of actions included in the checkpoint
     actions_count: i64,
     /// Running total of add actions included in the checkpoint
@@ -290,7 +291,9 @@ impl CheckpointWriter {
 
         // Wrap the iterator in a CheckpointDataIterator to track action counts[
         Ok(CheckpointDataIterator {
-            checkpoint_batch_iterator: Box::new(checkpoint_data.chain(checkpoint_metadata)),
+            checkpoint_batch_iterator: checkpoint_data
+                .async_chain(into_async_iter(checkpoint_metadata))
+                .into_boxed(),
             actions_count: 0,
             add_actions_count: 0,
         })
@@ -313,6 +316,7 @@ impl CheckpointWriter {
     // 1. Validates that the checkpoint data iterator is fully exhausted
     // 2. Creates the `_last_checkpoint` data with `create_last_checkpoint_data`
     // 3. Writes the `_last_checkpoint` data to the `_last_checkpoint` file in the delta log
+    #[async_fn]
     pub fn finalize(
         self,
         engine: &dyn Engine,
@@ -320,7 +324,7 @@ impl CheckpointWriter {
         mut checkpoint_data: CheckpointDataIterator,
     ) -> DeltaResult<()> {
         // Ensure the checkpoint data iterator is fully exhausted
-        if checkpoint_data.checkpoint_batch_iterator.next().is_some() {
+        if await_!(checkpoint_data.checkpoint_batch_iterator.async_next()).is_some() {
             return Err(Error::checkpoint_write(
                 "The checkpoint data iterator must be fully consumed and written to storage before calling finalize"
             ));
