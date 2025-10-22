@@ -16,7 +16,7 @@
 //! ## Architecture
 //!
 //! - [`CheckpointWriter`] - Core component that manages the checkpoint creation workflow
-//! - [`CheckpointDataIterator`] - Iterator over the checkpoint data to be written
+//! - [`ActionReconciliationIterator`] - Iterator over the checkpoint data to be written
 //!
 //! ## Usage
 //!
@@ -31,7 +31,7 @@
 //!
 //! ```no_run
 //! # use std::sync::Arc;
-//! # use delta_kernel::checkpoint::CheckpointDataIterator;
+//! # use delta_kernel::ActionReconciliationIterator;
 //! # use delta_kernel::checkpoint::CheckpointWriter;
 //! # use delta_kernel::Engine;
 //! # use delta_kernel::Snapshot;
@@ -40,7 +40,7 @@
 //! # use delta_kernel::Error;
 //! # use delta_kernel::FileMeta;
 //! # use url::Url;
-//! fn write_checkpoint_file(path: Url, data: &CheckpointDataIterator) -> DeltaResult<FileMeta> {
+//! fn write_checkpoint_file(path: Url, data: &ActionReconciliationIterator) -> DeltaResult<FileMeta> {
 //!     todo!() /* engine-specific logic to write data to object storage*/
 //! }
 //!
@@ -90,7 +90,7 @@ use std::sync::{Arc, LazyLock};
 use crate::action_reconciliation::log_replay::{
     ActionReconciliationBatch, ActionReconciliationProcessor,
 };
-use crate::action_reconciliation::RetentionCalculator;
+use crate::action_reconciliation::{ActionReconciliationIterator, RetentionCalculator};
 use crate::actions::{
     Add, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME, CHECKPOINT_METADATA_NAME,
     METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
@@ -104,8 +104,8 @@ use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _}
 use crate::snapshot::SnapshotRef;
 use crate::table_properties::TableProperties;
 use crate::{
-    async_fn, await_, into_async_iter, AsyncIterator as _, BoxedAsyncIterator, DeltaResult, Engine,
-    EngineData, Error, EvaluationHandlerExtension, FileMeta,
+    async_fn, await_, into_async_iter, AsyncIterator as _, DeltaResult, Engine, EngineData, Error,
+    EvaluationHandlerExtension, FileMeta,
 };
 
 use url::Url;
@@ -149,71 +149,6 @@ static CHECKPOINT_METADATA_ACTION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(||
     )]))
 });
 
-/// An iterator over the checkpoint data to be written to the file.
-///
-/// This iterator yields filtered checkpoint data batches ([`FilteredEngineData`]) and
-/// tracks action statistics required for finalizing the checkpoint.
-///
-/// # Warning
-/// The [`CheckpointDataIterator`] must be fully consumed to ensure proper collection of statistics for
-/// the checkpoint. Additionally, all yielded data must be written to the specified path before calling
-/// [`CheckpointWriter::finalize`]. Failing to do so may result in data loss or corruption.
-pub struct CheckpointDataIterator {
-    /// The nested iterator that yields checkpoint batches with action counts
-    checkpoint_batch_iterator: BoxedAsyncIterator<DeltaResult<ActionReconciliationBatch>>,
-    /// Running total of actions included in the checkpoint
-    actions_count: i64,
-    /// Running total of add actions included in the checkpoint
-    add_actions_count: i64,
-}
-
-// Sync mode: Implement Iterator
-#[cfg(not(feature = "async"))]
-impl Iterator for CheckpointDataIterator {
-    type Item = DeltaResult<FilteredEngineData>;
-
-    /// Advances the iterator and returns the next value.
-    ///
-    /// This implementation transforms the `ActionReconciliationBatch` items from the nested iterator into
-    /// [`FilteredEngineData`] items for the engine to write, while accumulating action counts from
-    /// each batch. The [`CheckpointDataIterator`] is passed back to the kernel on call to
-    /// [`CheckpointWriter::finalize`] for counts to be read and written to the `_last_checkpoint` file
-    fn next(&mut self) -> Option<Self::Item> {
-        // In sync mode, BoxedAsyncIterator is Box<dyn Iterator>, so .next() is synchronous
-        self.checkpoint_batch_iterator.next().map(|result| {
-            result.map(|batch| {
-                self.actions_count += batch.actions_count;
-                self.add_actions_count += batch.add_actions_count;
-                batch.filtered_data
-            })
-        })
-    }
-}
-
-// Async mode: Implement Stream
-#[cfg(feature = "async")]
-impl futures::stream::Stream for CheckpointDataIterator {
-    type Item = DeltaResult<FilteredEngineData>;
-
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        // In async mode, BoxedAsyncIterator is Pin<Box<dyn Stream>>
-        // Poll the inner stream
-        match self.checkpoint_batch_iterator.as_mut().poll_next(cx) {
-            std::task::Poll::Ready(Some(result)) => {
-                std::task::Poll::Ready(Some(result.map(|batch| {
-                    self.actions_count += batch.actions_count;
-                    self.add_actions_count += batch.add_actions_count;
-                    batch.filtered_data
-                })))
-            }
-            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
-    }
-}
 
 /// Orchestrates the process of creating a checkpoint for a table.
 ///
@@ -286,7 +221,7 @@ impl CheckpointWriter {
     /// # Parameters
     /// - `engine`: Implementation of [`Engine`] APIs.
     ///
-    /// # Returns: [`CheckpointDataIterator`] containing the checkpoint data
+    /// # Returns: [`ActionReconciliationIterator`] containing the checkpoint data
     // This method is the core of the checkpoint generation process. It:
     // 1. Determines whether to write a V1 or V2 checkpoint based on the table's
     //    `v2Checkpoints` feature support
@@ -296,7 +231,7 @@ impl CheckpointWriter {
     //    (i.e., if `v2Checkpoints` feature is supported by table)
     // 5. Generates the appropriate checkpoint path
     #[async_fn]
-    pub fn checkpoint_data(&self, engine: &dyn Engine) -> DeltaResult<CheckpointDataIterator> {
+    pub fn checkpoint_data(&self, engine: &dyn Engine) -> DeltaResult<ActionReconciliationIterator> {
         let is_v2_checkpoints_supported = self
             .snapshot
             .table_configuration()
@@ -319,14 +254,12 @@ impl CheckpointWriter {
         let checkpoint_metadata =
             is_v2_checkpoints_supported.then(|| self.create_checkpoint_metadata_batch(engine));
 
-        // Wrap the iterator in a CheckpointDataIterator to track action counts[
-        Ok(CheckpointDataIterator {
-            checkpoint_batch_iterator: checkpoint_data
+        // Wrap the iterator to track action counts
+        Ok(ActionReconciliationIterator::new(
+            checkpoint_data
                 .async_chain(into_async_iter(checkpoint_metadata))
                 .into_boxed(),
-            actions_count: 0,
-            add_actions_count: 0,
-        })
+        ))
     }
 
     /// Finalizes checkpoint creation by saving metadata about the checkpoint.
@@ -351,10 +284,10 @@ impl CheckpointWriter {
         self,
         engine: &dyn Engine,
         metadata: &FileMeta,
-        mut checkpoint_data: CheckpointDataIterator,
+        checkpoint_data: ActionReconciliationIterator,
     ) -> DeltaResult<()> {
         // Ensure the checkpoint data iterator is fully exhausted
-        if await_!(checkpoint_data.checkpoint_batch_iterator.async_next()).is_some() {
+        if !checkpoint_data.is_exhausted() {
             return Err(Error::checkpoint_write(
                 "The checkpoint data iterator must be fully consumed and written to storage before calling finalize"
             ));
@@ -370,8 +303,8 @@ impl CheckpointWriter {
         let data = create_last_checkpoint_data(
             engine,
             self.version,
-            checkpoint_data.actions_count,
-            checkpoint_data.add_actions_count,
+            checkpoint_data.actions_count(),
+            checkpoint_data.add_actions_count(),
             size_in_bytes,
         );
 

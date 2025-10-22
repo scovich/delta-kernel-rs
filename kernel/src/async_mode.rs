@@ -214,7 +214,11 @@ pub trait AsyncIterator: Stream + Send + Sized + 'static {
     ///
     /// Note: Unlike `TryStreamExt::try_fold`, this takes a sync closure for consistency
     /// with sync mode. The closure is wrapped in `future::ready` internally.
-    fn async_try_fold<B, F>(self, init: B, mut f: F) -> impl Future<Output = Result<B, Self::Error>> + Send
+    fn async_try_fold<B, F>(
+        self,
+        init: B,
+        mut f: F,
+    ) -> impl Future<Output = Result<B, Self::Error>> + Send
     where
         F: FnMut(B, Self::Ok) -> Result<B, Self::Error> + Send + 'static,
         B: Send + 'static,
