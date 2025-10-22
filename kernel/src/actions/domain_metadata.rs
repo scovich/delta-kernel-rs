@@ -51,8 +51,7 @@ fn scan_domain_metadatas(
     let mut visitor = DomainMetadataVisitor::new(domain.map(|s| s.to_owned()));
     // If a specific domain is requested then we can terminate log replay early as soon as it was
     // found. If all domains are requested then we are forced to replay the entire log.
-    let mut actions_iter =
-        await_!(replay_for_domain_metadatas(log_segment, engine))?.async_pin();
+    let mut actions_iter = await_!(replay_for_domain_metadatas(log_segment, engine))?.async_pin();
     while let Some(actions) = await_!(actions_iter.async_next()) {
         // throw away is_log_batch since we don't care
         let domain_metadatas = actions?.actions;

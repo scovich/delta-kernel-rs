@@ -95,7 +95,7 @@ pub type BoxedAsyncIterator<T> = Box<dyn Iterator<Item = T> + Send>;
 /// Unified trait for iterator operations
 ///
 /// In sync mode, this is implemented for all Iterator types.
-pub trait AsyncIterator: Iterator + Send + 'static {
+pub trait AsyncIterator: Iterator + Send + Sized + 'static {
     /// Get the next item from the iterator
     ///
     /// In sync mode, this is just a wrapper around `Iterator::next()`.
@@ -109,7 +109,6 @@ pub trait AsyncIterator: Iterator + Send + 'static {
     where
         F: FnMut(Self::Item) -> R + Send + 'static,
         R: Send + 'static,
-        Self: Sized,
     {
         self.map(f)
     }
@@ -118,7 +117,6 @@ pub trait AsyncIterator: Iterator + Send + 'static {
     fn async_filter<F>(self, f: F) -> impl AsyncIterator<Item = Self::Item>
     where
         F: FnMut(&Self::Item) -> bool + Send + 'static,
-        Self: Sized,
     {
         self.filter(f)
     }
@@ -126,7 +124,6 @@ pub trait AsyncIterator: Iterator + Send + 'static {
     /// Flatten nested iterators
     fn async_flatten(self) -> impl AsyncIterator<Item = <Self::Item as IntoIterator>::Item>
     where
-        Self: Sized,
         Self::Item: IntoIterator,
         <Self::Item as IntoIterator>::Item: Send + 'static,
         <Self::Item as IntoIterator>::IntoIter: Send + 'static,
@@ -144,7 +141,7 @@ pub trait AsyncIterator: Iterator + Send + 'static {
     //  when both outer and inner iterators yield Results.
     fn async_flatten_ok<T, E, I>(self) -> impl AsyncIterator<Item = Result<T, E>>
     where
-        Self: Iterator<Item = Result<I, E>> + Sized,
+        Self: Iterator<Item = Result<I, E>>,
         I: IntoIterator<Item = T> + 'static,
         I::IntoIter: Send + 'static,
         T: Send + 'static,
@@ -163,7 +160,7 @@ pub trait AsyncIterator: Iterator + Send + 'static {
     /// propagates through as Err.
     fn async_try_flatten<T, E, I>(self) -> impl AsyncIterator<Item = Result<T, E>>
     where
-        Self: Iterator<Item = Result<I, E>> + Sized,
+        Self: Iterator<Item = Result<I, E>>,
         I: IntoIterator<Item = Result<T, E>> + 'static,
         I::IntoIter: Send + 'static,
         T: Send + 'static,
@@ -185,7 +182,7 @@ pub trait AsyncIterator: Iterator + Send + 'static {
         B: Send + 'static,
         T: Send + 'static,
         E: Send + 'static,
-        Self: Iterator<Item = Result<T, E>> + Sized,
+        Self: Iterator<Item = Result<T, E>>,
     {
         self.try_fold(init, move |acc, item| f(acc, item?))
     }
@@ -201,7 +198,7 @@ pub trait AsyncIterator: Iterator + Send + 'static {
         T: Send + 'static,
         E: Send + 'static,
         R: Send + 'static,
-        Self: Iterator<Item = Result<T, E>> + Sized,
+        Self: Iterator<Item = Result<T, E>>,
     {
         self.map_ok(f)
     }
@@ -211,7 +208,6 @@ pub trait AsyncIterator: Iterator + Send + 'static {
     where
         U: IntoIterator<Item = Self::Item>,
         U::IntoIter: Send + 'static,
-        Self: Sized,
     {
         self.chain(other)
     }
@@ -220,18 +216,12 @@ pub trait AsyncIterator: Iterator + Send + 'static {
     ///
     /// In sync mode, this is a no-op (every iterator is iterable)
     /// In async mode, the returned stream implements `Unpin` (required by `async_next`).
-    fn async_pin(self) -> impl AsyncIterator<Item = Self::Item>
-    where
-        Self: Sized,
-    {
+    fn async_pin(self) -> impl AsyncIterator<Item = Self::Item> {
         self
     }
 
     /// Convert to boxed iterator
-    fn into_boxed(self) -> BoxedAsyncIterator<Self::Item>
-    where
-        Self: Sized,
-    {
+    fn into_boxed(self) -> BoxedAsyncIterator<Self::Item> {
         Box::new(self)
     }
 
@@ -252,7 +242,6 @@ pub trait AsyncIterator: Iterator + Send + 'static {
     where
         F: FnMut(Self::Item) -> R + Send + 'static,
         R: Send + 'static,
-        Self: Sized,
     {
         self.map(f)
     }

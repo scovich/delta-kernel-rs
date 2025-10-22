@@ -125,7 +125,7 @@ impl Future for YieldNow {
 /// Unified trait for iterator operations
 ///
 /// In async mode, this is implemented for all Stream types.
-pub trait AsyncIterator: Stream + Send + 'static {
+pub trait AsyncIterator: Stream + Send + Sized + 'static {
     /// Get the next item from the stream
     ///
     /// In sync mode, this is just a wrapper around `Iterator::next()`.
@@ -146,7 +146,6 @@ pub trait AsyncIterator: Stream + Send + 'static {
         F: FnMut(Self::Item) -> R + Send + 'static,
         R: Send + 'static,
         Self::Item: Send,
-        Self: Sized,
     {
         self.map(f)
     }
@@ -159,7 +158,6 @@ pub trait AsyncIterator: Stream + Send + 'static {
     where
         F: FnMut(&Self::Item) -> bool + Send + 'static,
         Self::Item: Send,
-        Self: Sized,
     {
         self.filter(move |item| future::ready(f(&item)))
     }
@@ -167,7 +165,6 @@ pub trait AsyncIterator: Stream + Send + 'static {
     /// Flatten nested streams
     fn async_flatten(self) -> impl AsyncIterator<Item = <Self::Item as Stream>::Item>
     where
-        Self: Sized,
         Self::Item: Stream + Send,
         <Self::Item as Stream>::Item: Send + 'static,
     {
@@ -184,7 +181,7 @@ pub trait AsyncIterator: Stream + Send + 'static {
     /// stream propagates through as Err.
     fn async_flatten_ok<T, E>(self) -> impl AsyncIterator<Item = Result<T, E>>
     where
-        Self: TryStream<Error = E> + Sized,
+        Self: TryStream<Error = E>,
         Self::Ok: Stream<Item = T> + Send + 'static,
         T: Send + 'static,
     {
@@ -202,7 +199,7 @@ pub trait AsyncIterator: Stream + Send + 'static {
     /// propagates through as Err.
     fn async_try_flatten<T>(self) -> impl AsyncIterator<Item = Result<T, Self::Error>>
     where
-        Self: TryStream + Sized,
+        Self: TryStream,
         Self::Ok: TryStream<Ok = T, Error = Self::Error> + Send,
         T: Send + 'static,
     {
@@ -221,7 +218,7 @@ pub trait AsyncIterator: Stream + Send + 'static {
     where
         F: FnMut(B, Self::Ok) -> Result<B, Self::Error> + Send + 'static,
         B: Send + 'static,
-        Self: Unpin + Sized + TryStream,
+        Self: Unpin + TryStream,
         Self::Ok: Send + 'static,
         Self::Error: Send + 'static,
     {
@@ -238,7 +235,7 @@ pub trait AsyncIterator: Stream + Send + 'static {
     where
         F: FnMut(Self::Ok) -> R + Send + 'static,
         R: Send + 'static,
-        Self: Sized + TryStream,
+        Self: TryStream,
         Self::Ok: Send + 'static,
         Self::Error: Send + 'static,
     {
@@ -249,7 +246,6 @@ pub trait AsyncIterator: Stream + Send + 'static {
     fn async_chain<U>(self, other: U) -> impl AsyncIterator<Item = Self::Item>
     where
         U: Stream<Item = Self::Item> + Send + 'static,
-        Self: Sized,
     {
         self.chain(other)
     }
@@ -258,18 +254,12 @@ pub trait AsyncIterator: Stream + Send + 'static {
     ///
     /// In sync mode, this is a no-op (every iterator is iterable)
     /// In async mode, the returned stream implements `Unpin` (required by `async_next`).
-    fn async_pin(self) -> impl AsyncIterator<Item = Self::Item> + Unpin
-    where
-        Self: Sized,
-    {
+    fn async_pin(self) -> impl AsyncIterator<Item = Self::Item> + Unpin {
         self.into_boxed()
     }
 
     /// Convert to boxed stream
-    fn into_boxed(self) -> BoxedAsyncIterator<Self::Item>
-    where
-        Self: Sized,
-    {
+    fn into_boxed(self) -> BoxedAsyncIterator<Self::Item> {
         Box::pin(self)
     }
 
@@ -291,7 +281,6 @@ pub trait AsyncIterator: Stream + Send + 'static {
         F: FnMut(Self::Item) -> Fut + Send + 'static,
         Fut: Future<Output = R> + Send + 'static,
         R: Send + 'static,
-        Self: Sized,
     {
         self.then(f)
     }
