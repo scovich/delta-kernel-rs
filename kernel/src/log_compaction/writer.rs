@@ -177,17 +177,45 @@ impl std::fmt::Debug for LogCompactionDataIterator {
     }
 }
 
+// Sync mode: Implement Iterator
+#[cfg(not(feature = "async"))]
 impl Iterator for LogCompactionDataIterator {
     type Item = DeltaResult<FilteredEngineData>;
 
     /// Advances the iterator and returns the next value.
     fn next(&mut self) -> Option<Self::Item> {
-        Some(
-            await_!(self.compaction_batch_iterator.async_next())?.map(|batch| {
+        // In sync mode, BoxedAsyncIterator is Box<dyn Iterator>, so .next() is synchronous
+        self.compaction_batch_iterator.next().map(|result| {
+            result.map(|batch| {
                 self.actions_count += batch.actions_count;
                 self.add_actions_count += batch.add_actions_count;
                 batch.filtered_data
-            }),
-        )
+            })
+        })
+    }
+}
+
+// Async mode: Implement Stream
+#[cfg(feature = "async")]
+impl futures::stream::Stream for LogCompactionDataIterator {
+    type Item = DeltaResult<FilteredEngineData>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        // In async mode, BoxedAsyncIterator is Pin<Box<dyn Stream>>
+        // Poll the inner stream
+        match self.compaction_batch_iterator.as_mut().poll_next(cx) {
+            std::task::Poll::Ready(Some(result)) => {
+                std::task::Poll::Ready(Some(result.map(|batch| {
+                    self.actions_count += batch.actions_count;
+                    self.add_actions_count += batch.add_actions_count;
+                    batch.filtered_data
+                })))
+            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
     }
 }

@@ -130,11 +130,11 @@ pub trait AsyncIterator: Stream + Send + Sized + 'static {
     ///
     /// In sync mode, this is just a wrapper around `Iterator::next()`.
     /// In async mode, this polls the stream and must be awaited.
-    async fn async_next(&mut self) -> Option<Self::Item>
+    fn async_next(&mut self) -> impl Future<Output = Option<Self::Item>> + Send
     where
         Self: Unpin,
     {
-        self.next().await
+        async move { self.next().await }
     }
 
     /// Map each item synchronously
@@ -159,7 +159,7 @@ pub trait AsyncIterator: Stream + Send + Sized + 'static {
         F: FnMut(&Self::Item) -> bool + Send + 'static,
         Self::Item: Send,
     {
-        self.filter(move |item| future::ready(f(&item)))
+        self.filter(move |item| future::ready(f(item)))
     }
 
     /// Flatten nested streams
@@ -214,7 +214,7 @@ pub trait AsyncIterator: Stream + Send + Sized + 'static {
     ///
     /// Note: Unlike `TryStreamExt::try_fold`, this takes a sync closure for consistency
     /// with sync mode. The closure is wrapped in `future::ready` internally.
-    async fn async_try_fold<B, F>(self, init: B, mut f: F) -> Result<B, Self::Error>
+    fn async_try_fold<B, F>(self, init: B, mut f: F) -> impl Future<Output = Result<B, Self::Error>> + Send
     where
         F: FnMut(B, Self::Ok) -> Result<B, Self::Error> + Send + 'static,
         B: Send + 'static,
@@ -222,8 +222,10 @@ pub trait AsyncIterator: Stream + Send + Sized + 'static {
         Self::Ok: Send + 'static,
         Self::Error: Send + 'static,
     {
-        self.try_fold(init, |acc, item| future::ready(f(acc, item)))
-            .await
+        async move {
+            self.try_fold(init, |acc, item| future::ready(f(acc, item)))
+                .await
+        }
     }
 
     /// Map over the successful values in a Result-yielding stream

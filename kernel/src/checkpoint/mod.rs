@@ -167,6 +167,8 @@ pub struct CheckpointDataIterator {
     add_actions_count: i64,
 }
 
+// Sync mode: Implement Iterator
+#[cfg(not(feature = "async"))]
 impl Iterator for CheckpointDataIterator {
     type Item = DeltaResult<FilteredEngineData>;
 
@@ -177,11 +179,39 @@ impl Iterator for CheckpointDataIterator {
     /// each batch. The [`CheckpointDataIterator`] is passed back to the kernel on call to
     /// [`CheckpointWriter::finalize`] for counts to be read and written to the `_last_checkpoint` file
     fn next(&mut self) -> Option<Self::Item> {
-        Some(self.checkpoint_batch_iterator.next()?.map(|batch| {
-            self.actions_count += batch.actions_count;
-            self.add_actions_count += batch.add_actions_count;
-            batch.filtered_data
-        }))
+        // In sync mode, BoxedAsyncIterator is Box<dyn Iterator>, so .next() is synchronous
+        self.checkpoint_batch_iterator.next().map(|result| {
+            result.map(|batch| {
+                self.actions_count += batch.actions_count;
+                self.add_actions_count += batch.add_actions_count;
+                batch.filtered_data
+            })
+        })
+    }
+}
+
+// Async mode: Implement Stream
+#[cfg(feature = "async")]
+impl futures::stream::Stream for CheckpointDataIterator {
+    type Item = DeltaResult<FilteredEngineData>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        // In async mode, BoxedAsyncIterator is Pin<Box<dyn Stream>>
+        // Poll the inner stream
+        match self.checkpoint_batch_iterator.as_mut().poll_next(cx) {
+            std::task::Poll::Ready(Some(result)) => {
+                std::task::Poll::Ready(Some(result.map(|batch| {
+                    self.actions_count += batch.actions_count;
+                    self.add_actions_count += batch.add_actions_count;
+                    batch.filtered_data
+                })))
+            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
     }
 }
 
