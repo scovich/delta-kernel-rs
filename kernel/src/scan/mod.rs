@@ -31,7 +31,7 @@ use crate::snapshot::SnapshotRef;
 use crate::table_features::ColumnMappingMode;
 use crate::transforms::TransformSpec;
 use crate::{
-    async_fn, await_, into_async_iter, AsyncIterator, BoxedAsyncIterator, DeltaResult, Engine,
+    async_closure, async_fn, await_, into_async_iter, AsyncIterator, BoxedAsyncIterator, DeltaResult, Engine,
     EngineData, Error, FileMeta, Version,
 };
 
@@ -675,12 +675,7 @@ impl Scan {
         let engine = engine.clone(); // Arc clone
         let result =
             scan_files_iter
-                .async_then(move |scan_file| {
-                    let table_root = table_root.clone();
-                    let physical_schema = physical_schema.clone();
-                    let logical_schema = logical_schema.clone();
-                    let engine = engine.clone(); // Arc clone
-                    async move {
+                .async_then(async_closure!(move |scan_file| clone[&table_root, &physical_schema, &logical_schema, &engine] {
                         let scan_file = scan_file?;
                         let file_path = table_root.join(&scan_file.path)?;
                         let mut selection_vector = scan_file
@@ -730,8 +725,7 @@ impl Scan {
                             selection_vector = rest;
                             result
                         }))
-                    }
-                })
+                }))
                 // AsyncIterator<DeltaResult<AsyncIterator<DeltaResult<ScanResult>>>> to AsyncIterator<DeltaResult<ScanResult>>
                 .async_try_flatten();
         Ok(result)

@@ -256,7 +256,7 @@ fn make_public(mut item: Item) -> Item {
     item
 }
 
-/// Conditionally adds or removes the `async` keyword based on feature flag.
+/// Conditionally adds the `async` keyword to a function based on the `async` feature flag.
 ///
 /// Use this for regular functions and struct impl methods (where there's no `#[async_trait]`).
 /// For trait definitions and trait impls, use `#[async_trait_fn]` instead.
@@ -416,13 +416,13 @@ pub fn async_trait_fn(
 /// ```ignore
 /// #[async_trait]
 /// pub trait ParquetHandler {
-///     #[async_fn]
+///     #[async_trait_fn]
 ///     async fn read_files(...) -> DeltaResult<FileDataReadResultIterator>;
 /// }
 ///
 /// #[async_trait]
 /// impl ParquetHandler for DefaultParquetHandler {
-///     #[async_fn]
+///     #[async_trait_fn]
 ///     async fn read_files(...) -> DeltaResult<FileDataReadResultIterator> {
 ///         // implementation
 ///     }

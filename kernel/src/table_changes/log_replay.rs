@@ -65,7 +65,7 @@ where
     let filter = DataSkippingFilter::new(engine.as_ref(), physical_predicate).map(Arc::new);
     let result = into_async_iter(commit_files)
         .async_then(
-            async_closure!(move |commit_file| clone[engine, filter, table_schema] {
+            async_closure!(move |commit_file| clone[&engine, &filter, &table_schema] {
                 let scanner = await_!(LogReplayScanner::try_new(
                     engine.as_ref(),
                     commit_file,

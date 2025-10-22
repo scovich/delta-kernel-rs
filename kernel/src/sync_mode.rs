@@ -41,39 +41,49 @@ macro_rules! yield_now {
 
 /// Create a closure that works uniformly in both sync and async modes
 ///
-/// In sync mode, creates a regular closure.
-/// In async mode, creates an async closure.
+/// In sync mode, creates a regular closure with zero-cost reference captures.
+/// In async mode, creates an async closure and clones captured variables.
 ///
 /// Use this with `async_then` to perform I/O operations on stream items.
 ///
 /// # Clone Specification
 ///
-/// Use `clone[var1, var2, ...]` to specify variables that need cloning for the
-/// inner async block. In sync mode, the clone specification is ignored (zero cost).
+/// Use e.g. `clone[owned1, &ref2, &ref3, owned4, ...]` to specify:
+/// - `var`: Variables captured by value (cloned in both modes)
+/// - `&var`: Variables captured by reference (zero-cost in sync, cloned in async)
 ///
 /// # Examples
 ///
 /// ```ignore
-/// // With clones (common case) - clones ignored in sync mode!
-/// items.async_then(async_closure!(move |item| clone[engine, schema] {
+/// // With reference captures (zero-cost in sync mode)
+/// items.async_then(async_closure!(move |item| clone[&engine, &schema] {
 ///     let data = await_!(fetch_data(item, engine))?;
 ///     Ok(process(data, schema))
+/// }))
+///
+/// // With owned captures (cloned in both modes)
+/// items.async_then(async_closure!(move |item| clone[table_root] {
+///     await_!(process(item, table_root))
+/// }))
+///
+/// // Mixed (both refs and owned)
+/// items.async_then(async_closure!(move |item| clone[table_root, &ctx] -> DeltaResult<T> {
+///     await_!(fetch(item, ctx, table_root))
 /// }))
 ///
 /// // Without clones (simple case)
 /// items.async_then(async_closure!(move |item| {
 ///     Ok(process(item?))
 /// }))
-///
-/// // With explicit return type (rare)
-/// items.async_then(async_closure!(move |item| clone[ctx] -> DeltaResult<T> {
-///     await_!(fetch(item, ctx))
-/// }))
 /// ```
 #[macro_export]
 macro_rules! async_closure {
-    (move | $($arg:tt),* | $( clone[ $($var:ident),+ $(,)? ] )? $( -> $return:ty )? $body:block ) => {
-        move |$($arg),*| $( -> $return )? { $body }
+    (move | $($arg:tt),* | $( clone[ $( $( $owned:ident )? $( &$borrowed:ident )? ),+ $(,)? ] )? $( -> $return:ty )? $body:block ) => {
+        move |$($arg),*| $( -> $return )? {
+            // Only clone owned values in sync mode (refs are zero-cost)
+            $( $( $( let $owned = $owned.clone(); )? )+ )?
+            $body
+        }
     };
 }
 

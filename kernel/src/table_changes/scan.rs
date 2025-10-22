@@ -217,7 +217,7 @@ impl TableChangesScan {
             }) // AsyncIterator-Result-Iterator
             .async_map_ok(into_async_iter) // AsyncIterator-Result-AsyncIterator
             .async_flatten_ok() // AsyncIterator-Result
-            .async_then(async_closure!(move |resolved_scan_file| clone[engine, state_info, table_root2, physical_predicate] {
+            .async_then(async_closure!(move |resolved_scan_file| clone[physical_predicate, &engine, &state_info, &table_root2] {
                 await_!(read_scan_file(
                     engine.as_ref(),
                     resolved_scan_file?,
