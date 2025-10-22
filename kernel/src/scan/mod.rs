@@ -31,8 +31,8 @@ use crate::snapshot::SnapshotRef;
 use crate::table_features::ColumnMappingMode;
 use crate::transforms::TransformSpec;
 use crate::{
-    async_closure, async_fn, await_, into_async_iter, AsyncIterator, BoxedAsyncIterator, DeltaResult, Engine,
-    EngineData, Error, FileMeta, Version,
+    async_closure, async_fn, await_, into_async_iter, AsyncIterator, BoxedAsyncIterator,
+    DeltaResult, Engine, EngineData, Error, FileMeta, Version,
 };
 
 use self::log_replay::scan_action_iter;

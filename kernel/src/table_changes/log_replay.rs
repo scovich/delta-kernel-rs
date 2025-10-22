@@ -169,11 +169,11 @@ impl LogReplayScanner {
         // As a result, we would read the file path for the remove action, which is unnecessary because
         // all of the rows will be filtered by the predicate. Instead, we wait until deletion
         // vectors are resolved so that we can skip both actions in the pair.
-        let mut action_iter = std::pin::pin!(await_!(engine.json_handler().read_json_files(
+        let mut action_iter = await_!(engine.json_handler().read_json_files(
             slice::from_ref(&commit_file.location),
             visitor_schema,
             None, // not safe to apply data skipping yet
-        ))?);
+        ))?;
 
         let mut remove_dvs = HashMap::default();
         let mut add_paths = HashSet::default();

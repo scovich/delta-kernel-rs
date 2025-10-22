@@ -501,7 +501,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
-        let mut actions_batches = std::pin::pin!(await_!(self.replay_for_metadata(engine))?);
+        let mut actions_batches = await_!(self.replay_for_metadata(engine))?.async_pin();
         let (mut metadata_opt, mut protocol_opt) = (None, None);
         while let Some(actions_batch) = await_!(actions_batches.async_next()) {
             let actions = actions_batch?.actions;

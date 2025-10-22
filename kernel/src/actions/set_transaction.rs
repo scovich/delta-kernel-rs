@@ -69,8 +69,8 @@ fn scan_application_transactions(
         SetTransactionVisitor::new(application_id.map(|s| s.to_owned()), expiration_timestamp);
     // If a specific id is requested then we can terminate log replay early as soon as it was
     // found. If all ids are requested then we are forced to replay the entire log.
-    let mut actions_iter: std::pin::Pin<&mut _> = std::pin::pin!(await_!(replay_for_app_ids(log_segment, engine))?);
-    while let Some(maybe_data) = await_!(actions_iter.as_mut().async_next()) {
+    let mut actions_iter = await_!(replay_for_app_ids(log_segment, engine))?.async_pin();
+    while let Some(maybe_data) = await_!(actions_iter.async_next()) {
         let txns = maybe_data?.actions;
         visitor.visit_rows_of(txns.as_ref())?;
         // if a specific id is requested and a transaction was found, then return

@@ -133,7 +133,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             }
         });
 
-        Ok(into_async_iter(rx.into_iter()).into_boxed())
+        Ok(into_async_iter(rx).into_boxed())
     }
 
     // note: for now we just buffer all the data and write it out all at once

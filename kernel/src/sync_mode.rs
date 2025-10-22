@@ -66,8 +66,8 @@ macro_rules! yield_now {
 ///     await_!(process(item, table_root))
 /// }))
 ///
-/// // Mixed (both refs and owned)
-/// items.async_then(async_closure!(move |item| clone[table_root, &ctx] -> DeltaResult<T> {
+/// // Mixed (both owned and refs)
+/// items.async_then(async_closure!(move |item| clone[&ctx, table_root] -> DeltaResult<T> {
 ///     await_!(fetch(item, ctx, table_root))
 /// }))
 ///
@@ -78,6 +78,8 @@ macro_rules! yield_now {
 /// ```
 #[macro_export]
 macro_rules! async_closure {
+    // NOTE: Every item on the list is a pair of owned and borrowed items -- both optional. In practice
+    // the macro will only succeed if one or the other is present, because we miss a comma between them.
     (move | $($arg:tt),* | $( clone[ $( $( $owned:ident )? $( &$borrowed:ident )? ),+ $(,)? ] )? $( -> $return:ty )? $body:block ) => {
         move |$($arg),*| $( -> $return )? {
             // Only clone owned values in sync mode (refs are zero-cost)
@@ -212,6 +214,17 @@ pub trait AsyncIterator: Iterator + Send + 'static {
         Self: Sized,
     {
         self.chain(other)
+    }
+
+    /// Returns an iterable version of this AsyncIterator (ie suitable for use with [`Self::async_next`]).
+    ///
+    /// In sync mode, this is a no-op (every iterator is iterable)
+    /// In async mode, the returned stream implements `Unpin` (required by `async_next`).
+    fn async_pin(self) -> impl AsyncIterator<Item = Self::Item>
+    where
+        Self: Sized,
+    {
+        self
     }
 
     /// Convert to boxed iterator

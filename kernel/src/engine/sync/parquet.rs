@@ -12,8 +12,8 @@ use crate::engine::arrow_utils::{
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
 use crate::{
-    async_trait, async_trait_fn, DeltaResult, FileDataReadResultIterator, FileMeta,
-    ParquetHandler, PredicateRef,
+    async_trait, async_trait_fn, DeltaResult, FileDataReadResultIterator, FileMeta, ParquetHandler,
+    PredicateRef,
 };
 
 pub(crate) struct SyncParquetHandler;
