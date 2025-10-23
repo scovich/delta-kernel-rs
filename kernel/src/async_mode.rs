@@ -257,6 +257,20 @@ pub trait AsyncIterator: Stream + Send + Sized + 'static {
         }
     }
 
+    /// Stateful stream adapter that maintains state and can optionally terminate early.
+    ///
+    /// Similar to Iterator::scan, this maintains a state value and uses it to transform
+    /// each item. The closure can return None to terminate the stream early.
+    fn async_scan<St, B, F>(self, initial_state: St, mut f: F) -> impl AsyncIterator<Item = B>
+    where
+        F: FnMut(&mut St, Self::Item) -> Option<B> + Send + 'static,
+        St: Send + 'static,
+        B: Send + 'static,
+        Self::Item: Send + 'static,
+    {
+        self.scan(initial_state, move |st, item| future::ready(f(st, item)))
+    }
+
     /// Map over the successful values in a Result-yielding stream
     ///
     /// This method requires the stream to yield `Result` types.

@@ -54,10 +54,8 @@ fn try_main() -> DeltaResult<()> {
         return Ok(());
     };
 
-    let mut rows_so_far = 0;
-    let batches: Vec<RecordBatch> = scan
-        .execute(Arc::new(engine))?
-        .map(|scan_result| -> DeltaResult<_> {
+    let batches: Vec<RecordBatch> = await_!(await_!(scan.execute(Arc::new(engine)))?
+        .async_map(|scan_result| -> DeltaResult<_> {
             // extract the batches and filter them if they have deletion vectors
             let scan_result = scan_result?;
             let mask = scan_result.full_mask();
@@ -73,17 +71,17 @@ fn try_main() -> DeltaResult<()> {
                 Ok(record_batch)
             }
         })
-        .scan(&mut rows_so_far, |rows_so_far, record_batch| {
+        .async_scan(0usize, move |rows_so_far, record_batch| {
             // handle truncation if we've specified a limit
             let Ok(batch) = record_batch else {
                 return Some(record_batch); // just forward the error
             };
             let batch_rows = batch.num_rows();
             let result = match cli.scan_args.limit {
-                Some(limit) if **rows_so_far >= limit => return None, // over the limit, stop iteration
+                Some(limit) if *rows_so_far >= limit => return None, // over the limit, stop iteration
                 Some(limit) => {
-                    let batch = if **rows_so_far + batch_rows > limit {
-                        common::truncate_batch(batch, limit - **rows_so_far)
+                    let batch = if *rows_so_far + batch_rows > limit {
+                        common::truncate_batch(batch, limit - *rows_so_far)
                     } else {
                         batch
                     };
@@ -91,10 +89,12 @@ fn try_main() -> DeltaResult<()> {
                 }
                 None => Ok(batch),
             };
-            **rows_so_far += batch_rows;
+            *rows_so_far += batch_rows;
             Some(result)
         })
-        .try_collect()?;
+        .async_pin()
+        .async_try_collect())?;
+    let rows_so_far = batches.iter().map(|b| b.num_rows()).sum::<usize>();
     if let Some(limit) = cli.scan_args.limit {
         if limit >= rows_so_far {
             println!("Printing all {rows_so_far} rows.");

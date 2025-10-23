@@ -207,6 +207,20 @@ pub trait AsyncIterator: Iterator + Send + Sized + 'static {
         self.try_fold(init, move |acc, item| f(acc, item?))
     }
 
+    /// Stateful iterator adapter that maintains state and can optionally terminate early.
+    ///
+    /// Similar to Iterator::scan, this maintains a state value and uses it to transform
+    /// each item. The closure can return None to terminate the iterator early.
+    fn async_scan<St, B, F>(self, initial_state: St, f: F) -> impl AsyncIterator<Item = B>
+    where
+        F: FnMut(&mut St, Self::Item) -> Option<B> + Send + 'static,
+        St: Send + 'static,
+        B: Send + 'static,
+        Self::Item: Send + 'static,
+    {
+        self.scan(initial_state, f)
+    }
+
     /// Map over the successful values in a Result-yielding iterator
     ///
     /// This method requires the iterator to yield `Result` types.
