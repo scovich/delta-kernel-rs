@@ -4,8 +4,14 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+# NOTE: This example only works in sync mode (without --features async).
+# It demonstrates partitioning scan work across OS threads, which is a
+# fundamentally synchronous pattern. For async examples, see read-table-single-threaded.
+
 [features]
-async = ["delta_kernel/async", "tokio"]
+# Async feature - defined only to allow compile_error check
+# Building with --features async will fail with a clear error message.
+async = ["delta_kernel/async"]
 
 [dependencies]
 arrow = { version = "56", features = ["prettyprint", "chrono-tz"] }
@@ -18,7 +24,6 @@ delta_kernel = { path = "../../../kernel", features = [
 ] }
 env_logger = "0.11.8"
 spmc = "0.3.0"
-tokio = { version = "1", features = ["rt", "macros"], optional = true }
 url = "2"
 
 # for cargo-release

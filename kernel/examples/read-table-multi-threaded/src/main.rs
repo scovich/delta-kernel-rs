@@ -1,3 +1,13 @@
+// This example only works in sync mode because it uses OS threads (std::thread)
+// rather than async tasks. For async examples, see read-table-single-threaded.
+// In distributed engines (Spark, Ray, etc.), workers are separate processes/machines,
+// making this a fundamentally synchronous workload pattern.
+#[cfg(feature = "async")]
+compile_error!(
+    "This example only works in sync mode. Use read-table-single-threaded for async examples. \
+     Build without --features async or use: cargo build --example read-table-multi-threaded"
+);
+
 use std::collections::HashMap;
 use std::process::ExitCode;
 use std::sync::mpsc::Sender;
@@ -12,7 +22,7 @@ use delta_kernel::actions::deletion_vector::split_vector;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
 use delta_kernel::schema::SchemaRef;
-use delta_kernel::{async_fn, await_, AsyncIterator as _, DeltaResult, Engine, EngineData, ExpressionRef, FileMeta, Snapshot};
+use delta_kernel::{DeltaResult, Engine, EngineData, ExpressionRef, FileMeta, Snapshot};
 
 use clap::Parser;
 use url::Url;
@@ -41,14 +51,7 @@ struct Cli {
 
 fn main() -> ExitCode {
     env_logger::init();
-    #[cfg(not(feature = "async"))]
-    let result = try_main();
-    #[cfg(feature = "async")]
-    let result = tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(try_main());
-    
-    match result {
+    match try_main() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             println!("{e:#?}");
@@ -100,14 +103,13 @@ struct ScanState {
     logical_schema: SchemaRef,
 }
 
-#[async_fn]
 fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Read", "read", "");
 
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
     println!("Reading {url}");
     let engine = common::get_engine(&url, &cli.location_args)?;
-    let snapshot = await_!(Snapshot::builder_for(url).build(&engine))?;
+    let snapshot = Snapshot::builder_for(url).build(&engine)?;
     let Some(scan) = common::get_scan(snapshot, &cli.scan_args)? else {
         return Ok(());
     };
@@ -117,13 +119,12 @@ fn try_main() -> DeltaResult<()> {
     // [`delta_kernel::scan::scan_row_schema`]. Generally engines will not need to interact with
     // this data directly, and can just call [`visit_scan_files`] to get pre-parsed data back from
     // the kernel.
-    let scan_metadata = await_!(scan.scan_metadata(&engine))?;
+    let scan_metadata = scan.scan_metadata(&engine)?;
 
     if cli.metadata {
-        let (scan_metadata_batches, scan_metadata_rows) = await_!(scan_metadata
-            .async_map(|res| res.unwrap().scan_files.data().len())
-            .async_pin()
-            .async_fold((0, 0), |(batches, rows), len| (batches + 1, rows + len)));
+        let (scan_metadata_batches, scan_metadata_rows) = scan_metadata
+            .map(|res| res.unwrap().scan_files.data().len())
+            .fold((0, 0), |(batches, rows), len| (batches + 1, rows + len));
         println!("Scan metadata: {scan_metadata_batches} chunks, {scan_metadata_rows} files",);
         return Ok(());
     }
@@ -146,7 +147,7 @@ fn try_main() -> DeltaResult<()> {
             let rb_tx = record_batch_tx.clone();
             let scan_file_rx = scan_file_rx.clone();
             s.spawn(|| {
-                await_!(do_work(&engine, scan_state, rb_tx, scan_file_rx));
+                do_work(&engine, scan_state, rb_tx, scan_file_rx);
             });
         });
 
@@ -154,9 +155,10 @@ fn try_main() -> DeltaResult<()> {
         // done sending
         drop(record_batch_tx);
 
-        scan_file_tx = await_!(scan_metadata.async_pin().async_try_fold(scan_file_tx, |tx, scan_metadata| {
-            scan_metadata.visit_scan_files(tx, send_scan_file)
-        }))?;
+        for res in scan_metadata {
+            let scan_metadata = res?;
+            scan_file_tx = scan_metadata.visit_scan_files(scan_file_tx, send_scan_file)?;
+        }
 
         drop(scan_file_tx);
 
@@ -187,7 +189,6 @@ fn try_main() -> DeltaResult<()> {
 }
 
 // this is the work each thread does
-#[async_fn]
 fn do_work(
     engine: &dyn Engine,
     scan_state: Arc<ScanState>,
@@ -222,13 +223,12 @@ fn do_work(
         // in chunks where each thread reads one chunk. The engine would need to ensure
         // enough meta-data was passed to each thread to correctly apply the selection
         // vector
-        let mut read_results = await_!(engine
+        let read_results = engine
             .parquet_handler()
-            .read_parquet_files(&[meta], scan_state.physical_schema.clone(), None))
-            .unwrap()
-            .async_pin();
+            .read_parquet_files(&[meta], scan_state.physical_schema.clone(), None)
+            .unwrap();
 
-        while let Some(read_result) = await_!(read_results.async_next()) {
+        for read_result in read_results {
             let read_result = read_result.unwrap();
             let len = read_result.len();
             // transform the physical data into the correct logical form

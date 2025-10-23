@@ -6,6 +6,10 @@ This example shows a program that reads a table using multiple threads. This sho
 `scan_metadata`, `global_scan_state`, and `visit_scan_files` methods, that can be used to partition work
 to either multiple threads, or workers (in the case of a distributed engine).
 
+**NOTE:** This example only works in **sync mode** (without `--features async`). It demonstrates
+partitioning scan work across OS threads, which is a fundamentally synchronous pattern. For async
+examples, see `read-table-single-threaded`.
+
 You can run this example from anywhere in this repository by running `cargo run -p read-table-multi-threaded -- [args]` or by navigating to this directory and running `cargo run -- [args]`.
 
 We use a single-producer-multi-consumer channel to send each file and its metadata that needs to be

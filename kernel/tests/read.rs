@@ -267,6 +267,11 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
     ));
     let snapshot = await_!(Snapshot::builder_for(location).build(engine.as_ref()))?;
 
+    // NOTE: 'static lifetime bounds on AsyncIterator and its methods mean we can't zip up the
+    // batches by reference. Wrap them in Arc so we can clone references cheaply instead.
+    let batch1 = Arc::new(batch1);
+    let batch2 = Arc::new(batch2);
+
     // The first file has id between 1 and 3; the second has id between 5 and 7. For each operator,
     // we validate the boundary values where we expect the set of matched files to change.
     //
@@ -313,6 +318,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
             .with_predicate(Arc::new(predicate.clone()))
             .build()?;
 
+        let expected_batches: Vec<_> = expected_batches.into_iter().cloned().collect();
         let expected_files = expected_batches.len();
         let mut files_scanned = 0;
         let stream = await_!(scan.execute(engine.clone()))?.async_zip(into_async_iter(expected_batches));
@@ -321,7 +327,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         while let Some((batch, expected)) = await_!(stream.async_next()) {
             let raw_data = batch?.raw_data?;
             files_scanned += 1;
-            assert_eq!(into_record_batch(raw_data), expected.clone());
+            assert_eq!(&into_record_batch(raw_data), expected.as_ref());
         }
         assert_eq!(expected_files, files_scanned, "{predicate:?}");
     }

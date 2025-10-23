@@ -13,17 +13,29 @@ members = [
 # note that in addition to the members above, the workspace includes examples:
 # - inspect-table
 # - read-table-changes
-# - read-table-multi-threaded
+# - read-table-multi-threaded (sync-only, excluded from default-members)
 # - read-table-single-threaded
 # - write-table
 
-# Default members exclude FFI to avoid building it in async mode
-# (FFI is sync-only and will fail with async feature)
+# Default members exclude sync-only components:
+# - FFI: sync-only, will fail with async feature
+# - read-table-multi-threaded: sync-only example using OS threads
+#
+# To build ALL components including sync-only ones (sync mode):
+#   cargo build --workspace
+# To build with async mode (must exclude sync-only components):
+#   cargo build --workspace --exclude delta_kernel_ffi --exclude read-table-multi-threaded --features async
+# Or just default members with async:
+#   cargo build --features async
 default-members = [
     "acceptance",
     "derive-macros",
     "kernel",
-    "kernel/examples/*",
+    "kernel/examples/common",
+    "kernel/examples/inspect-table",
+    "kernel/examples/read-table-changes",
+    "kernel/examples/read-table-single-threaded",
+    "kernel/examples/write-table",
     "test-utils",
     "feature-tests",
     "mem-test",

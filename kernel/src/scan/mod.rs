@@ -669,6 +669,10 @@ impl Scan {
             // AsyncIterator<DeltaResult<AsyncIterator>> to AsyncIterator<DeltaResult<ScanFile>>
             .async_flatten_ok();
 
+        // FIXME: These double (Arc) clones are annoying -- the outer closure needs `move` because
+        // it escapes the function as part of the impl AsyncIterator produced by `async_then`. Then
+        // we need an inner `async move` block so the logic can actually run async. And because the
+        // latter runs multiple times, it must clone the already-cloned state its parent captured.
         let table_root = self.snapshot.table_root().clone();
         let physical_schema = self.physical_schema().clone();
         let logical_schema = self.logical_schema().clone();
