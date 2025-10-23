@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+async = ["delta_kernel/async", "tokio"]
+
 [dependencies]
 arrow = { version = "56", features = ["prettyprint", "chrono-tz"] }
 clap = { version = "4.5", features = ["derive"] }
@@ -15,6 +18,7 @@ delta_kernel = { path = "../../../kernel", features = [
 ] }
 env_logger = "0.11.8"
 spmc = "0.3.0"
+tokio = { version = "1", features = ["rt", "macros"], optional = true }
 url = "2"
 
 # for cargo-release

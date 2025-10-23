@@ -12,7 +12,7 @@ use delta_kernel::actions::deletion_vector::split_vector;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
 use delta_kernel::schema::SchemaRef;
-use delta_kernel::{async_fn, await_, AsyncIterator, DeltaResult, Engine, EngineData, ExpressionRef, FileMeta, Snapshot};
+use delta_kernel::{async_fn, await_, AsyncIterator as _, DeltaResult, Engine, EngineData, ExpressionRef, FileMeta, Snapshot};
 
 use clap::Parser;
 use url::Url;
@@ -41,7 +41,14 @@ struct Cli {
 
 fn main() -> ExitCode {
     env_logger::init();
-    match try_main() {
+    #[cfg(not(feature = "async"))]
+    let result = try_main();
+    #[cfg(feature = "async")]
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(try_main());
+    
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             println!("{e:#?}");
@@ -113,9 +120,10 @@ fn try_main() -> DeltaResult<()> {
     let scan_metadata = await_!(scan.scan_metadata(&engine))?;
 
     if cli.metadata {
-        let (scan_metadata_batches, scan_metadata_rows) = scan_metadata
-            .map(|res| res.unwrap().scan_files.data().len())
-            .fold((0, 0), |(batches, rows), len| (batches + 1, rows + len));
+        let (scan_metadata_batches, scan_metadata_rows) = await_!(scan_metadata
+            .async_map(|res| res.unwrap().scan_files.data().len())
+            .async_pin()
+            .async_fold((0, 0), |(batches, rows), len| (batches + 1, rows + len)));
         println!("Scan metadata: {scan_metadata_batches} chunks, {scan_metadata_rows} files",);
         return Ok(());
     }
@@ -138,7 +146,7 @@ fn try_main() -> DeltaResult<()> {
             let rb_tx = record_batch_tx.clone();
             let scan_file_rx = scan_file_rx.clone();
             s.spawn(|| {
-                do_work(&engine, scan_state, rb_tx, scan_file_rx);
+                await_!(do_work(&engine, scan_state, rb_tx, scan_file_rx));
             });
         });
 
@@ -146,10 +154,9 @@ fn try_main() -> DeltaResult<()> {
         // done sending
         drop(record_batch_tx);
 
-        for res in scan_metadata {
-            let scan_metadata = res?;
-            scan_file_tx = scan_metadata.visit_scan_files(scan_file_tx, send_scan_file)?;
-        }
+        scan_file_tx = await_!(scan_metadata.async_pin().async_try_fold(scan_file_tx, |tx, scan_metadata| {
+            scan_metadata.visit_scan_files(tx, send_scan_file)
+        }))?;
 
         drop(scan_file_tx);
 
@@ -180,6 +187,7 @@ fn try_main() -> DeltaResult<()> {
 }
 
 // this is the work each thread does
+#[async_fn]
 fn do_work(
     engine: &dyn Engine,
     scan_state: Arc<ScanState>,
@@ -214,12 +222,13 @@ fn do_work(
         // in chunks where each thread reads one chunk. The engine would need to ensure
         // enough meta-data was passed to each thread to correctly apply the selection
         // vector
-        let read_results = engine
+        let mut read_results = await_!(engine
             .parquet_handler()
-            .read_parquet_files(&[meta], scan_state.physical_schema.clone(), None)
-            .unwrap();
+            .read_parquet_files(&[meta], scan_state.physical_schema.clone(), None))
+            .unwrap()
+            .async_pin();
 
-        for read_result in read_results {
+        while let Some(read_result) = await_!(read_results.async_next()) {
             let read_result = read_result.unwrap();
             let len = read_result.len();
             // transform the physical data into the correct logical form

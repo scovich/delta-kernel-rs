@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+async = ["delta_kernel/async", "tokio"]
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 common = { path = "../common" }
@@ -13,6 +16,7 @@ delta_kernel = { path = "../../../kernel", features = [
   "internal-api",
 ] }
 env_logger = "0.11.8"
+tokio = { version = "1", features = ["rt", "macros"], optional = true }
 
 # for cargo-release
 [package.metadata.release]

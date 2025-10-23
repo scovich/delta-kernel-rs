@@ -320,6 +320,7 @@ fn read_scan_file(
 mod tests {
     use std::sync::Arc;
 
+    use crate::{async_fn, await_};
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr, Scalar};
     use crate::scan::PhysicalPredicate;
@@ -329,14 +330,16 @@ mod tests {
     use crate::transforms::FieldTransformSpec;
     use crate::Predicate;
 
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn simple_table_changes_scan_builder() {
         let path = "./tests/data/table-with-cdf";
         let engine = Box::new(SyncEngine::new());
         let url = delta_kernel::try_parse_uri(path).unwrap();
 
         // A field in the schema goes from being nullable to non-nullable
-        let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1)).unwrap();
+        let table_changes = await_!(TableChanges::try_new(url, engine.as_ref(), 0, Some(1))).unwrap();
 
         let scan = table_changes.into_scan_builder().build().unwrap();
 
@@ -386,14 +389,16 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn projected_and_filtered_table_changes_scan_builder() {
         let path = "./tests/data/table-with-cdf";
         let engine = Box::new(SyncEngine::new());
         let url = delta_kernel::try_parse_uri(path).unwrap();
 
         // A field in the schema goes from being nullable to non-nullable
-        let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1)).unwrap();
+        let table_changes = await_!(TableChanges::try_new(url, engine.as_ref(), 0, Some(1))).unwrap();
 
         let schema = table_changes
             .schema()

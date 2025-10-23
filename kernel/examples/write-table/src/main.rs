@@ -8,7 +8,7 @@ use arrow::array::{BooleanArray, Float64Array, Int32Array, RecordBatch, StringAr
 use arrow::util::pretty::print_batches;
 use clap::Parser;
 use common::{LocationArgs, ParseWithExamples};
-use itertools::Itertools;
+use delta_kernel::AsyncIterator as _;
 use serde_json::{json, to_vec};
 use url::Url;
 use uuid::Uuid;
@@ -20,7 +20,7 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::{CommitResult, RetryableTransaction};
-use delta_kernel::{DeltaResult, Engine, Error, Snapshot, SnapshotRef};
+use delta_kernel::{await_, DeltaResult, Engine, Error, Snapshot, SnapshotRef};
 
 /// An example program that writes to a Delta table and creates it if necessary.
 #[derive(Parser)]
@@ -110,7 +110,7 @@ async fn try_main() -> DeltaResult<()> {
                 "Exceeded maximum 5 retries for committing transaction",
             ));
         }
-        txn = match txn.commit(&engine)? {
+        txn = match await_!(txn.commit(&engine))? {
             CommitResult::CommittedTransaction(committed) => break committed,
             CommitResult::ConflictedTransaction(conflicted) => {
                 let conflicting_version = conflicted.conflict_version();
@@ -143,7 +143,7 @@ async fn create_or_get_base_snapshot(
     schema_str: &str,
 ) -> DeltaResult<SnapshotRef> {
     // Check if table already exists
-    match Snapshot::builder_for(url.clone()).build(engine) {
+    match await_!(Snapshot::builder_for(url.clone()).build(engine)) {
         Ok(snapshot) => {
             println!("✓ Found existing table at version {}", snapshot.version());
             Ok(snapshot)
@@ -153,7 +153,7 @@ async fn create_or_get_base_snapshot(
             println!("Creating new Delta table...");
             let schema = parse_schema(schema_str)?;
             create_table(url, &schema).await?;
-            Snapshot::builder_for(url.clone()).build(engine)
+            await_!(Snapshot::builder_for(url.clone()).build(engine))
         }
     }
 }
@@ -312,12 +312,12 @@ async fn read_and_display_data(
     table_url: &Url,
     engine: DefaultEngine<TokioBackgroundExecutor>,
 ) -> DeltaResult<()> {
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let snapshot = await_!(Snapshot::builder_for(table_url.clone()).build(&engine))?;
     let scan = snapshot.scan_builder().build()?;
 
-    let batches: Vec<RecordBatch> = scan
-        .execute(Arc::new(engine))?
-        .map(|scan_result| -> DeltaResult<_> {
+    let batches: Vec<RecordBatch> = await_!(await_!(scan
+        .execute(Arc::new(engine)))?
+        .async_map(|scan_result| -> DeltaResult<_> {
             let scan_result = scan_result?;
             let mask = scan_result.full_mask();
             let data = scan_result.raw_data?;
@@ -336,7 +336,8 @@ async fn read_and_display_data(
                 Ok(record_batch)
             }
         })
-        .try_collect()?;
+        .async_pin()
+        .async_try_collect())?;
 
     print_batches(&batches)?;
     Ok(())

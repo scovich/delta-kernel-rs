@@ -1,21 +1,18 @@
 //! Read a small table with/without deletion vectors.
 //! Must run at the root of the crate
-use std::ops::Add;
 use std::path::PathBuf;
 
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::scan::ScanResult;
-use delta_kernel::{DeltaResult, Snapshot};
+use delta_kernel::{async_fn, await_, AsyncIterator, DeltaResult, Snapshot};
 use test_utils::DefaultEngineExtension;
 
-use itertools::Itertools;
-use test_log::test;
-
+#[async_fn]
 fn count_total_scan_rows(
-    scan_result_iter: impl Iterator<Item = DeltaResult<ScanResult>>,
+    scan_result_iter: impl AsyncIterator<Item = DeltaResult<ScanResult>>,
 ) -> DeltaResult<usize> {
-    scan_result_iter
-        .map(|scan_result| {
+    await_!(scan_result_iter
+        .async_map(|scan_result| {
             let scan_result = scan_result?;
             // NOTE: The mask only suppresses rows for which it is both present and false.
             let mask = scan_result.raw_mask();
@@ -23,12 +20,13 @@ fn count_total_scan_rows(
             let data = scan_result.raw_data?;
             Ok(data.len() - deleted_rows)
         })
-        .fold_ok(0, Add::add)
+        .async_pin()
+        .async_try_fold(0, |acc, count| Ok(acc + count)))
 }
 
 #[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[cfg_attr(not(feature = "async"), test_log::test)]
+#[cfg_attr(feature = "async", test_log::test(tokio::test))]
 fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/"))?;
     let url = url::Url::from_directory_path(path).unwrap();
@@ -44,8 +42,8 @@ fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[cfg_attr(not(feature = "async"), test_log::test)]
+#[cfg_attr(feature = "async", test_log::test(tokio::test))]
 fn non_dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/"))?;
     let url = url::Url::from_directory_path(path).unwrap();

@@ -3,8 +3,9 @@
 use super::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::{
-    DeltaResult, Engine, Error, EvaluationHandler, FileDataReadResultIterator, FileMeta,
-    JsonHandler, ParquetHandler, PredicateRef, SchemaRef, StorageHandler,
+    into_async_iter, AsyncIterator as _, DeltaResult, Engine, Error, EvaluationHandler,
+    FileDataReadResultIterator, FileMeta, JsonHandler, ParquetHandler, PredicateRef, SchemaRef,
+    StorageHandler,
 };
 
 use crate::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
@@ -71,7 +72,7 @@ where
 {
     debug!("Reading files: {files:#?} with schema {schema:#?} and predicate {predicate:#?}");
     if files.is_empty() {
-        return Ok(Box::new(std::iter::empty()));
+        return Ok(into_async_iter(std::iter::empty()).into_boxed());
     }
     let arrow_schema = Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?);
     let files = files.to_vec();
@@ -95,7 +96,7 @@ where
         .flatten_ok()
         // Double unpack and map Iterator<DeltaResult<Box<EngineData>>>
         .map(|data| Ok(Box::new(ArrowEngineData::new(data??.into())) as _));
-    Ok(Box::new(result))
+    Ok(into_async_iter(result).into_boxed())
 }
 
 #[cfg(test)]

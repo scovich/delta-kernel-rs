@@ -256,6 +256,7 @@ mod tests {
     use std::task::Waker;
 
     use crate::actions::get_log_schema;
+    use crate::await_;
     use crate::arrow::array::{AsArray, Int32Array, RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_data::ArrowEngineData;
@@ -544,11 +545,11 @@ mod tests {
         }];
 
         let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
-        let data: Vec<RecordBatch> = handler
-            .read_json_files(files, get_log_schema().clone(), None)
+        let iter = await_!(handler
+            .read_json_files(files, get_log_schema().clone(), None))
             .unwrap()
-            .map_ok(into_record_batch)
-            .try_collect()
+            .map_ok(into_record_batch);
+        let data: Vec<RecordBatch> = await_!(iter.async_pin().async_try_collect())
             .unwrap();
 
         assert_eq!(data.len(), 1);
@@ -556,11 +557,11 @@ mod tests {
 
         // limit batch size
         let handler = handler.with_batch_size(2);
-        let data: Vec<RecordBatch> = handler
-            .read_json_files(files, get_log_schema().clone(), None)
+        let iter = await_!(handler
+            .read_json_files(files, get_log_schema().clone(), None))
             .unwrap()
-            .map_ok(into_record_batch)
-            .try_collect()
+            .map_ok(into_record_batch);
+        let data: Vec<RecordBatch> = await_!(iter.async_pin().async_try_collect())
             .unwrap();
 
         assert_eq!(data.len(), 2);
@@ -709,11 +710,11 @@ mod tests {
                 "val",
                 DeltaDataType::INTEGER,
             )]));
-            let data: Vec<RecordBatch> = handler
-                .read_json_files(&files, physical_schema, None)
+            let iter = await_!(handler
+                .read_json_files(&files, physical_schema, None))
                 .unwrap()
-                .map_ok(into_record_batch)
-                .try_collect()
+                .map_ok(into_record_batch);
+            let data: Vec<RecordBatch> = await_!(iter.async_pin().async_try_collect())
                 .unwrap();
 
             // check the order

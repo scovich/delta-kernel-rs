@@ -131,6 +131,16 @@ pub trait AsyncIterator: Iterator + Send + Sized + 'static {
         self.flatten()
     }
 
+    /// Map and flatten - applies a function that returns an iterator, then flattens the result
+    fn async_flat_map<F, I>(self, f: F) -> impl AsyncIterator<Item = I::Item>
+    where
+        F: FnMut(Self::Item) -> I + Send + 'static,
+        I: Iterator + Send + 'static,
+        I::Item: Send + 'static,
+    {
+        self.flat_map(f)
+    }
+
     /// Flatten an iterator of Result<Iterator<T>> into an iterator of Result<T>
     ///
     /// This is the traditional itertools `flatten_ok` semantics:
@@ -171,6 +181,16 @@ pub trait AsyncIterator: Iterator + Send + Sized + 'static {
         self.flatten_ok().map(|result| result?)
     }
 
+    /// Folds an iterator into a single value.
+    fn async_fold<B, F>(self, init: B, f: F) -> B
+    where
+        F: FnMut(B, Self::Item) -> B + Send + 'static,
+        B: Send + 'static,
+        Self::Item: Send + 'static,
+    {
+        self.fold(init, f)
+    }
+
     /// Try fold with early exit on error
     ///
     /// This method requires the iterator to yield `Result` types.
@@ -206,10 +226,45 @@ pub trait AsyncIterator: Iterator + Send + Sized + 'static {
     /// Chain two iterators
     fn async_chain<U>(self, other: U) -> impl AsyncIterator<Item = Self::Item>
     where
-        U: IntoIterator<Item = Self::Item>,
-        U::IntoIter: Send + 'static,
+        U: Iterator<Item = Self::Item> + Send + 'static,
     {
         self.chain(other)
+    }
+
+    /// Zip two iterators together
+    ///
+    /// Combines this iterator with another, yielding pairs of items.
+    /// The resulting iterator ends when either input iterator ends.
+    fn async_zip<U>(self, other: U) -> impl AsyncIterator<Item = (Self::Item, U::Item)>
+    where
+        U: Iterator + Send + 'static,
+        U::Item: Send,
+        Self::Item: Send,
+    {
+        self.zip(other)
+    }
+
+    /// Collect an iterator of Results into a Result of collection
+    ///
+    /// In sync mode, this collects immediately (no Future).
+    /// Use with `await_!(iter.async_try_collect())` for mode-agnostic code.
+    fn async_try_collect<T, E, C>(self) -> Result<C, E>
+    where
+        Self: Iterator<Item = Result<T, E>>,
+        C: Extend<T> + FromIterator<T> + Default,
+    {
+        self.collect()
+    }
+
+    /// Collect an iterator into a collection
+    ///
+    /// In sync mode, this collects immediately (no Future).
+    /// Use with `await_!(iter.async_collect())` for mode-agnostic code.
+    fn async_collect<C>(self) -> C
+    where
+        C: Extend<Self::Item> + FromIterator<Self::Item> + Default,
+    {
+        self.collect()
     }
 
     /// Returns an iterable version of this AsyncIterator (ie suitable for use with [`Self::async_next`]).

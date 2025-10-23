@@ -16,7 +16,7 @@ use crate::actions::deletion_vector::{
 use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::transforms::ExpressionTransform;
-use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
+use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
 use crate::listed_log_files::ListedLogFiles;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
@@ -875,26 +875,17 @@ pub fn selection_vector(
 // some utils that are used in file_stream.rs and state.rs tests
 #[cfg(test)]
 pub(crate) mod test_utils {
+    use itertools::Itertools as _;
+
+    use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::sync::json::SyncJsonHandler;
+    use crate::engine::sync::SyncEngine;
     use crate::arrow::array::StringArray;
     use crate::utils::test_utils::string_array_to_engine_data;
-    use itertools::Itertools;
-    use std::sync::Arc;
+    use crate::JsonHandler as _;
 
-    use crate::log_replay::ActionsBatch;
-    use crate::{
-        actions::get_log_schema,
-        engine::{
-            arrow_data::ArrowEngineData,
-            sync::{json::SyncJsonHandler, SyncEngine},
-        },
-        scan::log_replay::scan_action_iter,
-        schema::SchemaRef,
-        JsonHandler,
-    };
-
+    use super::*;
     use super::state::ScanCallback;
-    use super::{PhysicalPredicate, StateInfo};
-    use crate::transforms::TransformSpec;
 
     // Generates a batch of sidecar actions with the given paths.
     // The schema is provided as null columns affect equality checks.
@@ -978,6 +969,7 @@ pub(crate) mod test_utils {
     /// Create a scan action iter and validate what's called back. If you pass `None` as
     /// `logical_schema`, `transform` should also be `None`
     #[allow(clippy::vec_box)]
+    #[async_fn]
     pub(crate) fn run_with_validate_callback<T: Clone>(
         batch: Vec<Box<ArrowEngineData>>,
         logical_schema: Option<SchemaRef>,
@@ -994,15 +986,15 @@ pub(crate) mod test_utils {
             physical_predicate: PhysicalPredicate::None,
             transform_spec,
         });
-        let iter = scan_action_iter(
+        let mut iter = scan_action_iter(
             &SyncEngine::new(),
-            batch
+            into_async_iter(batch
                 .into_iter()
-                .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
+                .map(|batch| Ok(ActionsBatch::new(batch as _, true)))),
             state_info,
-        );
+        ).async_pin();
         let mut batch_count = 0;
-        for res in iter {
+        while let Some(res) = await_!(iter.async_next()) {
             let scan_metadata = res.unwrap();
             assert_eq!(
                 scan_metadata.scan_files.selection_vector(),
@@ -1019,7 +1011,6 @@ pub(crate) mod test_utils {
 
 #[cfg(test)]
 mod tests {
-    use itertools::Itertools as _;
     use std::path::PathBuf;
 
     use crate::arrow::array::BooleanArray;
@@ -1027,10 +1018,10 @@ mod tests {
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
+    use crate::expressions::{column_expr, column_pred, Expression as Expr, Predicate as Pred, Scalar};
     use crate::schema::{ColumnMetadataKey, PrimitiveType};
     use crate::transforms::FieldTransformSpec;
-    use crate::Snapshot;
+    use crate::{Snapshot};
 
     use super::*;
 
@@ -1212,8 +1203,10 @@ mod tests {
         }
     }
 
+    #[async_fn]
     fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<String>> {
-        let scan_metadata_iter = scan.scan_metadata(engine)?;
+        let scan_metadata_iter = await_!(scan.scan_metadata(engine))?;
+        let mut iter = scan_metadata_iter.async_pin();
         fn scan_metadata_callback(
             paths: &mut Vec<String>,
             path: &str,
@@ -1227,23 +1220,25 @@ mod tests {
             assert!(dv_info.deletion_vector.is_none());
         }
         let mut files = vec![];
-        for res in scan_metadata_iter {
+        while let Some(res) = await_!(iter.async_next()) {
             let scan_metadata = res?;
             files = scan_metadata.visit_scan_files(files, scan_metadata_callback)?;
         }
         Ok(files)
     }
 
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn test_scan_metadata_paths() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = SyncEngine::new();
 
-        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let snapshot = await_!(Snapshot::builder_for(url).build(&engine)).unwrap();
         let scan = snapshot.scan_builder().build().unwrap();
-        let files = get_files_for_scan(scan, &engine).unwrap();
+        let files = await_!(get_files_for_scan(scan, &engine)).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(
             files[0],
@@ -1251,36 +1246,41 @@ mod tests {
         );
     }
 
-    #[test_log::test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test_log::test)]
+    #[cfg_attr(feature = "async", test_log::test(tokio::test))]
     fn test_scan_metadata() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = Arc::new(SyncEngine::new());
 
-        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+        let snapshot = await_!(Snapshot::builder_for(url).build(engine.as_ref())).unwrap();
         let scan = snapshot.scan_builder().build().unwrap();
-        let files: Vec<ScanResult> = scan.execute(engine).unwrap().try_collect().unwrap();
+        let iter = await_!(scan.execute(engine)).unwrap();
+        let files: Vec<ScanResult> = await_!(iter.async_pin().async_try_collect()).unwrap();
 
         assert_eq!(files.len(), 1);
         let num_rows = files[0].raw_data.as_ref().unwrap().len();
         assert_eq!(num_rows, 10)
     }
 
-    #[test_log::test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test_log::test)]
+    #[cfg_attr(feature = "async", test_log::test(tokio::test))]
     fn test_scan_metadata_from_same_version() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = Arc::new(SyncEngine::new());
 
-        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+        let snapshot = await_!(Snapshot::builder_for(url).build(engine.as_ref())).unwrap();
         let version = snapshot.version();
         let scan = snapshot.scan_builder().build().unwrap();
-        let files: Vec<_> = scan
-            .scan_metadata(engine.as_ref())
+        let iter = await_!(scan
+            .scan_metadata(engine.as_ref()))
             .unwrap()
-            .map_ok(|ScanMetadata { scan_files, .. }| {
+            .async_map_ok(|ScanMetadata { scan_files, .. }| {
                 let (underlying_data, selection_vector) = scan_files.into_parts();
                 let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
                     .unwrap()
@@ -1288,43 +1288,41 @@ mod tests {
                 let filtered_batch =
                     filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
                 Box::new(ArrowEngineData::from(filtered_batch)) as Box<dyn EngineData>
-            })
-            .try_collect()
+            });
+        let files: Vec<_> = await_!(iter.async_pin().async_try_collect()).unwrap();
+        let iter = await_!(scan.scan_metadata_from(engine.as_ref(), version, files, None))
             .unwrap();
-        let new_files: Vec<_> = scan
-            .scan_metadata_from(engine.as_ref(), version, files, None)
-            .unwrap()
-            .try_collect()
-            .unwrap();
+        let new_files: Vec<_> = await_!(iter.async_try_collect()).unwrap();
 
         assert_eq!(new_files.len(), 1);
     }
 
     // reading v0 with 3 files.
     // updating to v1 with 3 more files added.
-    #[test_log::test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test_log::test)]
+    #[cfg_attr(feature = "async", test_log::test(tokio::test))]
     fn test_scan_metadata_from_with_update() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = Arc::new(SyncEngine::new());
 
-        let snapshot = Snapshot::builder_for(url.clone())
+        let snapshot = await_!(Snapshot::builder_for(url.clone())
             .at_version(0)
-            .build(engine.as_ref())
+            .build(engine.as_ref()))
             .unwrap();
         let scan = snapshot.scan_builder().build().unwrap();
-        let files: Vec<_> = scan
-            .scan_metadata(engine.as_ref())
+        let iter = await_!(scan
+            .scan_metadata(engine.as_ref()))
             .unwrap()
-            .map_ok(|ScanMetadata { scan_files, .. }| {
+            .async_map_ok(|ScanMetadata { scan_files, .. }| {
                 let (underlying_data, selection_vector) = scan_files.into_parts();
                 let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
                     .unwrap()
                     .into();
                 filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap()
-            })
-            .try_collect()
-            .unwrap();
+            });
+        let files: Vec<_> = await_!(iter.async_pin().async_try_collect()).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].num_rows(), 3);
 
@@ -1332,23 +1330,22 @@ mod tests {
             .into_iter()
             .map(|b| Box::new(ArrowEngineData::from(b)) as Box<dyn EngineData>)
             .collect();
-        let snapshot = Snapshot::builder_for(url)
+        let snapshot = await_!(Snapshot::builder_for(url)
             .at_version(1)
-            .build(engine.as_ref())
+            .build(engine.as_ref()))
             .unwrap();
         let scan = snapshot.scan_builder().build().unwrap();
-        let new_files: Vec<_> = scan
-            .scan_metadata_from(engine.as_ref(), 0, files, None)
+        let iter = await_!(scan
+            .scan_metadata_from(engine.as_ref(), 0, files, None))
             .unwrap()
-            .map_ok(|ScanMetadata { scan_files, .. }| {
+            .async_map_ok(|ScanMetadata { scan_files, .. }| {
                 let (underlying_data, selection_vector) = scan_files.into_parts();
                 let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
                     .unwrap()
                     .into();
                 filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap()
-            })
-            .try_collect()
-            .unwrap();
+            });
+        let new_files: Vec<_> = await_!(iter.async_pin().async_try_collect()).unwrap();
         assert_eq!(new_files.len(), 2);
         assert_eq!(new_files[0].num_rows(), 3);
         assert_eq!(new_files[1].num_rows(), 3);
@@ -1398,19 +1395,18 @@ mod tests {
         }
     }
 
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn test_replay_for_scan_metadata() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
         let engine = SyncEngine::new();
 
-        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let snapshot = await_!(Snapshot::builder_for(url).build(&engine)).unwrap();
         let scan = snapshot.scan_builder().build().unwrap();
-        let data: Vec<_> = scan
-            .replay_for_scan_metadata(&engine)
-            .unwrap()
-            .try_collect()
-            .unwrap();
+        let iter = await_!(scan.replay_for_scan_metadata(&engine)).unwrap();
+        let data: Vec<_> = await_!(iter.async_pin().async_try_collect()).unwrap();
         // No predicate pushdown attempted, because at most one part of a multi-part checkpoint
         // could be skipped when looking for adds/removes.
         //
@@ -1418,19 +1414,22 @@ mod tests {
         assert_eq!(data.len(), 5);
     }
 
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn test_data_row_group_skipping() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
         let engine = Arc::new(SyncEngine::new());
 
-        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+        let snapshot = await_!(Snapshot::builder_for(url).build(engine.as_ref())).unwrap();
 
         // No predicate pushdown attempted, so the one data file should be returned.
         //
         // NOTE: The data file contains only five rows -- near guaranteed to produce one row group.
         let scan = snapshot.clone().scan_builder().build().unwrap();
-        let data: Vec<_> = scan.execute(engine.clone()).unwrap().try_collect().unwrap();
+        let iter = await_!(scan.execute(engine.clone())).unwrap();
+        let data: Vec<_> = await_!(iter.async_pin().async_try_collect()).unwrap();
         assert_eq!(data.len(), 1);
 
         // Ineffective predicate pushdown attempted, so the one data file should be returned.
@@ -1443,7 +1442,8 @@ mod tests {
             .with_predicate(predicate)
             .build()
             .unwrap();
-        let data: Vec<_> = scan.execute(engine.clone()).unwrap().try_collect().unwrap();
+        let iter = await_!(scan.execute(engine.clone())).unwrap();
+        let data: Vec<_> = await_!(iter.async_pin().async_try_collect()).unwrap();
         assert_eq!(data.len(), 1);
 
         // TODO(#860): we disable predicate pushdown until we support row indexes. Update this test
@@ -1457,17 +1457,20 @@ mod tests {
             .with_predicate(predicate)
             .build()
             .unwrap();
-        let data: Vec<_> = scan.execute(engine).unwrap().try_collect().unwrap();
+        let iter = await_!(scan.execute(engine.clone())).unwrap();
+        let data: Vec<_> = await_!(iter.async_pin().async_try_collect()).unwrap();
         assert_eq!(data.len(), 1);
     }
 
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn test_missing_column_row_group_skipping() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
         let engine = Arc::new(SyncEngine::new());
 
-        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+        let snapshot = await_!(Snapshot::builder_for(url).build(engine.as_ref())).unwrap();
 
         // Predicate over a logically valid but physically missing column. No data files should be
         // returned because the column is inferred to be all-null.
@@ -1481,7 +1484,8 @@ mod tests {
             .with_predicate(predicate)
             .build()
             .unwrap();
-        let data: Vec<_> = scan.execute(engine.clone()).unwrap().try_collect().unwrap();
+        let iter = await_!(scan.execute(engine.clone())).unwrap();
+        let data: Vec<_> = await_!(iter.async_pin().async_try_collect()).unwrap();
         assert_eq!(data.len(), 1);
 
         // Predicate over a logically missing column fails the scan
@@ -1493,7 +1497,9 @@ mod tests {
             .expect_err("unknown column");
     }
 
-    #[test_log::test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test_log::test)]
+    #[cfg_attr(feature = "async", test_log::test(tokio::test))]
     fn test_scan_with_checkpoint() -> DeltaResult<()> {
         let path = std::fs::canonicalize(PathBuf::from(
             "./tests/data/with_checkpoint_no_last_checkpoint/",
@@ -1502,9 +1508,9 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = SyncEngine::new();
 
-        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
-        let scan = snapshot.scan_builder().build()?;
-        let files = get_files_for_scan(scan, &engine)?;
+        let snapshot = await_!(Snapshot::builder_for(url).build(&engine)).unwrap();
+        let scan = snapshot.scan_builder().build().unwrap();
+        let files = await_!(get_files_for_scan(scan, &engine)).unwrap();
         // test case:
         //
         // commit0:     P and M, no add/remove

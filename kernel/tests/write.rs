@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::Error as KernelError;
-use delta_kernel::{DeltaResult, Engine, Snapshot, Version};
+use delta_kernel::{await_, DeltaResult, Engine, Snapshot, Version};
 use url::Url;
 use uuid::Uuid;
 
@@ -64,11 +64,11 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
         setup_test_tables(schema, &[], None, "test_table").await?
     {
         // create a transaction
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        let snapshot = await_!(Snapshot::builder_for(table_url.clone()).build(&engine))?;
         let txn = snapshot.transaction()?.with_engine_info("default engine");
 
         // commit!
-        let _ = txn.commit(&engine)?;
+        let _ = await_!(txn.commit(&engine))?;
 
         let commit1 = store
             .get(&Path::from(format!(
@@ -147,7 +147,7 @@ async fn write_data_and_check_result_and_stats(
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     expected_since_commit: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let snapshot = await_!(Snapshot::builder_for(table_url.clone()).build(engine.as_ref()))?;
     let mut txn = snapshot.transaction()?;
 
     // create two new arrow record batches to append
@@ -183,7 +183,7 @@ async fn write_data_and_check_result_and_stats(
     }
 
     // commit!
-    match txn.commit(engine.as_ref())? {
+    match await_!(txn.commit(engine.as_ref()))? {
         CommitResult::CommittedTransaction(committed) => {
             assert_eq!(committed.commit_version(), expected_since_commit as Version);
             assert_eq!(
@@ -214,10 +214,10 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
     {
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        let snapshot = await_!(Snapshot::builder_for(table_url.clone()).build(&engine))?;
         let txn = snapshot.transaction()?.with_engine_info("default engine");
 
-        let _ = txn.commit(&engine)?;
+        let _ = await_!(txn.commit(&engine))?;
 
         let commit = store
             .get(&Path::from(format!(
@@ -332,14 +332,14 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
 
         assert_eq!(parsed_commits, expected_commit);
 
-        test_read(
+        await_!(test_read(
             &ArrowEngineData::new(RecordBatch::try_new(
                 Arc::new(schema.as_ref().try_into_arrow()?),
                 vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6]))],
             )?),
             &table_url,
             engine,
-        )?;
+        ))?;
     }
     Ok(())
 }
@@ -357,11 +357,11 @@ async fn test_no_add_actions() -> Result<(), Box<dyn std::error::Error>> {
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
     {
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        let snapshot = await_!(Snapshot::builder_for(table_url.clone()).build(&engine))?;
         let txn = snapshot.transaction()?.with_engine_info("default engine");
 
         // Commit without adding any add files
-        assert!(txn.commit(&engine)?.is_committed());
+        assert!(await_!(txn.commit(&engine))?.is_committed());
 
         let commit1 = store
             .get(&Path::from(format!(
@@ -399,7 +399,7 @@ async fn test_append_twice() -> Result<(), Box<dyn std::error::Error>> {
         write_data_and_check_result_and_stats(table_url.clone(), schema.clone(), engine.clone(), 2)
             .await?;
 
-        test_read(
+        await_!(test_read(
             &ArrowEngineData::new(RecordBatch::try_new(
                 Arc::new(schema.as_ref().try_into_arrow()?),
                 vec![Arc::new(Int32Array::from(vec![
@@ -408,7 +408,7 @@ async fn test_append_twice() -> Result<(), Box<dyn std::error::Error>> {
             )?),
             &table_url,
             engine,
-        )?;
+        ))?;
     }
     Ok(())
 }
@@ -434,7 +434,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
     for (table_url, engine, store, table_name) in
         setup_test_tables(table_schema.clone(), &[partition_col], None, "test_table").await?
     {
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        let snapshot = await_!(Snapshot::builder_for(table_url.clone()).build(&engine))?;
         let mut txn = snapshot.transaction()?.with_engine_info("default engine");
 
         // create two new arrow record batches to append
@@ -475,7 +475,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // commit!
-        assert!(txn.commit(engine.as_ref())?.is_committed());
+        assert!(await_!(txn.commit(engine.as_ref()))?.is_committed());
 
         let commit1 = store
             .get(&Path::from(format!(
@@ -544,7 +544,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
 
         assert_eq!(parsed_commits, expected_commit);
 
-        test_read(
+        await_!(test_read(
             &ArrowEngineData::new(RecordBatch::try_new(
                 Arc::new(table_schema.as_ref().try_into_arrow()?),
                 vec![
@@ -554,7 +554,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
             )?),
             &table_url,
             engine,
-        )?;
+        ))?;
     }
     Ok(())
 }
@@ -577,7 +577,7 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
     for (table_url, engine, _store, _table_name) in
         setup_test_tables(table_schema, &[], None, "test_table").await?
     {
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        let snapshot = await_!(Snapshot::builder_for(table_url.clone()).build(&engine))?;
         let txn = snapshot.transaction()?.with_engine_info("default engine");
 
         // create two new arrow record batches to append
@@ -635,17 +635,17 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         setup_test_tables(schema, &[], None, "test_table").await?
     {
         // can't have duplicate app_id in same transaction
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        let snapshot = await_!(Snapshot::builder_for(table_url.clone()).build(&engine))?;
         assert!(matches!(
-            snapshot
+            await_!(snapshot
                 .transaction()?
                 .with_transaction_id("app_id1".to_string(), 0)
                 .with_transaction_id("app_id1".to_string(), 1)
-                .commit(&engine),
+                .commit(&engine)),
             Err(KernelError::Generic(msg)) if msg == "app_id app_id1 already exists in transaction"
         ));
 
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        let snapshot = await_!(Snapshot::builder_for(table_url.clone()).build(&engine))?;
         let txn = snapshot
             .transaction()?
             .with_engine_info("default engine")
@@ -653,21 +653,21 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
             .with_transaction_id("app_id2".to_string(), 2);
 
         // commit!
-        assert!(txn.commit(&engine)?.is_committed());
+        assert!(await_!(txn.commit(&engine))?.is_committed());
 
-        let snapshot = Snapshot::builder_for(table_url.clone())
+        let snapshot = await_!(Snapshot::builder_for(table_url.clone())
             .at_version(1)
-            .build(&engine)?;
+            .build(&engine))?;
         assert_eq!(
-            snapshot.clone().get_app_id_version("app_id1", &engine)?,
+            await_!(snapshot.clone().get_app_id_version("app_id1", &engine))?,
             Some(1)
         );
         assert_eq!(
-            snapshot.clone().get_app_id_version("app_id2", &engine)?,
+            await_!(snapshot.clone().get_app_id_version("app_id2", &engine))?,
             Some(2)
         );
         assert_eq!(
-            snapshot.clone().get_app_id_version("app_id3", &engine)?,
+            await_!(snapshot.clone().get_app_id_version("app_id3", &engine))?,
             None
         );
 
@@ -779,7 +779,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let snapshot = await_!(Snapshot::builder_for(table_url.clone()).build(&engine))?;
     let mut txn = snapshot.transaction()?.with_engine_info("default engine");
 
     // Create Arrow data with TIMESTAMP_NTZ values including edge cases
@@ -814,7 +814,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     txn.add_files(add_files_metadata);
 
     // Commit the transaction
-    assert!(txn.commit(engine.as_ref())?.is_committed());
+    assert!(await_!(txn.commit(engine.as_ref()))?.is_committed());
 
     // Verify the commit was written correctly
     let commit1 = store
@@ -834,7 +834,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     assert!(parsed_commits[1].get("add").is_some());
 
     // Verify the data can be read back correctly
-    test_read(&ArrowEngineData::new(data), &table_url, engine)?;
+    await_!(test_read(&ArrowEngineData::new(data), &table_url, engine))?;
 
     Ok(())
 }
@@ -914,7 +914,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let snapshot = await_!(Snapshot::builder_for(table_url.clone()).build(&engine))?;
     let mut txn = snapshot.transaction()?;
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
@@ -1021,7 +1021,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     txn.add_files(add_files_metadata);
 
     // Commit the transaction
-    assert!(txn.commit(engine.as_ref())?.is_committed());
+    assert!(await_!(txn.commit(engine.as_ref()))?.is_committed());
 
     // Verify the commit was written correctly
     let commit1_url = tmp_test_dir_url
@@ -1080,7 +1080,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     )
     .unwrap();
 
-    test_read(&ArrowEngineData::new(expected_data), &table_url, engine)?;
+    await_!(test_read(&ArrowEngineData::new(expected_data), &table_url, engine))?;
 
     Ok(())
 }
@@ -1124,7 +1124,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     )
     .await?;
 
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let snapshot = await_!(Snapshot::builder_for(table_url.clone()).build(&engine))?;
     let mut txn = snapshot.transaction()?;
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
@@ -1193,7 +1193,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     txn.add_files(add_files_metadata);
 
     // Commit the transaction
-    assert!(txn.commit(engine.as_ref())?.is_committed());
+    assert!(await_!(txn.commit(engine.as_ref()))?.is_committed());
 
     // Verify the commit was written correctly
     let commit1_url = tmp_test_dir_url
@@ -1213,7 +1213,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     // Check that the add action exists
     assert!(parsed_commits[1].get("add").is_some());
 
-    let res = test_read(&ArrowEngineData::new(data), &table_url, engine);
+    let res = await_!(test_read(&ArrowEngineData::new(data), &table_url, engine));
     assert!(matches!(res,
         Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
 
@@ -1243,7 +1243,7 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
     )
     .await?;
 
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let snapshot = await_!(Snapshot::builder_for(table_url.clone()).build(&engine))?;
 
     let txn = snapshot.transaction()?;
 
@@ -1256,10 +1256,10 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
     let domain2 = "spark.settings";
     let config2 = r#"{"cores": 4}"#;
 
-    assert!(txn
+    assert!(await_!(txn
         .with_domain_metadata(domain1.to_string(), config1.to_string())
         .with_domain_metadata(domain2.to_string(), config2.to_string())
-        .commit(&engine)?
+        .commit(&engine))?
         .is_committed());
 
     let commit_data = store
@@ -1291,10 +1291,10 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
         }
     }
 
-    let final_snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let domain1_config = final_snapshot.get_domain_metadata(domain1, &engine)?;
+    let final_snapshot = await_!(Snapshot::builder_for(table_url.clone()).build(&engine))?;
+    let domain1_config = await_!(final_snapshot.get_domain_metadata(domain1, &engine))?;
     assert_eq!(domain1_config, Some(config1.to_string()));
-    let domain2_config = final_snapshot.get_domain_metadata(domain2, &engine)?;
+    let domain2_config = await_!(final_snapshot.get_domain_metadata(domain2, &engine))?;
     assert_eq!(domain2_config, Some(config2.to_string()));
     Ok(())
 }
@@ -1321,13 +1321,13 @@ async fn test_set_domain_metadata_errors() -> Result<(), Box<dyn std::error::Err
     )
     .await?;
 
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let snapshot = await_!(Snapshot::builder_for(table_url.clone()).build(&engine))?;
 
     // System domain rejection
     let txn = snapshot.clone().transaction()?;
-    let res = txn
+    let res = await_!(txn
         .with_domain_metadata("delta.system".to_string(), "config".to_string())
-        .commit(&engine);
+        .commit(&engine));
     assert_result_error_with_message(
         res,
         "Cannot modify domains that start with 'delta.' as those are system controlled",
@@ -1335,10 +1335,10 @@ async fn test_set_domain_metadata_errors() -> Result<(), Box<dyn std::error::Err
 
     // Duplicate domain rejection
     let txn2 = snapshot.clone().transaction()?;
-    let res = txn2
+    let res = await_!(txn2
         .with_domain_metadata("app.config".to_string(), "v1".to_string())
         .with_domain_metadata("app.config".to_string(), "v2".to_string())
-        .commit(&engine);
+        .commit(&engine));
     assert_result_error_with_message(
         res,
         "Metadata for domain app.config already specified in this transaction",
@@ -1372,11 +1372,11 @@ async fn test_set_domain_metadata_unsupported_writer_feature(
     )
     .await?;
 
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let res = snapshot
+    let snapshot = await_!(Snapshot::builder_for(table_url.clone()).build(&engine))?;
+    let res = await_!(snapshot
         .transaction()?
         .with_domain_metadata("app.config".to_string(), "test_config".to_string())
-        .commit(&engine);
+        .commit(&engine));
 
     assert_result_error_with_message(res, "Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature");
 
@@ -1472,7 +1472,7 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     // FIRST COMMIT: This exercises version() == 0 branch and generates ICT
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let snapshot = await_!(Snapshot::builder_for(table_url.clone()).build(&engine))?;
     assert_eq!(
         snapshot.version(),
         0,
@@ -1485,7 +1485,7 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
     generate_and_add_data_file(&mut txn, &engine, schema.clone(), vec![1, 2, 3]).await?;
 
     // First commit
-    let commit_result = txn.commit(&engine)?;
+    let commit_result = await_!(txn.commit(&engine))?;
     match commit_result {
         CommitResult::CommittedTransaction(committed) => {
             assert_eq!(
@@ -1515,7 +1515,7 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Second commit
-    let snapshot2 = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let snapshot2 = await_!(Snapshot::builder_for(table_url.clone()).build(&engine))?;
     assert_eq!(
         snapshot2.version(),
         1,
@@ -1528,7 +1528,7 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
     generate_and_add_data_file(&mut txn2, &engine, schema, vec![4, 5, 6]).await?;
 
     // Second commit
-    let commit_result2 = txn2.commit(&engine)?;
+    let commit_result2 = await_!(txn2.commit(&engine))?;
     match commit_result2 {
         CommitResult::CommittedTransaction(committed) => {
             assert_eq!(

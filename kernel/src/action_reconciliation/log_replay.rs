@@ -575,10 +575,9 @@ mod tests {
 
     use super::*;
     use crate::arrow::array::StringArray;
+    use crate::into_async_iter;
     use crate::utils::test_utils::{action_batch, parse_json_batch};
-    use crate::Error;
-
-    use itertools::Itertools;
+    use crate::{async_fn, await_, AsyncIterator, Error};
 
     /// Helper function to create test batches from JSON strings
     fn create_batch(json_strings: Vec<&str>) -> DeltaResult<ActionsBatch> {
@@ -588,12 +587,14 @@ mod tests {
 
     /// Helper function which applies the [`ActionReconciliationProcessor`] to a set of
     /// input batches and returns the results.
+    #[async_fn]
     fn run_action_reconciliation_test(
         input_batches: Vec<ActionsBatch>,
     ) -> DeltaResult<(Vec<FilteredEngineData>, i64, i64)> {
-        let processed_batches: Vec<_> = ActionReconciliationProcessor::new(0, None)
-            .process_actions_iter(input_batches.into_iter().map(Ok))
-            .try_collect()?;
+        let processed_batches: Vec<_> = await_!(ActionReconciliationProcessor::new(0, None)
+            .process_actions_iter(into_async_iter(input_batches.into_iter().map(Ok)))
+            .async_pin()
+            .async_try_collect())?;
         let total_count: i64 = processed_batches.iter().map(|b| b.actions_count).sum();
         let add_count: i64 = processed_batches.iter().map(|b| b.add_actions_count).sum();
         let filtered_data = processed_batches
@@ -996,7 +997,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn test_action_reconciliation_actions_iter_with_txn_retention() -> DeltaResult<()> {
         // Test that transaction retention works across multiple batches
         let batch1 = vec![
@@ -1019,9 +1022,10 @@ mod tests {
 
         // Create processor with txn expiration timestamp
         let processor = ActionReconciliationProcessor::new(0, Some(1000));
-        let results: Vec<_> = processor
-            .process_actions_iter(input_batches.into_iter().map(Ok))
-            .try_collect()?;
+        let results: Vec<_> = await_!(processor
+            .process_actions_iter(into_async_iter(input_batches.into_iter().map(Ok)))
+            .async_pin()
+            .async_try_collect())?;
 
         // Verify results
         assert_eq!(results.len(), 2);

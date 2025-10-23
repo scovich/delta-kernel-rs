@@ -24,6 +24,20 @@ struct Cli {
 }
 
 fn main() -> DeltaResult<()> {
+    #[cfg(not(feature = "async"))]
+    {
+        try_main()
+    }
+    #[cfg(feature = "async")]
+    {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(try_main())
+    }
+}
+
+#[async_fn]
+fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse_with_examples(
         env!("CARGO_PKG_NAME"),
         "Read changes in",
@@ -32,12 +46,11 @@ fn main() -> DeltaResult<()> {
     );
     let url = delta_kernel::try_parse_uri(cli.location_args.path.as_str())?;
     let engine = common::get_engine(&url, &cli.location_args)?;
-    let table_changes = TableChanges::try_new(url, &engine, cli.start_version, cli.end_version)?;
+    let table_changes = await_!(TableChanges::try_new(url, &engine, cli.start_version, cli.end_version))?;
 
     let table_changes_scan = table_changes.into_scan_builder().build()?;
-    let batches: Vec<RecordBatch> = table_changes_scan
-        .execute(Arc::new(engine))?
-        .map(|scan_result| -> DeltaResult<_> {
+    let batches: Vec<RecordBatch> = await_!(await_!(table_changes_scan.execute(Arc::new(engine)))?
+        .async_map(|scan_result| -> DeltaResult<_> {
             let scan_result = scan_result?;
             let mask = scan_result.full_mask();
             let data = scan_result.raw_data?;
@@ -52,7 +65,8 @@ fn main() -> DeltaResult<()> {
                 Ok(record_batch)
             }
         })
-        .try_collect()?;
+        .async_pin()
+        .async_try_collect())?;
     print_batches(&batches)?;
     Ok(())
 }

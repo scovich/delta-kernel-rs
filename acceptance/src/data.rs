@@ -10,7 +10,7 @@ use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{async_fn, await_, AsyncIterator as _, DeltaResult, Engine, Error};
+use delta_kernel::{await_, AsyncIterator as _, DeltaResult, Engine, Error};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use futures::{stream::TryStreamExt, StreamExt};
 use object_store::{local::LocalFileSystem, ObjectStore};
@@ -115,11 +115,9 @@ pub async fn assert_scan_metadata(
     test_case: &TestCaseInfo,
 ) -> TestResult<()> {
     let table_root = test_case.table_root()?;
-    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
+    let snapshot = await_!(Snapshot::builder_for(table_root).build(engine.as_ref()))?;
     let scan = snapshot.scan_builder().build()?;
-    let mut schema = None;
-    let batches: Vec<RecordBatch> = scan
-        .execute(engine)?
+    let batches: Vec<RecordBatch> = await_!(await_!(scan.execute(engine))?
         .map(|scan_result| -> DeltaResult<_> {
             let scan_result = scan_result?;
             let mask = scan_result.full_mask();
@@ -129,17 +127,16 @@ pub async fn assert_scan_metadata(
                 .downcast::<ArrowEngineData>()
                 .unwrap()
                 .into();
-            if schema.is_none() {
-                schema = Some(record_batch.schema());
-            }
             if let Some(mask) = mask {
-                Ok(filter_record_batch(&record_batch, &mask.into())?)
+                Ok(filter_record_batch(&record_batch, &mask.into()).map_err(Error::from)?)
             } else {
                 Ok(record_batch)
             }
         })
-        .try_collect()?;
-    let all_data = concat_batches(&schema.unwrap(), batches.iter()).map_err(Error::from)?;
+        .async_pin()
+        .async_try_collect())?;
+    let schema = batches.first().map(|b| b.schema()).unwrap();
+    let all_data = concat_batches(&schema, batches.iter()).map_err(Error::from)?;
     let all_data = sort_record_batch(all_data)?;
     let golden = read_golden(test_case.root_dir(), None).await?;
     let golden = sort_record_batch(golden)?;

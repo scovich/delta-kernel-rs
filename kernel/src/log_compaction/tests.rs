@@ -47,7 +47,7 @@ fn test_invalid_version_range() {
     let start_version = 20;
     let end_version = 10; // Invalid: start > end
 
-    let result = LogCompactionWriter::try_new(create_mock_snapshot(), start_version, end_version);
+    let result = LogCompactionWriter::try_new(await_!(create_mock_snapshot()), start_version, end_version);
 
     assert!(result.is_err());
     assert!(result
@@ -63,7 +63,7 @@ fn test_equal_version_range_invalid() {
     let start_version = 5;
     let end_version = 5; // Invalid: start == end (must be start < end)
 
-    let result = LogCompactionWriter::try_new(create_mock_snapshot(), start_version, end_version);
+    let result = LogCompactionWriter::try_new(await_!(create_mock_snapshot()), start_version, end_version);
 
     assert!(result.is_err());
     assert!(result
@@ -324,7 +324,7 @@ fn test_no_compaction_staged_commits() {
     });
 
     let table_root = url::Url::parse("memory:///").unwrap();
-    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+    let snapshot = await_!(Snapshot::builder_for(table_root).build(&engine)).unwrap();
 
     // Normal compaction should work fine since staged commits are filtered during listing
     let writer = LogCompactionWriter::try_new(snapshot, 0, 1);

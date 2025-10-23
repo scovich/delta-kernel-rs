@@ -9,6 +9,14 @@
 //! accidentally enable the async feature when building the FFI, you'll get clear compiler
 //! errors about type mismatches.
 
+#[cfg(feature = "async")]
+compile_error!(
+    "FFI is incompatible with async mode.\n\
+     The FFI crate is sync-only and cannot be built with the async feature.\n\
+     To build the workspace with async, use:\n\
+     cargo build --workspace --exclude delta_kernel_ffi --features async"
+);
+
 #[cfg(feature = "default-engine-base")]
 use std::collections::HashMap;
 use std::default::Default;

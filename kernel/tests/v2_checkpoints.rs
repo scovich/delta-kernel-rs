@@ -5,6 +5,7 @@ use delta_kernel::{async_fn, await_, DeltaResult, Snapshot};
 
 mod common;
 
+use itertools::Itertools;
 use test_utils::{load_test_data, DefaultEngineExtension};
 use test_utils::read_scan;
 

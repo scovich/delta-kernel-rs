@@ -613,18 +613,18 @@ mod tests {
             .build(&engine))
             .unwrap();
         // 1. new version < existing version: error
-        let snapshot_res = Snapshot::builder_from(old_snapshot.clone())
+        let snapshot_res = await_!(Snapshot::builder_from(old_snapshot.clone())
             .at_version(0)
-            .build(&engine);
+            .build(&engine));
         assert!(matches!(
             snapshot_res,
             Err(Error::Generic(msg)) if msg == "Requested snapshot version 0 is older than snapshot hint version 1"
         ));
 
         // 2. new version == existing version
-        let snapshot = Snapshot::builder_from(old_snapshot.clone())
+        let snapshot = await_!(Snapshot::builder_from(old_snapshot.clone())
             .at_version(1)
-            .build(&engine)
+            .build(&engine))
             .unwrap();
         let expected = old_snapshot.clone();
         assert_eq!(snapshot, expected);
@@ -638,18 +638,19 @@ mod tests {
         // - commit 1 -> final snapshots at this version
         //
         // in each test we will modify versions 1 and 2 to test different scenarios
+        #[async_fn]
         fn test_new_from(store: Arc<InMemory>) -> DeltaResult<()> {
             let url = Url::parse("memory:///")?;
             let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
-            let base_snapshot = Snapshot::builder_for(url.clone())
+            let base_snapshot = await_!(Snapshot::builder_for(url.clone())
                 .at_version(0)
-                .build(&engine)?;
-            let snapshot = Snapshot::builder_from(base_snapshot.clone())
+                .build(&engine))?;
+            let snapshot = await_!(Snapshot::builder_from(base_snapshot.clone())
                 .at_version(1)
-                .build(&engine)?;
-            let expected = Snapshot::builder_for(url.clone())
+                .build(&engine))?;
+            let expected = await_!(Snapshot::builder_for(url.clone())
                 .at_version(1)
-                .build(&engine)?;
+                .build(&engine))?;
             assert_eq!(snapshot, expected);
             Ok(())
         }
@@ -694,17 +695,17 @@ mod tests {
             Arc::new(store.fork()),
             Arc::new(TokioBackgroundExecutor::new()),
         );
-        let base_snapshot = Snapshot::builder_for(url.clone())
+        let base_snapshot = await_!(Snapshot::builder_for(url.clone())
             .at_version(0)
-            .build(&engine)?;
-        let snapshot = Snapshot::builder_from(base_snapshot.clone()).build(&engine)?;
-        let expected = Snapshot::builder_for(url.clone())
+            .build(&engine))?;
+        let snapshot = await_!(Snapshot::builder_from(base_snapshot.clone()).build(&engine))?;
+        let expected = await_!(Snapshot::builder_for(url.clone())
             .at_version(0)
-            .build(&engine)?;
+            .build(&engine))?;
         assert_eq!(snapshot, expected);
         // version exceeds latest version of the table = err
         assert!(matches!(
-            Snapshot::builder_from(base_snapshot.clone()).at_version(1).build(&engine),
+            await_!(Snapshot::builder_from(base_snapshot.clone()).at_version(1).build(&engine)),
             Err(Error::Generic(msg)) if msg == "Requested snapshot version 1 is newer than the latest version 0"
         ));
 
@@ -748,7 +749,7 @@ mod tests {
             )
             .await
             .unwrap();
-        test_new_from(store_3a.into())?;
+        await_!(test_new_from(store_3a.into()))?;
 
         // c. log segment for old..=new version has no checkpoint
         // i. commits have (new protocol, new metadata)
@@ -762,16 +763,16 @@ mod tests {
         });
         commit1[2]["partitionColumns"] = serde_json::to_value(["some_partition_column"])?;
         commit(store_3c_i.as_ref(), 1, commit1).await;
-        test_new_from(store_3c_i.clone())?;
+        await_!(test_new_from(store_3c_i.clone()))?;
 
         // new commits AND request version > end of log
         let url = Url::parse("memory:///")?;
         let engine = DefaultEngine::new(store_3c_i, Arc::new(TokioBackgroundExecutor::new()));
-        let base_snapshot = Snapshot::builder_for(url.clone())
+        let base_snapshot = await_!(Snapshot::builder_for(url.clone())
             .at_version(0)
-            .build(&engine)?;
+            .build(&engine))?;
         assert!(matches!(
-            Snapshot::builder_from(base_snapshot.clone()).at_version(2).build(&engine),
+            await_!(Snapshot::builder_from(base_snapshot.clone()).at_version(2).build(&engine)),
             Err(Error::Generic(msg)) if msg == "LogSegment end version 1 not the same as the specified end version 2"
         ));
 
@@ -786,7 +787,7 @@ mod tests {
         });
         commit1.remove(2); // remove metadata
         commit(&store_3c_ii, 1, commit1).await;
-        test_new_from(store_3c_ii.into())?;
+        await_!(test_new_from(store_3c_ii.into()))?;
 
         // iii. commits have (no protocol, new metadata)
         let store_3c_iii = store.fork();
@@ -794,13 +795,13 @@ mod tests {
         commit1[2]["partitionColumns"] = serde_json::to_value(["some_partition_column"])?;
         commit1.remove(1); // remove protocol
         commit(&store_3c_iii, 1, commit1).await;
-        test_new_from(store_3c_iii.into())?;
+        await_!(test_new_from(store_3c_iii.into()))?;
 
         // iv. commits have (no protocol, no metadata)
         let store_3c_iv = store.fork();
         let commit1 = vec![commit0[0].clone()];
         commit(&store_3c_iv, 1, commit1).await;
-        test_new_from(store_3c_iv.into())?;
+        await_!(test_new_from(store_3c_iv.into()))?;
 
         Ok(())
     }
@@ -876,17 +877,17 @@ mod tests {
         store.put(&path, crc.to_string().into()).await?;
 
         // base snapshot is at version 0
-        let base_snapshot = Snapshot::builder_for(url.clone())
+        let base_snapshot = await_!(Snapshot::builder_for(url.clone())
             .at_version(0)
-            .build(&engine)?;
+            .build(&engine))?;
 
         // first test: no new crc
-        let snapshot = Snapshot::builder_from(base_snapshot.clone())
+        let snapshot = await_!(Snapshot::builder_from(base_snapshot.clone())
             .at_version(1)
-            .build(&engine)?;
-        let expected = Snapshot::builder_for(url.clone())
+            .build(&engine))?;
+        let expected = await_!(Snapshot::builder_for(url.clone())
             .at_version(1)
-            .build(&engine)?;
+            .build(&engine))?;
         assert_eq!(snapshot, expected);
         assert_eq!(
             snapshot
@@ -910,12 +911,12 @@ mod tests {
             "protocol": protocol(1, 2),
         });
         store.put(&path, crc.to_string().into()).await?;
-        let snapshot = Snapshot::builder_from(base_snapshot.clone())
+        let snapshot = await_!(Snapshot::builder_from(base_snapshot.clone())
             .at_version(1)
-            .build(&engine)?;
-        let expected = Snapshot::builder_for(url.clone())
+            .build(&engine))?;
+        let expected = await_!(Snapshot::builder_for(url.clone())
             .at_version(1)
-            .build(&engine)?;
+            .build(&engine))?;
         assert_eq!(snapshot, expected);
         assert_eq!(
             snapshot
@@ -1024,7 +1025,9 @@ mod tests {
         assert!(invalid.is_none());
     }
 
-    #[test_log::test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test_log::test)]
+    #[cfg_attr(feature = "async", test_log::test(tokio::test))]
     fn test_read_table_with_checkpoint() {
         let path = std::fs::canonicalize(PathBuf::from(
             "./tests/data/with_checkpoint_no_last_checkpoint/",
@@ -1032,7 +1035,7 @@ mod tests {
         .unwrap();
         let location = url::Url::from_directory_path(path).unwrap();
         let engine = SyncEngine::new();
-        let snapshot = Snapshot::builder_for(location).build(&engine).unwrap();
+        let snapshot = await_!(Snapshot::builder_for(location).build(&engine)).unwrap();
 
         assert_eq!(snapshot.log_segment.checkpoint_parts.len(), 1);
         assert_eq!(
@@ -1139,19 +1142,18 @@ mod tests {
         .join("\n");
         add_commit(store.as_ref(), 1, commit).await.unwrap();
 
-        let snapshot = Snapshot::builder_for(url.clone()).build(&engine)?;
+        let snapshot = await_!(Snapshot::builder_for(url.clone()).build(&engine))?;
 
-        assert_eq!(snapshot.get_domain_metadata("domain1", &engine)?, None);
+        assert_eq!(await_!(snapshot.get_domain_metadata("domain1", &engine))?, None);
         assert_eq!(
-            snapshot.get_domain_metadata("domain2", &engine)?,
+            await_!(snapshot.get_domain_metadata("domain2", &engine))?,
             Some("domain2_commit1".to_string())
         );
         assert_eq!(
-            snapshot.get_domain_metadata("domain3", &engine)?,
+            await_!(snapshot.get_domain_metadata("domain3", &engine))?,
             Some("domain3_commit0".to_string())
         );
-        let err = snapshot
-            .get_domain_metadata("delta.domain3", &engine)
+        let err = await_!(snapshot.get_domain_metadata("delta.domain3", &engine))
             .unwrap_err();
         assert!(matches!(err, Error::Generic(msg) if
                 msg == "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
@@ -1167,7 +1169,7 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
 
         let engine = SyncEngine::new();
-        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let snapshot = await_!(Snapshot::builder_for(url).build(&engine)).unwrap();
 
         // Test creating a log compaction writer
         let writer = snapshot.clone().log_compaction_writer(0, 1).unwrap();
@@ -1196,10 +1198,10 @@ mod tests {
         let commit0 = create_basic_commit(false, None);
         add_commit(store.as_ref(), 0, commit0).await?;
 
-        let snapshot = Snapshot::builder_for(url).build(&engine)?;
+        let snapshot = await_!(Snapshot::builder_for(url).build(&engine))?;
 
         // When ICT is disabled, get_timestamp should return None
-        let result = snapshot.get_in_commit_timestamp(&engine)?;
+        let result = await_!(snapshot.get_in_commit_timestamp(&engine))?;
         assert_eq!(result, None);
 
         Ok(())
@@ -1229,17 +1231,17 @@ mod tests {
         add_commit(store.as_ref(), 2, commit2.to_string()).await?;
 
         // Read snapshot at version 0 (before ICT enablement)
-        let snapshot_v0 = Snapshot::builder_for(url.clone())
+        let snapshot_v0 = await_!(Snapshot::builder_for(url.clone())
             .at_version(0)
-            .build(&engine)?;
+            .build(&engine))?;
         // This snapshot version predates ICT enablement, so ICT is not available
-        let result_v0 = snapshot_v0.get_in_commit_timestamp(&engine)?;
+        let result_v0 = await_!(snapshot_v0.get_in_commit_timestamp(&engine))?;
         assert_eq!(result_v0, None);
 
         // Read snapshot at version 2 (after ICT enabled)
-        let snapshot_v2 = Snapshot::builder_for(url).at_version(2).build(&engine)?;
+        let snapshot_v2 = await_!(Snapshot::builder_for(url).at_version(2).build(&engine))?;
         // When ICT is enabled and available, timestamp() should return inCommitTimestamp
-        let result_v2 = snapshot_v2.get_in_commit_timestamp(&engine)?;
+        let result_v2 = await_!(snapshot_v2.get_in_commit_timestamp(&engine))?;
         assert_eq!(result_v2, Some(expected_timestamp));
 
         Ok(())
@@ -1282,8 +1284,8 @@ mod tests {
         let commit_predates = [create_commit_info(1234567890, None)];
         commit(store.as_ref(), 1, commit_predates.to_vec()).await;
 
-        let snapshot_predates = Snapshot::builder_for(url).at_version(1).build(&engine)?;
-        let result_predates = snapshot_predates.get_in_commit_timestamp(&engine);
+        let snapshot_predates = await_!(Snapshot::builder_for(url).at_version(1).build(&engine))?;
+        let result_predates = await_!(snapshot_predates.get_in_commit_timestamp(&engine));
 
         // Version 1 with enablement at version 5 is invalid - should error
         assert_result_error_with_message(
@@ -1317,8 +1319,8 @@ mod tests {
         let commit_missing_ict = [create_commit_info(1234567890, None)];
         commit(store.as_ref(), 1, commit_missing_ict.to_vec()).await;
 
-        let snapshot_missing = Snapshot::builder_for(url).at_version(1).build(&engine)?;
-        let result = snapshot_missing.get_in_commit_timestamp(&engine);
+        let snapshot_missing = await_!(Snapshot::builder_for(url).at_version(1).build(&engine))?;
+        let result = await_!(snapshot_missing.get_in_commit_timestamp(&engine));
         assert_result_error_with_message(result, "In-Commit Timestamp not found");
 
         Ok(())
@@ -1347,9 +1349,9 @@ mod tests {
         commit(store.as_ref(), 0, commit_data.to_vec()).await;
 
         // Build snapshot to get table configuration
-        let snapshot = Snapshot::builder_for(url.clone())
+        let snapshot = await_!(Snapshot::builder_for(url.clone())
             .at_version(0)
-            .build(&engine)?;
+            .build(&engine))?;
 
         // Create a log segment with only checkpoint and no commit file (simulating scenario
         // where a checkpoint exists but the commit file has been cleaned up)
@@ -1375,7 +1377,7 @@ mod tests {
         let snapshot_no_commit = Snapshot::new(log_segment, table_config);
 
         // Should return an error when commit file is missing
-        let result = snapshot_no_commit.get_in_commit_timestamp(&engine);
+        let result = await_!(snapshot_no_commit.get_in_commit_timestamp(&engine));
         assert_result_error_with_message(result, "Last commit file not found in log segment");
 
         Ok(())
@@ -1442,10 +1444,10 @@ mod tests {
         commit(store.as_ref(), 1, commit1_data.to_vec()).await;
 
         // Build snapshot - LogSegment will filter out the commit file because checkpoint exists at same version
-        let snapshot = Snapshot::builder_for(url).at_version(1).build(&engine)?;
+        let snapshot = await_!(Snapshot::builder_for(url).at_version(1).build(&engine))?;
 
         // We should successfully read ICT by falling back to storage
-        let timestamp = snapshot.get_in_commit_timestamp(&engine)?;
+        let timestamp = await_!(snapshot.get_in_commit_timestamp(&engine))?;
         assert_eq!(timestamp, Some(expected_ict));
 
         Ok(())
@@ -1478,12 +1480,12 @@ mod tests {
         ];
         commit(store.as_ref(), 0, commit0).await;
 
-        let base_snapshot = Snapshot::builder_for(url.clone())
+        let base_snapshot = await_!(Snapshot::builder_for(url.clone())
             .at_version(0)
-            .build(&engine)?;
+            .build(&engine))?;
 
         // Test with empty log tail - should return same snapshot
-        let result = Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, None)?;
+        let result = await_!(Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, None))?;
         assert_eq!(result, base_snapshot);
 
         Ok(())
@@ -1524,9 +1526,9 @@ mod tests {
         )
         .await;
 
-        let base_snapshot = Snapshot::builder_for(url.clone())
+        let base_snapshot = await_!(Snapshot::builder_for(url.clone())
             .at_version(1)
-            .build(&engine)?;
+            .build(&engine))?;
 
         // Verify base snapshot has latest_commit_file at version 1
         assert_eq!(
@@ -1551,7 +1553,7 @@ mod tests {
 
         // Create new snapshot from base to version 2 using try_new_from directly
         let new_snapshot =
-            Snapshot::try_new_from(base_snapshot.clone(), log_tail, &engine, Some(2))?;
+            await_!(Snapshot::try_new_from(base_snapshot.clone(), log_tail, &engine, Some(2)))?;
 
         // Latest commit should now be version 2
         assert_eq!(
@@ -1595,16 +1597,16 @@ mod tests {
         )
         .await;
 
-        let base_snapshot = Snapshot::builder_for(url.clone())
+        let base_snapshot = await_!(Snapshot::builder_for(url.clone())
             .at_version(1)
-            .build(&engine)?;
+            .build(&engine))?;
 
         // Test requesting same version - should return same snapshot
-        let same_version = Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, Some(1))?;
+        let same_version = await_!(Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, Some(1)))?;
         assert!(Arc::ptr_eq(&same_version, &base_snapshot));
 
         // Test requesting older version - should error
-        let older_version = Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, Some(0));
+        let older_version = await_!(Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, Some(0)));
         assert!(matches!(
             older_version,
             Err(Error::Generic(msg)) if msg.contains("older than snapshot hint version")

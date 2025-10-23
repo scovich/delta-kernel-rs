@@ -117,7 +117,6 @@ mod tests {
 
     use crate::arrow::array::StringArray;
     use crate::{async_fn, await_, AsyncIterator};
-    use itertools::Itertools;
 
     #[async_fn]
     fn get_latest_transactions(
@@ -182,34 +181,37 @@ mod tests {
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
         let engine = SyncEngine::new();
 
-        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let snapshot = await_!(Snapshot::builder_for(url).build(&engine)).unwrap();
         let log_segment = snapshot.log_segment();
 
         // The checkpoint has five parts, each containing one action. There are two app ids.
-        let data: Vec<_> = replay_for_app_ids(log_segment, &engine)
+        let data: Vec<_> = await_!(await_!(replay_for_app_ids(log_segment, &engine))
             .unwrap()
-            .try_collect()
+            .async_pin()
+            .async_try_collect())
             .unwrap();
         assert_eq!(data.len(), 2);
     }
 
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn test_txn_retention_filtering() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-with-last-updated/"));
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
         let engine = SyncEngine::new();
 
-        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let snapshot = await_!(Snapshot::builder_for(url).build(&engine)).unwrap();
         let log_segment = snapshot.log_segment();
 
         // Test with no retention (should get all transactions)
-        let all_txns = SetTransactionScanner::get_all(log_segment, &engine, None).unwrap();
+        let all_txns = await_!(SetTransactionScanner::get_all(log_segment, &engine, None)).unwrap();
         assert_eq!(all_txns.len(), 4);
 
         // Test with retention that filters out old transactions
         let expiration_timestamp = Some(100); // Very old timestamp
         let filtered_txns =
-            SetTransactionScanner::get_all(log_segment, &engine, expiration_timestamp).unwrap();
+            await_!(SetTransactionScanner::get_all(log_segment, &engine, expiration_timestamp)).unwrap();
 
         // Exact count depends on test data
         assert!(filtered_txns.len() <= all_txns.len());

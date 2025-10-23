@@ -258,13 +258,14 @@ mod tests {
     use super::{scan_metadata_to_scan_file, CdfScanFile, CdfScanFileType};
     use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
     use crate::actions::{Add, Cdc, Remove};
+    use crate::await_;
     use crate::engine::sync::SyncEngine;
     use crate::log_segment::LogSegment;
     use crate::scan::state::DvInfo;
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_changes::log_replay::table_changes_action_iter;
     use crate::utils::test_utils::{Action, LocalMockTable};
-    use crate::Engine as _;
+    use crate::{AsyncIterator as _, Engine as _};
 
     #[tokio::test]
     async fn test_scan_file_visiting() {
@@ -346,15 +347,16 @@ mod tests {
             StructField::nullable("id", DataType::INTEGER),
             StructField::nullable("value", DataType::STRING),
         ]);
-        let scan_metadata = table_changes_action_iter(
+        let scan_metadata = await_!(table_changes_action_iter(
             Arc::new(engine),
             log_segment.ascending_commit_files.clone(),
             table_schema.into(),
             None,
-        )
+        ))
         .unwrap();
-        let scan_files: Vec<_> = scan_metadata_to_scan_file(scan_metadata)
-            .try_collect()
+        let scan_files: Vec<_> = await_!(scan_metadata_to_scan_file(scan_metadata)
+            .async_pin()
+            .async_try_collect())
             .unwrap();
 
         // Generate the expected [`CdfScanFile`]

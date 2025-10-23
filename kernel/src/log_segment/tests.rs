@@ -27,7 +27,7 @@ use crate::scan::test_utils::{
 };
 use crate::utils::test_utils::{assert_batch_matches, assert_result_error_with_message, Action};
 use crate::{
-    async_fn, await_, AsyncIterator, DeltaResult, Engine as _, EngineData, Expression, FileMeta,
+    async_fn, await_, DeltaResult, Engine as _, EngineData, Expression, FileMeta,
     PredicateRef, RowVisitor, Snapshot, StorageHandler,
 };
 use test_utils::{compacted_log_path_for_versions, delta_path_for_version};
@@ -53,12 +53,11 @@ fn test_replay_for_metadata() {
     let engine = SyncEngine::new();
 
     let snapshot = await_!(Snapshot::builder_for(url).build(&engine)).unwrap();
-    let data: Vec<_> = snapshot
+    let iter = await_!(snapshot
         .log_segment()
-        .replay_for_metadata(&engine)
-        .unwrap()
-        .try_collect()
+        .replay_for_metadata(&engine))
         .unwrap();
+    let data: Vec<_> = await_!(iter.async_pin().async_try_collect()).unwrap();
 
     // The checkpoint has five parts, each containing one action:
     // 1. txn (physically missing P&M columns)
@@ -936,29 +935,32 @@ fn test_sidecar_to_filemeta_valid_paths() -> DeltaResult<()> {
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
     let (_, log_root) = new_in_memory_store();
     let engine = Arc::new(SyncEngine::new());
     let checkpoint_batch = add_batch_simple(get_log_schema().clone());
 
-    let mut iter = LogSegment::process_sidecars(
+    let iter = await_!(LogSegment::process_sidecars(
         engine.parquet_handler(),
         log_root,
         checkpoint_batch.as_ref(),
         get_log_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?,
         None,
-    )?
-    .into_iter()
-    .flatten();
+    ))?;
+    let mut iter = into_async_iter(iter).async_flatten().async_pin();
 
     // Assert no batches are returned
-    assert!(iter.next().is_none());
+    assert!(await_!(iter.async_next()).is_none());
 
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
@@ -980,25 +982,26 @@ fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<
         read_schema.clone(),
     );
 
-    let mut iter = LogSegment::process_sidecars(
+    let iter = await_!(LogSegment::process_sidecars(
         engine.parquet_handler(),
         log_root,
         checkpoint_batch.as_ref(),
         read_schema.clone(),
         None,
-    )?
-    .into_iter()
-    .flatten();
+    ))?;
+    let mut iter = into_async_iter(iter).async_flatten().async_pin();
 
     // Assert the correctness of batches returned
-    assert_batch_matches(iter.next().unwrap()?, add_batch_simple(read_schema.clone()));
-    assert_batch_matches(iter.next().unwrap()?, add_batch_with_remove(read_schema));
-    assert!(iter.next().is_none());
+    assert_batch_matches(await_!(iter.async_next()).unwrap()?, add_batch_simple(read_schema.clone()));
+    assert_batch_matches(await_!(iter.async_next()).unwrap()?, add_batch_with_remove(read_schema));
+    assert!(await_!(iter.async_next()).is_none());
 
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
@@ -1008,24 +1011,25 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
         get_log_schema().clone(),
     );
 
-    let mut iter = LogSegment::process_sidecars(
+    let iter = await_!(LogSegment::process_sidecars(
         engine.parquet_handler(),
         log_root,
         checkpoint_batch.as_ref(),
         get_log_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?,
         None,
-    )?
-    .into_iter()
-    .flatten();
+    ))?;
+    let mut iter = into_async_iter(iter).async_flatten().async_pin();
 
     // Assert that an error is returned when trying to read sidecar files that do not exist
-    let err = iter.next().unwrap();
+    let err = await_!(iter.async_next()).unwrap();
     assert_result_error_with_message(err, "Arrow error: External: Object at location _delta_log/_sidecars/sidecarfile1.parquet not found: No data in memory found. Location: _delta_log/_sidecars/sidecarfile1.parquet");
 
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
@@ -1048,23 +1052,24 @@ fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
         ))
     });
 
-    let mut iter = LogSegment::process_sidecars(
+    let iter = await_!(LogSegment::process_sidecars(
         engine.parquet_handler(),
         log_root,
         checkpoint_batch.as_ref(),
         read_schema.clone(),
         remove_predicate.clone(),
-    )?
-    .into_iter()
-    .flatten();
+    ))?;
+    let mut iter = into_async_iter(iter).async_flatten().async_pin();
 
     // As the sidecar batch contains only add actions, the batch should be filtered out
-    assert!(iter.next().is_none());
+    assert!(await_!(iter.async_next()).is_none());
 
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn test_create_checkpoint_stream_errors_when_schema_has_remove_but_no_sidecar_action(
 ) -> DeltaResult<()> {
     let engine = SyncEngine::new();
@@ -1084,11 +1089,11 @@ fn test_create_checkpoint_stream_errors_when_schema_has_remove_but_no_sidecar_ac
         log_root,
         None,
     )?;
-    let result = log_segment.create_checkpoint_stream(
+    let result = await_!(log_segment.create_checkpoint_stream(
         &engine,
         get_log_schema().project(&[REMOVE_NAME])?,
         None,
-    );
+    ));
 
     // Errors because the schema has an REMOVE action but no SIDECAR action.
     assert_result_error_with_message(result, "Invalid Checkpoint: If the checkpoint read schema contains file actions, it must contain the sidecar column");
@@ -1096,7 +1101,9 @@ fn test_create_checkpoint_stream_errors_when_schema_has_remove_but_no_sidecar_ac
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn test_create_checkpoint_stream_errors_when_schema_has_add_but_no_sidecar_action(
 ) -> DeltaResult<()> {
     let engine = SyncEngine::new();
@@ -1116,7 +1123,7 @@ fn test_create_checkpoint_stream_errors_when_schema_has_add_but_no_sidecar_actio
         log_root,
         None,
     )?;
-    let result = log_segment.create_checkpoint_stream(&engine, get_log_add_schema().clone(), None);
+    let result = await_!(log_segment.create_checkpoint_stream(&engine, get_log_add_schema().clone(), None));
 
     // Errors because the schema has an ADD action but no SIDECAR action.
     assert_result_error_with_message(result, "Invalid Checkpoint: If the checkpoint read schema contains file actions, it must contain the sidecar column");
@@ -1124,7 +1131,9 @@ fn test_create_checkpoint_stream_errors_when_schema_has_add_but_no_sidecar_actio
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_no_file_actions(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
@@ -1153,25 +1162,28 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_
         log_root,
         None,
     )?;
-    let mut iter =
-        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
+    let iter =
+        await_!(log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None))?;
+    let mut iter = iter.async_pin();
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let ActionsBatch {
         actions: first_batch,
         is_log_batch,
-    } = iter.next().unwrap()?;
+    } = await_!(iter.async_next()).unwrap()?;
     assert!(!is_log_batch);
     assert_batch_matches(
         first_batch,
         sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], v2_checkpoint_read_schema),
     );
-    assert!(iter.next().is_none());
+    assert!(await_!(iter.async_next()).is_none());
 
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_multi_part(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
@@ -1216,15 +1228,16 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
         log_root,
         None,
     )?;
-    let mut iter =
-        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
+    let iter =
+        await_!(log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None))?;
+    let mut iter = iter.async_pin();
 
     // Assert the correctness of batches returned
     for expected_sidecar in ["sidecar1.parquet", "sidecar2.parquet"].iter() {
         let ActionsBatch {
             actions: batch,
             is_log_batch,
-        } = iter.next().unwrap()?;
+        } = await_!(iter.async_next()).unwrap()?;
         assert!(!is_log_batch);
         assert_batch_matches(
             batch,
@@ -1234,12 +1247,14 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
             ),
         );
     }
-    assert!(iter.next().is_none());
+    assert!(await_!(iter.async_next()).is_none());
 
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars() -> DeltaResult<()>
 {
     let (store, log_root) = new_in_memory_store();
@@ -1268,22 +1283,25 @@ fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars
         log_root,
         None,
     )?;
-    let mut iter =
-        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
+    let iter =
+        await_!(log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None))?;
+    let mut iter = iter.async_pin();
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let ActionsBatch {
         actions: first_batch,
         is_log_batch,
-    } = iter.next().unwrap()?;
+    } = await_!(iter.async_next()).unwrap()?;
     assert!(!is_log_batch);
     assert_batch_matches(first_batch, add_batch_simple(v2_checkpoint_read_schema));
-    assert!(iter.next().is_none());
+    assert!(await_!(iter.async_next()).is_none());
 
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
@@ -1315,21 +1333,22 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
         log_root,
         None,
     )?;
-    let mut iter =
-        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema, None)?;
+    let iter =
+        await_!(log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema, None))?;
+    let mut iter = iter.async_pin();
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let ActionsBatch {
         actions: first_batch,
         is_log_batch,
-    } = iter.next().unwrap()?;
+    } = await_!(iter.async_next()).unwrap()?;
     assert!(!is_log_batch);
     let mut visitor = AddVisitor::default();
     visitor.visit_rows_of(&*first_batch)?;
     assert!(visitor.adds.len() == 1);
     assert!(visitor.adds[0].path == "fake_path_1");
 
-    assert!(iter.next().is_none());
+    assert!(await_!(iter.async_next()).is_none());
 
     Ok(())
 }
@@ -1340,7 +1359,9 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
 // - As sidecar references are present, the corresponding sidecar files are processed correctly.
 // - Batches from both the checkpoint file and sidecar files are returned.
 // - Each returned batch is correctly flagged with is_log_batch set to false
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batches(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
@@ -1383,14 +1404,15 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
         log_root,
         None,
     )?;
-    let mut iter =
-        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
+    let iter =
+        await_!(log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None))?;
+    let mut iter = iter.async_pin();
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let ActionsBatch {
         actions: first_batch,
         is_log_batch,
-    } = iter.next().unwrap()?;
+    } = await_!(iter.async_next()).unwrap()?;
     assert!(!is_log_batch);
     assert_batch_matches(
         first_batch,
@@ -1403,7 +1425,7 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
     let ActionsBatch {
         actions: second_batch,
         is_log_batch,
-    } = iter.next().unwrap()?;
+    } = await_!(iter.async_next()).unwrap()?;
     assert!(!is_log_batch);
     assert_batch_matches(
         second_batch,
@@ -1414,14 +1436,14 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
     let ActionsBatch {
         actions: third_batch,
         is_log_batch,
-    } = iter.next().unwrap()?;
+    } = await_!(iter.async_next()).unwrap()?;
     assert!(!is_log_batch);
     assert_batch_matches(
         third_batch,
         add_batch_with_remove(v2_checkpoint_read_schema),
     );
 
-    assert!(iter.next().is_none());
+    assert!(await_!(iter.async_next()).is_none());
 
     Ok(())
 }

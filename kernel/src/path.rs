@@ -352,6 +352,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::await_;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DefaultEngine;
     use crate::engine::sync::SyncEngine;
@@ -884,7 +885,7 @@ mod tests {
         .unwrap();
 
         // Now actually test reading the timestamp
-        let result = parsed_path.read_in_commit_timestamp(&engine).unwrap();
+        let result = await_!(parsed_path.read_in_commit_timestamp(&engine)).unwrap();
         assert_eq!(result, 2000);
     }
 
@@ -913,11 +914,13 @@ mod tests {
         .unwrap();
 
         // Should return error when ICT is missing
-        let result = parsed_path.read_in_commit_timestamp(&engine);
+        let result = await_!(parsed_path.read_in_commit_timestamp(&engine));
         assert_result_error_with_message(result, "In-Commit Timestamp not found");
     }
 
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn test_read_in_commit_timestamp_not_commit_file() {
         let engine = SyncEngine::new();
         let table_url = url::Url::try_from("file:///tmp/test_table").unwrap();
@@ -935,7 +938,7 @@ mod tests {
         .unwrap();
 
         // Should return error for non-commit files
-        let result = parsed_path.read_in_commit_timestamp(&engine);
+        let result = await_!(parsed_path.read_in_commit_timestamp(&engine));
         assert_result_error_with_message(
             result,
             "read_in_commit_timestamp can only be called on commit files",

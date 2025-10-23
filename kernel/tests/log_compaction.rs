@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use delta_kernel::engine::to_json_bytes;
 use delta_kernel::schema::{DataType, StructField, StructType};
-use delta_kernel::{async_fn, await_, AsyncIterator, Snapshot};
+use delta_kernel::{await_, AsyncIterator, Snapshot};
 use test_utils::{create_table, engine_store_setup};
 
 use object_store::path::Path;
@@ -21,10 +21,8 @@ fn url_to_object_store_path(url: &Url) -> Result<Path, Box<dyn std::error::Error
     Ok(Path::from(path_string))
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
-fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     // Create a simple table schema: one int column named 'id'

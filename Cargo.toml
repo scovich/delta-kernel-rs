@@ -16,6 +16,19 @@ members = [
 # - read-table-multi-threaded
 # - read-table-single-threaded
 # - write-table
+
+# Default members exclude FFI to avoid building it in async mode
+# (FFI is sync-only and will fail with async feature)
+default-members = [
+    "acceptance",
+    "derive-macros",
+    "kernel",
+    "kernel/examples/*",
+    "test-utils",
+    "feature-tests",
+    "mem-test",
+    "uc-client",
+]
 resolver = "2"
 
 [workspace.package]

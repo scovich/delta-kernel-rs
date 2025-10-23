@@ -17,7 +17,7 @@ use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterPropertie
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
 use delta_kernel::scan::{Scan, ScanResult};
 use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, StructType};
-use delta_kernel::{async_fn, await_, AsyncIterator, Engine, FileMeta, Snapshot};
+use delta_kernel::{async_fn, await_, into_async_iter, AsyncIterator, Engine, FileMeta, Snapshot};
 
 use itertools::Itertools;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
@@ -90,9 +90,10 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
     let scan = snapshot.scan_builder().build()?;
 
     let mut files = 0;
-    let stream = await_!(scan.execute(engine))?.zip(expected_data);
+    let stream = await_!(scan.execute(engine))?.async_zip(into_async_iter(expected_data));
+    let mut stream = stream.async_pin();
 
-    for (data, expected) in stream {
+    while let Some((data, expected)) = await_!(stream.async_next()) {
         let raw_data = data?.raw_data?;
         files += 1;
         assert_eq!(into_record_batch(raw_data), expected);
@@ -142,9 +143,10 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let scan = snapshot.scan_builder().build()?;
 
     let mut files = 0;
-    let stream = await_!(scan.execute(Arc::new(engine)))?.zip(expected_data);
+    let stream = await_!(scan.execute(Arc::new(engine)))?.async_zip(into_async_iter(expected_data));
+    let mut stream = stream.async_pin();
 
-    for (data, expected) in stream {
+    while let Some((data, expected)) = await_!(stream.async_next()) {
         let raw_data = data?.raw_data?;
         files += 1;
         assert_eq!(into_record_batch(raw_data), expected);
@@ -194,10 +196,11 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = await_!(Snapshot::builder_for(location).build(&engine))?;
     let scan = snapshot.scan_builder().build()?;
 
-    let stream = await_!(scan.execute(Arc::new(engine)))?.zip(expected_data);
+    let stream = await_!(scan.execute(Arc::new(engine)))?.async_zip(into_async_iter(expected_data));
+    let mut stream = stream.async_pin();
 
     let mut files = 0;
-    for (data, expected) in stream {
+    while let Some((data, expected)) = await_!(stream.async_next()) {
         let raw_data = data?.raw_data?;
         files += 1;
         assert_eq!(into_record_batch(raw_data), expected);
@@ -312,9 +315,10 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
 
         let expected_files = expected_batches.len();
         let mut files_scanned = 0;
-        let stream = await_!(scan.execute(engine.clone()))?.zip(expected_batches);
+        let stream = await_!(scan.execute(engine.clone()))?.async_zip(into_async_iter(expected_batches));
+        let mut stream = stream.async_pin();
 
-        for (batch, expected) in stream {
+        while let Some((batch, expected)) = await_!(stream.async_next()) {
             let raw_data = batch?.raw_data?;
             files_scanned += 1;
             assert_eq!(into_record_batch(raw_data), expected.clone());
@@ -1119,10 +1123,11 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
         .with_predicate(Arc::new(predicate))
         .build()?;
 
-    let stream = scan.execute(engine)?;
+    let stream = await_!(scan.execute(engine))?;
+    let mut stream = stream.async_pin();
 
     let mut files_scanned = 0;
-    for engine_data in stream {
+    while let Some(engine_data) = await_!(stream.async_next()) {
         let mut result_batch = into_record_batch(engine_data?.raw_data?);
         let _ = result_batch.remove_column(result_batch.schema().index_of("id")?);
         assert_eq!(&batch, &result_batch);
@@ -1181,10 +1186,11 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
         .with_predicate(Arc::new(predicate))
         .build()?;
 
-    let stream = scan.execute(engine)?;
+    let stream = await_!(scan.execute(engine))?;
+    let mut stream = stream.async_pin();
 
     let mut files_scanned = 0;
-    for engine_data in stream {
+    while let Some(engine_data) = await_!(stream.async_next()) {
         let result_batch = into_record_batch(engine_data?.raw_data?);
         assert_eq!(&batch_2, &result_batch);
         files_scanned += 1;
@@ -1483,9 +1489,10 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
 
     let mut file_count = 0;
     let expected_row_counts = [5, 3, 4];
-    let stream = scan.execute(engine.clone())?;
+    let stream = await_!(scan.execute(engine.clone()))?;
+    let mut stream = stream.async_pin();
 
-    for scan_result in stream {
+    while let Some(scan_result) = await_!(stream.async_next()) {
         let batch = extract_record_batch(scan_result?)?;
         file_count += 1;
 
@@ -1560,16 +1567,17 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
         ),
     ];
     for (column_name, metadata_spec, error_text) in test_cases {
-        let snapshot = Snapshot::builder_for(location.clone()).build(engine.as_ref())?;
+        let snapshot = await_!(Snapshot::builder_for(location.clone()).build(engine.as_ref()))?;
         let schema = Arc::new(StructType::try_new([
             StructField::nullable("id", DataType::INTEGER),
             StructField::create_metadata_column(column_name, metadata_spec),
         ])?);
         let scan = snapshot.scan_builder().with_schema(schema).build()?;
-        let stream = scan.execute(engine.clone())?;
+        let stream = await_!(scan.execute(engine.clone()))?;
+        let mut stream = stream.async_pin();
 
         let mut found_error = false;
-        for scan_result in stream {
+        while let Some(scan_result) = await_!(stream.async_next()) {
             match scan_result {
                 Err(e) => {
                     let error_msg = e.to_string();

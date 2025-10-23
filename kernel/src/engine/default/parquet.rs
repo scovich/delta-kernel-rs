@@ -434,13 +434,12 @@ mod tests {
     use std::slice;
 
     use crate::arrow::array::{Array, RecordBatch};
-
+    use crate::await_;
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::EngineData;
 
-    use itertools::Itertools;
     use object_store::{local::LocalFileSystem, memory::InMemory, ObjectStore};
     use url::Url;
 
@@ -482,15 +481,15 @@ mod tests {
         }];
 
         let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
-        let data: Vec<RecordBatch> = handler
+        let iter = await_!(handler
             .read_parquet_files(
                 files,
                 Arc::new(physical_schema.try_into_kernel().unwrap()),
                 None,
-            )
+            ))
             .unwrap()
-            .map(into_record_batch)
-            .try_collect()
+            .map(into_record_batch);
+        let data: Vec<RecordBatch> = await_!(iter.async_pin().async_try_collect())
             .unwrap();
 
         assert_eq!(data.len(), 1);
@@ -610,15 +609,15 @@ mod tests {
             .schema()
             .clone();
 
-        let data: Vec<RecordBatch> = parquet_handler
+        let iter = await_!(parquet_handler
             .read_parquet_files(
                 slice::from_ref(parquet_file),
                 Arc::new(physical_schema.try_into_kernel().unwrap()),
                 None,
-            )
+            ))
             .unwrap()
-            .map(into_record_batch)
-            .try_collect()
+            .map(into_record_batch);
+        let data: Vec<RecordBatch> = await_!(iter.async_pin().async_try_collect())
             .unwrap();
 
         assert_eq!(data.len(), 1);

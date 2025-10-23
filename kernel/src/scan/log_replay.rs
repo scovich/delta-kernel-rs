@@ -7,10 +7,9 @@ use super::{PhysicalPredicate, ScanMetadata, StateInfo};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{column_name, ColumnName, Expression, ExpressionRef, PredicateRef};
+use crate::expressions::{column_name, ColumnName, Expression, ExpressionRef, PredicateRef, Scalar};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor};
-use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
 use crate::transforms::{get_transform_expr, parse_partition_values, TransformSpec};
@@ -378,7 +377,6 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use crate::actions::get_log_schema;
-    use crate::expressions::Scalar;
     use crate::log_replay::ActionsBatch;
     use crate::scan::state::{DvInfo, Stats};
     use crate::scan::test_utils::{
@@ -388,10 +386,10 @@ mod tests {
     use crate::scan::{PhysicalPredicate, StateInfo};
     use crate::table_features::ColumnMappingMode;
     use crate::Expression as Expr;
+    use crate::engine::sync::SyncEngine;
+    use crate::schema::{DataType, SchemaRef, StructField, StructType};
     use crate::{
-        engine::sync::SyncEngine,
-        schema::{DataType, SchemaRef, StructField, StructType},
-        ExpressionRef,
+        async_fn, await_, into_async_iter, AsyncIterator as _, ExpressionRef, Scalar,
     };
 
     use super::scan_action_iter;
@@ -418,31 +416,37 @@ mod tests {
         assert_eq!(part_vals.get("non-existent"), None);
     }
 
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn test_scan_action_iter() {
-        run_with_validate_callback(
+        await_!(run_with_validate_callback(
             vec![add_batch_simple(get_log_schema().clone())],
             None, // not testing schema
             None, // not testing transform
             &[true, false],
             (),
             validate_simple,
-        );
+        ));
     }
 
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn test_scan_action_iter_with_remove() {
-        run_with_validate_callback(
+        await_!(run_with_validate_callback(
             vec![add_batch_with_remove(get_log_schema().clone())],
             None, // not testing schema
             None, // not testing transform
             &[false, false, true, false],
             (),
             validate_simple,
-        );
+        ));
     }
 
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn test_no_transforms() {
         let batch = vec![add_batch_simple(get_log_schema().clone())];
         let logical_schema = Arc::new(StructType::new_unchecked(vec![]));
@@ -452,14 +456,14 @@ mod tests {
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
         });
-        let iter = scan_action_iter(
+        let mut iter = scan_action_iter(
             &SyncEngine::new(),
-            batch
+            into_async_iter(batch
                 .into_iter()
-                .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
+                .map(|batch| Ok(ActionsBatch::new(batch as _, true)))),
             state_info,
-        );
-        for res in iter {
+        ).async_pin();
+        while let Some(res) = await_!(iter.async_next()) {
             let scan_metadata = res.unwrap();
             assert!(
                 scan_metadata.scan_file_transforms.is_empty(),
@@ -468,7 +472,9 @@ mod tests {
         }
     }
 
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn test_simple_transform() {
         let schema: SchemaRef = Arc::new(StructType::new_unchecked([
             StructField::new("value", DataType::INTEGER, true),
@@ -486,11 +492,12 @@ mod tests {
         let batch = vec![add_batch_with_partition_col()];
         let iter = scan_action_iter(
             &SyncEngine::new(),
-            batch
+            into_async_iter(batch
                 .into_iter()
-                .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
+                .map(|batch| Ok(ActionsBatch::new(batch as _, true)))),
             Arc::new(state_info),
         );
+        let mut iter = iter.async_pin();
 
         fn validate_transform(transform: Option<&ExpressionRef>, expected_date_offset: i32) {
             assert!(transform.is_some());
@@ -514,7 +521,7 @@ mod tests {
             assert!(field_transforms.next().is_none());
         }
 
-        for res in iter {
+        while let Some(res) = await_!(iter.async_next()) {
             let scan_metadata = res.unwrap();
             let transforms = scan_metadata.scan_file_transforms;
             // in this case we have a metadata action first and protocol 3rd, so we expect 4 items,

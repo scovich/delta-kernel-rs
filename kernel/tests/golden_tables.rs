@@ -2,7 +2,7 @@
 //!
 //! Data (golden tables) are stored in tests/golden_data/<table_name>.tar.zst
 //! Each table directory has a table/ and expected/ subdirectory with the input/output respectively
-
+//!
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -18,10 +18,9 @@ use delta_kernel::parquet::arrow::async_reader::{
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::{DeltaResult, Snapshot};
+use delta_kernel::{await_, AsyncIterator, DeltaResult, Snapshot};
 
 use futures::{stream::TryStreamExt, StreamExt};
-use itertools::Itertools;
 use object_store::{local::LocalFileSystem, ObjectStore};
 use paste::paste;
 use url::Url;
@@ -168,10 +167,10 @@ async fn latest_snapshot_test(
     url: Url,
     expected_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let snapshot = Snapshot::builder_for(url).build(&engine)?;
+    let snapshot = await_!(Snapshot::builder_for(url).build(&engine))?;
     let scan = snapshot.scan_builder().build()?;
-    let scan_res = scan.execute(Arc::new(engine))?;
-    let batches: Vec<RecordBatch> = scan_res
+    let scan_res = await_!(scan.execute(Arc::new(engine)))?;
+    let mapped = scan_res
         .map(|scan_result| -> DeltaResult<_> {
             let scan_result = scan_result?;
             let mask = scan_result.full_mask();
@@ -182,9 +181,8 @@ async fn latest_snapshot_test(
             } else {
                 Ok(record_batch)
             }
-        })
-        .try_collect()?;
-
+        });
+    let batches: Vec<RecordBatch> = await_!(mapped.async_pin().async_try_collect())?;
     let expected = read_expected(&expected_path.expect("expect an expected dir")).await?;
 
     let schema = Arc::new(Schema::try_from_kernel(scan.logical_schema().as_ref())?);
@@ -271,11 +269,12 @@ async fn canonicalized_paths_test(
     _expected: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // assert latest version is 1 and there are no files in the snapshot (add is removed)
-    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+    let snapshot = await_!(Snapshot::builder_for(table_root).build(&engine)).unwrap();
     assert_eq!(snapshot.version(), 1);
     let scan = snapshot.scan_builder().build().expect("build the scan");
-    let mut scan_metadata = scan.scan_metadata(&engine).expect("scan metadata");
-    assert!(scan_metadata.next().is_none());
+    let scan_metadata = await_!(scan.scan_metadata(&engine)).expect("scan metadata");
+    let mut scan_metadata = scan_metadata.async_pin();
+    assert!(await_!(scan_metadata.async_next()).is_none());
     Ok(())
 }
 
@@ -284,13 +283,11 @@ async fn checkpoint_test(
     table_root: Url,
     _expected: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+    let snapshot = await_!(Snapshot::builder_for(table_root).build(&engine)).unwrap();
     let version = snapshot.version();
     let scan = snapshot.scan_builder().build().expect("build the scan");
-    let scan_metadata: Vec<_> = scan
-        .scan_metadata(&engine)
-        .expect("scan metadata")
-        .collect();
+    let scan_metadata_iter = await_!(scan.scan_metadata(&engine)).expect("scan metadata");
+    let scan_metadata: Vec<_> = await_!(scan_metadata_iter.async_pin().async_collect());
     assert_eq!(version, 14);
     assert!(scan_metadata.len() == 1);
     Ok(())

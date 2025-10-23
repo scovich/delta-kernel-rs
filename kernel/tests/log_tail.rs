@@ -6,7 +6,7 @@ use url::Url;
 
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::{async_fn, await_, FileMeta, LogPath, Snapshot};
+use delta_kernel::{await_, FileMeta, LogPath, Snapshot};
 
 use test_utils::{
     actions_to_string, add_commit, add_staged_commit, delta_path_for_version, TestAction,
@@ -174,9 +174,9 @@ async fn basic_snapshot_with_log_tail() -> Result<(), Box<dyn std::error::Error>
         create_log_path(&table_root, delta_path_for_version(2, "json")),
     ];
 
-    let snapshot = Snapshot::builder_for(table_root.clone())
+    let snapshot = await_!(Snapshot::builder_for(table_root.clone())
         .with_log_tail(log_tail)
-        .build(engine.as_ref())?;
+        .build(engine.as_ref()))?;
 
     assert_eq!(snapshot.version(), 2);
     Ok(())
@@ -200,9 +200,9 @@ async fn log_tail_behind_filesystem() -> Result<(), Box<dyn std::error::Error>> 
         create_log_path(&table_root, delta_path_for_version(1, "json")),
     ];
 
-    let snapshot = Snapshot::builder_for(table_root.clone())
+    let snapshot = await_!(Snapshot::builder_for(table_root.clone())
         .with_log_tail(log_tail)
-        .build(engine.as_ref())?;
+        .build(engine.as_ref()))?;
 
     // snapshot stops at version 1, not 2
     assert_eq!(
@@ -226,9 +226,9 @@ async fn incremental_snapshot_with_log_tail() -> Result<(), Box<dyn std::error::
     add_commit(storage.as_ref(), 2, actions_to_string(actions)).await?;
 
     // initial snapshot at version 1
-    let initial_snapshot = Snapshot::builder_for(table_root.clone())
+    let initial_snapshot = await_!(Snapshot::builder_for(table_root.clone())
         .at_version(1)
-        .build(engine.as_ref())?;
+        .build(engine.as_ref()))?;
     assert_eq!(initial_snapshot.version(), 1);
 
     // add commit 3, 4
@@ -245,9 +245,9 @@ async fn incremental_snapshot_with_log_tail() -> Result<(), Box<dyn std::error::
     ];
 
     // Build incremental snapshot with log_tail
-    let new_snapshot = Snapshot::builder_from(initial_snapshot)
+    let new_snapshot = await_!(Snapshot::builder_from(initial_snapshot)
         .with_log_tail(log_tail)
-        .build(engine.as_ref())?;
+        .build(engine.as_ref()))?;
 
     // Verify we advanced to version 4
     assert_eq!(new_snapshot.version(), 4);
@@ -280,10 +280,10 @@ async fn log_tail_exceeds_requested_version() -> Result<(), Box<dyn std::error::
     ];
 
     // user asks for version 3 (or catalog says latest is 3)
-    let snapshot = Snapshot::builder_for(table_root.clone())
+    let snapshot = await_!(Snapshot::builder_for(table_root.clone())
         .at_version(3)
         .with_log_tail(log_tail)
-        .build(engine.as_ref())?;
+        .build(engine.as_ref()))?;
 
     // Should stop at version 3 even though log tail has version 4
     assert_eq!(snapshot.version(), 3);
@@ -315,10 +315,10 @@ async fn log_tail_behind_requested_version() -> Result<(), Box<dyn std::error::E
 
     // User asks for version 4, but log tail only has up to version 3
     // This should fail with an error
-    let result = Snapshot::builder_for(table_root.clone())
+    let result = await_!(Snapshot::builder_for(table_root.clone())
         .at_version(4)
         .with_log_tail(log_tail)
-        .build(engine.as_ref());
+        .build(engine.as_ref()));
 
     assert!(result
         .unwrap_err()

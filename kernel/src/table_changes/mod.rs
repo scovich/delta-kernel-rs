@@ -301,13 +301,16 @@ fn ensure_cdf_read_supported(protocol: &Protocol) -> DeltaResult<()> {
 mod tests {
     use super::*;
 
+    use crate::{async_fn, await_};
     use crate::engine::sync::SyncEngine;
     use crate::schema::{DataType, StructField};
     use crate::table_changes::CDF_FIELDS;
     use crate::Error;
     use itertools::assert_equal;
 
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn table_changes_checks_enable_cdf_flag() {
         // Table with CDF enabled, then disabled at version 2 and enabled at version 3
         let path = "./tests/data/table-with-cdf";
@@ -316,12 +319,12 @@ mod tests {
 
         let valid_ranges = [(0, 1), (0, 0), (1, 1)];
         for (start_version, end_version) in valid_ranges {
-            let table_changes = TableChanges::try_new(
+            let table_changes = await_!(TableChanges::try_new(
                 url.clone(),
                 engine.as_ref(),
                 start_version,
                 end_version.into(),
-            )
+            ))
             .unwrap();
             assert_eq!(table_changes.start_version, start_version);
             assert_eq!(table_changes.end_version(), end_version);
@@ -329,16 +332,18 @@ mod tests {
 
         let invalid_ranges = [(0, 2), (1, 2), (2, 2), (2, 3)];
         for (start_version, end_version) in invalid_ranges {
-            let res = TableChanges::try_new(
+            let res = await_!(TableChanges::try_new(
                 url.clone(),
                 engine.as_ref(),
                 start_version,
                 end_version.into(),
-            );
+            ));
             assert!(matches!(res, Err(Error::ChangeDataFeedUnsupported(_))))
         }
     }
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn schema_evolution_fails() {
         let path = "./tests/data/table-with-cdf";
         let engine = Box::new(SyncEngine::new());
@@ -346,11 +351,13 @@ mod tests {
         let expected_msg = "Failed to build TableChanges: Start and end version schemas are different. Found start version schema StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: true, metadata: {} }}, metadata_columns: {} } and end version schema StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: false, metadata: {} }}, metadata_columns: {} }";
 
         // A field in the schema goes from being nullable to non-nullable
-        let table_changes_res = TableChanges::try_new(url, engine.as_ref(), 3, Some(4));
+        let table_changes_res = await_!(TableChanges::try_new(url, engine.as_ref(), 3, Some(4)));
         assert!(matches!(table_changes_res, Err(Error::Generic(msg)) if msg == expected_msg));
     }
 
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn table_changes_has_cdf_schema() {
         let path = "./tests/data/table-with-cdf";
         let engine = Box::new(SyncEngine::new());
@@ -363,7 +370,7 @@ mod tests {
         .chain(CDF_FIELDS.clone());
 
         let table_changes =
-            TableChanges::try_new(url.clone(), engine.as_ref(), 0, 0.into()).unwrap();
+            await_!(TableChanges::try_new(url.clone(), engine.as_ref(), 0, 0.into())).unwrap();
         assert_equal(expected_schema, table_changes.schema().fields().cloned());
     }
 }

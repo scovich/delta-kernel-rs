@@ -429,10 +429,13 @@ pub fn to_arrow(data: Box<dyn EngineData>) -> DeltaResult<RecordBatch> {
         .into())
 }
 
+#[async_fn]
 pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> DeltaResult<Vec<RecordBatch>> {
-    let scan_results = scan.execute(engine)?;
-    scan_results
-        .map(|scan_result| -> DeltaResult<_> {
+    use delta_kernel::AsyncIterator;
+    
+    let scan_results = await_!(scan.execute(engine))?;
+    await_!(scan_results
+        .async_map(|scan_result| -> DeltaResult<_> {
             let scan_result = scan_result?;
             let mask = scan_result.full_mask();
             let data = scan_result.raw_data?;
@@ -443,17 +446,19 @@ pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> DeltaResult<Vec<Record
                 Ok(record_batch)
             }
         })
-        .try_collect()
+        .async_pin()
+        .async_try_collect())
 }
 
+#[async_fn]
 pub fn test_read(
     expected: &ArrowEngineData,
     url: &Url,
     engine: Arc<dyn Engine>,
 ) -> DeltaResult<()> {
-    let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
+    let snapshot = await_!(Snapshot::builder_for(url.clone()).build(engine.as_ref()))?;
     let scan = snapshot.scan_builder().build()?;
-    let batches = read_scan(&scan, engine)?;
+    let batches = await_!(read_scan(&scan, engine))?;
     let formatted = pretty_format_batches(&batches).unwrap().to_string();
 
     let expected = pretty_format_batches(&[expected.record_batch().clone()])

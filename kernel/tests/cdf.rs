@@ -49,9 +49,9 @@ fn read_cdf_for_table(
         .build()?;
     let scan_schema_as_arrow =
         ArrowSchema::try_from_kernel(scan.logical_schema().as_ref()).unwrap();
-    let batches: Vec<RecordBatch> = scan
-        .execute(engine)?
-        .map(|scan_result| -> DeltaResult<_> {
+    
+    let batches: Vec<RecordBatch> = await_!(await_!(scan.execute(engine))?
+        .async_map(move |scan_result| -> DeltaResult<_> {
             let scan_result = scan_result?;
             let mask = scan_result.full_mask();
             let data = scan_result.raw_data?;
@@ -63,13 +63,16 @@ fn read_cdf_for_table(
                 None => Ok(record_batch),
             }
         })
-        .try_collect()?;
+        .async_pin()
+        .async_try_collect())?;
     Ok(batches)
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn cdf_with_deletion_vector() -> Result<(), Box<dyn error::Error>> {
-    let batches = read_cdf_for_table("cdf-table-with-dv", 0, None, None)?;
+    let batches = await_!(read_cdf_for_table("cdf-table-with-dv", 0, None, None))?;
     // Each commit performs the following:
     // 0. Insert  0..=9
     // 1. Remove  [0, 9]

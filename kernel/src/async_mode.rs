@@ -171,6 +171,17 @@ pub trait AsyncIterator: Stream + Send + Sized + 'static {
         self.flatten()
     }
 
+    /// Map and flatten - applies a function that returns an iterator/stream,
+    /// then flattens the result
+    fn async_flat_map<F, I>(self, mut f: F) -> impl AsyncIterator<Item = I::Item>
+    where
+        F: FnMut(Self::Item) -> I + Send + 'static,
+        I: Stream + Send + 'static,
+        I::Item: Send + 'static,
+    {
+        self.then(move |item| future::ready(f(item))).flatten()
+    }
+
     /// Flatten a stream of Result<Stream<T>> into a stream of Result<T>
     ///
     /// This is the traditional flatten_ok semantics for streams:
@@ -204,6 +215,20 @@ pub trait AsyncIterator: Stream + Send + Sized + 'static {
         T: Send + 'static,
     {
         self.try_flatten()
+    }
+
+    /// Folds an iterator into a single value.
+    fn async_fold<B, F>(self, init: B, mut f: F) -> impl Future<Output = B> + Send
+    where
+        F: FnMut(B, Self::Item) -> B + Send + 'static,
+        B: Send + 'static,
+        Self: Unpin,
+        Self::Item: Send + 'static,
+    {
+        async move {
+            self.fold(init, |acc, item| future::ready(f(acc, item)))
+                .await
+        }
     }
 
     /// Try fold with early exit on error
@@ -254,6 +279,44 @@ pub trait AsyncIterator: Stream + Send + Sized + 'static {
         U: Stream<Item = Self::Item> + Send + 'static,
     {
         self.chain(other)
+    }
+
+    /// Zip two streams together
+    ///
+    /// Combines this stream with another, yielding pairs of items.
+    /// The resulting stream ends when either input stream ends.
+    fn async_zip<U>(self, other: U) -> impl AsyncIterator<Item = (Self::Item, U::Item)>
+    where
+        U: Stream + Send + 'static,
+        U::Item: Send,
+        Self::Item: Send,
+    {
+        self.zip(other)
+    }
+
+    /// Collect a stream of Results into a Result of collection
+    ///
+    /// This returns a Future in async mode. Use with `await_!(stream.async_try_collect())`.
+    fn async_try_collect<C>(self) -> impl Future<Output = Result<C, Self::Error>> + Send
+    where
+        Self: TryStream + Unpin,
+        C: Default + Extend<Self::Ok> + Send,
+        Self::Ok: Send,
+        Self::Error: Send,
+    {
+        self.try_collect()
+    }
+
+    /// Collect a stream into a collection
+    ///
+    /// This returns a Future in async mode. Use with `await_!(stream.async_collect())`.
+    fn async_collect<C>(self) -> impl Future<Output = C> + Send
+    where
+        Self: Unpin,
+        C: Default + Extend<Self::Item> + Send,
+        Self::Item: Send,
+    {
+        self.collect()
     }
 
     /// Returns an iterable version of this AsyncIterator (ie suitable for use with [`Self::async_next`]).

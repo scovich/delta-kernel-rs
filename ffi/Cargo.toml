@@ -52,6 +52,10 @@ default-engine-rustls = ["delta_kernel/default-engine-rustls", "default-engine-b
 # default-engine-native-tls or default-engine-rustls, so default-engine-base will not work by itself
 default-engine-base = ["delta_kernel/default-engine-base", "delta_kernel/arrow"]
 
+# Async feature - propagated from kernel to trigger compile_error!
+# FFI is sync-only and incompatible with async mode
+async = ["delta_kernel/async"]
+
 tracing = [ "tracing-core", "tracing-subscriber" ]
 internal-api = []
 test-ffi = []

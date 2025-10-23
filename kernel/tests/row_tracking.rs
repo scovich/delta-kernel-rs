@@ -16,7 +16,7 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{DeltaResult, Error, Snapshot};
+use delta_kernel::{await_, DeltaResult, Error, Snapshot};
 
 use test_utils::{create_table, engine_store_setup, read_scan, test_read};
 
@@ -56,7 +56,7 @@ async fn write_data_to_table(
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     data: Vec<ArrowEngineData>,
 ) -> DeltaResult<CommitResult> {
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let snapshot = await_!(Snapshot::builder_for(table_url.clone()).build(engine.as_ref()))?;
     let mut txn = snapshot.transaction()?;
 
     // Write data out by spawning async tasks to simulate executors
@@ -79,7 +79,7 @@ async fn write_data_to_table(
     }
 
     // Commit the transaction
-    txn.commit(engine.as_ref())
+    await_!(txn.commit(engine.as_ref()))
 }
 
 /// Helper function to create an Arc<dyn Array> from an i32 vector.
@@ -232,14 +232,14 @@ async fn test_row_tracking_append() -> DeltaResult<()> {
     .await?;
 
     // Verify the data can still be read correctly
-    test_read(
+    await_!(test_read(
         &ArrowEngineData::new(RecordBatch::try_new(
             Arc::new(schema.as_ref().try_into_arrow()?),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6]))],
         )?),
         &table_url,
         engine,
-    )?;
+    ))?;
 
     Ok(())
 }
@@ -314,14 +314,14 @@ async fn test_row_tracking_large_batch() -> DeltaResult<()> {
     .await?;
 
     // Verify the data can still be read correctly
-    test_read(
+    await_!(test_read(
         &ArrowEngineData::new(RecordBatch::try_new(
             Arc::new(schema.as_ref().try_into_arrow()?),
             vec![Arc::new(Int32Array::from(large_batch))],
         )?),
         &table_url,
         engine,
-    )?;
+    ))?;
 
     Ok(())
 }
@@ -380,14 +380,14 @@ async fn test_row_tracking_consecutive_transactions() -> DeltaResult<()> {
     .await?;
 
     // Verify the data can still be read correctly
-    test_read(
+    await_!(test_read(
         &ArrowEngineData::new(RecordBatch::try_new(
             Arc::new(schema.as_ref().try_into_arrow()?),
             vec![Arc::new(Int32Array::from(vec![7, 8, 1, 2, 3, 4, 5, 6]))],
         )?),
         &table_url,
         engine,
-    )?;
+    ))?;
 
     Ok(())
 }
@@ -521,14 +521,14 @@ async fn test_row_tracking_with_regular_and_empty_adds() -> DeltaResult<()> {
     .await?;
 
     // Verify the data can still be read correctly
-    test_read(
+    await_!(test_read(
         &ArrowEngineData::new(RecordBatch::try_new(
             Arc::new(schema.as_ref().try_into_arrow()?),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6]))],
         )?),
         &table_url,
         engine,
-    )?;
+    ))?;
 
     Ok(())
 }
@@ -573,9 +573,9 @@ async fn test_row_tracking_with_empty_adds() -> DeltaResult<()> {
     .await?;
 
     // Verify that the table is empty
-    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let snapshot = await_!(Snapshot::builder_for(table_url).build(engine.as_ref()))?;
     let scan = snapshot.scan_builder().build()?;
-    let batches = read_scan(&scan, engine)?;
+    let batches = await_!(read_scan(&scan, engine))?;
 
     assert!(batches.is_empty(), "Table should be empty");
 
@@ -595,11 +595,11 @@ async fn test_row_tracking_without_adds() -> DeltaResult<()> {
     let (table_url, engine, store) =
         create_row_tracking_table(&tmp_test_dir, "test_consecutive_commits", schema.clone())
             .await?;
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let snapshot = await_!(Snapshot::builder_for(table_url.clone()).build(engine.as_ref()))?;
     let txn = snapshot.transaction()?;
 
     // Commit without adding any add files
-    assert!(txn.commit(engine.as_ref())?.is_committed());
+    assert!(await_!(txn.commit(engine.as_ref()))?.is_committed());
 
     // Fetch and parse the commit
     let commit_url = table_url.join(&format!("_delta_log/{:020}.json", 1))?;
@@ -635,8 +635,8 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     let engine2 = engine;
 
     // Create two snapshots from the same initial state
-    let snapshot1 = Snapshot::builder_for(table_url.clone()).build(engine1.as_ref())?;
-    let snapshot2 = Snapshot::builder_for(table_url.clone()).build(engine2.as_ref())?;
+    let snapshot1 = await_!(Snapshot::builder_for(table_url.clone()).build(engine1.as_ref()))?;
+    let snapshot2 = await_!(Snapshot::builder_for(table_url.clone()).build(engine2.as_ref()))?;
 
     // Create two transactions from the same snapshot (simulating parallel transactions)
     let mut txn1 = snapshot1.transaction()?.with_engine_info("transaction 1");
@@ -678,7 +678,7 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     txn2.add_files(metadata2);
 
     // Commit the first transaction - this should succeed
-    let result1 = txn1.commit(engine1.as_ref())?;
+    let result1 = await_!(txn1.commit(engine1.as_ref()))?;
     match result1 {
         CommitResult::CommittedTransaction(committed) => {
             assert_eq!(
@@ -699,7 +699,7 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     }
 
     // Commit the second transaction - this should result in a conflict
-    let result2 = txn2.commit(engine2.as_ref())?;
+    let result2 = await_!(txn2.commit(engine2.as_ref()))?;
     match result2 {
         CommitResult::CommittedTransaction(committed) => {
             panic!(
@@ -733,14 +733,14 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     .await?;
 
     // Verify the data matches the winning transaction
-    test_read(
+    await_!(test_read(
         &ArrowEngineData::new(RecordBatch::try_new(
             Arc::new(schema.as_ref().try_into_arrow()?),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))], // Only data from winning transaction
         )?),
         &table_url,
         engine1,
-    )?;
+    ))?;
 
     Ok(())
 }
