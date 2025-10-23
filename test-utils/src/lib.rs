@@ -17,7 +17,7 @@ use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::SchemaRef;
-use delta_kernel::{DeltaResult, Engine, EngineData, Snapshot};
+use delta_kernel::{async_fn, await_, DeltaResult, Engine, EngineData, Snapshot};
 
 use itertools::Itertools;
 use object_store::local::LocalFileSystem;

@@ -6,8 +6,7 @@ use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::{compute::filter_record_batch, util::pretty::print_batches};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::table_changes::TableChanges;
-use delta_kernel::DeltaResult;
-use itertools::Itertools;
+use delta_kernel::{async_fn, await_, AsyncIterator as _, DeltaResult};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]

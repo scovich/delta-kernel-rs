@@ -17,7 +17,7 @@ use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterPropertie
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
 use delta_kernel::scan::{Scan, ScanResult};
 use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, StructType};
-use delta_kernel::{Engine, FileMeta, Snapshot};
+use delta_kernel::{async_fn, await_, AsyncIterator, Engine, FileMeta, Snapshot};
 
 use itertools::Itertools;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
@@ -86,11 +86,11 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
 
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let snapshot = await_!(Snapshot::builder_for(location).build(engine.as_ref()))?;
     let scan = snapshot.scan_builder().build()?;
 
     let mut files = 0;
-    let stream = scan.execute(engine)?.zip(expected_data);
+    let stream = await_!(scan.execute(engine))?.zip(expected_data);
 
     for (data, expected) in stream {
         let raw_data = data?.raw_data?;
@@ -138,11 +138,11 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
 
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = Snapshot::builder_for(location).build(&engine)?;
+    let snapshot = await_!(Snapshot::builder_for(location).build(&engine))?;
     let scan = snapshot.scan_builder().build()?;
 
     let mut files = 0;
-    let stream = scan.execute(Arc::new(engine))?.zip(expected_data);
+    let stream = await_!(scan.execute(Arc::new(engine)))?.zip(expected_data);
 
     for (data, expected) in stream {
         let raw_data = data?.raw_data?;
@@ -191,10 +191,10 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
 
     let expected_data = vec![batch];
 
-    let snapshot = Snapshot::builder_for(location).build(&engine)?;
+    let snapshot = await_!(Snapshot::builder_for(location).build(&engine))?;
     let scan = snapshot.scan_builder().build()?;
 
-    let stream = scan.execute(Arc::new(engine))?.zip(expected_data);
+    let stream = await_!(scan.execute(Arc::new(engine)))?.zip(expected_data);
 
     let mut files = 0;
     for (data, expected) in stream {
@@ -262,7 +262,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         storage.clone(),
         Arc::new(TokioBackgroundExecutor::new()),
     ));
-    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let snapshot = await_!(Snapshot::builder_for(location).build(engine.as_ref()))?;
 
     // The first file has id between 1 and 3; the second has id between 5 and 7. For each operator,
     // we validate the boundary values where we expect the set of matched files to change.
@@ -312,7 +312,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
 
         let expected_files = expected_batches.len();
         let mut files_scanned = 0;
-        let stream = scan.execute(engine.clone())?.zip(expected_batches);
+        let stream = await_!(scan.execute(engine.clone()))?.zip(expected_batches);
 
         for (batch, expected) in stream {
             let raw_data = batch?.raw_data?;
@@ -324,6 +324,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[async_fn]
 fn read_with_execute(
     engine: Arc<dyn Engine>,
     scan: &Scan,
@@ -332,7 +333,7 @@ fn read_with_execute(
     let result_schema = Arc::new(ArrowSchema::try_from_kernel(
         scan.logical_schema().as_ref(),
     )?);
-    let batches = read_scan(scan, engine)?;
+    let batches = await_!(read_scan(scan, engine))?;
 
     if expected.is_empty() {
         assert_eq!(batches.len(), 0);
@@ -367,6 +368,7 @@ fn scan_metadata_callback(
     });
 }
 
+#[async_fn]
 fn read_with_scan_metadata(
     location: &Url,
     engine: &dyn Engine,
@@ -376,9 +378,9 @@ fn read_with_scan_metadata(
     let result_schema = Arc::new(ArrowSchema::try_from_kernel(
         scan.logical_schema().as_ref(),
     )?);
-    let scan_metadata = scan.scan_metadata(engine)?;
+    let mut scan_metadata = await_!(scan.scan_metadata(engine))?.async_pin();
     let mut scan_files = vec![];
-    for res in scan_metadata {
+    while let Some(res) = await_!(scan_metadata.async_next()) {
         let scan_metadata = res?;
         scan_files = scan_metadata.visit_scan_files(scan_files, scan_metadata_callback)?;
     }
@@ -395,16 +397,16 @@ fn read_with_scan_metadata(
             size: scan_file.size.try_into().unwrap(),
             location: file_path,
         };
-        let read_results = engine
+        let mut read_results = await_!(engine
             .parquet_handler()
             .read_parquet_files(
                 &[meta],
                 scan.physical_schema().clone(),
                 scan.physical_predicate().clone(),
-            )
+            ))
             .unwrap();
 
-        for read_result in read_results {
+        while let Some(read_result) = await_!(read_results.async_next()) {
             let read_result = read_result.unwrap();
             let len = read_result.len();
             // to transform the physical data into the correct logical form
@@ -438,6 +440,7 @@ fn read_with_scan_metadata(
     Ok(())
 }
 
+#[async_fn]
 fn read_table_data(
     path: &str,
     select_cols: Option<&[&str]>,
@@ -453,7 +456,7 @@ fn read_table_data(
         Arc::new(TokioBackgroundExecutor::new()),
     )?);
 
-    let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
+    let snapshot = await_!(Snapshot::builder_for(url.clone()).build(engine.as_ref()))?;
 
     let read_schema = select_cols.map(|select_cols| {
         let table_schema = snapshot.schema();
@@ -470,27 +473,30 @@ fn read_table_data(
         .build()?;
 
     sort_lines!(expected);
-    read_with_scan_metadata(&url, engine.as_ref(), &scan, &expected)?;
-    read_with_execute(engine, &scan, &expected)?;
+    await_!(read_with_scan_metadata(&url, engine.as_ref(), &scan, &expected))?;
+    await_!(read_with_execute(engine, &scan, &expected))?;
     Ok(())
 }
 
 // util to take a Vec<&str> and call read_table_data with Vec<String>
+#[async_fn]
 fn read_table_data_str(
     path: &str,
     select_cols: Option<&[&str]>,
     predicate: Option<Pred>,
     expected: Vec<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    read_table_data(
+    await_!(read_table_data(
         path,
         select_cols,
         predicate,
         expected.into_iter().map(String::from).collect(),
-    )
+    ))
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn data() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+--------+--------+---------+",
@@ -504,12 +510,14 @@ fn data() -> Result<(), Box<dyn std::error::Error>> {
         "| e      | 5      | 5.5     |",
         "+--------+--------+---------+",
     ];
-    read_table_data_str("./tests/data/basic_partitioned", None, None, expected)?;
+    await_!(read_table_data_str("./tests/data/basic_partitioned", None, None, expected))?;
 
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn column_ordering() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+---------+--------+--------+",
@@ -523,17 +531,19 @@ fn column_ordering() -> Result<(), Box<dyn std::error::Error>> {
         "| 3.3     | c      | 3      |",
         "+---------+--------+--------+",
     ];
-    read_table_data_str(
+    await_!(read_table_data_str(
         "./tests/data/basic_partitioned",
         Some(&["a_float", "letter", "number"]),
         None,
         expected,
-    )?;
+    ))?;
 
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn column_ordering_and_projection() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+---------+--------+",
@@ -547,12 +557,12 @@ fn column_ordering_and_projection() -> Result<(), Box<dyn std::error::Error>> {
         "| 3.3     | 3      |",
         "+---------+--------+",
     ];
-    read_table_data_str(
+    await_!(read_table_data_str(
         "./tests/data/basic_partitioned",
         Some(&["a_float", "number"]),
         None,
         expected,
-    )?;
+    ))?;
 
     Ok(())
 }
@@ -594,7 +604,9 @@ fn table_for_letters(letters: &[char]) -> Vec<String> {
     res
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn predicate_on_number() -> Result<(), Box<dyn std::error::Error>> {
     let cases = vec![
         (
@@ -624,17 +636,19 @@ fn predicate_on_number() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     for (pred, expected) in cases.into_iter() {
-        read_table_data(
+        await_!(read_table_data(
             "./tests/data/basic_partitioned",
             Some(&["a_float", "number"]),
             Some(pred),
             expected,
-        )?;
+        ))?;
     }
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn predicate_on_letter() -> Result<(), Box<dyn std::error::Error>> {
     // Test basic column pruning. Note that the actual predicate machinery is already well-tested,
     // so we're just testing wiring here.
@@ -682,17 +696,19 @@ fn predicate_on_letter() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     for (pred, expected) in cases {
-        read_table_data(
+        await_!(read_table_data(
             "./tests/data/basic_partitioned",
             Some(&["letter", "number"]),
             Some(pred),
             expected,
-        )?;
+        ))?;
     }
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn predicate_on_letter_and_number() -> Result<(), Box<dyn std::error::Error>> {
     // Partition skipping and file skipping are currently implemented separately. Mixing them in an
     // AND clause will evaulate each separately, but mixing them in an OR clause disables both.
@@ -742,17 +758,19 @@ fn predicate_on_letter_and_number() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     for (pred, expected) in cases {
-        read_table_data(
+        await_!(read_table_data(
             "./tests/data/basic_partitioned",
             Some(&["letter", "number"]),
             Some(pred),
             expected,
-        )?;
+        ))?;
     }
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn predicate_on_number_not() -> Result<(), Box<dyn std::error::Error>> {
     let cases = vec![
         (
@@ -781,17 +799,19 @@ fn predicate_on_number_not() -> Result<(), Box<dyn std::error::Error>> {
         ),
     ];
     for (pred, expected) in cases.into_iter() {
-        read_table_data(
+        await_!(read_table_data(
             "./tests/data/basic_partitioned",
             Some(&["a_float", "number"]),
             Some(pred),
             expected,
-        )?;
+        ))?;
     }
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn predicate_on_number_with_not_null() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+---------+--------+",
@@ -801,7 +821,7 @@ fn predicate_on_number_with_not_null() -> Result<(), Box<dyn std::error::Error>>
         "| 2.2     | 2      |",
         "+---------+--------+",
     ];
-    read_table_data_str(
+    await_!(read_table_data_str(
         "./tests/data/basic_partitioned",
         Some(&["a_float", "number"]),
         Some(Pred::and(
@@ -809,23 +829,27 @@ fn predicate_on_number_with_not_null() -> Result<(), Box<dyn std::error::Error>>
             column_expr!("number").lt(Expr::literal(3i64)),
         )),
         expected,
-    )?;
+    ))?;
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn predicate_null() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![]; // number is never null
-    read_table_data_str(
+    await_!(read_table_data_str(
         "./tests/data/basic_partitioned",
         Some(&["a_float", "number"]),
         Some(column_expr!("number").is_null()),
         expected,
-    )?;
+    ))?;
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn mixed_null() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+------+--------------+",
@@ -843,16 +867,18 @@ fn mixed_null() -> Result<(), Box<dyn std::error::Error>> {
         "| 2    |              |",
         "+------+--------------+",
     ];
-    read_table_data_str(
+    await_!(read_table_data_str(
         "./tests/data/mixed-nulls",
         Some(&["part", "n"]),
         Some(column_expr!("n").is_null()),
         expected,
-    )?;
+    ))?;
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn mixed_not_null() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+------+--------------+",
@@ -870,16 +896,18 @@ fn mixed_not_null() -> Result<(), Box<dyn std::error::Error>> {
         "| 2    | non-null-mix |",
         "+------+--------------+",
     ];
-    read_table_data_str(
+    await_!(read_table_data_str(
         "./tests/data/mixed-nulls",
         Some(&["part", "n"]),
         Some(column_expr!("n").is_not_null()),
         expected,
-    )?;
+    ))?;
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
     let cases = vec![
         (
@@ -912,17 +940,19 @@ fn and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
         ),
     ];
     for (pred, expected) in cases.into_iter() {
-        read_table_data(
+        await_!(read_table_data(
             "./tests/data/basic_partitioned",
             Some(&["a_float", "number"]),
             Some(pred),
             expected,
-        )?;
+        ))?;
     }
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn not_and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
     let cases = vec![
         (
@@ -955,17 +985,19 @@ fn not_and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
         ),
     ];
     for (pred, expected) in cases.into_iter() {
-        read_table_data(
+        await_!(read_table_data(
             "./tests/data/basic_partitioned",
             Some(&["a_float", "number"]),
             Some(pred),
             expected,
-        )?;
+        ))?;
     }
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn invalid_skips_none_predicates() -> Result<(), Box<dyn std::error::Error>> {
     let empty_struct = Expr::struct_from(Vec::<ExpressionRef>::new());
     let cases = vec![
@@ -1008,17 +1040,19 @@ fn invalid_skips_none_predicates() -> Result<(), Box<dyn std::error::Error>> {
         ),
     ];
     for (pred, expected) in cases.into_iter() {
-        read_table_data(
+        await_!(read_table_data(
             "./tests/data/basic_partitioned",
             Some(&["a_float", "number"]),
             Some(pred),
             expected,
-        )?;
+        ))?;
     }
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn with_predicate_and_removes() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+-------+",
@@ -1034,12 +1068,12 @@ fn with_predicate_and_removes() -> Result<(), Box<dyn std::error::Error>> {
         "| 8     |",
         "+-------+",
     ];
-    read_table_data_str(
+    await_!(read_table_data_str(
         "./tests/data/table-with-dv-small/",
         None,
         Some(Pred::gt(column_expr!("value"), Expr::literal(3))),
         expected,
-    )?;
+    ))?;
     Ok(())
 }
 
@@ -1077,7 +1111,7 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
         storage.clone(),
         Arc::new(TokioBackgroundExecutor::new()),
     ));
-    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let snapshot = await_!(Snapshot::builder_for(location).build(engine.as_ref()))?;
 
     let predicate = Pred::eq(column_expr!("id"), Expr::literal(2));
     let scan = snapshot
@@ -1139,7 +1173,7 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
         storage.clone(),
         Arc::new(TokioBackgroundExecutor::new()),
     ));
-    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let snapshot = await_!(Snapshot::builder_for(location).build(engine.as_ref()))?;
 
     let predicate = Pred::eq(column_expr!("val"), Expr::literal("g"));
     let scan = snapshot
@@ -1161,7 +1195,9 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn short_dv() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+----+-------+--------------------------+---------------------+",
@@ -1176,11 +1212,13 @@ fn short_dv() -> Result<(), Box<dyn std::error::Error>> {
         "| 9  | 9     | 2023-05-31T18:58:33.633Z | 0.5175919190815845  |",
         "+----+-------+--------------------------+---------------------+",
     ];
-    read_table_data_str("./tests/data/with-short-dv/", None, None, expected)?;
+    await_!(read_table_data_str("./tests/data/with-short-dv/", None, None, expected))?;
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn basic_decimal() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+----------------+---------+--------------+------------------------+",
@@ -1192,11 +1230,13 @@ fn basic_decimal() -> Result<(), Box<dyn std::error::Error>> {
         "| 2342222.23454  | 111.11  | 22222.22222  | 3333333333.3333333333  |",
         "+----------------+---------+--------------+------------------------+",
     ];
-    read_table_data_str("./tests/data/basic-decimal-table/", None, None, expected)?;
+    await_!(read_table_data_str("./tests/data/basic-decimal-table/", None, None, expected))?;
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+----+----------------------------+----------------------------+",
@@ -1213,16 +1253,18 @@ fn timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
         "| 8  |                            |                            |",
         "+----+----------------------------+----------------------------+",
     ];
-    read_table_data_str(
+    await_!(read_table_data_str(
         "./tests/data/data-reader-timestamp_ntz/",
         None,
         None,
         expected,
-    )?;
+    ))?;
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn type_widening_basic() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+---------------------+---------------------+--------------------+----------------+----------------+----------------+----------------------------+",
@@ -1242,10 +1284,12 @@ fn type_widening_basic() -> Result<(), Box<dyn std::error::Error>> {
         "date_timestamp_ntz",
     ]);
 
-    read_table_data_str("./tests/data/type-widening/", select_cols, None, expected)
+    await_!(read_table_data_str("./tests/data/type-widening/", select_cols, None, expected))
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn type_widening_decimal() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+----------------------------+-------------------------------+--------------+---------------+--------------+----------------------+",
@@ -1263,11 +1307,13 @@ fn type_widening_decimal() -> Result<(), Box<dyn std::error::Error>> {
         "int_decimal",
         "long_decimal",
     ]);
-    read_table_data_str("./tests/data/type-widening/", select_cols, None, expected)
+    await_!(read_table_data_str("./tests/data/type-widening/", select_cols, None, expected))
 }
 
 // Verify that predicates over invalid/missing columns do not cause skipping.
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::error::Error>> {
     // Attempted skipping over a logically valid but physically missing column. We should be able to
     // skip the data file because the missing column is inferred to be all-null.
@@ -1293,12 +1339,12 @@ fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::erro
         "+-------------------------------------------------------------------------------------------+---------+",
     ];
     let predicate = column_expr!("missing").lt(Expr::literal(10i64));
-    read_table_data_str(
+    await_!(read_table_data_str(
         "./tests/data/parquet_row_group_skipping/",
         Some(columns),
         Some(predicate),
         expected,
-    )?;
+    ))?;
 
     // Attempted skipping over an invalid (logically missing) column. Ideally this should throw a
     // query error, but at a minimum it should not cause incorrect data skipping.
@@ -1314,12 +1360,12 @@ fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::erro
         "+-------------------------------------------------------------------------------------------+",
     ];
     let predicate = column_expr!("invalid").lt(Expr::literal(10));
-    read_table_data_str(
+    await_!(read_table_data_str(
         "./tests/data/parquet_row_group_skipping/",
         Some(columns),
         Some(predicate),
         expected,
-    )
+    ))
     .expect_err("unknown column");
     Ok(())
 }
@@ -1328,7 +1374,9 @@ fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::erro
 // `time=1971-07-22T03:06:40.000000Z`. This is disallowed in windows due to having a `:` in
 // the name.
 #[cfg(not(windows))]
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn timestamp_partitioned_table() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+----+-----+---+----------------------+",
@@ -1340,10 +1388,12 @@ fn timestamp_partitioned_table() -> Result<(), Box<dyn std::error::Error>> {
     let test_name = "timestamp-partitioned-table";
     let test_dir = load_test_data("./tests/data", test_name).unwrap();
     let test_path = test_dir.path().join(test_name);
-    read_table_data_str(test_path.to_str().unwrap(), None, None, expected)
+    await_!(read_table_data_str(test_path.to_str().unwrap(), None, None, expected))
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn compacted_log_files_table() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+----+--------------------+",
@@ -1359,16 +1409,18 @@ fn compacted_log_files_table() -> Result<(), Box<dyn std::error::Error>> {
     let test_name = "compacted-log-files-table";
     let test_dir = load_test_data("./tests/data", test_name).unwrap();
     let test_path = test_dir.path().join(test_name);
-    read_table_data_str(test_path.to_str().unwrap(), None, None, expected)
+    await_!(read_table_data_str(test_path.to_str().unwrap(), None, None, expected))
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn unshredded_variant_table() -> Result<(), Box<dyn std::error::Error>> {
     let expected = include!("data/unshredded-variant.expected.in");
     let test_name = "unshredded-variant";
     let test_dir = load_test_data("./tests/data", test_name).unwrap();
     let test_path = test_dir.path().join(test_name);
-    read_table_data_str(test_path.to_str().unwrap(), None, None, expected)
+    await_!(read_table_data_str(test_path.to_str().unwrap(), None, None, expected))
 }
 
 #[tokio::test]
@@ -1426,7 +1478,7 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
         StructField::nullable("value", DataType::STRING),
     ])?);
 
-    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let snapshot = await_!(Snapshot::builder_for(location).build(engine.as_ref()))?;
     let scan = snapshot.scan_builder().with_schema(schema).build()?;
 
     let mut file_count = 0;

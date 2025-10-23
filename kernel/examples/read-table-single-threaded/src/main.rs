@@ -6,10 +6,9 @@ use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
 use common::{LocationArgs, ParseWithExamples, ScanArgs};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::{DeltaResult, Snapshot};
+use delta_kernel::{async_fn, await_, AsyncIterator as _, DeltaResult, Snapshot};
 
 use clap::Parser;
-use itertools::Itertools;
 
 /// An example program that dumps out the data of a delta table.
 #[derive(Parser)]

@@ -831,7 +831,9 @@ mod tests {
 
     /// This test ensures that the processor correctly deduplicates and filters
     /// non-file actions (metadata, protocol, txn) across multiple batches.
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn test_action_reconciliation_actions_iter_non_file_actions() -> DeltaResult<()> {
         // Batch 1: protocol, metadata, and txn actions
         let batch1 = vec![
@@ -858,7 +860,7 @@ mod tests {
             create_batch(batch2)?,
             create_batch(batch3)?,
         ];
-        let (results, actions_count, add_actions) = run_action_reconciliation_test(input_batches)?;
+        let (results, actions_count, add_actions) = await_!(run_action_reconciliation_test(input_batches))?;
 
         // Verify results
         assert_eq!(results.len(), 2, "Expected two batches in results");
@@ -875,7 +877,9 @@ mod tests {
 
     /// This test ensures that the processor correctly deduplicates and filters
     /// file actions (add, remove) across multiple batches.
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn test_action_reconciliation_actions_iter_file_actions() -> DeltaResult<()> {
         // Batch 1: add action (file1) - new, should be included
         let batch1 = vec![
@@ -900,7 +904,7 @@ mod tests {
             create_batch(batch2)?,
             create_batch(batch3)?,
         ];
-        let (results, actions_count, add_actions) = run_action_reconciliation_test(input_batches)?;
+        let (results, actions_count, add_actions) = await_!(run_action_reconciliation_test(input_batches))?;
 
         // Verify results
         assert_eq!(results.len(), 2); // The third batch should be filtered out since there are no selected actions
@@ -914,7 +918,9 @@ mod tests {
 
     /// This test ensures that the processor correctly deduplicates and filters
     /// file actions (add, remove) with deletion vectors across multiple batches.
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn test_action_reconciliation_actions_iter_file_actions_with_deletion_vectors(
     ) -> DeltaResult<()> {
         // Batch 1: add actions with deletion vectors
@@ -936,7 +942,7 @@ mod tests {
         ];
 
         let input_batches = vec![create_batch(batch1)?, create_batch(batch2)?];
-        let (results, actions_count, add_actions) = run_action_reconciliation_test(input_batches)?;
+        let (results, actions_count, add_actions) = await_!(run_action_reconciliation_test(input_batches))?;
 
         // Verify results
         assert_eq!(results.len(), 2);

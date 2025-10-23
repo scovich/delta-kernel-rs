@@ -14,7 +14,7 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::parquet::arrow::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
-use delta_kernel::Snapshot;
+use delta_kernel::{async_fn, await_, AsyncIterator, Snapshot};
 
 use arrow::compute::filter_record_batch;
 use object_store::local::LocalFileSystem;
@@ -102,7 +102,9 @@ fn create_commit(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[ignore = "mem-test - run manually"]
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn test_dhat_large_table_data() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
     let table_path = dir.path();
@@ -124,8 +126,8 @@ fn test_dhat_large_table_data() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(TokioBackgroundExecutor::new()),
     ));
 
-    let snapshot = Snapshot::builder_for(url)
-        .build(engine.as_ref())
+    let snapshot = await_!(Snapshot::builder_for(url)
+        .build(engine.as_ref()))
         .expect("Failed to create snapshot");
 
     let stats = dhat::HeapStats::get();
@@ -142,7 +144,9 @@ fn test_dhat_large_table_data() -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 5: Execute the scan and read data
     let mut row_count = 0;
-    for scan_result in scan.execute(engine)? {
+    let scan_results = await_!(scan.execute(engine))?;
+    let mut iter = scan_results.async_pin();
+    while let Some(scan_result) = await_!(iter.async_next()) {
         let scan_result = scan_result?;
         let mask = scan_result.full_mask();
         let data = scan_result.raw_data?;

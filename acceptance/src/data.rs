@@ -10,9 +10,9 @@ use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{engine::arrow_data::ArrowEngineData, DeltaResult, Engine, Error};
+use delta_kernel::{async_fn, await_, AsyncIterator as _, DeltaResult, Engine, Error};
+use delta_kernel::engine::arrow_data::ArrowEngineData;
 use futures::{stream::TryStreamExt, StreamExt};
-use itertools::Itertools;
 use object_store::{local::LocalFileSystem, ObjectStore};
 
 use crate::{TestCaseInfo, TestResult};

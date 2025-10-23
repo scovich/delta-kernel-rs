@@ -6,7 +6,7 @@ use url::Url;
 
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::{FileMeta, LogPath, Snapshot};
+use delta_kernel::{async_fn, await_, FileMeta, LogPath, Snapshot};
 
 use test_utils::{
     actions_to_string, add_commit, add_staged_commit, delta_path_for_version, TestAction,
@@ -61,9 +61,9 @@ async fn basic_snapshot_with_log_tail_staged_commits() -> Result<(), Box<dyn std
         create_log_path(&table_root, path1.clone()),
         create_log_path(&table_root, path2.clone()),
     ];
-    let snapshot = Snapshot::builder_for(table_root.clone())
+    let snapshot = await_!(Snapshot::builder_for(table_root.clone())
         .with_log_tail(log_tail.clone())
-        .build(engine.as_ref())?;
+        .build(engine.as_ref()))?;
     assert_eq!(snapshot.version(), 2);
     let log_segment = snapshot.log_segment();
     assert_eq!(log_segment.ascending_commit_files.len(), 3);
@@ -84,10 +84,10 @@ async fn basic_snapshot_with_log_tail_staged_commits() -> Result<(), Box<dyn std
     );
 
     // 2. Now check for time-travel to 1
-    let snapshot = Snapshot::builder_for(table_root.clone())
+    let snapshot = await_!(Snapshot::builder_for(table_root.clone())
         .with_log_tail(log_tail)
         .at_version(1)
-        .build(engine.as_ref())?;
+        .build(engine.as_ref()))?;
     assert_eq!(snapshot.version(), 1);
     let log_segment = snapshot.log_segment();
     assert_eq!(log_segment.ascending_commit_files.len(), 2);
@@ -104,9 +104,9 @@ async fn basic_snapshot_with_log_tail_staged_commits() -> Result<(), Box<dyn std
 
     // 3. Check case for log_tail is only 1 staged commit
     let log_tail = vec![create_log_path(&table_root, path1.clone())];
-    let snapshot = Snapshot::builder_for(table_root.clone())
+    let snapshot = await_!(Snapshot::builder_for(table_root.clone())
         .with_log_tail(log_tail)
-        .build(engine.as_ref())?;
+        .build(engine.as_ref()))?;
     assert_eq!(snapshot.version(), 1);
     let log_segment = snapshot.log_segment();
     assert_eq!(log_segment.ascending_commit_files.len(), 2);
@@ -122,7 +122,7 @@ async fn basic_snapshot_with_log_tail_staged_commits() -> Result<(), Box<dyn std
     );
 
     // 4. Check if we don't pass log tail
-    let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
+    let snapshot = await_!(Snapshot::builder_for(table_root.clone()).build(engine.as_ref()))?;
     assert_eq!(snapshot.version(), 0);
     let log_segment = snapshot.log_segment();
     assert_eq!(log_segment.ascending_commit_files.len(), 1);
@@ -137,9 +137,9 @@ async fn basic_snapshot_with_log_tail_staged_commits() -> Result<(), Box<dyn std
         &table_root,
         delta_path_for_version(0, "json"),
     )];
-    let snapshot = Snapshot::builder_for(table_root.clone())
+    let snapshot = await_!(Snapshot::builder_for(table_root.clone())
         .with_log_tail(log_tail)
-        .build(engine.as_ref())?;
+        .build(engine.as_ref()))?;
 
     assert_eq!(snapshot.version(), 0);
     let log_segment = snapshot.log_segment();

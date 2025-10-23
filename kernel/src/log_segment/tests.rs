@@ -27,8 +27,8 @@ use crate::scan::test_utils::{
 };
 use crate::utils::test_utils::{assert_batch_matches, assert_result_error_with_message, Action};
 use crate::{
-    DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor, Snapshot,
-    StorageHandler,
+    async_fn, await_, AsyncIterator, DeltaResult, Engine as _, EngineData, Expression, FileMeta,
+    PredicateRef, RowVisitor, Snapshot, StorageHandler,
 };
 use test_utils::{compacted_log_path_for_versions, delta_path_for_version};
 
@@ -44,13 +44,15 @@ use super::*;
 //              type    nulls  min / max
 // txn.appId    BINARY  0      "3ae45b72-24e1-865a-a211-3..." / "3ae45b72-24e1-865a-a211-3..."
 // txn.version  INT64   0      "4390" / "4390"
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn test_replay_for_metadata() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
     let url = url::Url::from_directory_path(path.unwrap()).unwrap();
     let engine = SyncEngine::new();
 
-    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+    let snapshot = await_!(Snapshot::builder_for(url).build(&engine)).unwrap();
     let data: Vec<_> = snapshot
         .log_segment()
         .replay_for_metadata(&engine)

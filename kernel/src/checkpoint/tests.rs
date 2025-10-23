@@ -12,7 +12,7 @@ use crate::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEn
 use crate::log_replay::HasSelectionVector;
 use crate::schema::{DataType as KernelDataType, StructField, StructType};
 use crate::utils::test_utils::Action;
-use crate::{await_, DeltaResult, FileMeta, LogPath, Snapshot};
+use crate::{async_fn, await_, AsyncIterator, DeltaResult, FileMeta, LogPath, Snapshot};
 
 use arrow_56::{
     array::{create_array, RecordBatch},
@@ -24,7 +24,9 @@ use serde_json::{from_slice, json, Value};
 use test_utils::delta_path_for_version;
 use url::Url;
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn test_deleted_file_retention_timestamp() -> DeltaResult<()> {
     const MILLIS_PER_SECOND: i64 = 1_000;
 
@@ -57,7 +59,9 @@ fn test_deleted_file_retention_timestamp() -> DeltaResult<()> {
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
@@ -74,7 +78,7 @@ fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     )?;
 
     let table_root = Url::parse("memory:///")?;
-    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+    let snapshot = await_!(Snapshot::builder_for(table_root).build(&engine))?;
     let writer = snapshot.checkpoint()?;
 
     let checkpoint_batch = writer.create_checkpoint_metadata_batch(&engine)?;
@@ -109,7 +113,9 @@ fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn test_create_last_checkpoint_data() -> DeltaResult<()> {
     let version = 10;
     let total_actions_counter = 100;
@@ -274,7 +280,9 @@ fn read_last_checkpoint_file(store: &Arc<InMemory>) -> DeltaResult<Value> {
 /// Tests the `checkpoint()` API with:
 /// - A table that does not support v2Checkpoint
 /// - No version specified (latest version is used)
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
@@ -301,7 +309,7 @@ fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
     )?;
 
     let table_root = Url::parse("memory:///")?;
-    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+    let snapshot = await_!(Snapshot::builder_for(table_root).build(&engine))?;
     let writer = snapshot.checkpoint()?;
 
     // Verify the checkpoint file path is the latest version by default.
@@ -310,18 +318,18 @@ fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
         Url::parse("memory:///_delta_log/00000000000000000002.checkpoint.parquet")?
     );
 
-    let mut data_iter = writer.checkpoint_data(&engine)?;
+    let mut data_iter = await_!(writer.checkpoint_data(&engine))?;
     // The first batch should be the metadata and protocol actions.
-    let batch = data_iter.next().unwrap()?;
+    let batch = await_!(data_iter.async_next()).unwrap()?;
     assert_eq!(batch.selection_vector(), &[true, true]);
 
     // The second batch should include both the add action and the remove action
-    let batch = data_iter.next().unwrap()?;
+    let batch = await_!(data_iter.async_next()).unwrap()?;
     assert_eq!(batch.selection_vector(), &[true, true]);
 
     // The third batch should not be included as the selection vector does not
     // contain any true values, as the file added is removed in a following commit.
-    assert!(data_iter.next().is_none());
+    assert!(await_!(data_iter.async_next()).is_none());
 
     // Finalize and verify checkpoint metadata
     let size_in_bytes = 10;
@@ -344,7 +352,9 @@ fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
 /// Tests the `checkpoint()` API with:
 /// - A table that does not support v2Checkpoint
 /// - A specific version specified (version 0)
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
@@ -369,9 +379,9 @@ fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     // Specify version 0 for checkpoint
-    let snapshot = Snapshot::builder_for(table_root)
+    let snapshot = await_!(Snapshot::builder_for(table_root)
         .at_version(0)
-        .build(&engine)?;
+        .build(&engine))?;
     let writer = snapshot.checkpoint()?;
 
     // Verify the checkpoint file path is the specified version.
@@ -380,13 +390,13 @@ fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
         Url::parse("memory:///_delta_log/00000000000000000000.checkpoint.parquet")?
     );
 
-    let mut data_iter = writer.checkpoint_data(&engine)?;
+    let mut data_iter = await_!(writer.checkpoint_data(&engine))?;
     // The first batch should be the metadata and protocol actions.
-    let batch = data_iter.next().unwrap()?;
+    let batch = await_!(data_iter.async_next()).unwrap()?;
     assert_eq!(batch.selection_vector(), &[true, true]);
 
     // No more data should exist because we only requested version 0
-    assert!(data_iter.next().is_none());
+    assert!(await_!(data_iter.async_next()).is_none());
 
     // Finalize and verify checkpoint metadata
     let size_in_bytes = 10;
@@ -406,7 +416,9 @@ fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
@@ -419,11 +431,11 @@ fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> DeltaR
     )?;
 
     let table_root = Url::parse("memory:///")?;
-    let snapshot = Snapshot::builder_for(table_root)
+    let snapshot = await_!(Snapshot::builder_for(table_root)
         .at_version(0)
-        .build(&engine)?;
+        .build(&engine))?;
     let writer = snapshot.checkpoint()?;
-    let data_iter = writer.checkpoint_data(&engine)?;
+    let data_iter = await_!(writer.checkpoint_data(&engine))?;
 
     /* The returned data iterator has batches that we do not consume */
 
@@ -435,8 +447,8 @@ fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> DeltaR
     };
 
     // Attempt to finalize the checkpoint with an iterator that has not been fully consumed
-    let err = writer
-        .finalize(&engine, &metadata, data_iter)
+    let err = await_!(writer
+        .finalize(&engine, &metadata, data_iter))
         .expect_err("finalize should fail");
     assert!(
         err.to_string().contains("Error writing checkpoint: The checkpoint data iterator must be fully consumed and written to storage before calling finalize")
@@ -448,7 +460,9 @@ fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> DeltaR
 /// Tests the `checkpoint()` API with:
 /// - A table that does supports v2Checkpoint
 /// - No version specified (latest version is used)
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
@@ -475,7 +489,7 @@ fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     )?;
 
     let table_root = Url::parse("memory:///")?;
-    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+    let snapshot = await_!(Snapshot::builder_for(table_root).build(&engine))?;
     let writer = snapshot.checkpoint()?;
 
     // Verify the checkpoint file path is the latest version by default.
@@ -484,23 +498,23 @@ fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
         Url::parse("memory:///_delta_log/00000000000000000001.checkpoint.parquet")?
     );
 
-    let mut data_iter = writer.checkpoint_data(&engine)?;
+    let mut data_iter = await_!(writer.checkpoint_data(&engine))?;
     // The first batch should be the metadata and protocol actions.
-    let batch = data_iter.next().unwrap()?;
+    let batch = await_!(data_iter.async_next()).unwrap()?;
     assert_eq!(batch.selection_vector(), &[true, true]);
 
     // The second batch should include both the add action and the remove action
-    let batch = data_iter.next().unwrap()?;
+    let batch = await_!(data_iter.async_next()).unwrap()?;
     assert_eq!(batch.selection_vector(), &[true, true]);
 
     // The third batch should be the CheckpointMetaData action.
-    let batch = data_iter.next().unwrap()?;
+    let batch = await_!(data_iter.async_next()).unwrap()?;
     // According to the new contract, with_all_rows_selected creates an empty selection vector
     assert_eq!(batch.selection_vector(), &[] as &[bool]);
     assert!(batch.has_selected_rows());
 
     // No more data should exist
-    assert!(data_iter.next().is_none());
+    assert!(await_!(data_iter.async_next()).is_none());
 
     // Finalize and verify checkpoint metadata
     let size_in_bytes = 10;
@@ -520,7 +534,9 @@ fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     Ok(())
 }
 
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn test_no_checkpoint_staged_commits() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
@@ -553,9 +569,9 @@ fn test_no_checkpoint_staged_commits() -> DeltaResult<()> {
         last_modified: 0,
         size: 100,
     };
-    let snapshot = Snapshot::builder_for(table_root.clone())
+    let snapshot = await_!(Snapshot::builder_for(table_root.clone())
         .with_log_tail(vec![LogPath::try_new(staged_commit).unwrap()])
-        .build(&engine)?;
+        .build(&engine))?;
 
     assert!(matches!(
         snapshot.checkpoint().unwrap_err(),

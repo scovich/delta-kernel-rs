@@ -13,6 +13,10 @@ version.workspace = true
 [package.metadata.release]
 release = false
 
+[features]
+# Propagate async feature from delta_kernel
+async = ["delta_kernel/async", "tokio"]
+
 [dependencies]
 arrow = "56"
 delta_kernel = { path = "../kernel", features = ["arrow", "default-engine-rustls"] }
@@ -21,5 +25,6 @@ object_store = "0.12.3"
 rayon = "1.10"
 serde_json = "1"
 tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros"], optional = true }
 tracing = "0.1"
 url = "2"

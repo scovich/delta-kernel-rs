@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use delta_kernel::engine::to_json_bytes;
 use delta_kernel::schema::{DataType, StructField, StructType};
-use delta_kernel::Snapshot;
+use delta_kernel::{async_fn, await_, AsyncIterator, Snapshot};
 use test_utils::{create_table, engine_store_setup};
 
 use object_store::path::Path;
@@ -21,8 +21,10 @@ fn url_to_object_store_path(url: &Url) -> Result<Path, Box<dyn std::error::Error
     Ok(Path::from(path_string))
 }
 
-#[tokio::test]
-async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
+fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     // Create a simple table schema: one int column named 'id'
@@ -77,11 +79,11 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
         .await?;
 
     // Create snapshot and log compaction writer
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let snapshot = await_!(Snapshot::builder_for(table_url.clone()).build(&engine))?;
     let mut writer = snapshot.log_compaction_writer(0, 2)?;
 
     // Get compaction data iterator
-    let mut compaction_data = writer.compaction_data(&engine)?;
+    let mut compaction_data = await_!(writer.compaction_data(&engine))?;
     let compaction_path = writer.compaction_path().clone();
 
     // Verify the compaction file name
@@ -102,7 +104,7 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
     // Note: Actions are processed in reverse chronological order (newest to oldest).
     // The reconciliation keeps the first (newest) occurrence of each action type
     // for each unique file path, so both add and remove actions for file1 are kept.
-    for batch_result in compaction_data.by_ref() {
+    while let Some(batch_result) = await_!(compaction_data.async_next()) {
         let batch = batch_result?;
         compacted_data_batches.push(batch);
         batch_count += 1;
@@ -277,10 +279,10 @@ async fn expired_tombstone_exclusion() -> Result<(), Box<dyn std::error::Error>>
         )
         .await?;
 
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let snapshot = await_!(Snapshot::builder_for(table_url.clone()).build(&engine))?;
     let mut writer = snapshot.log_compaction_writer(0, 3)?;
 
-    let mut compaction_data = writer.compaction_data(&engine)?;
+    let mut compaction_data = await_!(writer.compaction_data(&engine))?;
     let compaction_path = writer.compaction_path().clone();
 
     // Verify the compaction file name
@@ -290,7 +292,7 @@ async fn expired_tombstone_exclusion() -> Result<(), Box<dyn std::error::Error>>
     let mut batch_count = 0;
     let mut compacted_data_batches = Vec::new();
 
-    for batch_result in compaction_data.by_ref() {
+    while let Some(batch_result) = await_!(compaction_data.async_next()) {
         let batch = batch_result?;
         compacted_data_batches.push(batch);
         batch_count += 1;

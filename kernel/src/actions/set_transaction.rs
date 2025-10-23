@@ -116,8 +116,10 @@ mod tests {
     use crate::Snapshot;
 
     use crate::arrow::array::StringArray;
+    use crate::{async_fn, await_, AsyncIterator};
     use itertools::Itertools;
 
+    #[async_fn]
     fn get_latest_transactions(
         path: &str,
         app_id: &str,
@@ -126,22 +128,24 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = SyncEngine::new();
 
-        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let snapshot = await_!(Snapshot::builder_for(url).build(&engine)).unwrap();
         let log_segment = snapshot.log_segment();
 
         (
-            SetTransactionScanner::get_all(log_segment, &engine, None).unwrap(),
-            SetTransactionScanner::get_one(log_segment, app_id, &engine, None).unwrap(),
+            await_!(SetTransactionScanner::get_all(log_segment, &engine, None)).unwrap(),
+            await_!(SetTransactionScanner::get_one(log_segment, app_id, &engine, None)).unwrap(),
         )
     }
 
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn test_txn() {
-        let (txns, txn) = get_latest_transactions("./tests/data/basic_partitioned/", "test");
+        let (txns, txn) = await_!(get_latest_transactions("./tests/data/basic_partitioned/", "test"));
         assert!(txn.is_none());
         assert_eq!(txns.len(), 0);
 
-        let (txns, txn) = get_latest_transactions("./tests/data/app-txn-no-checkpoint/", "my-app");
+        let (txns, txn) = await_!(get_latest_transactions("./tests/data/app-txn-no-checkpoint/", "my-app"));
         assert!(txn.is_some());
         assert_eq!(txns.len(), 2);
         assert_eq!(txns.get("my-app"), txn.as_ref());
@@ -155,7 +159,7 @@ mod tests {
             .as_ref()
         );
 
-        let (txns, txn) = get_latest_transactions("./tests/data/app-txn-checkpoint/", "my-app");
+        let (txns, txn) = await_!(get_latest_transactions("./tests/data/app-txn-checkpoint/", "my-app"));
         assert!(txn.is_some());
         assert_eq!(txns.len(), 2);
         assert_eq!(txns.get("my-app"), txn.as_ref());
@@ -170,7 +174,9 @@ mod tests {
         );
     }
 
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn test_replay_for_app_ids() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();

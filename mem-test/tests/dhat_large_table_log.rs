@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::Snapshot;
+use delta_kernel::{async_fn, await_, AsyncIterator, Snapshot};
 use object_store::local::LocalFileSystem;
 use serde_json::json;
 use tempfile::tempdir;
@@ -97,7 +97,9 @@ fn generate_delta_log(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[ignore = "mem-test - run manually"]
-#[test]
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
 fn test_dhat_large_table_log() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
     let table_path = dir.path();
@@ -113,8 +115,8 @@ fn test_dhat_large_table_log() -> Result<(), Box<dyn std::error::Error>> {
     let url = Url::from_directory_path(table_path).unwrap();
     let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
 
-    let snapshot = Snapshot::builder_for(url)
-        .build(&engine)
+    let snapshot = await_!(Snapshot::builder_for(url)
+        .build(&engine))
         .expect("Failed to get latest snapshot");
 
     let stats = dhat::HeapStats::get();
@@ -124,10 +126,11 @@ fn test_dhat_large_table_log() -> Result<(), Box<dyn std::error::Error>> {
         .scan_builder()
         .build()
         .expect("Failed to build scan");
-    let scan_metadata = scan
-        .scan_metadata(&engine)
+    let scan_metadata = await_!(scan
+        .scan_metadata(&engine))
         .expect("Failed to get scan metadata");
-    for res in scan_metadata {
+    let mut iter = scan_metadata.async_pin();
+    while let Some(res) = await_!(iter.async_next()) {
         let _scan_metadata = res.expect("Failed to read scan metadata");
     }
 

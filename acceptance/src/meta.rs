@@ -8,7 +8,7 @@ use object_store::{self, local::LocalFileSystem, ObjectStore};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use delta_kernel::{Engine, Error, Snapshot, Version};
+use delta_kernel::{async_fn, await_, Engine, Error, Snapshot, Version};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AssertionError {

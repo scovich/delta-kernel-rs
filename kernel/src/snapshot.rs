@@ -446,6 +446,7 @@ mod tests {
     use crate::engine::default::DefaultEngine;
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
+    use crate::{async_fn, await_};
     use crate::listed_log_files::ListedLogFiles;
     use crate::log_segment::LogSegment;
     use crate::parquet::arrow::ArrowWriter;
@@ -536,16 +537,18 @@ mod tests {
         format!("{}\n{}", protocol, metadata)
     }
 
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn test_snapshot_read_metadata() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
 
         let engine = SyncEngine::new();
-        let snapshot = Snapshot::builder_for(url)
+        let snapshot = await_!(Snapshot::builder_for(url)
             .at_version(1)
-            .build(&engine)
+            .build(&engine))
             .unwrap();
 
         let expected =
@@ -557,14 +560,16 @@ mod tests {
         assert_eq!(snapshot.schema(), expected);
     }
 
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn test_new_snapshot() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
 
         let engine = SyncEngine::new();
-        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let snapshot = await_!(Snapshot::builder_for(url).build(&engine)).unwrap();
 
         let expected =
             Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"])).unwrap();
@@ -603,9 +608,9 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
 
         let engine = SyncEngine::new();
-        let old_snapshot = Snapshot::builder_for(url.clone())
+        let old_snapshot = await_!(Snapshot::builder_for(url.clone())
             .at_version(1)
-            .build(&engine)
+            .build(&engine))
             .unwrap();
         // 1. new version < existing version: error
         let snapshot_res = Snapshot::builder_from(old_snapshot.clone())
@@ -925,7 +930,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn test_read_table_with_missing_last_checkpoint() {
         // this table doesn't have a _last_checkpoint file
         let path = std::fs::canonicalize(PathBuf::from(
@@ -945,7 +952,9 @@ mod tests {
         r#"{"size":8,"sizeInBytes":21857,"version":1}"#.as_bytes().to_vec()
     }
 
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn test_read_table_with_empty_last_checkpoint() {
         // in memory file system
         let store = Arc::new(InMemory::new());
@@ -970,7 +979,9 @@ mod tests {
         assert!(invalid.is_none())
     }
 
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn test_read_table_with_last_checkpoint() {
         // in memory file system
         let store = Arc::new(InMemory::new());
@@ -1147,7 +1158,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[async_fn]
+    #[cfg_attr(not(feature = "async"), test)]
+    #[cfg_attr(feature = "async", tokio::test)]
     fn test_log_compaction_writer() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();

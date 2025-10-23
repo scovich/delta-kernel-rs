@@ -12,7 +12,7 @@ use delta_kernel::actions::deletion_vector::split_vector;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
 use delta_kernel::schema::SchemaRef;
-use delta_kernel::{DeltaResult, Engine, EngineData, ExpressionRef, FileMeta, Snapshot};
+use delta_kernel::{async_fn, await_, AsyncIterator, DeltaResult, Engine, EngineData, ExpressionRef, FileMeta, Snapshot};
 
 use clap::Parser;
 use url::Url;
@@ -93,13 +93,14 @@ struct ScanState {
     logical_schema: SchemaRef,
 }
 
+#[async_fn]
 fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Read", "read", "");
 
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
     println!("Reading {url}");
     let engine = common::get_engine(&url, &cli.location_args)?;
-    let snapshot = Snapshot::builder_for(url).build(&engine)?;
+    let snapshot = await_!(Snapshot::builder_for(url).build(&engine))?;
     let Some(scan) = common::get_scan(snapshot, &cli.scan_args)? else {
         return Ok(());
     };
@@ -109,7 +110,7 @@ fn try_main() -> DeltaResult<()> {
     // [`delta_kernel::scan::scan_row_schema`]. Generally engines will not need to interact with
     // this data directly, and can just call [`visit_scan_files`] to get pre-parsed data back from
     // the kernel.
-    let scan_metadata = scan.scan_metadata(&engine)?;
+    let scan_metadata = await_!(scan.scan_metadata(&engine))?;
 
     if cli.metadata {
         let (scan_metadata_batches, scan_metadata_rows) = scan_metadata
