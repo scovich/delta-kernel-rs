@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::scan::ScanResult;
-use delta_kernel::{async_fn, await_, AsyncIterator, DeltaResult, Snapshot};
+use delta_kernel::{async_fn, async_test, await_, AsyncIterator, DeltaResult, Snapshot};
 use test_utils::DefaultEngineExtension;
 
 #[async_fn]
@@ -24,9 +24,7 @@ fn count_total_scan_rows(
         .async_try_fold(0, |acc, count| Ok(acc + count)))
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test_log::test)]
-#[cfg_attr(feature = "async", test_log::test(tokio::test))]
+#[async_test(test_log::test)]
 fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/"))?;
     let url = url::Url::from_directory_path(path).unwrap();
@@ -41,9 +39,7 @@ fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test_log::test)]
-#[cfg_attr(feature = "async", test_log::test(tokio::test))]
+#[async_test(test_log::test)]
 fn non_dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/"))?;
     let url = url::Url::from_directory_path(path).unwrap();

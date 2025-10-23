@@ -2,7 +2,7 @@ use super::{should_compact, LogCompactionWriter, COMPACTION_ACTIONS_SCHEMA};
 use crate::action_reconciliation::RetentionCalculator;
 use crate::engine::sync::SyncEngine;
 use crate::snapshot::Snapshot;
-use crate::{async_fn, await_, AsyncIterator, SnapshotRef};
+use crate::{async_fn, async_test, await_, AsyncIterator, SnapshotRef};
 
 #[async_fn]
 fn create_mock_snapshot() -> SnapshotRef {
@@ -24,9 +24,7 @@ fn create_multi_version_snapshot() -> SnapshotRef {
     await_!(Snapshot::builder_for(url).build(&engine)).unwrap()
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_log_compaction_writer_creation() {
     let snapshot = await_!(create_mock_snapshot());
     let start_version = 0;
@@ -40,9 +38,7 @@ fn test_log_compaction_writer_creation() {
     assert!(path.to_string().ends_with(expected_filename));
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_invalid_version_range() {
     let start_version = 20;
     let end_version = 10; // Invalid: start > end
@@ -56,9 +52,7 @@ fn test_invalid_version_range() {
         .contains("Invalid version range"));
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_equal_version_range_invalid() {
     let start_version = 5;
     let end_version = 5; // Invalid: start == end (must be start < end)
@@ -72,9 +66,7 @@ fn test_equal_version_range_invalid() {
         .contains("Invalid version range"));
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_should_compact() {
     assert!(should_compact(9, 10));
     assert!(!should_compact(5, 10));
@@ -83,9 +75,7 @@ fn test_should_compact() {
     assert!(should_compact(19, 10));
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_compaction_actions_schema_access() {
     let schema = &*COMPACTION_ACTIONS_SCHEMA;
     assert!(schema.fields().len() > 0);
@@ -98,9 +88,7 @@ fn test_compaction_actions_schema_access() {
     assert!(field_names.contains(&"protocol"));
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_writer_debug_impl() {
     let snapshot = await_!(create_mock_snapshot());
     let writer = LogCompactionWriter::try_new(snapshot, 1, 5).unwrap();
@@ -109,9 +97,7 @@ fn test_writer_debug_impl() {
     assert!(debug_str.contains("LogCompactionWriter"));
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_compaction_data() {
     let snapshot = await_!(create_mock_snapshot());
     let mut writer = LogCompactionWriter::try_new(snapshot, 0, 1).unwrap();
@@ -133,9 +119,7 @@ fn test_compaction_data() {
     assert!(debug_str.contains("add_actions_count"));
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_end_version_exceeds_snapshot_version() {
     let snapshot = await_!(create_mock_snapshot());
     let snapshot_version = snapshot.version();
@@ -152,9 +136,7 @@ fn test_end_version_exceeds_snapshot_version() {
         .contains("exceeds snapshot version"));
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_retention_calculator() {
     let snapshot = await_!(create_mock_snapshot());
     let writer = LogCompactionWriter::try_new(snapshot.clone(), 0, 1).unwrap();
@@ -163,9 +145,7 @@ fn test_retention_calculator() {
     assert_eq!(table_props, snapshot.table_properties());
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_compaction_data_with_actual_iterator() {
     let snapshot = await_!(create_multi_version_snapshot());
     let mut writer = LogCompactionWriter::try_new(snapshot, 0, 1).unwrap();
@@ -193,9 +173,7 @@ fn test_compaction_data_with_actual_iterator() {
     assert!(batch_count > 0, "Expected to process at least one batch");
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_compaction_paths() {
     let snapshot = await_!(create_mock_snapshot());
 
@@ -230,9 +208,7 @@ fn test_compaction_paths() {
     }
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_version_filtering() {
     let snapshot = await_!(create_multi_version_snapshot());
     let engine = SyncEngine::new();
@@ -254,9 +230,7 @@ fn test_version_filtering() {
     }
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_no_compaction_staged_commits() {
     use crate::actions::Add;
     use crate::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};

@@ -389,7 +389,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::schema::{DataType, SchemaRef, StructField, StructType};
     use crate::{
-        async_fn, await_, into_async_iter, AsyncIterator as _, ExpressionRef, Scalar,
+        async_fn, async_test, await_, into_async_iter, AsyncIterator as _, ExpressionRef, Scalar,
     };
 
     use super::scan_action_iter;
@@ -416,9 +416,7 @@ mod tests {
         assert_eq!(part_vals.get("non-existent"), None);
     }
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn test_scan_action_iter() {
         await_!(run_with_validate_callback(
             vec![add_batch_simple(get_log_schema().clone())],
@@ -430,9 +428,7 @@ mod tests {
         ));
     }
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn test_scan_action_iter_with_remove() {
         await_!(run_with_validate_callback(
             vec![add_batch_with_remove(get_log_schema().clone())],
@@ -444,9 +440,7 @@ mod tests {
         ));
     }
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn test_no_transforms() {
         let batch = vec![add_batch_simple(get_log_schema().clone())];
         let logical_schema = Arc::new(StructType::new_unchecked(vec![]));
@@ -472,9 +466,7 @@ mod tests {
         }
     }
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn test_simple_transform() {
         let schema: SchemaRef = Arc::new(StructType::new_unchecked([
             StructField::new("value", DataType::INTEGER, true),

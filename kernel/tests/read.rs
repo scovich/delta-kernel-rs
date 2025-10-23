@@ -17,7 +17,7 @@ use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterPropertie
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
 use delta_kernel::scan::{Scan, ScanResult};
 use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, StructType};
-use delta_kernel::{async_fn, await_, into_async_iter, AsyncIterator, Engine, FileMeta, Snapshot};
+use delta_kernel::{async_fn, async_test, await_, into_async_iter, AsyncIterator, Engine, FileMeta, Snapshot};
 
 use itertools::Itertools;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
@@ -498,9 +498,7 @@ fn read_table_data_str(
     ))
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn data() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+--------+--------+---------+",
@@ -519,9 +517,7 @@ fn data() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn column_ordering() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+---------+--------+--------+",
@@ -545,9 +541,7 @@ fn column_ordering() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn column_ordering_and_projection() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+---------+--------+",
@@ -608,9 +602,7 @@ fn table_for_letters(letters: &[char]) -> Vec<String> {
     res
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn predicate_on_number() -> Result<(), Box<dyn std::error::Error>> {
     let cases = vec![
         (
@@ -650,9 +642,7 @@ fn predicate_on_number() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn predicate_on_letter() -> Result<(), Box<dyn std::error::Error>> {
     // Test basic column pruning. Note that the actual predicate machinery is already well-tested,
     // so we're just testing wiring here.
@@ -710,9 +700,7 @@ fn predicate_on_letter() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn predicate_on_letter_and_number() -> Result<(), Box<dyn std::error::Error>> {
     // Partition skipping and file skipping are currently implemented separately. Mixing them in an
     // AND clause will evaulate each separately, but mixing them in an OR clause disables both.
@@ -772,9 +760,7 @@ fn predicate_on_letter_and_number() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn predicate_on_number_not() -> Result<(), Box<dyn std::error::Error>> {
     let cases = vec![
         (
@@ -813,9 +799,7 @@ fn predicate_on_number_not() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn predicate_on_number_with_not_null() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+---------+--------+",
@@ -837,9 +821,7 @@ fn predicate_on_number_with_not_null() -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn predicate_null() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![]; // number is never null
     await_!(read_table_data_str(
@@ -851,9 +833,7 @@ fn predicate_null() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn mixed_null() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+------+--------------+",
@@ -880,9 +860,7 @@ fn mixed_null() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn mixed_not_null() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+------+--------------+",
@@ -909,9 +887,7 @@ fn mixed_not_null() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
     let cases = vec![
         (
@@ -954,9 +930,7 @@ fn and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn not_and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
     let cases = vec![
         (
@@ -999,9 +973,7 @@ fn not_and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn invalid_skips_none_predicates() -> Result<(), Box<dyn std::error::Error>> {
     let empty_struct = Expr::struct_from(Vec::<ExpressionRef>::new());
     let cases = vec![
@@ -1054,9 +1026,7 @@ fn invalid_skips_none_predicates() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn with_predicate_and_removes() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+-------+",
@@ -1201,9 +1171,7 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn short_dv() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+----+-------+--------------------------+---------------------+",
@@ -1222,9 +1190,7 @@ fn short_dv() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn basic_decimal() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+----------------+---------+--------------+------------------------+",
@@ -1240,9 +1206,7 @@ fn basic_decimal() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+----+----------------------------+----------------------------+",
@@ -1268,9 +1232,7 @@ fn timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn type_widening_basic() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+---------------------+---------------------+--------------------+----------------+----------------+----------------+----------------------------+",
@@ -1293,9 +1255,7 @@ fn type_widening_basic() -> Result<(), Box<dyn std::error::Error>> {
     await_!(read_table_data_str("./tests/data/type-widening/", select_cols, None, expected))
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn type_widening_decimal() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+----------------------------+-------------------------------+--------------+---------------+--------------+----------------------+",
@@ -1317,9 +1277,7 @@ fn type_widening_decimal() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // Verify that predicates over invalid/missing columns do not cause skipping.
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::error::Error>> {
     // Attempted skipping over a logically valid but physically missing column. We should be able to
     // skip the data file because the missing column is inferred to be all-null.
@@ -1380,9 +1338,7 @@ fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::erro
 // `time=1971-07-22T03:06:40.000000Z`. This is disallowed in windows due to having a `:` in
 // the name.
 #[cfg(not(windows))]
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn timestamp_partitioned_table() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+----+-----+---+----------------------+",
@@ -1397,9 +1353,7 @@ fn timestamp_partitioned_table() -> Result<(), Box<dyn std::error::Error>> {
     await_!(read_table_data_str(test_path.to_str().unwrap(), None, None, expected))
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn compacted_log_files_table() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+----+--------------------+",
@@ -1418,9 +1372,7 @@ fn compacted_log_files_table() -> Result<(), Box<dyn std::error::Error>> {
     await_!(read_table_data_str(test_path.to_str().unwrap(), None, None, expected))
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn unshredded_variant_table() -> Result<(), Box<dyn std::error::Error>> {
     let expected = include!("data/unshredded-variant.expected.in");
     let test_name = "unshredded-variant";

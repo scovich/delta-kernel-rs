@@ -27,7 +27,7 @@ use crate::scan::test_utils::{
 };
 use crate::utils::test_utils::{assert_batch_matches, assert_result_error_with_message, Action};
 use crate::{
-    async_fn, await_, DeltaResult, Engine as _, EngineData, Expression, FileMeta,
+    async_fn, async_test, await_, DeltaResult, Engine as _, EngineData, Expression, FileMeta,
     PredicateRef, RowVisitor, Snapshot, StorageHandler,
 };
 use test_utils::{compacted_log_path_for_versions, delta_path_for_version};
@@ -44,9 +44,7 @@ use super::*;
 //              type    nulls  min / max
 // txn.appId    BINARY  0      "3ae45b72-24e1-865a-a211-3..." / "3ae45b72-24e1-865a-a211-3..."
 // txn.version  INT64   0      "4390" / "4390"
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_replay_for_metadata() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
     let url = url::Url::from_directory_path(path.unwrap()).unwrap();
@@ -935,9 +933,7 @@ fn test_sidecar_to_filemeta_valid_paths() -> DeltaResult<()> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
     let (_, log_root) = new_in_memory_store();
     let engine = Arc::new(SyncEngine::new());
@@ -958,9 +954,7 @@ fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
@@ -999,9 +993,7 @@ fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
@@ -1027,9 +1019,7 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
@@ -1067,9 +1057,7 @@ fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_create_checkpoint_stream_errors_when_schema_has_remove_but_no_sidecar_action(
 ) -> DeltaResult<()> {
     let engine = SyncEngine::new();
@@ -1101,9 +1089,7 @@ fn test_create_checkpoint_stream_errors_when_schema_has_remove_but_no_sidecar_ac
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_create_checkpoint_stream_errors_when_schema_has_add_but_no_sidecar_action(
 ) -> DeltaResult<()> {
     let engine = SyncEngine::new();
@@ -1131,9 +1117,7 @@ fn test_create_checkpoint_stream_errors_when_schema_has_add_but_no_sidecar_actio
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_no_file_actions(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
@@ -1181,9 +1165,7 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_multi_part(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
@@ -1252,9 +1234,7 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars() -> DeltaResult<()>
 {
     let (store, log_root) = new_in_memory_store();
@@ -1299,9 +1279,7 @@ fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
@@ -1359,9 +1337,7 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
 // - As sidecar references are present, the corresponding sidecar files are processed correctly.
 // - Batches from both the checkpoint file and sidecar files are returned.
 // - Each returned batch is correctly flagged with is_log_batch set to false
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batches(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();

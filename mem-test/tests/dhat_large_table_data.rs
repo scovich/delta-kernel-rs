@@ -14,7 +14,7 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::parquet::arrow::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
-use delta_kernel::{async_fn, await_, AsyncIterator, Snapshot};
+use delta_kernel::{async_fn, async_test, await_, AsyncIterator, Snapshot};
 
 use arrow::compute::filter_record_batch;
 use object_store::local::LocalFileSystem;
@@ -102,9 +102,7 @@ fn create_commit(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[ignore = "mem-test - run manually"]
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_dhat_large_table_data() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
     let table_path = dir.path();

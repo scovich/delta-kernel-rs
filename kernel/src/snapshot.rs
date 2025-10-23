@@ -446,7 +446,7 @@ mod tests {
     use crate::engine::default::DefaultEngine;
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
-    use crate::{async_fn, await_};
+    use crate::{async_fn, async_test, await_};
     use crate::listed_log_files::ListedLogFiles;
     use crate::log_segment::LogSegment;
     use crate::parquet::arrow::ArrowWriter;
@@ -537,9 +537,7 @@ mod tests {
         format!("{}\n{}", protocol, metadata)
     }
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn test_snapshot_read_metadata() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
@@ -560,9 +558,7 @@ mod tests {
         assert_eq!(snapshot.schema(), expected);
     }
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn test_new_snapshot() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
@@ -931,9 +927,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn test_read_table_with_missing_last_checkpoint() {
         // this table doesn't have a _last_checkpoint file
         let path = std::fs::canonicalize(PathBuf::from(
@@ -953,9 +947,7 @@ mod tests {
         r#"{"size":8,"sizeInBytes":21857,"version":1}"#.as_bytes().to_vec()
     }
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn test_read_table_with_empty_last_checkpoint() {
         // in memory file system
         let store = Arc::new(InMemory::new());
@@ -980,9 +972,7 @@ mod tests {
         assert!(invalid.is_none())
     }
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn test_read_table_with_last_checkpoint() {
         // in memory file system
         let store = Arc::new(InMemory::new());
@@ -1025,9 +1015,7 @@ mod tests {
         assert!(invalid.is_none());
     }
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test_log::test)]
-    #[cfg_attr(feature = "async", test_log::test(tokio::test))]
+    #[async_test(test_log::test)]
     fn test_read_table_with_checkpoint() {
         let path = std::fs::canonicalize(PathBuf::from(
             "./tests/data/with_checkpoint_no_last_checkpoint/",
@@ -1160,9 +1148,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn test_log_compaction_writer() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();

@@ -84,6 +84,9 @@ mod async_mode;
 #[cfg(feature = "async")]
 pub use async_mode::*;
 
+// Test helper macro - available for any code that needs mode-agnostic tests
+pub use delta_kernel_derive::async_test;
+
 use std::any::Any;
 use std::fs::DirEntry;
 use std::sync::Arc;

@@ -116,7 +116,7 @@ impl SnapshotBuilder {
 mod tests {
     use std::sync::Arc;
 
-    use crate::{async_fn, await_};
+    use crate::{async_fn, async_test, await_};
     use crate::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
 
     use itertools::Itertools;
@@ -206,9 +206,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn test_snapshot_builder() -> Result<(), Box<dyn std::error::Error>> {
         let (engine, store, table_root) = setup_test();
         let engine = engine.as_ref();

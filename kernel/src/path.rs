@@ -352,7 +352,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::await_;
+    use crate::{async_test, await_};
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DefaultEngine;
     use crate::engine::sync::SyncEngine;
@@ -918,9 +918,7 @@ mod tests {
         assert_result_error_with_message(result, "In-Commit Timestamp not found");
     }
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn test_read_in_commit_timestamp_not_commit_file() {
         let engine = SyncEngine::new();
         let table_url = url::Url::try_from("file:///tmp/test_table").unwrap();

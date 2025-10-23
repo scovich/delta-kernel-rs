@@ -577,7 +577,7 @@ mod tests {
     use crate::arrow::array::StringArray;
     use crate::into_async_iter;
     use crate::utils::test_utils::{action_batch, parse_json_batch};
-    use crate::{async_fn, await_, AsyncIterator, Error};
+    use crate::{async_fn, async_test, await_, AsyncIterator, Error};
 
     /// Helper function to create test batches from JSON strings
     fn create_batch(json_strings: Vec<&str>) -> DeltaResult<ActionsBatch> {
@@ -832,9 +832,7 @@ mod tests {
 
     /// This test ensures that the processor correctly deduplicates and filters
     /// non-file actions (metadata, protocol, txn) across multiple batches.
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn test_action_reconciliation_actions_iter_non_file_actions() -> DeltaResult<()> {
         // Batch 1: protocol, metadata, and txn actions
         let batch1 = vec![
@@ -878,9 +876,7 @@ mod tests {
 
     /// This test ensures that the processor correctly deduplicates and filters
     /// file actions (add, remove) across multiple batches.
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn test_action_reconciliation_actions_iter_file_actions() -> DeltaResult<()> {
         // Batch 1: add action (file1) - new, should be included
         let batch1 = vec![
@@ -919,9 +915,7 @@ mod tests {
 
     /// This test ensures that the processor correctly deduplicates and filters
     /// file actions (add, remove) with deletion vectors across multiple batches.
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn test_action_reconciliation_actions_iter_file_actions_with_deletion_vectors(
     ) -> DeltaResult<()> {
         // Batch 1: add actions with deletion vectors
@@ -997,9 +991,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn test_action_reconciliation_actions_iter_with_txn_retention() -> DeltaResult<()> {
         // Test that transaction retention works across multiple batches
         let batch1 = vec![

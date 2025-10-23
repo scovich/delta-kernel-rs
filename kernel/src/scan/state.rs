@@ -231,7 +231,7 @@ mod tests {
 
     use crate::actions::get_log_schema;
     use crate::scan::test_utils::{add_batch_simple, run_with_validate_callback};
-    use crate::{async_fn, await_, ExpressionRef};
+    use crate::{async_fn, async_test, await_, ExpressionRef};
 
     use super::{DvInfo, Stats};
 
@@ -265,9 +265,7 @@ mod tests {
         assert_eq!(context.id, 2);
     }
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn test_simple_visit_scan_metadata() {
         let context = TestContext { id: 2 };
         await_!(run_with_validate_callback(

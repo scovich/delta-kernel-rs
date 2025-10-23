@@ -1,7 +1,7 @@
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::engine::default::DefaultEngine;
 
-use delta_kernel::{async_fn, await_, DeltaResult, Snapshot};
+use delta_kernel::{async_fn, async_test, await_, DeltaResult, Snapshot};
 
 mod common;
 
@@ -164,9 +164,7 @@ fn get_without_sidecars_table() -> Vec<String> {
 /// - `V2 Checkpoint compat file equivalency to normal V2 Checkpoint` -> `v2_classic_checkpoint_parquet`
 /// - `last checkpoint contains correct schema for v1/v2 Checkpoints` -> `v2_checkpoints_json_with_last_checkpoint`
 /// - `last checkpoint contains correct schema for v1/v2 Checkpoints` -> `v2_checkpoints_parquet_with_last_checkpoint`
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn v2_checkpoints_json_with_sidecars() -> DeltaResult<()> {
     await_!(test_v2_checkpoint_with_table(
         "v2-checkpoints-json-with-sidecars",
@@ -174,9 +172,7 @@ fn v2_checkpoints_json_with_sidecars() -> DeltaResult<()> {
     ))
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn v2_checkpoints_parquet_with_sidecars() -> DeltaResult<()> {
     await_!(test_v2_checkpoint_with_table(
         "v2-checkpoints-parquet-with-sidecars",
@@ -184,9 +180,7 @@ fn v2_checkpoints_parquet_with_sidecars() -> DeltaResult<()> {
     ))
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn v2_checkpoints_json_without_sidecars() -> DeltaResult<()> {
     await_!(test_v2_checkpoint_with_table(
         "v2-checkpoints-json-without-sidecars",
@@ -194,9 +188,7 @@ fn v2_checkpoints_json_without_sidecars() -> DeltaResult<()> {
     ))
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn v2_checkpoints_parquet_without_sidecars() -> DeltaResult<()> {
     await_!(test_v2_checkpoint_with_table(
         "v2-checkpoints-parquet-without-sidecars",
@@ -204,16 +196,12 @@ fn v2_checkpoints_parquet_without_sidecars() -> DeltaResult<()> {
     ))
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn v2_classic_checkpoint_json() -> DeltaResult<()> {
     await_!(test_v2_checkpoint_with_table("v2-classic-checkpoint-json", get_classic_checkpoint_table()))
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn v2_classic_checkpoint_parquet() -> DeltaResult<()> {
     await_!(test_v2_checkpoint_with_table(
         "v2-classic-checkpoint-parquet",
@@ -221,9 +209,7 @@ fn v2_classic_checkpoint_parquet() -> DeltaResult<()> {
     ))
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn v2_checkpoints_json_with_last_checkpoint() -> DeltaResult<()> {
     await_!(test_v2_checkpoint_with_table(
         "v2-checkpoints-json-with-last-checkpoint",
@@ -231,9 +217,7 @@ fn v2_checkpoints_json_with_last_checkpoint() -> DeltaResult<()> {
     ))
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn v2_checkpoints_parquet_with_last_checkpoint() -> DeltaResult<()> {
     await_!(test_v2_checkpoint_with_table(
         "v2-checkpoints-parquet-with-last-checkpoint",

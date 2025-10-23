@@ -8,7 +8,7 @@ use itertools::Itertools;
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::table_changes::TableChanges;
-use delta_kernel::{async_fn, await_, AsyncIterator, DeltaResult, Error, PredicateRef, Version};
+use delta_kernel::{async_fn, async_test, await_, AsyncIterator, DeltaResult, Error, PredicateRef, Version};
 
 mod common;
 
@@ -68,9 +68,7 @@ fn read_cdf_for_table(
     Ok(batches)
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn cdf_with_deletion_vector() -> Result<(), Box<dyn error::Error>> {
     let batches = await_!(read_cdf_for_table("cdf-table-with-dv", 0, None, None))?;
     // Each commit performs the following:
@@ -116,9 +114,7 @@ fn cdf_with_deletion_vector() -> Result<(), Box<dyn error::Error>> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn basic_cdf() -> Result<(), Box<dyn error::Error>> {
     let batches = await_!(read_cdf_for_table("cdf-table", 0, None, None))?;
     let mut expected = vec![
@@ -155,9 +151,7 @@ fn basic_cdf() -> Result<(), Box<dyn error::Error>> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn cdf_non_partitioned() -> Result<(), Box<dyn error::Error>> {
     let batches = await_!(read_cdf_for_table("cdf-table-non-partitioned", 0, None, None))?;
     let mut expected = vec![
@@ -196,9 +190,7 @@ fn cdf_non_partitioned() -> Result<(), Box<dyn error::Error>> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn cdf_with_cdc_and_dvs() -> Result<(), Box<dyn error::Error>> {
     let batches = await_!(read_cdf_for_table("cdf-table-with-cdc-and-dvs", 0, None, None))?;
     let mut expected = vec![
@@ -255,9 +247,7 @@ fn cdf_with_cdc_and_dvs() -> Result<(), Box<dyn error::Error>> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn simple_cdf_version_ranges() -> DeltaResult<()> {
     let batches = await_!(read_cdf_for_table("cdf-table-simple", 0, 0, None))?;
     let mut expected = vec![
@@ -351,9 +341,7 @@ fn simple_cdf_version_ranges() -> DeltaResult<()> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn update_operations() -> DeltaResult<()> {
     let batches = await_!(read_cdf_for_table("cdf-table-update-ops", 0, 2, None))?;
     // Note: `update_pre` and `update_post` are technically not part of the delta spec, and instead
@@ -390,9 +378,7 @@ fn update_operations() -> DeltaResult<()> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn false_data_change_is_ignored() -> DeltaResult<()> {
     let batches = await_!(read_cdf_for_table("cdf-table-data-change", 0, 1, None))?;
     let mut expected = vec![
@@ -416,9 +402,7 @@ fn false_data_change_is_ignored() -> DeltaResult<()> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn invalid_range_end_before_start() {
     let res = await_!(read_cdf_for_table("cdf-table-simple", 1, 0, None));
     let expected_msg =
@@ -426,18 +410,14 @@ fn invalid_range_end_before_start() {
     assert!(matches!(res, Err(Error::Generic(msg)) if msg == expected_msg));
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn invalid_range_start_after_last_version_of_table() {
     let res = await_!(read_cdf_for_table("cdf-table-simple", 3, 4, None));
     let expected_msg = "Expected the first commit to have version 3";
     assert!(matches!(res, Err(Error::Generic(msg)) if msg == expected_msg));
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn partition_table() -> DeltaResult<()> {
     let batches = await_!(read_cdf_for_table("cdf-table-partitioned", 0, 2, None))?;
     let mut expected = vec![
@@ -463,9 +443,7 @@ fn partition_table() -> DeltaResult<()> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn backtick_column_names() -> DeltaResult<()> {
     let batches = await_!(read_cdf_for_table("cdf-table-backtick-column-names", 0, None, None))?;
     let mut expected = vec![
@@ -484,9 +462,7 @@ fn backtick_column_names() -> DeltaResult<()> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn unconditional_delete() -> DeltaResult<()> {
     let batches = await_!(read_cdf_for_table("cdf-table-delete-unconditional", 0, None, None))?;
     let mut expected = vec![
@@ -520,9 +496,7 @@ fn unconditional_delete() -> DeltaResult<()> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn conditional_delete_all_rows() -> DeltaResult<()> {
     let batches = await_!(read_cdf_for_table("cdf-table-delete-conditional-all-rows", 0, None, None))?;
     let mut expected = vec![
@@ -556,9 +530,7 @@ fn conditional_delete_all_rows() -> DeltaResult<()> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn conditional_delete_two_rows() -> DeltaResult<()> {
     let batches = await_!(read_cdf_for_table("cdf-table-delete-conditional-two-rows", 0, None, None))?;
     let mut expected = vec![

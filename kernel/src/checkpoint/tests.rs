@@ -12,7 +12,7 @@ use crate::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEn
 use crate::log_replay::HasSelectionVector;
 use crate::schema::{DataType as KernelDataType, StructField, StructType};
 use crate::utils::test_utils::Action;
-use crate::{async_fn, await_, AsyncIterator, DeltaResult, FileMeta, LogPath, Snapshot};
+use crate::{async_fn, async_test, await_, AsyncIterator, DeltaResult, FileMeta, LogPath, Snapshot};
 
 use arrow_56::{
     array::{create_array, RecordBatch},
@@ -24,9 +24,7 @@ use serde_json::{from_slice, json, Value};
 use test_utils::delta_path_for_version;
 use url::Url;
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_deleted_file_retention_timestamp() -> DeltaResult<()> {
     const MILLIS_PER_SECOND: i64 = 1_000;
 
@@ -59,9 +57,7 @@ fn test_deleted_file_retention_timestamp() -> DeltaResult<()> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
@@ -113,9 +109,7 @@ fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_create_last_checkpoint_data() -> DeltaResult<()> {
     let version = 10;
     let total_actions_counter = 100;
@@ -280,9 +274,7 @@ fn read_last_checkpoint_file(store: &Arc<InMemory>) -> DeltaResult<Value> {
 /// Tests the `checkpoint()` API with:
 /// - A table that does not support v2Checkpoint
 /// - No version specified (latest version is used)
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
@@ -352,9 +344,7 @@ fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
 /// Tests the `checkpoint()` API with:
 /// - A table that does not support v2Checkpoint
 /// - A specific version specified (version 0)
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
@@ -416,9 +406,7 @@ fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
@@ -460,9 +448,7 @@ fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> DeltaR
 /// Tests the `checkpoint()` API with:
 /// - A table that does supports v2Checkpoint
 /// - No version specified (latest version is used)
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
@@ -534,9 +520,7 @@ fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     Ok(())
 }
 
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_no_checkpoint_staged_commits() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));

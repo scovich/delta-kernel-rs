@@ -1021,7 +1021,7 @@ mod tests {
     use crate::expressions::{column_expr, column_pred, Expression as Expr, Predicate as Pred, Scalar};
     use crate::schema::{ColumnMetadataKey, PrimitiveType};
     use crate::transforms::FieldTransformSpec;
-    use crate::{Snapshot};
+    use crate::{async_test, Snapshot};
 
     use super::*;
 
@@ -1227,9 +1227,7 @@ mod tests {
         Ok(files)
     }
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn test_scan_metadata_paths() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
@@ -1246,9 +1244,7 @@ mod tests {
         );
     }
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test_log::test)]
-    #[cfg_attr(feature = "async", test_log::test(tokio::test))]
+    #[async_test(test_log::test)]
     fn test_scan_metadata() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
@@ -1265,9 +1261,7 @@ mod tests {
         assert_eq!(num_rows, 10)
     }
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test_log::test)]
-    #[cfg_attr(feature = "async", test_log::test(tokio::test))]
+    #[async_test(test_log::test)]
     fn test_scan_metadata_from_same_version() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
@@ -1299,9 +1293,7 @@ mod tests {
 
     // reading v0 with 3 files.
     // updating to v1 with 3 more files added.
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test_log::test)]
-    #[cfg_attr(feature = "async", test_log::test(tokio::test))]
+    #[async_test(test_log::test)]
     fn test_scan_metadata_from_with_update() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
@@ -1395,9 +1387,7 @@ mod tests {
         }
     }
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn test_replay_for_scan_metadata() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
@@ -1414,9 +1404,7 @@ mod tests {
         assert_eq!(data.len(), 5);
     }
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn test_data_row_group_skipping() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
@@ -1462,9 +1450,7 @@ mod tests {
         assert_eq!(data.len(), 1);
     }
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn test_missing_column_row_group_skipping() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
@@ -1497,9 +1483,7 @@ mod tests {
             .expect_err("unknown column");
     }
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test_log::test)]
-    #[cfg_attr(feature = "async", test_log::test(tokio::test))]
+    #[async_test(test_log::test)]
     fn test_scan_with_checkpoint() -> DeltaResult<()> {
         let path = std::fs::canonicalize(PathBuf::from(
             "./tests/data/with_checkpoint_no_last_checkpoint/",

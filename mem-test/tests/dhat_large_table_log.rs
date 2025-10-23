@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::{async_fn, await_, AsyncIterator, Snapshot};
+use delta_kernel::{async_fn, async_test, await_, AsyncIterator, Snapshot};
 use object_store::local::LocalFileSystem;
 use serde_json::json;
 use tempfile::tempdir;
@@ -97,9 +97,7 @@ fn generate_delta_log(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[ignore = "mem-test - run manually"]
-#[async_fn]
-#[cfg_attr(not(feature = "async"), test)]
-#[cfg_attr(feature = "async", tokio::test)]
+#[async_test]
 fn test_dhat_large_table_log() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
     let table_path = dir.path();

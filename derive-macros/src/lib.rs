@@ -436,3 +436,78 @@ pub fn async_trait(
     // Sync mode: no-op, return item unchanged
     item
 }
+
+/// Mode-agnostic test macro that works in both sync and async modes.
+///
+/// This macro combines `#[async_fn]` with conditional test attributes to create
+/// tests that run correctly in both sync mode (regular `#[test]`) and async mode
+/// (using `#[tokio::test]`).
+///
+/// # Basic Usage
+///
+/// ```ignore
+/// #[async_test]
+/// fn my_test() {
+///     let result = await_!(async_operation())?;
+///     assert_eq!(result, expected);
+/// }
+/// ```
+///
+/// # With Test Wrapper
+///
+/// For tests that need a wrapper (like `test_log::test` for logging), provide the
+/// wrapper's name as an optional argument.
+///
+/// # Expansion
+///
+/// Without arguments:
+/// ```ignore
+/// #[async_test]
+/// fn my_test() { ... }
+/// ```
+/// Expands to:
+/// ```ignore
+/// #[async_fn]
+/// #[cfg_attr(not(feature = "async"), test)]
+/// #[cfg_attr(feature = "async", ::tokio::test)]
+/// fn my_test() { ... }
+/// ```
+///
+/// With wrapper argument:
+/// ```ignore
+/// #[async_test(test_log::test)]
+/// fn my_test() { ... }
+/// ```
+/// Expands to:
+/// ```ignore
+/// #[async_fn]
+/// #[cfg_attr(not(feature = "async"), test_log::test)]
+/// #[cfg_attr(feature = "async", test_log::test(::tokio::test))]
+/// fn my_test() { ... }
+/// ```
+#[proc_macro_attribute]
+pub fn async_test(
+    attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    let item: proc_macro2::TokenStream = item.into();
+    
+    // Determine the test attributes based on whether a wrapper is provided
+    let (sync_test, async_test) = if attr.is_empty() {
+        // No wrapper - use built-in test
+        (quote! { test }, quote! { ::tokio::test })
+    } else {
+        // Has wrapper - user provides the full path (e.g., test_log::test)
+        let wrapper: proc_macro2::TokenStream = attr.into();
+        (quote! { #wrapper }, quote! { #wrapper(::tokio::test) })
+    };
+    
+    let output = quote! {
+        #[async_fn]
+        #[cfg_attr(not(feature = "async"), #sync_test)]
+        #[cfg_attr(feature = "async", #async_test)]
+        #item
+    };
+    
+    output.into()
+}

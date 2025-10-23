@@ -301,16 +301,14 @@ fn ensure_cdf_read_supported(protocol: &Protocol) -> DeltaResult<()> {
 mod tests {
     use super::*;
 
-    use crate::{async_fn, await_};
+    use crate::{async_fn, async_test, await_};
     use crate::engine::sync::SyncEngine;
     use crate::schema::{DataType, StructField};
     use crate::table_changes::CDF_FIELDS;
     use crate::Error;
     use itertools::assert_equal;
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn table_changes_checks_enable_cdf_flag() {
         // Table with CDF enabled, then disabled at version 2 and enabled at version 3
         let path = "./tests/data/table-with-cdf";
@@ -341,9 +339,7 @@ mod tests {
             assert!(matches!(res, Err(Error::ChangeDataFeedUnsupported(_))))
         }
     }
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn schema_evolution_fails() {
         let path = "./tests/data/table-with-cdf";
         let engine = Box::new(SyncEngine::new());
@@ -355,9 +351,7 @@ mod tests {
         assert!(matches!(table_changes_res, Err(Error::Generic(msg)) if msg == expected_msg));
     }
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn table_changes_has_cdf_schema() {
         let path = "./tests/data/table-with-cdf";
         let engine = Box::new(SyncEngine::new());

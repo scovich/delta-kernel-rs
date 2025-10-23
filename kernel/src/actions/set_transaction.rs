@@ -116,7 +116,7 @@ mod tests {
     use crate::Snapshot;
 
     use crate::arrow::array::StringArray;
-    use crate::{async_fn, await_, AsyncIterator};
+    use crate::{async_fn, async_test, await_, AsyncIterator};
 
     #[async_fn]
     fn get_latest_transactions(
@@ -136,9 +136,7 @@ mod tests {
         )
     }
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn test_txn() {
         let (txns, txn) = await_!(get_latest_transactions("./tests/data/basic_partitioned/", "test"));
         assert!(txn.is_none());
@@ -173,9 +171,7 @@ mod tests {
         );
     }
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn test_replay_for_app_ids() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
@@ -193,9 +189,7 @@ mod tests {
         assert_eq!(data.len(), 2);
     }
 
-    #[async_fn]
-    #[cfg_attr(not(feature = "async"), test)]
-    #[cfg_attr(feature = "async", tokio::test)]
+    #[async_test]
     fn test_txn_retention_filtering() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-with-last-updated/"));
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
