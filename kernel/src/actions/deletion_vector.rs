@@ -12,7 +12,7 @@ use url::Url;
 
 use crate::schema::DataType;
 use crate::utils::require;
-use crate::{DeltaResult, Error, StorageHandler};
+use crate::{async_fn, await_, AsyncIterator, DeltaResult, Error, StorageHandler};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -150,11 +150,13 @@ impl DeletionVectorDescriptor {
     //  little, while the version, size, and checksum are big
     //  - dvs can potentially indicate the size in the delta log, and _also_ in the file. If both
     //  are present, we assert they are the same
+    #[async_fn]
     pub fn read(
         &self,
         storage: Arc<dyn StorageHandler>,
         parent: &Url,
     ) -> DeltaResult<RoaringTreemap> {
+        // TODO: Refactor both these match as let-else to remove 2+ layers of nesting
         match self.absolute_path(parent)? {
             None => {
                 let byte_slice = z85::decode(&self.path_or_inline_dv)
@@ -173,9 +175,8 @@ impl DeletionVectorDescriptor {
                 let offset = self.offset;
                 let size_in_bytes = self.size_in_bytes;
 
-                let dv_data = storage
-                    .read_files(vec![(path, None)])?
-                    .next()
+                let mut iter = await_!(storage.read_files(vec![(path, None)]))?;
+                let dv_data = await_!(iter.async_next())
                     .ok_or(Error::missing_data("No deletion vector data"))??;
 
                 let mut cursor = Cursor::new(dv_data);
@@ -224,12 +225,13 @@ impl DeletionVectorDescriptor {
 
     /// Materialize the row indexes of the deletion vector as a `Vec<u64>` in which each element
     /// represents a row index that is deleted from the table.
+    #[async_fn]
     pub fn row_indexes(
         &self,
         storage: Arc<dyn StorageHandler>,
         parent: &Url,
     ) -> DeltaResult<Vec<u64>> {
-        Ok(self.read(storage, parent)?.into_iter().collect())
+        Ok(await_!(self.read(storage, parent))?.into_iter().collect())
     }
 }
 
@@ -336,7 +338,7 @@ mod tests {
 
     use roaring::RoaringTreemap;
 
-    use crate::{engine::sync::SyncEngine, Engine};
+    use crate::{async_test, engine::sync::SyncEngine, Engine};
 
     use super::DeletionVectorDescriptor;
     use super::*;
@@ -412,13 +414,13 @@ mod tests {
         assert_eq!(dv_url, example.absolute_path(&parent).unwrap().unwrap());
     }
 
-    #[test]
+    #[async_test]
     fn test_inline_read() {
         let inline = dv_inline();
         let sync_engine = SyncEngine::new();
         let storage = sync_engine.storage_handler();
         let parent = Url::parse("http://not.used").unwrap();
-        let tree_map = inline.read(storage, &parent).unwrap();
+        let tree_map = await_!(inline.read(storage, &parent)).unwrap();
         assert_eq!(tree_map.len(), 6);
         for i in [3, 4, 7, 11, 18, 29] {
             assert!(tree_map.contains(i));
@@ -428,7 +430,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[async_test]
     fn test_deletion_vector_read() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
@@ -437,7 +439,7 @@ mod tests {
         let storage = sync_engine.storage_handler();
 
         let example = dv_example();
-        let tree_map = example.read(storage, &parent).unwrap();
+        let tree_map = await_!(example.read(storage, &parent)).unwrap();
 
         let expected: Vec<u64> = vec![0, 9];
         let found = tree_map.iter().collect::<Vec<_>>();
@@ -490,13 +492,13 @@ mod tests {
         assert_eq!(bools, expected);
     }
 
-    #[test]
+    #[async_test]
     fn test_dv_row_indexes() {
         let example = dv_inline();
         let sync_engine = SyncEngine::new();
         let storage = sync_engine.storage_handler();
         let parent = Url::parse("http://not.used").unwrap();
-        let row_idx = example.row_indexes(storage, &parent).unwrap();
+        let row_idx = await_!(example.row_indexes(storage, &parent)).unwrap();
 
         assert_eq!(row_idx.len(), 6);
         assert_eq!(&row_idx, &[3, 4, 7, 11, 18, 29]);

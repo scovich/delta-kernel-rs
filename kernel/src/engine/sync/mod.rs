@@ -103,12 +103,13 @@ where
 mod tests {
     use super::*;
     use crate::engine::tests::test_arrow_engine;
+    use crate::{async_test, await_};
 
-    #[test]
+    #[async_test]
     fn test_sync_engine() {
         let tmp = tempfile::tempdir().unwrap();
         let url = url::Url::from_directory_path(tmp.path()).unwrap();
         let engine = SyncEngine::new();
-        test_arrow_engine(&engine, &url);
+        await_!(test_arrow_engine(&engine, &url));
     }
 }

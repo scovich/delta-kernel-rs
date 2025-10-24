@@ -536,20 +536,25 @@ pub(crate) trait IntoEngineData {
 /// Delta Kernel uses this handler whenever it needs to access the underlying
 /// file system where the Delta table is present. Connector implementation of
 /// this trait can hide filesystem specific details from Delta Kernel.
+#[async_trait]
 pub trait StorageHandler: AsAny {
     /// List the paths in the same directory that are lexicographically greater than
     /// (UTF-8 sorting) the given `path`. The result should also be sorted by the file name.
     ///
     /// If the path is directory-like (ends with '/'), the result should contain
     /// all the files in the directory.
-    fn list_from(&self, path: &Url)
-        -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>>;
+    #[async_trait_fn]
+    async fn list_from(
+        &self,
+        path: &Url,
+    ) -> DeltaResult<BoxedAsyncIterator<DeltaResult<FileMeta>>>;
 
     /// Read data specified by the start and end offset from the file.
-    fn read_files(
+    #[async_trait_fn]
+    async fn read_files(
         &self,
         files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>>;
+    ) -> DeltaResult<BoxedAsyncIterator<DeltaResult<Bytes>>>;
 }
 
 /// Provides JSON handling functionality to Delta Kernel.

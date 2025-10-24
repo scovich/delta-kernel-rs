@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::{async_fn, async_test, await_, AsyncIterator, Snapshot};
+use delta_kernel::{async_test, await_, AsyncIterator, Snapshot};
 use object_store::local::LocalFileSystem;
 use serde_json::json;
 use tempfile::tempdir;

@@ -2,17 +2,19 @@ use bytes::Bytes;
 use itertools::Itertools;
 use url::Url;
 
-use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
+use crate::{async_trait, async_trait_fn, into_async_iter, AsyncIterator as _, BoxedAsyncIterator, DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
 pub(crate) struct SyncStorageHandler;
 
+#[async_trait]
 impl StorageHandler for SyncStorageHandler {
     /// List the paths in the same directory that are lexicographically greater or equal to
     /// (UTF-8 sorting) the given `path`. The result is sorted by the file name.
-    fn list_from(
+    #[async_trait_fn]
+    async fn list_from(
         &self,
         url_path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    ) -> DeltaResult<BoxedAsyncIterator<DeltaResult<FileMeta>>> {
         if url_path.scheme() == "file" {
             let path = url_path
                 .to_file_path()
@@ -46,17 +48,18 @@ impl StorageHandler for SyncStorageHandler {
                 .into_iter()
                 .sorted_by_key(|ent| ent.path())
                 .map(TryFrom::try_from);
-            Ok(Box::new(it))
+            Ok(into_async_iter(it).into_boxed())
         } else {
             Err(Error::generic("Can only read local filesystem"))
         }
     }
 
     /// Read data specified by the start and end offset from the file.
-    fn read_files(
+    #[async_trait_fn]
+    async fn read_files(
         &self,
         files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+    ) -> DeltaResult<BoxedAsyncIterator<DeltaResult<Bytes>>> {
         let iter = files.into_iter().map(|(url, _range_opt)| {
             if url.scheme() == "file" {
                 if let Ok(file_path) = url.to_file_path() {
@@ -68,7 +71,7 @@ impl StorageHandler for SyncStorageHandler {
             }
             Err(Error::generic("Can only read local filesystem"))
         });
-        Ok(Box::new(iter))
+        Ok(into_async_iter(iter).into_boxed())
     }
 }
 
@@ -79,19 +82,19 @@ mod tests {
     use std::time::Duration;
 
     use bytes::{BufMut, BytesMut};
-    use itertools::Itertools;
     use url::Url;
 
     use super::SyncStorageHandler;
-    use crate::utils::current_time_duration;
-    use crate::StorageHandler;
+    use crate::AsyncIterator as _;
+use crate::utils::current_time_duration;
+use crate::{async_test, await_, StorageHandler};
 
     /// generate json filenames that follow the spec (numbered padded to 20 chars)
     fn get_json_filename(index: usize) -> String {
         format!("{index:020}.json")
     }
 
-    #[test]
+    #[async_test]
     fn test_file_meta_is_correct() -> Result<(), Box<dyn std::error::Error>> {
         let storage = SyncStorageHandler;
         let tmp_dir = tempfile::tempdir().unwrap();
@@ -105,7 +108,8 @@ mod tests {
 
         let url_path = tmp_dir.path().join(get_json_filename(0));
         let url = Url::from_file_path(url_path).unwrap();
-        let files: Vec<_> = storage.list_from(&url)?.try_collect()?;
+        let iter = await_!(storage.list_from(&url))?.async_pin();
+        let files: Vec<_> = await_!(iter.async_try_collect())?;
 
         assert!(!files.is_empty());
         for meta in files.iter() {
@@ -115,7 +119,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[async_test]
     fn test_list_from() -> Result<(), Box<dyn std::error::Error>> {
         let storage = SyncStorageHandler;
         let tmp_dir = tempfile::tempdir().unwrap();
@@ -128,9 +132,9 @@ mod tests {
         }
         let url_path = tmp_dir.path().join(get_json_filename(1));
         let url = Url::from_file_path(url_path).unwrap();
-        let list = storage.list_from(&url)?;
+        let mut list = await_!(storage.list_from(&url))?.async_enumerate().async_pin();
         let mut file_count = 0;
-        for (i, file) in list.enumerate() {
+        while let Some((i, file)) = await_!(list.async_next()) {
             // i+1 in index because we started at 0001 in the listing
             assert_eq!(
                 file?.location.to_file_path().unwrap().to_str().unwrap(),
@@ -142,19 +146,19 @@ mod tests {
 
         let url_path = tmp_dir.path().join("");
         let url = Url::from_file_path(url_path).unwrap();
-        let list = storage.list_from(&url)?;
-        file_count = list.count();
+        let list = await_!(storage.list_from(&url))?;
+        file_count = await_!(list.async_count());
         assert_eq!(file_count, 3);
 
         let url_path = tmp_dir.path().join(format!("{:020}", 1));
         let url = Url::from_file_path(url_path).unwrap();
-        let list = storage.list_from(&url)?;
-        file_count = list.count();
+        let list = await_!(storage.list_from(&url))?;
+        file_count = await_!(list.async_count());
         assert_eq!(file_count, 2);
         Ok(())
     }
 
-    #[test]
+    #[async_test]
     fn test_read_files() -> Result<(), Box<dyn std::error::Error>> {
         let storage = SyncStorageHandler;
         let tmp_dir = tempfile::tempdir().unwrap();
@@ -163,12 +167,12 @@ mod tests {
         writeln!(f, "null")?;
         let url = Url::from_file_path(path).unwrap();
         let file_slice = (url.clone(), None);
-        let read = storage.read_files(vec![file_slice])?;
+        let mut read = await_!(storage.read_files(vec![file_slice]))?.async_pin();
         let mut file_count = 0;
         let mut buf = BytesMut::with_capacity(16);
         buf.put(&b"null\n"[..]);
         let a = buf.split();
-        for result in read {
+        while let Some(result) = await_!(read.async_next()) {
             let result = result?;
             assert_eq!(result, a);
             file_count += 1;

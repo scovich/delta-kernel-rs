@@ -142,12 +142,12 @@ impl TableChanges {
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
         let log_root = table_root.join("_delta_log/")?;
-        let log_segment = LogSegment::for_table_changes(
+        let log_segment = await_!(LogSegment::for_table_changes(
             engine.storage_handler().as_ref(),
             log_root,
             start_version,
             end_version,
-        )?;
+        ))?;
 
         // Both snapshots ensure that reading is supported at the start and end version using
         // `ensure_read_supported`. Note that we must still verify that reading is
@@ -301,7 +301,7 @@ fn ensure_cdf_read_supported(protocol: &Protocol) -> DeltaResult<()> {
 mod tests {
     use super::*;
 
-    use crate::{async_fn, async_test, await_};
+    use crate::{async_test, await_};
     use crate::engine::sync::SyncEngine;
     use crate::schema::{DataType, StructField};
     use crate::table_changes::CDF_FIELDS;

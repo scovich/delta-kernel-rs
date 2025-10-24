@@ -3,7 +3,7 @@ use url::Url;
 use super::scan_file::CdfScanFileType;
 use crate::actions::deletion_vector::{deletion_treemap_to_bools, selection_treemap_to_bools};
 use crate::table_changes::scan_file::CdfScanFile;
-use crate::{DeltaResult, Engine, Error};
+use crate::{async_fn, await_, DeltaResult, Engine, Error};
 
 /// A [`CdfScanFile`] with its associated `selection_vector`. The `scan_type` is resolved to
 /// match the `_change_type` that its rows will have in the change data feed.
@@ -32,17 +32,17 @@ pub(crate) struct ResolvedCdfScanFile {
 /// 2. The second case handles all other add, remove, and cdc [`CdfScanFile`]s. These will simply
 ///    read the deletion vector (if present), and each is converted into a [`ResolvedCdfScanFile`].
 ///    No changes are made to the `scan_type`.
+#[async_fn]
 pub(crate) fn resolve_scan_file_dv(
     engine: &dyn Engine,
     table_root: &Url,
     scan_file: CdfScanFile,
 ) -> DeltaResult<impl Iterator<Item = ResolvedCdfScanFile>> {
-    let add_dv = scan_file.dv_info.get_treemap(engine, table_root)?;
-    let rm_dv = scan_file
-        .remove_dv
-        .as_ref()
-        .map(|rm_dv| rm_dv.get_treemap(engine, table_root))
-        .transpose()?;
+    let add_dv = await_!(scan_file.dv_info.get_treemap(engine, table_root))?;
+    let rm_dv = match &scan_file.remove_dv {
+        Some(rm_dv) => Some(await_!(rm_dv.get_treemap(engine, table_root))?),
+        None => None,
+    };
     let (add_dv, rm_dv) = match (add_dv, rm_dv, &scan_file.scan_type) {
         (_, Some(_), CdfScanFileType::Remove) => {
             return Err(Error::generic(
@@ -159,13 +159,11 @@ mod tests {
     use itertools::Itertools;
     use roaring::RoaringTreemap;
 
-    use crate::{
-        actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType},
-        engine::sync::SyncEngine,
-        scan::state::DvInfo,
-        table_changes::scan_file::{CdfScanFile, CdfScanFileType},
-        Error,
-    };
+    use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
+    use crate::engine::sync::SyncEngine;
+    use crate::scan::state::DvInfo;
+    use crate::table_changes::scan_file::{CdfScanFile, CdfScanFileType};
+    use crate::{async_test, await_, Error};
 
     use super::resolve_scan_file_dv;
 
@@ -202,7 +200,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[async_test]
     fn add_with_dv() {
         let engine = SyncEngine::new();
         let path =
@@ -225,14 +223,14 @@ mod tests {
         let mut expected_sv = vec![false; 10];
         expected_sv[0] = true;
         expected_sv[9] = true;
-        let resolved = resolve_scan_file_dv(&engine, &table_root, scan_file)
+        let resolved = await_!(resolve_scan_file_dv(&engine, &table_root, scan_file))
             .unwrap()
             .map(|file| (file.scan_file.scan_type, file.selection_vector))
             .collect_vec();
         assert_eq!(resolved, vec![(CdfScanFileType::Remove, Some(expected_sv))]);
     }
 
-    #[test]
+    #[async_test]
     fn rm_with_dv() {
         let engine = SyncEngine::new();
         let path =
@@ -256,14 +254,14 @@ mod tests {
         let mut expected_sv = vec![false; 10];
         expected_sv[0] = true;
         expected_sv[9] = true;
-        let resolved = resolve_scan_file_dv(&engine, &table_root, scan_file)
+        let resolved = await_!(resolve_scan_file_dv(&engine, &table_root, scan_file))
             .unwrap()
             .map(|file| (file.scan_file.scan_type, file.selection_vector))
             .collect_vec();
         assert_eq!(resolved, vec![(CdfScanFileType::Add, Some(expected_sv))]);
     }
 
-    #[test]
+    #[async_test]
     fn restore_subset() {
         let engine = SyncEngine::new();
         let path =
@@ -280,13 +278,13 @@ mod tests {
         let mut expected_sv = vec![false; 5];
         expected_sv[1] = true;
         expected_sv[4] = true;
-        let resolved = resolve_scan_file_dv(&engine, &table_root, scan_file)
+        let resolved = await_!(resolve_scan_file_dv(&engine, &table_root, scan_file))
             .unwrap()
             .map(|file| (file.scan_file.scan_type, file.selection_vector))
             .collect_vec();
         assert_eq!(resolved, vec![(CdfScanFileType::Add, Some(expected_sv))]);
     }
-    #[test]
+    #[async_test]
     fn delete_subset() {
         let engine = SyncEngine::new();
         let path =
@@ -303,14 +301,14 @@ mod tests {
         let mut expected_sv = vec![false; 5];
         expected_sv[1] = true;
         expected_sv[4] = true;
-        let resolved = resolve_scan_file_dv(&engine, &table_root, scan_file)
+        let resolved = await_!(resolve_scan_file_dv(&engine, &table_root, scan_file))
             .unwrap()
             .map(|file| (file.scan_file.scan_type, file.selection_vector))
             .collect_vec();
         assert_eq!(resolved, vec![(CdfScanFileType::Remove, Some(expected_sv))]);
     }
 
-    #[test]
+    #[async_test]
     fn adds_and_removes() {
         let engine = SyncEngine::new();
         let path =
@@ -329,7 +327,7 @@ mod tests {
         let mut add_sv = vec![false; 3];
         add_sv[2] = true;
 
-        let resolved = resolve_scan_file_dv(&engine, &table_root, scan_file)
+        let resolved = await_!(resolve_scan_file_dv(&engine, &table_root, scan_file))
             .unwrap()
             .map(|file| (file.scan_file.scan_type, file.selection_vector))
             .collect_vec();
@@ -342,7 +340,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[async_test]
     fn cdc_and_remove_with_remove_dv_fails() {
         let engine = SyncEngine::new();
         let path =
@@ -357,7 +355,7 @@ mod tests {
         let expected_err =
             Error::generic("CdfScanFile with type cdc cannot have a remove deletion vector");
 
-        let res = resolve_scan_file_dv(&engine, &table_root, scan_file.clone())
+        let res = await_!(resolve_scan_file_dv(&engine, &table_root, scan_file.clone()))
             .err()
             .unwrap();
         assert_eq!(res.to_string(), expected_err.to_string());
@@ -365,13 +363,13 @@ mod tests {
         scan_file.scan_type = CdfScanFileType::Remove;
         let expected_err =
             Error::generic("CdfScanFile with type remove cannot have a remove deletion vector");
-        let res = resolve_scan_file_dv(&engine, &table_root, scan_file)
+        let res = await_!(resolve_scan_file_dv(&engine, &table_root, scan_file))
             .err()
             .unwrap();
         assert_eq!(res.to_string(), expected_err.to_string());
     }
 
-    #[test]
+    #[async_test]
     fn cdc_file_resolution() {
         let engine = SyncEngine::new();
         let path =
@@ -380,14 +378,14 @@ mod tests {
 
         let scan_file = get_scan_file(CdfScanFileType::Cdc, Default::default(), None);
 
-        let resolved = resolve_scan_file_dv(&engine, &table_root, scan_file.clone())
+        let resolved = await_!(resolve_scan_file_dv(&engine, &table_root, scan_file.clone()))
             .unwrap()
             .map(|file| (file.scan_file.scan_type, file.selection_vector))
             .collect_vec();
         assert_eq!(resolved, vec![(CdfScanFileType::Cdc, None)]);
     }
 
-    #[test]
+    #[async_test]
     fn remove_file_resolution() {
         let engine = SyncEngine::new();
         let path =
@@ -396,13 +394,13 @@ mod tests {
 
         let scan_file = get_scan_file(CdfScanFileType::Remove, Default::default(), None);
 
-        let resolved = resolve_scan_file_dv(&engine, &table_root, scan_file.clone())
+        let resolved = await_!(resolve_scan_file_dv(&engine, &table_root, scan_file.clone()))
             .unwrap()
             .map(|file| (file.scan_file.scan_type, file.selection_vector))
             .collect_vec();
         assert_eq!(resolved, vec![(CdfScanFileType::Remove, None)]);
     }
-    #[test]
+    #[async_test]
     fn add_file_no_dv_resolution() {
         let engine = SyncEngine::new();
         let path =
@@ -411,7 +409,7 @@ mod tests {
 
         let scan_file = get_scan_file(CdfScanFileType::Add, Default::default(), None);
 
-        let resolved = resolve_scan_file_dv(&engine, &table_root, scan_file.clone())
+        let resolved = await_!(resolve_scan_file_dv(&engine, &table_root, scan_file.clone()))
             .unwrap()
             .map(|file| (file.scan_file.scan_type, file.selection_vector))
             .collect_vec();

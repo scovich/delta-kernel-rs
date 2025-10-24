@@ -92,12 +92,12 @@ impl LogCompactionWriter {
 
         // Create a log segment specifically for the compaction range
         // This ensures we only process commits in [start_version, end_version]
-        let compaction_log_segment = LogSegment::for_table_changes(
+        let compaction_log_segment = await_!(LogSegment::for_table_changes(
             engine.storage_handler().as_ref(),
             self.snapshot.log_segment().log_root.clone(),
             self.start_version,
             Some(self.end_version),
-        )?;
+        ))?;
 
         // Read actions from the version-filtered log segment
         let actions_iter = await_!(compaction_log_segment.read_actions(

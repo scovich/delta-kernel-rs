@@ -14,7 +14,7 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::parquet::arrow::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
-use delta_kernel::{async_fn, async_test, await_, AsyncIterator, Snapshot};
+use delta_kernel::{async_test, await_, AsyncIterator, Snapshot};
 
 use arrow::compute::filter_record_batch;
 use object_store::local::LocalFileSystem;

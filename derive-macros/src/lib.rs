@@ -503,7 +503,7 @@ pub fn async_test(
     };
     
     let output = quote! {
-        #[async_fn]
+        #[delta_kernel::async_fn]
         #[cfg_attr(not(feature = "async"), #sync_test)]
         #[cfg_attr(feature = "async", #async_test)]
         #item

@@ -10,6 +10,7 @@ use crate::utils::require;
 use crate::ExpressionRef;
 use crate::{
     actions::{deletion_vector::DeletionVectorDescriptor, visitors::visit_deletion_vector_at},
+    async_fn, await_,
     engine_data::{GetData, RowVisitor, TypedGetData as _},
     schema::{ColumnName, ColumnNamesAndTypes, DataType, SchemaRef},
     DeltaResult, Engine, EngineData, Error,
@@ -52,42 +53,39 @@ impl DvInfo {
         self.deletion_vector.is_some()
     }
 
+    #[async_fn]
     pub(crate) fn get_treemap(
         &self,
         engine: &dyn Engine,
         table_root: &url::Url,
     ) -> DeltaResult<Option<RoaringTreemap>> {
-        self.deletion_vector
-            .as_ref()
-            .map(|dv_descriptor| {
-                let storage = engine.storage_handler();
-                dv_descriptor.read(storage, table_root)
-            })
-            .transpose()
+        Ok(match &self.deletion_vector {
+            Some(dv) => Some(await_!(dv.read(engine.storage_handler(), table_root))?),
+            None => None,
+        })
     }
 
+    #[async_fn]
     pub fn get_selection_vector(
         &self,
         engine: &dyn Engine,
         table_root: &url::Url,
     ) -> DeltaResult<Option<Vec<bool>>> {
-        let dv_treemap = self.get_treemap(engine, table_root)?;
+        let dv_treemap = await_!(self.get_treemap(engine, table_root))?;
         Ok(dv_treemap.map(deletion_treemap_to_bools))
     }
 
     /// Returns a vector of row indexes that should be *removed* from the result set
+    #[async_fn]
     pub fn get_row_indexes(
         &self,
         engine: &dyn Engine,
         table_root: &url::Url,
     ) -> DeltaResult<Option<Vec<u64>>> {
-        self.deletion_vector
-            .as_ref()
-            .map(|dv| {
-                let storage = engine.storage_handler();
-                dv.row_indexes(storage, table_root)
-            })
-            .transpose()
+        Ok(match &self.deletion_vector {
+            Some(dv) => Some(await_!(dv.row_indexes(engine.storage_handler(), table_root))?),
+            None => None,
+        })
     }
 }
 
@@ -231,7 +229,7 @@ mod tests {
 
     use crate::actions::get_log_schema;
     use crate::scan::test_utils::{add_batch_simple, run_with_validate_callback};
-    use crate::{async_fn, async_test, await_, ExpressionRef};
+    use crate::{async_test, await_, ExpressionRef};
 
     use super::{DvInfo, Stats};
 

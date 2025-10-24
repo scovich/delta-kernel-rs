@@ -682,9 +682,9 @@ impl Scan {
                 .async_then(async_closure!(move |scan_file| clone[&table_root, &physical_schema, &logical_schema, &engine] {
                         let scan_file = scan_file?;
                         let file_path = table_root.join(&scan_file.path)?;
-                        let mut selection_vector = scan_file
+                        let mut selection_vector = await_!(scan_file
                             .dv_info
-                            .get_selection_vector(engine.as_ref(), &table_root)?;
+                            .get_selection_vector(engine.as_ref(), &table_root))?;
                         let meta = FileMeta {
                             last_modified: 0,
                             size: scan_file.size.try_into().map_err(|_| {
@@ -866,13 +866,14 @@ impl StateInfo {
     }
 }
 
+#[async_fn]
 pub fn selection_vector(
     engine: &dyn Engine,
     descriptor: &DeletionVectorDescriptor,
     table_root: &Url,
 ) -> DeltaResult<Vec<bool>> {
     let storage = engine.storage_handler();
-    let dv_treemap = descriptor.read(storage, table_root)?;
+    let dv_treemap = await_!(descriptor.read(storage, table_root))?;
     Ok(deletion_treemap_to_bools(dv_treemap))
 }
 

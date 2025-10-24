@@ -23,8 +23,12 @@ use super::arrow_expression::ArrowEvaluationHandler;
 use crate::schema::Schema;
 use crate::transaction::WriteContext;
 use crate::{
-    DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
+    DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler,
+    StorageHandler,
 };
+
+#[cfg(not(feature = "async"))]
+use crate::{AsyncIterator, BoxedAsyncIterator};
 
 pub mod executor;
 pub mod file_stream;
@@ -32,6 +36,26 @@ pub mod filesystem;
 pub mod json;
 pub mod parquet;
 pub mod storage;
+
+/// Adapter for converting Stream-producing futures to BoxedAsyncIterator in sync mode.
+///
+/// This is a utility for the default engine implementations (filesystem, json, parquet)
+/// to bridge between the async object_store API and the sync StorageHandler trait.
+#[cfg(not(feature = "async"))]
+pub(crate) fn into_boxed_async_iterator<Fut, S, T>(
+    stream_future: Fut,
+) -> DeltaResult<BoxedAsyncIterator<T>>
+where
+    Fut: std::future::Future<Output = DeltaResult<S>>,
+    S: futures::stream::Stream<Item = T> + Send + 'static,
+    T: Send + 'static,
+{
+    use futures::stream::StreamExt as _;
+    let mut stream = Box::pin(futures::executor::block_on(stream_future)?);
+    let iter =
+        std::iter::from_fn(move || futures::executor::block_on(async { stream.next().await }));
+    Ok(iter.into_boxed())
+}
 
 #[derive(Debug)]
 pub struct DefaultEngine<E: TaskExecutor> {
@@ -172,15 +196,16 @@ mod tests {
     use super::executor::tokio::TokioBackgroundExecutor;
     use super::*;
     use crate::engine::tests::test_arrow_engine;
+    use crate::{async_test, await_};
     use object_store::local::LocalFileSystem;
 
-    #[test]
+    #[async_test]
     fn test_default_engine() {
         let tmp = tempfile::tempdir().unwrap();
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
         let engine = DefaultEngine::new(object_store, Arc::new(TokioBackgroundExecutor::new()));
-        test_arrow_engine(&engine, &url);
+        await_!(test_arrow_engine(&engine, &url));
     }
 
     #[test]

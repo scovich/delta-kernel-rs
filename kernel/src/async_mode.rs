@@ -3,7 +3,6 @@
 //! This module provides the async-mode implementation of kernel utilities.
 //! When the async feature is enabled, this module is re-exported as the main kernel utilities.
 
-use crate::DeltaResult;
 use futures::future;
 use futures::stream::{Stream, StreamExt as _, TryStream, TryStreamExt as _};
 use std::future::Future;
@@ -85,14 +84,19 @@ macro_rules! yield_now {
 macro_rules! async_closure {
     // NOTE: Every item on the list is a pair of owned and borrowed items -- both optional. In practice
     // the macro will only succeed if one or the other is present, because we miss a comma between them.
-    (move | $($arg:tt),* | $( clone[ $( $( $owned:ident )? $( &$borrowed:ident )? ),+ $(,)? ] )? $( -> $return:ty )? $body:block ) => {
-        move |$($arg),*| $( -> $return )? {
+    (move | $($arg:ident),* | $( clone[ $( $( $owned:ident )? $( &$borrowed:ident )? ),+ $(,)? ] )? $( -> $return:ty )? $body:block ) => {
+        move |$($arg),*| {
             // Clone everything in async mode
             $( $(
                 $( let $owned = $owned.clone(); )?
                 $( let $borrowed = $borrowed.clone(); )?
             )+ )?
-            async move $body
+            async move {
+                // Apply the return type here, because the async block returns impl Future and
+                // closure return types are not allowed to use impl Trait syntax.
+                let result $( : $return )? = $body;
+                result
+            }
         }
     };
 }
@@ -287,6 +291,39 @@ pub trait AsyncIterator: Stream + Send + Sized + 'static {
         self.map_ok(f)
     }
 
+    /// Filter and map over the successful values in a Result-yielding stream
+    ///
+    /// This method requires the stream to yield `Result` types.
+    /// The closure receives the unwrapped `Ok` value and returns `Option<R>`:
+    /// - `Some(value)` yields `Ok(value)`
+    /// - `None` skips the item
+    /// - Errors are passed through unchanged
+    ///
+    /// This matches itertools::Itertools::filter_map_ok semantics.
+    /// Uses futures::stream::TryStreamExt::try_filter_map with a non-failing closure.
+    fn async_filter_map_ok<F, R>(self, mut f: F) -> impl AsyncIterator<Item = Result<R, Self::Error>>
+    where
+        F: FnMut(Self::Ok) -> Option<R> + Send + 'static,
+        R: Send + 'static,
+        Self: TryStream,
+        Self::Ok: Send + 'static,
+        Self::Error: Send + 'static,
+    {
+        self.try_filter_map(move |value| future::ready(Ok(f(value))))
+    }
+
+    /// Take items while predicate is true
+    ///
+    /// Yields items from the stream as long as the predicate returns `true`.
+    /// Once the predicate returns `false`, the stream stops.
+    fn async_take_while<F>(self, mut f: F) -> impl AsyncIterator<Item = Self::Item>
+    where
+        F: FnMut(&Self::Item) -> bool + Send + 'static,
+        Self::Item: Send + 'static,
+    {
+        self.take_while(move |item| future::ready(f(item)))
+    }
+
     /// Chain two streams
     fn async_chain<U>(self, other: U) -> impl AsyncIterator<Item = Self::Item>
     where
@@ -331,6 +368,22 @@ pub trait AsyncIterator: Stream + Send + Sized + 'static {
         Self::Item: Send,
     {
         self.collect()
+    }
+
+    /// Count the number of items in the iterator
+    fn async_count(self) -> impl Future<Output = usize> + Send
+    where
+        Self::Item: Send + 'static,
+    {
+        self.count()
+    }
+
+    /// Enumerate items with their index
+    fn async_enumerate(self) -> impl AsyncIterator<Item = (usize, Self::Item)>
+    where
+        Self::Item: Send + 'static,
+    {
+        self.enumerate()
     }
 
     /// Returns an iterable version of this AsyncIterator (ie suitable for use with [`Self::async_next`]).
@@ -379,19 +432,4 @@ where
     I::Item: Send + 'static,
 {
     futures::stream::iter(i)
-}
-
-/// Adapter for converting Stream-producing futures to BoxedAsyncIterator
-///
-/// In async mode: awaits the future and boxes the stream.
-pub async fn into_boxed_async_iterator<Fut, S, T>(
-    stream_future: Fut,
-) -> DeltaResult<BoxedAsyncIterator<T>>
-where
-    Fut: Future<Output = DeltaResult<S>>,
-    S: Stream<Item = T> + Send + 'static,
-    T: Send + 'static,
-{
-    let stream = stream_future.await?;
-    Ok(stream.into_boxed())
 }

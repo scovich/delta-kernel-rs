@@ -398,9 +398,9 @@ fn read_with_scan_metadata(
     let mut batches = vec![];
     for scan_file in scan_files.into_iter() {
         let file_path = location.join(&scan_file.path)?;
-        let mut selection_vector = scan_file
+        let mut selection_vector = await_!(scan_file
             .dv_info
-            .get_selection_vector(engine, location)
+            .get_selection_vector(engine, location))
             .unwrap();
         let meta = FileMeta {
             last_modified: 0,

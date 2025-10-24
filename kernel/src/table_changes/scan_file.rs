@@ -258,14 +258,13 @@ mod tests {
     use super::{scan_metadata_to_scan_file, CdfScanFile, CdfScanFileType};
     use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
     use crate::actions::{Add, Cdc, Remove};
-    use crate::await_;
     use crate::engine::sync::SyncEngine;
     use crate::log_segment::LogSegment;
     use crate::scan::state::DvInfo;
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_changes::log_replay::table_changes_action_iter;
     use crate::utils::test_utils::{Action, LocalMockTable};
-    use crate::{AsyncIterator as _, Engine as _};
+    use crate::{await_, AsyncIterator as _, Engine as _};
 
     #[tokio::test]
     async fn test_scan_file_visiting() {
@@ -341,7 +340,7 @@ mod tests {
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
         let log_root = table_root.join("_delta_log/").unwrap();
         let log_segment =
-            LogSegment::for_table_changes(engine.storage_handler().as_ref(), log_root, 0, None)
+            await_!(LogSegment::for_table_changes(engine.storage_handler().as_ref(), log_root, 0, None))
                 .unwrap();
         let table_schema = StructType::new_unchecked([
             StructField::nullable("id", DataType::INTEGER),

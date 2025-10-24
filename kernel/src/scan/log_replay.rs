@@ -389,7 +389,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::schema::{DataType, SchemaRef, StructField, StructType};
     use crate::{
-        async_fn, async_test, await_, into_async_iter, AsyncIterator as _, ExpressionRef, Scalar,
+        async_test, await_, into_async_iter, AsyncIterator as _, ExpressionRef, Scalar,
     };
 
     use super::scan_action_iter;

@@ -1,8 +1,9 @@
+use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use delta_kernel_derive::internal_api;
-use futures::stream::StreamExt;
+use futures::stream::{self, Stream, StreamExt as _};
 use itertools::Itertools;
 use object_store::path::Path;
 use object_store::{DynObjectStore, ObjectStore};
@@ -10,7 +11,7 @@ use url::Url;
 
 use super::UrlExt;
 use crate::engine::default::executor::TaskExecutor;
-use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
+use crate::{async_trait, BoxedAsyncIterator, DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
 #[derive(Debug)]
 pub struct ObjectStoreStorageHandler<E: TaskExecutor> {
@@ -34,13 +35,12 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
         self.readahead = readahead;
         self
     }
-}
 
-impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
-    fn list_from(
+    /// Native async implementation for list_from
+    async fn list_from_impl(
         &self,
         path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    ) -> DeltaResult<Pin<Box<dyn Stream<Item = DeltaResult<FileMeta>> + Send>>> {
         // The offset is used for list-after; the prefix is used to restrict the listing to a specific directory.
         // Unfortunately, `Path` provides no easy way to check whether a name is directory-like,
         // because it strips trailing /, so we're reduced to manually checking the original URL.
@@ -79,62 +79,44 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         //   in your Cloud Storage buckets, which are ordered in the list lexicographically by name."
         // So we just need to know if we're local and then if so, we sort the returned file list
         let has_ordered_listing = path.scheme() != "file";
-
-        // This channel will become the iterator
-        let (sender, receiver) = std::sync::mpsc::sync_channel(4_000);
         let url = path.clone();
-        self.task_executor.spawn(async move {
-            let mut stream = store.list_with_offset(Some(&prefix), &offset);
 
-            while let Some(meta) = stream.next().await {
+        let stream = store.list_with_offset(Some(&prefix), &offset)
+            .map(move |meta| {
                 match meta {
                     Ok(meta) => {
                         let mut location = url.clone();
                         location.set_path(&format!("/{}", meta.location.as_ref()));
-                        sender
-                            .send(Ok(FileMeta {
-                                location,
-                                last_modified: meta.last_modified.timestamp_millis(),
-                                size: meta.size,
-                            }))
-                            .ok();
+                        Ok(FileMeta {
+                            location,
+                            last_modified: meta.last_modified.timestamp_millis(),
+                            size: meta.size,
+                        })
                     }
-                    Err(e) => {
-                        sender.send(Err(e.into())).ok();
-                    }
+                    Err(e) => Err(e.into()),
                 }
-            }
-        });
+            });
 
         if !has_ordered_listing {
-            // This FS doesn't return things in the order we require
-            let mut fms: Vec<FileMeta> = receiver.into_iter().try_collect()?;
-            fms.sort_unstable();
-            Ok(Box::new(fms.into_iter().map(Ok)))
+            // Local filesystem doesn't return sorted list - need to collect and sort
+            let items: Vec<_> = stream.collect().await;
+            let mut sorted: Vec<FileMeta> = items.into_iter().try_collect()?;
+            sorted.sort_unstable();
+            Ok(Box::pin(stream::iter(sorted.into_iter().map(Ok))))
         } else {
-            Ok(Box::new(receiver.into_iter()))
+            Ok(Box::pin(stream))
         }
     }
 
-    /// Read data specified by the start and end offset from the file.
-    ///
-    /// This will return the data in the same order as the provided file slices.
-    ///
-    /// Multiple reads may occur in parallel, depending on the configured readahead.
-    /// See [`Self::with_readahead`].
-    fn read_files(
+    /// Native async implementation for read_files
+    async fn read_files_impl(
         &self,
         files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+    ) -> DeltaResult<Pin<Box<dyn Stream<Item = DeltaResult<Bytes>> + Send>>> {
         let store = self.inner.clone();
-
-        // This channel will become the output iterator.
-        // Because there will already be buffering in the stream, we set the
-        // buffer size to 0.
-        let (sender, receiver) = std::sync::mpsc::sync_channel(0);
-
-        self.task_executor.spawn(
-            futures::stream::iter(files)
+        
+        Ok(Box::pin(
+            stream::iter(files)
                 .map(move |(url, range)| {
                     let store = store.clone();
                     async move {
@@ -164,16 +146,48 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
                     }
                 })
                 // We allow executing up to `readahead` futures concurrently and
-                // buffer the results. This allows us to achieve async concurrency
-                // within a synchronous method.
-                .buffered(self.readahead)
-                .for_each(move |res| {
-                    sender.send(res).ok();
-                    futures::future::ready(())
-                }),
-        );
+                // buffer the results. This allows us to achieve async concurrency.
+                .buffered(self.readahead),
+        ))
+    }
+}
 
-        Ok(Box::new(receiver.into_iter()))
+#[async_trait]
+impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
+    // Sync mode: pass future to helper which blocks internally
+    #[cfg(not(feature = "async"))]
+    fn list_from(
+        &self,
+        path: &Url,
+    ) -> DeltaResult<BoxedAsyncIterator<DeltaResult<FileMeta>>> {
+        super::into_boxed_async_iterator(self.list_from_impl(path))
+    }
+
+    // Async mode: await the future and return the boxed stream
+    #[cfg(feature = "async")]
+    async fn list_from(
+        &self,
+        path: &Url,
+    ) -> DeltaResult<BoxedAsyncIterator<DeltaResult<FileMeta>>> {
+        self.list_from_impl(path).await
+    }
+
+    // Sync mode: pass future to helper which blocks internally
+    #[cfg(not(feature = "async"))]
+    fn read_files(
+        &self,
+        files: Vec<FileSlice>,
+    ) -> DeltaResult<BoxedAsyncIterator<DeltaResult<Bytes>>> {
+        super::into_boxed_async_iterator(self.read_files_impl(files))
+    }
+
+    // Async mode: await the future and return the boxed stream
+    #[cfg(feature = "async")]
+    async fn read_files(
+        &self,
+        files: Vec<FileSlice>,
+    ) -> DeltaResult<BoxedAsyncIterator<DeltaResult<Bytes>>> {
+        self.read_files_impl(files).await
     }
 }
 
@@ -182,7 +196,6 @@ mod tests {
     use std::ops::Range;
     use std::time::Duration;
 
-    use itertools::Itertools;
     use object_store::memory::InMemory;
     use object_store::{local::LocalFileSystem, ObjectStore};
 
@@ -191,7 +204,7 @@ mod tests {
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DefaultEngine;
     use crate::utils::current_time_duration;
-    use crate::Engine as _;
+    use crate::{await_, into_async_iter, AsyncIterator as _, Engine as _};
 
     use super::*;
 
@@ -230,7 +243,8 @@ mod tests {
         url.set_path(&format!("{}/c", url.path()));
         slices.push((url, Some(Range { start: 4, end: 9 })));
         dbg!("Slices are: {}", &slices);
-        let data: Vec<Bytes> = storage.read_files(slices).unwrap().try_collect().unwrap();
+        let iter = await_!(storage.read_files(slices)).unwrap();
+        let data: Vec<Bytes> = await_!(iter.async_pin().async_try_collect()).unwrap();
 
         assert_eq!(data.len(), 3);
         assert_eq!(data[0], Bytes::from("kernel"));
@@ -250,12 +264,11 @@ mod tests {
 
         let table_root = Url::parse("memory:///").expect("valid url");
         let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
-        let files: Vec<_> = engine
+        let iter = await_!(engine
             .storage_handler()
-            .list_from(&table_root.join("_delta_log").unwrap().join("0").unwrap())
-            .unwrap()
-            .try_collect()
+            .list_from(&table_root.join("_delta_log").unwrap().join("0").unwrap()))
             .unwrap();
+        let files: Vec<_> = await_!(iter.async_pin().async_try_collect()).unwrap();
 
         assert!(!files.is_empty());
         for meta in files.into_iter() {
@@ -280,12 +293,13 @@ mod tests {
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let store = Arc::new(LocalFileSystem::new());
         let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
-        let files = engine
+        let files = await_!(engine
             .storage_handler()
-            .list_from(&url.join("_delta_log").unwrap().join("0").unwrap())
+            .list_from(&url.join("_delta_log").unwrap().join("0").unwrap()))
             .unwrap();
         let mut len = 0;
-        for (file, expected) in files.zip(expected_names.iter()) {
+        let mut zipped = files.async_zip(into_async_iter(expected_names)).async_pin();
+        while let Some((file, expected)) = await_!(zipped.async_next()) {
             assert!(
                 file.as_ref()
                     .unwrap()

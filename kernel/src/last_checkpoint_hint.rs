@@ -2,7 +2,7 @@
 //! log_segment module since it should only really be used there? as hint for listing?
 
 use crate::schema::Schema;
-use crate::{DeltaResult, Error, StorageHandler, Version};
+use crate::{async_fn, await_, AsyncIterator, DeltaResult, Error, StorageHandler, Version};
 use delta_kernel_derive::internal_api;
 
 use serde::{Deserialize, Serialize};
@@ -50,12 +50,14 @@ impl LastCheckpointHint {
     /// are assumed to cause failure.
     // TODO(#1047): weird that we propagate FileNotFound as part of the iterator instead of top-
     // level result coming from storage.read_files
+    #[async_fn]
     pub(crate) fn try_read(
         storage: &dyn StorageHandler,
         log_root: &Url,
     ) -> DeltaResult<Option<LastCheckpointHint>> {
         let file_path = Self::path(log_root)?;
-        match storage.read_files(vec![(file_path, None)])?.next() {
+        let mut iter = await_!(storage.read_files(vec![(file_path, None)]))?.async_pin();
+        match await_!(iter.async_next()) {
             Some(Ok(data)) => Ok(serde_json::from_slice(&data)
                 .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
                 .ok()),

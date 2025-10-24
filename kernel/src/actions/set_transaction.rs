@@ -116,7 +116,7 @@ mod tests {
     use crate::Snapshot;
 
     use crate::arrow::array::StringArray;
-    use crate::{async_fn, async_test, await_, AsyncIterator};
+    use crate::{async_test, await_, AsyncIterator};
 
     #[async_fn]
     fn get_latest_transactions(
@@ -181,8 +181,8 @@ mod tests {
         let log_segment = snapshot.log_segment();
 
         // The checkpoint has five parts, each containing one action. There are two app ids.
-        let data: Vec<_> = await_!(await_!(replay_for_app_ids(log_segment, &engine))
-            .unwrap()
+        let replay_iter = await_!(replay_for_app_ids(log_segment, &engine)).unwrap();
+        let data: Vec<_> = await_!(replay_iter
             .async_pin()
             .async_try_collect())
             .unwrap();

@@ -3,10 +3,7 @@
 //! This module provides the sync-mode implementation of kernel utilities.
 //! When the async feature is disabled, this module is re-exported as the main kernel utilities.
 
-use crate::DeltaResult;
-use futures::stream::{Stream, StreamExt as _};
 use itertools::Itertools as _;
-use std::future::Future;
 
 // Re-export macros
 pub use delta_kernel_derive::{async_fn, async_trait, async_trait_fn};
@@ -80,7 +77,7 @@ macro_rules! yield_now {
 macro_rules! async_closure {
     // NOTE: Every item on the list is a pair of owned and borrowed items -- both optional. In practice
     // the macro will only succeed if one or the other is present, because we miss a comma between them.
-    (move | $($arg:tt),* | $( clone[ $( $( $owned:ident )? $( &$borrowed:ident )? ),+ $(,)? ] )? $( -> $return:ty )? $body:block ) => {
+    (move | $($arg:ident),* | $( clone[ $( $( $owned:ident )? $( &$borrowed:ident )? ),+ $(,)? ] )? $( -> $return:ty )? $body:block ) => {
         move |$($arg),*| $( -> $return )? {
             // Only clone owned values in sync mode (refs are zero-cost)
             $( $( $( let $owned = $owned.clone(); )? )+ )?
@@ -237,6 +234,38 @@ pub trait AsyncIterator: Iterator + Send + Sized + 'static {
         self.map_ok(f)
     }
 
+    /// Filter and map over the successful values in a Result-yielding iterator
+    ///
+    /// This method requires the iterator to yield `Result` types.
+    /// The closure receives the unwrapped `Ok` value and returns `Option<R>`:
+    /// - `Some(value)` yields `Ok(value)` 
+    /// - `None` skips the item
+    /// - Errors are passed through unchanged
+    ///
+    /// This matches itertools::Itertools::filter_map_ok semantics.
+    fn async_filter_map_ok<T, E, F, R>(self, f: F) -> impl AsyncIterator<Item = Result<R, E>>
+    where
+        F: FnMut(T) -> Option<R> + Send + 'static,
+        T: Send + 'static,
+        E: Send + 'static,
+        R: Send + 'static,
+        Self: Iterator<Item = Result<T, E>>,
+    {
+        self.filter_map_ok(f)
+    }
+
+    /// Take items while predicate is true
+    ///
+    /// Yields items from the iterator as long as the predicate returns `true`.
+    /// Once the predicate returns `false`, iteration stops.
+    fn async_take_while<F>(self, f: F) -> impl AsyncIterator<Item = Self::Item>
+    where
+        F: FnMut(&Self::Item) -> bool + Send + 'static,
+        Self::Item: Send + 'static,
+    {
+        self.take_while(f)
+    }
+
     /// Chain two iterators
     fn async_chain<U>(self, other: U) -> impl AsyncIterator<Item = Self::Item>
     where
@@ -279,6 +308,22 @@ pub trait AsyncIterator: Iterator + Send + Sized + 'static {
         C: Extend<Self::Item> + FromIterator<Self::Item> + Default,
     {
         self.collect()
+    }
+
+    /// Count the number of items in the iterator
+    fn async_count(self) -> usize
+    where
+        Self::Item: Send + 'static,
+    {
+        self.count()
+    }
+
+    /// Enumerate items with their index
+    fn async_enumerate(self) -> impl AsyncIterator<Item = (usize, Self::Item)>
+    where
+        Self::Item: Send + 'static,
+    {
+        self.enumerate()
     }
 
     /// Returns an iterable version of this AsyncIterator (ie suitable for use with [`Self::async_next`]).
@@ -328,25 +373,3 @@ where
     i.into_iter()
 }
 
-/// Adapter for converting Stream-producing futures to BoxedAsyncIterator
-///
-/// In sync mode: blocks on the future and wraps the stream to block on each item.
-///
-/// # Panics
-///
-/// This function uses `futures::executor::block_on` which will panic if called from
-/// within an async context. If you need to use kernel APIs from async code, enable
-/// the `async` feature and use the async mode APIs instead.
-pub fn into_boxed_async_iterator<Fut, S, T>(
-    stream_future: Fut,
-) -> DeltaResult<BoxedAsyncIterator<T>>
-where
-    Fut: Future<Output = DeltaResult<S>>,
-    S: Stream<Item = T> + Send + 'static,
-    T: Send + 'static,
-{
-    let mut stream = Box::pin(futures::executor::block_on(stream_future)?);
-    let iter =
-        std::iter::from_fn(move || futures::executor::block_on(async { stream.next().await }));
-    Ok(iter.into_boxed())
-}

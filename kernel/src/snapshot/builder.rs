@@ -84,12 +84,12 @@ impl SnapshotBuilder {
     pub fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
         let log_tail = self.log_tail.into_iter().map(Into::into).collect();
         if let Some(table_root) = self.table_root {
-            let log_segment = LogSegment::for_snapshot(
+            let log_segment = await_!(LogSegment::for_snapshot(
                 engine.storage_handler().as_ref(),
                 table_root.join("_delta_log/")?,
                 log_tail,
                 self.version,
-            )?;
+            ))?;
             Ok(await_!(Snapshot::try_new_from_log_segment(
                 table_root,
                 log_segment,
@@ -116,7 +116,7 @@ impl SnapshotBuilder {
 mod tests {
     use std::sync::Arc;
 
-    use crate::{async_fn, async_test, await_};
+    use crate::{async_test, await_};
     use crate::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
 
     use itertools::Itertools;

@@ -212,10 +212,10 @@ impl TableChangesScan {
         let dv_engine_ref = engine.clone();
 
         let result = scan_files
-            .async_map(move |scan_file| {
-                resolve_scan_file_dv(dv_engine_ref.as_ref(), &table_root1, scan_file?)
-            }) // AsyncIterator-Result-Iterator
-            .async_map_ok(into_async_iter) // AsyncIterator-Result-AsyncIterator
+            .async_then(async_closure!(move |scan_file| clone[&dv_engine_ref, &table_root1] -> DeltaResult<_> {
+                let resolved_iter = await_!(resolve_scan_file_dv(dv_engine_ref.as_ref(), &table_root1, scan_file?))?;
+                Ok(into_async_iter(resolved_iter))
+            })) // AsyncIterator-Result-AsyncIterator
             .async_flatten_ok() // AsyncIterator-Result
             .async_then(async_closure!(move |resolved_scan_file| clone[physical_predicate, &engine, &state_info, &table_root2] {
                 await_!(read_scan_file(
@@ -320,7 +320,7 @@ fn read_scan_file(
 mod tests {
     use std::sync::Arc;
 
-    use crate::{async_fn, async_test, await_};
+    use crate::{async_test, await_};
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr, Scalar};
     use crate::scan::PhysicalPredicate;

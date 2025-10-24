@@ -12,7 +12,7 @@ use crate::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEn
 use crate::log_replay::HasSelectionVector;
 use crate::schema::{DataType as KernelDataType, StructField, StructType};
 use crate::utils::test_utils::Action;
-use crate::{async_fn, async_test, await_, AsyncIterator, DeltaResult, FileMeta, LogPath, Snapshot};
+use crate::{async_test, await_, AsyncIterator, DeltaResult, FileMeta, LogPath, Snapshot};
 
 use arrow_56::{
     array::{create_array, RecordBatch},

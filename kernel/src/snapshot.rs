@@ -127,13 +127,13 @@ impl Snapshot {
         let listing_start = old_log_segment.checkpoint_version.unwrap_or(0) + 1;
 
         // Check for new commits (and CRC)
-        let new_listed_files = ListedLogFiles::list(
+        let new_listed_files = await_!(ListedLogFiles::list(
             storage.as_ref(),
             &log_root,
             log_tail,
             Some(listing_start),
             new_version,
-        )?;
+        ))?;
 
         // NB: we need to check both checkpoints and commits since we filter commits at and below
         // the checkpoint version. Example: if we have a checkpoint + commit at version 1, the log
@@ -446,7 +446,7 @@ mod tests {
     use crate::engine::default::DefaultEngine;
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
-    use crate::{async_fn, async_test, await_};
+    use crate::{async_test, await_};
     use crate::listed_log_files::ListedLogFiles;
     use crate::log_segment::LogSegment;
     use crate::parquet::arrow::ArrowWriter;
@@ -939,7 +939,7 @@ mod tests {
         let store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let storage = ObjectStoreStorageHandler::new(store, executor);
-        let cp = LastCheckpointHint::try_read(&storage, &url).unwrap();
+        let cp = await_!(LastCheckpointHint::try_read(&storage, &url)).unwrap();
         assert!(cp.is_none());
     }
 
@@ -968,7 +968,7 @@ mod tests {
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let storage = ObjectStoreStorageHandler::new(store, executor);
         let url = Url::parse("memory:///invalid/").expect("valid url");
-        let invalid = LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
+        let invalid = await_!(LastCheckpointHint::try_read(&storage, &url)).expect("read last checkpoint");
         assert!(invalid.is_none())
     }
 
@@ -999,9 +999,9 @@ mod tests {
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let storage = ObjectStoreStorageHandler::new(store, executor);
         let url = Url::parse("memory:///valid/").expect("valid url");
-        let valid = LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
+        let valid = await_!(LastCheckpointHint::try_read(&storage, &url)).expect("read last checkpoint");
         let url = Url::parse("memory:///invalid/").expect("valid url");
-        let invalid = LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
+        let invalid = await_!(LastCheckpointHint::try_read(&storage, &url)).expect("read last checkpoint");
         let expected = LastCheckpointHint {
             version: 1,
             size: 8,
