@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
@@ -30,7 +31,7 @@ use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
 use crate::transaction::add_files_schema;
 use crate::{
-    async_trait, async_trait_fn, into_async_iter, AsyncIterator, DeltaResult, EngineData, Error,
+    async_trait, DeltaResult, EngineData, Error,
     FileDataReadResultIterator, FileMeta, ParquetHandler, PredicateRef,
 };
 
@@ -205,17 +206,16 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     }
 }
 
-#[async_trait]
-impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
-    #[async_trait_fn]
-    async fn read_parquet_files(
-        &self,
-        files: &[FileMeta],
+impl<E: TaskExecutor> DefaultParquetHandler<E> {
+    /// Internal async implementation of read_parquet_files
+    async fn read_parquet_files_impl(
+        store: Arc<DynObjectStore>,
+        files: Vec<FileMeta>,
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> DeltaResult<Pin<Box<dyn futures::Stream<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'static>>> {
         if files.is_empty() {
-            return Ok(into_async_iter(std::iter::empty()).into_boxed());
+            return Ok(Box::pin(futures::stream::empty()));
         }
 
         // get the first FileMeta to decide how to fetch the file.
@@ -237,16 +237,50 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
                 1024,
                 physical_schema.clone(),
                 predicate,
-                self.store.clone(),
+                store,
             ))
         };
-        FileStream::new_async_read_iterator(
-            self.task_executor.clone(),
-            Arc::new(physical_schema.as_ref().try_into_arrow()?),
-            file_opener,
-            files,
-            self.readahead,
+
+        let arrow_schema = Arc::new(physical_schema.as_ref().try_into_arrow()?);
+        let stream = FileStream::new(files, arrow_schema, file_opener)?;
+
+        // Convert the stream to a boxed stream of engine data
+        use futures::stream::TryStreamExt as _;
+        let stream = stream
+            .map_ok(|record_batch| -> Box<dyn EngineData> {
+                Box::new(ArrowEngineData::new(record_batch))
+            });
+
+        Ok(Box::pin(stream))
+    }
+}
+
+#[async_trait]
+impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
+    // Sync mode: use helper to bridge async to sync
+    #[cfg(not(feature = "async"))]
+    fn read_parquet_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        super::into_boxed_async_iterator(
+            self.task_executor.clone(), 
+            Self::read_parquet_files_impl(self.store.clone(), files.to_vec(), physical_schema, predicate)
         )
+    }
+
+    // Async mode: directly return the stream from implementation
+    #[cfg(feature = "async")]
+    async fn read_parquet_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        // The stream is already Pin<Box<dyn Stream>> which is what FileDataReadResultIterator is in async mode
+        Self::read_parquet_files_impl(self.store.clone(), files.to_vec(), physical_schema, predicate).await
     }
 }
 
@@ -439,6 +473,7 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::EngineData;
+    use crate::AsyncIterator;
 
     use object_store::{local::LocalFileSystem, memory::InMemory, ObjectStore};
     use url::Url;
@@ -488,7 +523,7 @@ mod tests {
                 None,
             ))
             .unwrap()
-            .map(into_record_batch);
+            .async_map(into_record_batch);
         let data: Vec<RecordBatch> = await_!(iter.async_pin().async_try_collect())
             .unwrap();
 

@@ -441,6 +441,7 @@ mod tests {
     use crate::arrow::array::StringArray;
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::default::executor::TaskExecutor as _;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::filesystem::ObjectStoreStorageHandler;
     use crate::engine::default::DefaultEngine;
@@ -956,17 +957,16 @@ mod tests {
         let empty = "{}".as_bytes().to_vec();
         let invalid_path = Path::from("invalid/_last_checkpoint");
 
-        tokio::runtime::Runtime::new()
-            .expect("create tokio runtime")
-            .block_on(async {
-                store
-                    .put(&invalid_path, empty.into())
-                    .await
-                    .expect("put _last_checkpoint");
-            });
-
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor);
+        let store_clone = store.clone();
+        executor.block_on(async move {
+            store_clone
+                .put(&invalid_path, empty.into())
+                .await
+                .expect("put _last_checkpoint");
+        });
+
+        let storage = ObjectStoreStorageHandler::new(store, executor.clone());
         let url = Url::parse("memory:///invalid/").expect("valid url");
         let invalid = await_!(LastCheckpointHint::try_read(&storage, &url)).expect("read last checkpoint");
         assert!(invalid.is_none())
@@ -983,20 +983,19 @@ mod tests {
         let path = Path::from("valid/_last_checkpoint");
         let invalid_path = Path::from("invalid/_last_checkpoint");
 
-        tokio::runtime::Runtime::new()
-            .expect("create tokio runtime")
-            .block_on(async {
-                store
-                    .put(&path, data.into())
-                    .await
-                    .expect("put _last_checkpoint");
-                store
-                    .put(&invalid_path, invalid_data.into())
-                    .await
-                    .expect("put _last_checkpoint");
-            });
-
         let executor = Arc::new(TokioBackgroundExecutor::new());
+        let store_clone = store.clone();
+        executor.block_on(async move {
+            store_clone
+                .put(&path, data.into())
+                .await
+                .expect("put _last_checkpoint");
+            store_clone
+                .put(&invalid_path, invalid_data.into())
+                .await
+                .expect("put _last_checkpoint");
+        });
+
         let storage = ObjectStoreStorageHandler::new(store, executor);
         let url = Url::parse("memory:///valid/").expect("valid url");
         let valid = await_!(LastCheckpointHint::try_read(&storage, &url)).expect("read last checkpoint");

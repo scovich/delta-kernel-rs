@@ -108,7 +108,7 @@ use crate::{async_test, await_, StorageHandler};
 
         let url_path = tmp_dir.path().join(get_json_filename(0));
         let url = Url::from_file_path(url_path).unwrap();
-        let iter = await_!(storage.list_from(&url))?.async_pin();
+        let iter = storage.list_from(&url).async_await()?.async_pin();
         let files: Vec<_> = await_!(iter.async_try_collect())?;
 
         assert!(!files.is_empty());

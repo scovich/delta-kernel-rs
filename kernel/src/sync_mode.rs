@@ -8,6 +8,38 @@ use itertools::Itertools as _;
 // Re-export macros
 pub use delta_kernel_derive::{async_fn, async_trait, async_trait_fn};
 
+/// Placeholder trait for IDE support - DO NOT IMPORT MANUALLY
+///
+/// This trait exists solely to help IDEs recognize `.async_await()` method calls.
+/// The actual transformation is done by the `#[async_fn]` or `#[async_test]` 
+/// proc macros, which will remove the `.async_await()` call entirely in sync mode.
+///
+/// In sync mode, `.async_await()` is transformed to just the receiver expression.
+/// For example: `future.async_await()` becomes just `future`.
+///
+/// # Usage
+///
+/// ```ignore
+/// #[async_fn]
+/// fn my_function() {
+///     let result = some_operation().async_await()?;
+///     // In sync mode, becomes: let result = some_operation()?;
+/// }
+/// ```
+///
+/// # Panic Behavior
+///
+/// If you see this panic at runtime, you forgot to annotate your function with
+/// `#[async_fn]` or `#[async_test]`. The proc macro must transform the code
+/// before it runs.
+pub trait AsyncAwaitPlaceholder: Sized {
+    fn async_await(self) -> Self {
+        super::panic_async_await_not_transformed()
+    }
+}
+
+impl<T: Sized> AsyncAwaitPlaceholder for T {}
+
 /// Conditionally adds `.await` to an expression (no-op in sync mode)
 #[macro_export]
 macro_rules! await_ {

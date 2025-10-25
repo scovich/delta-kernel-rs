@@ -2,7 +2,8 @@
 
 use std::io::BufReader;
 use std::ops::Range;
-use std::sync::{mpsc, Arc};
+use std::pin::Pin;
+use std::sync::{Arc};
 use std::task::Poll;
 
 use crate::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
@@ -13,7 +14,6 @@ use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{self, DynObjectStore, GetResultPayload, PutMode};
-use tracing::warn;
 use url::Url;
 
 use super::executor::TaskExecutor;
@@ -24,7 +24,7 @@ use crate::engine::arrow_utils::to_json_bytes;
 use crate::engine_data::FilteredEngineData;
 use crate::schema::SchemaRef;
 use crate::{
-    async_trait, async_trait_fn, into_async_iter, AsyncIterator, DeltaResult, EngineData, Error,
+    async_trait, into_async_iter, AsyncIterator, BoxedAsyncIterator, DeltaResult, EngineData, Error,
     FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
 };
 
@@ -83,6 +83,69 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
         self.batch_size = batch_size;
         self
     }
+
+    /// Internal async implementation of read_json_files
+    async fn read_json_files_impl(
+        store: Arc<DynObjectStore>,
+        files: Vec<FileMeta>,
+        physical_schema: SchemaRef,
+        _predicate: Option<PredicateRef>,
+        batch_size: usize,
+        buffer_size: usize,
+    ) -> DeltaResult<Pin<Box<dyn futures::Stream<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'static>>> {
+        if files.is_empty() {
+            return Ok(Box::pin(futures::stream::empty()));
+        }
+
+        let schema = Arc::new(ArrowSchema::try_from_kernel(physical_schema.as_ref())?);
+        let file_opener = Arc::new(JsonOpener::new(batch_size, schema.clone(), store));
+
+        // Create a stream from the file futures
+        let stream = stream::iter(files)
+            .map(move |file| {
+                let opener = file_opener.clone();
+                async move { opener.open(file, None).await }
+            })
+            .buffered(buffer_size)
+            .try_flatten()
+            .map_ok(|record_batch| -> Box<dyn EngineData> {
+                Box::new(ArrowEngineData::new(record_batch))
+            });
+
+        Ok(Box::pin(stream))
+    }
+
+    /// Internal async implementation of write_json_file
+    /// Note: for now we just buffer all the data and write it out all at once
+    async fn write_json_file_impl(
+        store: Arc<DynObjectStore>,
+        path: Url,
+        data: Pin<Box<dyn futures::Stream<Item = DeltaResult<FilteredEngineData>> + Send>>,
+        overwrite: bool,
+    ) -> DeltaResult<()> {
+        use futures::StreamExt;
+        // Collect all items from the stream
+        let items: Vec<_> = data.collect().await;
+        let buffer = to_json_bytes(Box::new(items.into_iter()))?;
+        let put_mode = if overwrite {
+            PutMode::Overwrite
+        } else {
+            PutMode::Create
+        };
+
+        let path = Path::from_url_path(path.path())?;
+        let path_str = path.to_string();
+        
+        // Direct await - no executor needed in the async impl
+        store
+            .put_opts(&path, buffer.into(), put_mode.into())
+            .await
+            .map_err(|e| match e {
+                object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(path_str),
+                e => e.into(),
+            })?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -95,71 +158,70 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         arrow_parse_json(json_strings, output_schema)
     }
 
-    #[async_trait_fn]
+    // Sync mode: use task executor to spawn async work and bridge via channel
+    #[cfg(not(feature = "async"))]
+    fn read_json_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        super::into_boxed_async_iterator(
+            self.task_executor.clone(), 
+            Self::read_json_files_impl(
+                self.store.clone(), 
+                files.to_vec(), 
+                physical_schema, 
+                predicate, 
+                self.batch_size, 
+                self.buffer_size
+            )
+        )
+    }
+
+    // Async mode: directly return the stream from implementation
+    #[cfg(feature = "async")]
     async fn read_json_files(
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
-        _predicate: Option<PredicateRef>,
+        predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        if files.is_empty() {
-            return Ok(into_async_iter(std::iter::empty()).into_boxed());
-        }
-
-        let schema = Arc::new(ArrowSchema::try_from_kernel(physical_schema.as_ref())?);
-        let file_opener = JsonOpener::new(self.batch_size, schema.clone(), self.store.clone());
-
-        let (tx, rx) = mpsc::sync_channel(self.buffer_size);
-        let files = files.to_vec();
-        let buffer_size = self.buffer_size;
-
-        self.task_executor.spawn(async move {
-            // an iterator of futures that open each file
-            let file_futures = files.into_iter().map(|file| file_opener.open(file, None));
-
-            // create a stream from that iterator which buffers up to `buffer_size` futures at a time
-            let mut stream = stream::iter(file_futures)
-                .buffered(buffer_size)
-                .try_flatten()
-                .map_ok(|record_batch| -> Box<dyn EngineData> {
-                    Box::new(ArrowEngineData::new(record_batch))
-                });
-
-            // send each record batch over the channel
-            while let Some(item) = stream.next().await {
-                if tx.send(item).is_err() {
-                    warn!("read_json receiver end of channel dropped before sending completed");
-                }
-            }
-        });
-
-        Ok(into_async_iter(rx).into_boxed())
+        Self::read_json_files_impl(
+            self.store.clone(), 
+            files.to_vec(), 
+            physical_schema, 
+            predicate, 
+            self.batch_size, 
+            self.buffer_size
+        ).await
     }
 
-    // note: for now we just buffer all the data and write it out all at once
+    // Sync mode: block on async impl
+    #[cfg(not(feature = "async"))]
     fn write_json_file(
         &self,
         path: &Url,
-        data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        data: BoxedAsyncIterator<DeltaResult<FilteredEngineData>>,
         overwrite: bool,
     ) -> DeltaResult<()> {
-        let buffer = to_json_bytes(data)?;
-        let put_mode = if overwrite {
-            PutMode::Overwrite
-        } else {
-            PutMode::Create
-        };
+        // Convert iterator to stream for the async impl
+        let stream = Box::pin(futures::stream::iter(data));
+        self.task_executor.block_on(
+            Self::write_json_file_impl(self.store.clone(), path.clone(), stream, overwrite)
+        )
+    }
 
-        let store = self.store.clone(); // cheap Arc
-        let path = Path::from_url_path(path.path())?;
-        let path_str = path.to_string();
-        self.task_executor
-            .block_on(async move { store.put_opts(&path, buffer.into(), put_mode.into()).await })
-            .map_err(|e| match e {
-                object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(path_str),
-                e => e.into(),
-            })?;
-        Ok(())
+    // Async mode: direct async call
+    #[cfg(feature = "async")]
+    async fn write_json_file(
+        &self,
+        path: &Url,
+        data: BoxedAsyncIterator<DeltaResult<FilteredEngineData>>,
+        overwrite: bool,
+    ) -> DeltaResult<()> {
+        // Data is already a stream in async mode, use it directly
+        Self::write_json_file_impl(self.store.clone(), path.clone(), data, overwrite).await
     }
 }
 
@@ -256,7 +318,7 @@ mod tests {
     use std::task::Waker;
 
     use crate::actions::get_log_schema;
-    use crate::await_;
+    use crate::{async_fn, async_test, await_};
     use crate::arrow::array::{AsArray, Int32Array, RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_data::ArrowEngineData;
@@ -265,6 +327,7 @@ mod tests {
     };
     use crate::schema::{DataType as DeltaDataType, Schema, StructField};
     use crate::utils::test_utils::string_array_to_engine_data;
+    use crate::AsyncIterator;
     use futures::future;
     use itertools::Itertools;
     use object_store::local::LocalFileSystem;
@@ -548,7 +611,7 @@ mod tests {
         let iter = await_!(handler
             .read_json_files(files, get_log_schema().clone(), None))
             .unwrap()
-            .map_ok(into_record_batch);
+            .async_map_ok(into_record_batch);
         let data: Vec<RecordBatch> = await_!(iter.async_pin().async_try_collect())
             .unwrap();
 
@@ -560,7 +623,7 @@ mod tests {
         let iter = await_!(handler
             .read_json_files(files, get_log_schema().clone(), None))
             .unwrap()
-            .map_ok(into_record_batch);
+            .async_map_ok(into_record_batch);
         let data: Vec<RecordBatch> = await_!(iter.async_pin().async_try_collect())
             .unwrap();
 
@@ -713,7 +776,7 @@ mod tests {
             let iter = await_!(handler
                 .read_json_files(&files, physical_schema, None))
                 .unwrap()
-                .map_ok(into_record_batch);
+                .async_map_ok(into_record_batch);
             let data: Vec<RecordBatch> = await_!(iter.async_pin().async_try_collect())
                 .unwrap();
 
@@ -742,6 +805,7 @@ mod tests {
     }
 
     // Helper function to read JSON file asynchronously
+    // Note: object_store is natively async, so this helper must be async
     async fn read_json_file(
         store: &Arc<InMemory>,
         path: &Path,
@@ -760,17 +824,19 @@ mod tests {
         Ok(json)
     }
 
-    #[tokio::test]
-    async fn test_write_json_file_without_overwrite() -> DeltaResult<()> {
-        do_test_write_json_file(false).await
+    // Mode-aware tests that work in both sync and async modes
+    #[async_test]
+    fn test_write_json_file_without_overwrite() -> DeltaResult<()> {
+        await_!(do_test_write_json_file(false))
     }
 
-    #[tokio::test]
-    async fn test_write_json_file_overwrite() -> DeltaResult<()> {
-        do_test_write_json_file(true).await
+    #[async_test]
+    fn test_write_json_file_overwrite() -> DeltaResult<()> {
+        await_!(do_test_write_json_file(true))
     }
 
-    async fn do_test_write_json_file(overwrite: bool) -> DeltaResult<()> {
+    #[async_fn]
+    fn do_test_write_json_file(overwrite: bool) -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let handler = DefaultJsonHandler::new(store.clone(), executor);
@@ -781,23 +847,24 @@ mod tests {
         let data = create_test_data(vec!["remi", "wilson"])?;
         let filtered_data = Ok(FilteredEngineData::with_all_rows_selected(data));
         let result =
-            handler.write_json_file(&path, Box::new(std::iter::once(filtered_data)), overwrite);
+            await_!(handler.write_json_file(&path, into_async_iter(std::iter::once(filtered_data)).into_boxed(), overwrite));
 
         // Verify the first write is successful
         assert!(result.is_ok());
-        let json = read_json_file(&store, &object_path).await?;
+        // read_json_file is a native async fn, so we use futures::executor::block_on in sync mode
+        let json = futures::executor::block_on(read_json_file(&store, &object_path))?;
         assert_eq!(json, vec![json!({"dog": "remi"}), json!({"dog": "wilson"})]);
 
         // Second write with existing file
         let data = create_test_data(vec!["seb", "tia"])?;
         let filtered_data = Ok(FilteredEngineData::with_all_rows_selected(data));
         let result =
-            handler.write_json_file(&path, Box::new(std::iter::once(filtered_data)), overwrite);
+            await_!(handler.write_json_file(&path, into_async_iter(std::iter::once(filtered_data)).into_boxed(), overwrite));
 
         if overwrite {
             // Verify the second write is successful
             assert!(result.is_ok());
-            let json = read_json_file(&store, &object_path).await?;
+            let json = futures::executor::block_on(read_json_file(&store, &object_path))?;
             assert_eq!(json, vec![json!({"dog": "seb"}), json!({"dog": "tia"})]);
         } else {
             // Verify the second write fails with FileAlreadyExists error

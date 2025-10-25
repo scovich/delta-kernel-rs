@@ -2,9 +2,10 @@ use proc_macro2::{Ident, Span, TokenStream};
 use quote::{quote, quote_spanned, ToTokens};
 use syn::parse_macro_input;
 use syn::spanned::Spanned;
+use syn::visit_mut::VisitMut;
 use syn::{
-    Data, DataStruct, DeriveInput, Error, Fields, ImplItemFn, Item, ItemFn, Meta, PathArguments,
-    TraitItemFn, Type, Visibility,
+    Data, DataStruct, DeriveInput, Error, Expr, ExprAwait, Fields, ImplItemFn, Item, ItemFn, Meta,
+    PathArguments, TraitItemFn, Type, Visibility,
 };
 
 /// Parses a dot-delimited column name into an array of field names. See
@@ -256,6 +257,43 @@ fn make_public(mut item: Item) -> Item {
     item
 }
 
+/// Visitor that transforms `.async_await()` method calls based on the async feature flag.
+///
+/// In async mode: `.async_await()` becomes `.await`
+/// In sync mode: `.async_await()` is removed entirely
+struct AsyncAwaitTransformer;
+
+impl VisitMut for AsyncAwaitTransformer {
+    fn visit_expr_mut(&mut self, expr: &mut Expr) {
+        // Check if this is a .async_await() call before recursing
+        // This avoids unnecessary work on expressions we're about to replace
+        if let Expr::MethodCall(method_call) = expr {
+            if method_call.method == "async_await" && method_call.args.is_empty() {
+                let receiver = std::mem::replace(
+                    method_call.receiver.as_mut(),
+                    Expr::Verbatim(Default::default()),
+                );
+
+                if cfg!(feature = "async") {
+                    // Transform to an `.await` on the receiver
+                    *expr = Expr::Await(ExprAwait {
+                        attrs: std::mem::take(&mut method_call.attrs),
+                        base: Box::new(receiver),
+                        dot_token: Default::default(),
+                        await_token: Default::default(),
+                    });
+                } else {
+                    // Remove the call, keeping just the receiver
+                    *expr = receiver;
+                }
+            }
+        }
+
+        // Recurse into whatever survived rewrites (possibly everything)
+        syn::visit_mut::visit_expr_mut(self, expr);
+    }
+}
+
 /// Conditionally adds the `async` keyword to a function based on the `async` feature flag.
 ///
 /// Use this for regular functions and struct impl methods (where there's no `#[async_trait]`).
@@ -265,17 +303,40 @@ fn make_public(mut item: Item) -> Item {
 ///
 /// Write WITHOUT `async` in source. The macro adds it in async mode.
 ///
+/// # Await Transformation
+///
+/// This macro also transforms `.async_await()` method calls in the function body:
+/// - **Async mode**: `.async_await()` → `.await`
+/// - **Sync mode**: `.async_await()` → (removed entirely)
+///
+/// The `.async_await()` syntax provides IDE support via the `AsyncAwaitPlaceholder` trait
+/// and is cleaner than the legacy `await_!()` macro. Both styles work, but `.async_await()`
+/// is preferred for new code.
+///
 /// # Examples
 ///
 /// ```ignore
-/// // Regular function
+/// // Regular function with .async_await() (preferred)
 /// #[async_fn]
-/// fn helper() { await_!(operation())?; }
+/// fn helper() {
+///     let result = operation().async_await()?;
+///     // Async mode:  let result = operation().await?;
+///     // Sync mode:   let result = operation()?;
+/// }
+///
+/// // Legacy await_!() macro (still supported)
+/// #[async_fn]
+/// fn helper_legacy() {
+///     let result = await_!(operation())?;
+/// }
 ///
 /// // Struct impl method
 /// impl MyStruct {
 ///     #[async_fn]
-///     fn process(&self) { await_!(operation())?; }
+///     fn process(&self) {
+///         let data = fetch_data().async_await()?;
+///         Ok(data)
+///     }
 /// }
 /// ```
 #[proc_macro_attribute]
@@ -287,12 +348,18 @@ pub fn async_fn(
 
     // Try regular function first (most common case)
     if let Ok(mut item_fn) = syn::parse::<ItemFn>(item.clone()) {
+        // Apply transformation to function body
+        AsyncAwaitTransformer.visit_block_mut(&mut item_fn.block);
+        
         item_fn.sig.asyncness = asyncness;
         return quote! { #item_fn }.into();
     }
 
-    // Try struct impl method (NOT trait impl - use #[async_trait_fn] for those)
+    // Try struct or trait impl method (use #[async_trait_fn] trait method declarations)
     if let Ok(mut impl_fn) = syn::parse::<ImplItemFn>(item.clone()) {
+        // Apply transformation to function body
+        AsyncAwaitTransformer.visit_block_mut(&mut impl_fn.block);
+        
         impl_fn.sig.asyncness = asyncness;
         return quote! { #impl_fn }.into();
     }

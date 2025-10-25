@@ -87,6 +87,29 @@ pub use async_mode::*;
 // Test helper macro - available for any code that needs mode-agnostic tests
 pub use delta_kernel_derive::async_test;
 
+/// Helper function for async_await placeholder panic message
+///
+/// This message is shown when `.async_await()` is called without the enclosing
+/// function being annotated with `#[async_fn]` or `#[async_test]`.
+#[cold]
+#[inline(never)]
+fn panic_async_await_not_transformed() -> ! {
+    unreachable!(
+        "
+async_await() called without #[async_fn] or #[async_test] annotation.
+
+This method is a placeholder that must be transformed by proc macros.
+Annotate the enclosing function with #[async_fn] or #[async_test].
+
+Example:
+    #[async_fn]
+    fn my_function() {{
+        let result = operation().async_await()?;
+    }}
+"
+    )
+}
+
 use std::any::Any;
 use std::fs::DirEntry;
 use std::sync::Arc;
@@ -622,10 +645,22 @@ pub trait JsonHandler: AsAny {
     ///   each row is a JSON object on a single line)
     /// - `overwrite` - If true, overwrite the file if it exists. If false, the call must fail if
     ///   the file exists.
+    #[cfg(not(feature = "async"))]
     fn write_json_file(
         &self,
         path: &Url,
-        data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        data: BoxedAsyncIterator<DeltaResult<FilteredEngineData>>,
+        overwrite: bool,
+    ) -> DeltaResult<()>;
+
+    /// Write data as a JSON file
+    ///
+    /// This method performs the same operation as the sync version, but asynchronously.
+    #[cfg(feature = "async")]
+    async fn write_json_file(
+        &self,
+        path: &Url,
+        data: BoxedAsyncIterator<DeltaResult<FilteredEngineData>>,
         overwrite: bool,
     ) -> DeltaResult<()>;
 }

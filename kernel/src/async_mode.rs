@@ -13,6 +13,38 @@ use std::task::{Context, Poll};
 pub use async_trait::async_trait;
 pub use delta_kernel_derive::{async_fn, async_trait_fn};
 
+/// Placeholder trait for IDE support - DO NOT IMPORT MANUALLY
+///
+/// This trait exists solely to help IDEs recognize `.async_await()` method calls.
+/// The actual transformation is done by the `#[async_fn]` or `#[async_test]` 
+/// proc macros, which will transform `.async_await()` into `.await` in async mode.
+///
+/// In async mode, `.async_await()` is transformed to `.await`.
+/// For example: `future.async_await()` becomes `future.await`.
+///
+/// # Usage
+///
+/// ```ignore
+/// #[async_fn]
+/// fn my_function() {
+///     let result = some_future().async_await()?;
+///     // In async mode, becomes: let result = some_future().await?;
+/// }
+/// ```
+///
+/// # Panic Behavior
+///
+/// If you see this panic at runtime, you forgot to annotate your function with
+/// `#[async_fn]` or `#[async_test]`. The proc macro must transform the code
+/// before it runs.
+pub trait AsyncAwaitPlaceholder: Future + Sized {
+    fn async_await(self) -> Self::Output {
+        super::panic_async_await_not_transformed()
+    }
+}
+
+impl<T: Future + Sized> AsyncAwaitPlaceholder for T {}
+
 /// Conditionally adds `.await` to an expression (adds .await in async mode)
 #[macro_export]
 macro_rules! await_ {

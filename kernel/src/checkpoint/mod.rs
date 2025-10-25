@@ -104,7 +104,7 @@ use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _}
 use crate::snapshot::SnapshotRef;
 use crate::table_properties::TableProperties;
 use crate::{
-    async_fn, await_, into_async_iter, AsyncIterator as _, DeltaResult, Engine, EngineData, Error,
+    async_fn, await_, into_async_iter, AsyncIterator, DeltaResult, Engine, EngineData, Error,
     EvaluationHandlerExtension, FileMeta,
 };
 
@@ -312,11 +312,11 @@ impl CheckpointWriter {
 
         // Write the `_last_checkpoint` file to `table/_delta_log/_last_checkpoint`
         let filtered_data = FilteredEngineData::with_all_rows_selected(data?);
-        engine.json_handler().write_json_file(
+        await_!(engine.json_handler().write_json_file(
             &last_checkpoint_path,
-            Box::new(std::iter::once(Ok(filtered_data))),
+            into_async_iter(std::iter::once(Ok(filtered_data))).into_boxed(),
             true,
-        )?;
+        ))?;
 
         Ok(())
     }

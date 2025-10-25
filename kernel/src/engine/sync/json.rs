@@ -12,7 +12,7 @@ use crate::engine::arrow_utils::to_json_bytes;
 use crate::engine_data::FilteredEngineData;
 use crate::schema::SchemaRef;
 use crate::{
-    async_trait, async_trait_fn, DeltaResult, EngineData, Error, FileDataReadResultIterator,
+    async_fn, async_test, async_trait, async_trait_fn, await_, into_async_iter, AsyncIterator, DeltaResult, EngineData, Error, FileDataReadResultIterator,
     FileMeta, JsonHandler, PredicateRef,
 };
 
@@ -53,6 +53,7 @@ impl JsonHandler for SyncJsonHandler {
     // For sync writer we write data to a tmp file then atomically rename it to the final path.
     // This is highly OS-dependent and for now relies on the atomicity of tempfile's
     // `persist_noclobber`.
+    #[cfg(not(feature = "async"))]
     fn write_json_file(
         &self,
         path: &Url,
@@ -96,6 +97,57 @@ impl JsonHandler for SyncJsonHandler {
 
         Ok(())
     }
+
+    // Async mode version - same logic but with async signature
+    #[cfg(feature = "async")]
+    async fn write_json_file(
+        &self,
+        path: &Url,
+        data: crate::BoxedAsyncIterator<DeltaResult<FilteredEngineData>>,
+        overwrite: bool,
+    ) -> DeltaResult<()> {
+        use futures::StreamExt;
+        
+        let path_clone = path
+            .to_file_path()
+            .map_err(|_| crate::Error::generic("sync client can only read local files"))?;
+        let Some(parent) = path_clone.parent() else {
+            return Err(crate::Error::generic(format!(
+                "no parent found for {path_clone:?}"
+            )));
+        };
+
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        // Collect the stream into a vector
+        let items: Vec<_> = data.collect().await;
+        
+        // write data to tmp file
+        let mut tmp_file = NamedTempFile::new_in(parent)?;
+        let buf = to_json_bytes(Box::new(items.into_iter()))?;
+        tmp_file.write_all(&buf)?;
+        tmp_file.flush()?;
+
+        let persist_result = if overwrite {
+            tmp_file.persist(path_clone.clone())
+        } else {
+            // use 'persist_noclobber' to atomically rename tmp file to final path
+            tmp_file.persist_noclobber(path_clone.clone())
+        };
+
+        // Map errors (handling AlreadyExists only in non-overwrite mode).
+        persist_result.map_err(|e| {
+            if !overwrite && e.error.kind() == std::io::ErrorKind::AlreadyExists {
+                Error::FileAlreadyExists(path_clone.to_string_lossy().to_string())
+            } else {
+                Error::IOError(e.into())
+            }
+        })?;
+
+        Ok(())
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -130,16 +182,17 @@ mod tests {
         Ok(json)
     }
 
-    #[test]
-    fn test_write_json_file_without_overwrite() -> DeltaResult<()> {
-        do_test_write_json_file(false)
+    #[async_test]
+    async fn test_write_json_file_without_overwrite() -> DeltaResult<()> {
+        await_!(do_test_write_json_file(false))
     }
 
-    #[test]
-    fn test_write_json_file_overwrite() -> DeltaResult<()> {
-        do_test_write_json_file(true)
+    #[async_test]
+    async fn test_write_json_file_overwrite() -> DeltaResult<()> {
+        await_!(do_test_write_json_file(true))
     }
 
+    #[async_fn]
     fn do_test_write_json_file(overwrite: bool) -> DeltaResult<()> {
         let test_dir = TempDir::new().unwrap();
         let path = test_dir.path().join("00000000000000000001.json");
@@ -149,8 +202,9 @@ mod tests {
         // First write with no existing file
         let data = create_test_data(vec!["remi", "wilson"])?;
         let filtered_data = Ok(FilteredEngineData::with_all_rows_selected(data));
-        let result =
-            handler.write_json_file(&url, Box::new(std::iter::once(filtered_data)), overwrite);
+        let result = await_!(
+            handler.write_json_file(&url, into_async_iter(std::iter::once(filtered_data)).into_boxed(), overwrite)
+        );
 
         // Verify the first write is successful
         assert!(result.is_ok());
@@ -160,8 +214,9 @@ mod tests {
         // Second write with existing file
         let data = create_test_data(vec!["seb", "tia"])?;
         let filtered_data = Ok(FilteredEngineData::with_all_rows_selected(data));
-        let result =
-            handler.write_json_file(&url, Box::new(std::iter::once(filtered_data)), overwrite);
+        let result = await_!(
+            handler.write_json_file(&url, into_async_iter(std::iter::once(filtered_data)).into_boxed(), overwrite)
+        );
 
         if overwrite {
             // Verify the second write is successful

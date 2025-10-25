@@ -38,9 +38,9 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
 
     /// Native async implementation for list_from
     async fn list_from_impl(
-        &self,
-        path: &Url,
-    ) -> DeltaResult<Pin<Box<dyn Stream<Item = DeltaResult<FileMeta>> + Send>>> {
+        store: Arc<DynObjectStore>,
+        path: Url,
+    ) -> DeltaResult<Pin<Box<dyn Stream<Item = DeltaResult<FileMeta>> + Send + 'static>>> {
         // The offset is used for list-after; the prefix is used to restrict the listing to a specific directory.
         // Unfortunately, `Path` provides no easy way to check whether a name is directory-like,
         // because it strips trailing /, so we're reduced to manually checking the original URL.
@@ -57,9 +57,7 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
             }
             Path::from_iter(parts)
         };
-
-        let store = self.inner.clone();
-
+        
         // HACK to check if we're using a LocalFileSystem from ObjectStore. We need this because
         // local filesystem doesn't return a sorted list by default. Although the `object_store`
         // crate explicitly says it _does not_ return a sorted listing, in practice all the cloud
@@ -79,30 +77,25 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
         //   in your Cloud Storage buckets, which are ordered in the list lexicographically by name."
         // So we just need to know if we're local and then if so, we sort the returned file list
         let has_ordered_listing = path.scheme() != "file";
-        let url = path.clone();
 
+        use futures::TryStreamExt as _;
         let stream = store.list_with_offset(Some(&prefix), &offset)
             .map(move |meta| {
-                match meta {
-                    Ok(meta) => {
-                        let mut location = url.clone();
-                        location.set_path(&format!("/{}", meta.location.as_ref()));
-                        Ok(FileMeta {
-                            location,
-                            last_modified: meta.last_modified.timestamp_millis(),
-                            size: meta.size,
-                        })
-                    }
-                    Err(e) => Err(e.into()),
-                }
+                let meta = meta?;
+                let mut location = path.clone();
+                location.set_path(&format!("/{}", meta.location.as_ref()));
+                Ok(FileMeta {
+                    location,
+                    last_modified: meta.last_modified.timestamp_millis(),
+                    size: meta.size,
+                })
             });
 
         if !has_ordered_listing {
             // Local filesystem doesn't return sorted list - need to collect and sort
-            let items: Vec<_> = stream.collect().await;
-            let mut sorted: Vec<FileMeta> = items.into_iter().try_collect()?;
-            sorted.sort_unstable();
-            Ok(Box::pin(stream::iter(sorted.into_iter().map(Ok))))
+            let mut items: Vec<_> = stream.try_collect().await?;
+            items.sort_unstable();
+            Ok(Box::pin(stream::iter(items.into_iter().map(Ok))))
         } else {
             Ok(Box::pin(stream))
         }
@@ -110,11 +103,10 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
 
     /// Native async implementation for read_files
     async fn read_files_impl(
-        &self,
+        store: Arc<DynObjectStore>,
         files: Vec<FileSlice>,
-    ) -> DeltaResult<Pin<Box<dyn Stream<Item = DeltaResult<Bytes>> + Send>>> {
-        let store = self.inner.clone();
-        
+        readahead: usize,
+    ) -> DeltaResult<Pin<Box<dyn Stream<Item = DeltaResult<Bytes>> + Send + 'static>>> {
         Ok(Box::pin(
             stream::iter(files)
                 .map(move |(url, range)| {
@@ -147,7 +139,7 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
                 })
                 // We allow executing up to `readahead` futures concurrently and
                 // buffer the results. This allows us to achieve async concurrency.
-                .buffered(self.readahead),
+                .buffered(readahead),
         ))
     }
 }
@@ -160,7 +152,10 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         &self,
         path: &Url,
     ) -> DeltaResult<BoxedAsyncIterator<DeltaResult<FileMeta>>> {
-        super::into_boxed_async_iterator(self.list_from_impl(path))
+        super::into_boxed_async_iterator(
+            self.task_executor.clone(), 
+            Self::list_from_impl(self.inner.clone(), path.clone())
+        )
     }
 
     // Async mode: await the future and return the boxed stream
@@ -169,7 +164,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         &self,
         path: &Url,
     ) -> DeltaResult<BoxedAsyncIterator<DeltaResult<FileMeta>>> {
-        self.list_from_impl(path).await
+        Self::list_from_impl(self.inner.clone(), path.clone()).await
     }
 
     // Sync mode: pass future to helper which blocks internally
@@ -178,7 +173,10 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         &self,
         files: Vec<FileSlice>,
     ) -> DeltaResult<BoxedAsyncIterator<DeltaResult<Bytes>>> {
-        super::into_boxed_async_iterator(self.read_files_impl(files))
+        super::into_boxed_async_iterator(
+            self.task_executor.clone(), 
+            Self::read_files_impl(self.inner.clone(), files, self.readahead)
+        )
     }
 
     // Async mode: await the future and return the boxed stream
@@ -187,7 +185,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         &self,
         files: Vec<FileSlice>,
     ) -> DeltaResult<BoxedAsyncIterator<DeltaResult<Bytes>>> {
-        self.read_files_impl(files).await
+        Self::read_files_impl(self.inner.clone(), files, self.readahead).await
     }
 }
 

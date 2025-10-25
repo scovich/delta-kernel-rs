@@ -233,13 +233,14 @@ fn test_version_filtering() {
 #[async_test]
 fn test_no_compaction_staged_commits() {
     use crate::actions::Add;
-    use crate::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
+    use crate::engine::default::{executor::{tokio::TokioBackgroundExecutor, TaskExecutor}, DefaultEngine};
     use object_store::{memory::InMemory, path::Path, ObjectStore};
     use std::sync::Arc;
 
     // Set up in-memory store
     let store = Arc::new(InMemory::new());
-    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let executor = Arc::new(TokioBackgroundExecutor::new());
+    let engine = DefaultEngine::new(store.clone(), executor.clone());
 
     // Create basic commits with proper metadata and protocol
     use crate::actions::{Metadata, Protocol};
@@ -266,11 +267,13 @@ fn test_no_compaction_staged_commits() {
 
     // Write version 0
     let commit_0_path = Path::from("_delta_log/00000000000000000000.json");
-    futures::executor::block_on(async {
-        store
+    let store_clone = store.clone();
+    let metadata_protocol = format!("{}\n{}", metadata_action, protocol_action);
+    executor.block_on(async move {
+        store_clone
             .put(
                 &commit_0_path,
-                format!("{}\n{}", metadata_action, protocol_action).into(),
+                metadata_protocol.into(),
             )
             .await
             .unwrap();
@@ -279,9 +282,11 @@ fn test_no_compaction_staged_commits() {
     // Write version 1
     let add_action = serde_json::to_string(&Action::Add(Add::default())).unwrap();
     let commit_1_path = Path::from("_delta_log/00000000000000000001.json");
-    futures::executor::block_on(async {
-        store
-            .put(&commit_1_path, add_action.clone().into())
+    let store_clone = store.clone();
+    let add_action_clone = add_action.clone();
+    executor.block_on(async move {
+        store_clone
+            .put(&commit_1_path, add_action_clone.into())
             .await
             .unwrap();
     });
@@ -290,8 +295,9 @@ fn test_no_compaction_staged_commits() {
     let staged_commit_path = Path::from(
         "_delta_log/_staged_commits/00000000000000000002.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
     );
-    futures::executor::block_on(async {
-        store
+    let store_clone = store.clone();
+    executor.block_on(async move {
+        store_clone
             .put(&staged_commit_path, add_action.into())
             .await
             .unwrap();

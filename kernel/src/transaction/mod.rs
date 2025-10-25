@@ -18,7 +18,7 @@ use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
 use crate::utils::current_time_ms;
 use crate::{
-    async_fn, await_, DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef,
+    async_fn, await_, into_async_iter, AsyncIterator, DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef,
     IntoEngineData, RowVisitor, Version,
 };
 
@@ -234,11 +234,12 @@ impl Transaction {
             .chain(domain_metadata_actions);
 
         // Convert EngineData to FilteredEngineData with all rows selected
-        let filtered_actions = actions
-            .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected));
+        let filtered_actions: Vec<_> = actions
+            .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected))
+            .collect();
 
         let json_handler = engine.json_handler();
-        match json_handler.write_json_file(&commit_path.location, Box::new(filtered_actions), false)
+        match await_!(json_handler.write_json_file(&commit_path.location, into_async_iter(filtered_actions).into_boxed(), false))
         {
             Ok(()) => Ok(CommitResult::CommittedTransaction(
                 self.into_committed(commit_version),

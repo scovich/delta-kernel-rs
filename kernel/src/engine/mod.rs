@@ -37,8 +37,9 @@ mod tests {
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_data::ArrowEngineData;
+    use crate::into_async_iter;
     use crate::engine_data::FilteredEngineData;
-    use crate::{async_fn, await_, AsyncIterator as _, Engine, EngineData};
+    use crate::{async_fn, await_, AsyncIterator, Engine, EngineData};
 
     use test_utils::delta_path_for_version;
 
@@ -61,10 +62,10 @@ mod tests {
 
         for i in expected_names.iter().rev() {
             let path = base_url.join(i.as_ref()).unwrap();
-            json.write_json_file(&path, get_data(), false).unwrap();
+            await_!(json.write_json_file(&path, into_async_iter(get_data()).into_boxed(), false)).unwrap();
         }
         let path = base_url.join("other").unwrap();
-        json.write_json_file(&path, get_data(), false).unwrap();
+        await_!(json.write_json_file(&path, into_async_iter(get_data()).into_boxed(), false)).unwrap();
 
         let storage = engine.storage_handler();
 

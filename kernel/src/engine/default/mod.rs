@@ -37,24 +37,52 @@ pub mod json;
 pub mod parquet;
 pub mod storage;
 
-/// Adapter for converting Stream-producing futures to BoxedAsyncIterator in sync mode.
+/// Adapter for converting Stream-producing futures to BoxedAsyncIterator
+///
+/// In sync mode: blocks on the future and wraps the stream to block on each item.
+/// In async mode: this should not be used (just await the future directly).
 ///
 /// This is a utility for the default engine implementations (filesystem, json, parquet)
 /// to bridge between the async object_store API and the sync StorageHandler trait.
+///
+/// Uses the provided TaskExecutor to spawn the stream in the background and bridge via channel.
+/// This avoids nested block_on calls that can cause deadlocks.
 #[cfg(not(feature = "async"))]
-pub(crate) fn into_boxed_async_iterator<Fut, S, T>(
+pub(crate) fn into_boxed_async_iterator<Fut, S, T, E: executor::TaskExecutor>(
+    task_executor: Arc<E>,
     stream_future: Fut,
 ) -> DeltaResult<BoxedAsyncIterator<T>>
 where
-    Fut: std::future::Future<Output = DeltaResult<S>>,
+    Fut: std::future::Future<Output = DeltaResult<S>> + Send + 'static,
     S: futures::stream::Stream<Item = T> + Send + 'static,
     T: Send + 'static,
 {
     use futures::stream::StreamExt as _;
-    let mut stream = Box::pin(futures::executor::block_on(stream_future)?);
-    let iter =
-        std::iter::from_fn(move || futures::executor::block_on(async { stream.next().await }));
-    Ok(iter.into_boxed())
+    
+    // Create the stream by blocking on the future
+    let mut stream = Box::pin(task_executor.block_on(stream_future)?);
+    
+    // Create a channel to bridge async stream to sync iterator
+    let (sender, receiver) = std::sync::mpsc::sync_channel(50);
+    
+    // Spawn the stream processing in the background
+    let executor_for_block = task_executor.clone();
+    task_executor.spawn(async move {
+        while let Some(item) = stream.next().await {
+            let sender_clone = sender.clone();
+            let join_res = executor_for_block
+                .spawn_blocking(move || sender_clone.send(item))
+                .await;
+            match join_res {
+                Ok(Ok(())) => continue,
+                Ok(Err(_)) => break, // Receiver dropped
+                Err(_) => break,     // spawn_blocking failed
+            }
+        }
+    });
+    
+    // Return the receiver as an iterator
+    Ok(receiver.into_iter().into_boxed())
 }
 
 #[derive(Debug)]
