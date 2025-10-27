@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use acceptance::read_dat_case;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::storage::parse_url_opts;
 use delta_kernel::engine::default::DefaultEngine;
 
 // TODO(zach): skip iceberg_compat_v1 test until DAT is fixed
@@ -27,14 +27,9 @@ fn reader_test(path: &Path) -> datatest_stable::Result<()> {
         .block_on(async {
             let case = read_dat_case(root_dir).unwrap();
             let table_root = case.table_root().unwrap();
-            let engine = Arc::new(
-                DefaultEngine::try_new(
-                    &table_root,
-                    std::iter::empty::<(&str, &str)>(),
-                    Arc::new(TokioBackgroundExecutor::new()),
-                )
-                .unwrap(),
-            );
+            let (store, _) = parse_url_opts(&table_root, std::iter::empty::<(&str, &str)>())
+                .unwrap();
+            let engine = Arc::new(DefaultEngine::new(Arc::new(store)));
 
             case.assert_metadata(engine.clone()).await.unwrap();
             acceptance::data::assert_scan_metadata(engine.clone(), &case)

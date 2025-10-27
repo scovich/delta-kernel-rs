@@ -3,23 +3,40 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::panic)]
 
-//! The default engine uses Async IO to read files, but the kernel APIs are all
-//! synchronous. Therefore, we need an executor to run the async IO on in the
-//! background.
+//! Task executor for running async IO in synchronous contexts.
 //!
-//! A generic trait [TaskExecutor] can be implemented with your preferred async
-//! runtime. Behind the `tokio` feature flag, we provide a both a single-threaded
-//! and multi-threaded executor based on Tokio.
+//! # Sync Mode (default)
+//!
+//! In sync mode, the default engine uses async IO internally (via `object_store`),
+//! but kernel APIs are synchronous. The [TaskExecutor] trait provides methods to
+//! run async tasks on a background thread.
+//!
+//! Behind the `tokio` feature flag, we provide both single-threaded and multi-threaded
+//! executors based on Tokio:
+//! - [tokio::TokioBackgroundExecutor] - Single-threaded runtime on a background thread
+//! - [tokio::TokioMultiThreadExecutor] - Multi-threaded runtime
+//!
+//! # Async Mode (with `async` feature)
+//!
+//! In async mode, kernel APIs are natively async. [TaskExecutor] becomes an empty
+//! marker trait with no methods, and the unit type `()` serves as the executor.
+//! No actual task executor is needed since everything is already async.
+#[cfg(not(feature = "async"))]
 use futures::{future::BoxFuture, Future};
 
+#[cfg(not(feature = "async"))]
 use crate::DeltaResult;
 
 /// An executor that can be used to run async tasks. This is used by IO functions
 /// within the `DefaultEngine`.
 ///
+/// In sync mode: This trait provides methods to run async tasks on a background thread.
+/// In async mode: This is an empty marker trait (executor methods are not needed).
+///
 /// This must be capable of running within an async context and running futures
 /// on another thread. This could be a multi-threaded runtime, like Tokio's or
 /// could be a single-threaded runtime on a background thread.
+#[cfg(not(feature = "async"))]
 pub trait TaskExecutor: Send + Sync + 'static {
     /// Block on the given future, returning its output.
     ///
@@ -41,7 +58,49 @@ pub trait TaskExecutor: Send + Sync + 'static {
         R: Send + 'static;
 }
 
-#[cfg(any(feature = "tokio", test))]
+/// Empty marker trait for async mode - no executor methods needed.
+#[cfg(feature = "async")]
+pub trait TaskExecutor: Send + Sync + 'static {}
+
+/// In async mode, the unit type `()` serves as the executor.
+/// Since TaskExecutor is an empty marker trait in async mode, `()` is perfect:
+/// - Zero-sized (no runtime cost)
+/// - Already implements Send + Sync + Default
+/// - Clearly represents "no executor needed"
+#[cfg(feature = "async")]
+impl TaskExecutor for () {}
+
+/// The default executor type for the current build configuration.
+///
+/// In sync mode (default): `TokioBackgroundExecutor`
+/// In async mode (with `async` feature): `()` (unit type - no executor needed)
+#[cfg(not(feature = "async"))]
+pub type DefaultTaskExecutor = tokio::TokioBackgroundExecutor;
+
+#[cfg(feature = "async")]
+pub type DefaultTaskExecutor = ();
+
+/// Create a default task executor.
+///
+/// Returns an `Arc<DefaultTaskExecutor>` which is:
+/// - In sync mode: `Arc<TokioBackgroundExecutor>`
+/// - In async mode: `Arc<()>`
+///
+/// This helper is useful for tests to avoid clippy warnings in async mode about
+/// "passing a unit value to a function" when calling `Arc::new(DefaultTaskExecutor::default())`.
+///
+/// # Example
+///
+/// ```rust
+/// # use delta_kernel::engine::default::executor::default_task_executor;
+/// let executor = default_task_executor();
+/// // Use with handlers, engines, etc.
+/// ```
+pub fn default_task_executor() -> std::sync::Arc<DefaultTaskExecutor> {
+    Default::default()
+}
+
+#[cfg(all(any(feature = "tokio", test), not(feature = "async")))]
 pub mod tokio {
     use super::TaskExecutor;
     use futures::TryFutureExt;
@@ -215,6 +274,7 @@ pub mod tokio {
     #[cfg(test)]
     mod test {
         use super::*;
+        use crate::engine::default::executor::DefaultTaskExecutor;
 
         async fn test_executor(executor: impl TaskExecutor) {
             // Can run a task
@@ -237,7 +297,7 @@ pub mod tokio {
 
         #[tokio::test]
         async fn test_tokio_background_executor() {
-            let executor = TokioBackgroundExecutor::new();
+            let executor = DefaultTaskExecutor::default();
             test_executor(executor).await;
         }
 

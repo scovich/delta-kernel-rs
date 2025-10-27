@@ -16,11 +16,12 @@ use uuid::Uuid;
 use delta_kernel::arrow::array::TimestampMicrosecondArray;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::executor::DefaultTaskExecutor;
+use delta_kernel::engine::default::storage::parse_url_opts;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::{CommitResult, RetryableTransaction};
-use delta_kernel::{await_, DeltaResult, Engine, Error, Snapshot, SnapshotRef};
+use delta_kernel::{async_fn, await_, DeltaResult, Engine, Error, Snapshot, SnapshotRef};
 
 /// An example program that writes to a Delta table and creates it if necessary.
 #[derive(Parser)]
@@ -45,10 +46,24 @@ struct Cli {
     // TODO: Support specifying whether the transaction should overwrite, append, or error if the table already exists
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+/// This example works in both sync and async modes.
+/// - Default (sync): `cargo run --example write-table`
+/// - Async mode: `cargo run --example write-table --features async`
+///
+/// The conditional runtime setup below shows how to write async-agnostic code
+/// that works seamlessly in either mode.
+fn main() -> ExitCode {
     env_logger::init();
-    match try_main().await {
+    // Sync mode: call try_main directly (no async runtime needed)
+    #[cfg(not(feature = "async"))]
+    let result = try_main();
+    // Async mode: create a tokio runtime to execute the async function
+    #[cfg(feature = "async")]
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(try_main());
+    
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             println!("{e:#?}");
@@ -58,7 +73,8 @@ async fn main() -> ExitCode {
 }
 
 // TODO: Update the example once official write APIs are introduced (issue#1123)
-async fn try_main() -> DeltaResult<()> {
+#[async_fn]
+fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Write", "write", "");
 
     // Check if path is a directory and if not, create it
@@ -75,14 +91,11 @@ async fn try_main() -> DeltaResult<()> {
     println!("Using Delta table at: {url}");
 
     // Get the engine for local filesystem
-    let engine = DefaultEngine::try_new(
-        &url,
-        HashMap::<String, String>::new(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    )?;
+    let (store, _) = parse_url_opts(&url, HashMap::<String, String>::new())?;
+    let engine = DefaultEngine::new(Arc::new(store));
 
     // Create or get the table
-    let snapshot = create_or_get_base_snapshot(&url, &engine, &cli.schema).await?;
+    let snapshot = await_!(create_or_get_base_snapshot(&url, &engine, &cli.schema))?;
 
     // Create sample data based on the schema
     let sample_data = create_sample_data(&snapshot.schema(), cli.num_rows)?;
@@ -95,9 +108,8 @@ async fn try_main() -> DeltaResult<()> {
 
     // Write the data using the engine
     let write_context = Arc::new(txn.get_write_context());
-    let file_metadata = engine
-        .write_parquet(&sample_data, write_context.as_ref(), HashMap::new(), true)
-        .await?;
+    let file_metadata = await_!(engine
+        .write_parquet(&sample_data, write_context.as_ref(), HashMap::new(), true))?;
 
     // Add the file metadata to the transaction
     txn.add_files(file_metadata);
@@ -130,14 +142,15 @@ async fn try_main() -> DeltaResult<()> {
     println!("✓ Successfully wrote {} rows to the table", cli.num_rows);
 
     // Read and display the data
-    read_and_display_data(&url, engine).await?;
+    await_!(read_and_display_data(&url, engine))?;
     println!("✓ Successfully read data from the table");
 
     Ok(())
 }
 
 /// Creates a new Delta table or gets an existing one.
-async fn create_or_get_base_snapshot(
+#[async_fn]
+fn create_or_get_base_snapshot(
     url: &Url,
     engine: &dyn Engine,
     schema_str: &str,
@@ -152,7 +165,7 @@ async fn create_or_get_base_snapshot(
             // Create new table
             println!("Creating new Delta table...");
             let schema = parse_schema(schema_str)?;
-            create_table(url, &schema).await?;
+            await_!(create_table(url, &schema))?;
             await_!(Snapshot::builder_for(url.clone()).build(engine))
         }
     }
@@ -196,7 +209,8 @@ fn parse_schema(schema_str: &str) -> DeltaResult<SchemaRef> {
 ///
 /// Creating a Delta table is not officially supported by kernel-rs yet, so we manually create the
 /// initial transaction log.
-async fn create_table(table_url: &Url, schema: &SchemaRef) -> DeltaResult<()> {
+#[async_fn]
+fn create_table(table_url: &Url, schema: &SchemaRef) -> DeltaResult<()> {
     let table_id = Uuid::new_v4().to_string();
     let schema_str = serde_json::to_string(&schema)?;
 
@@ -308,9 +322,10 @@ fn create_sample_data(schema: &SchemaRef, num_rows: usize) -> DeltaResult<ArrowE
 }
 
 /// Read and display data from the table.
-async fn read_and_display_data(
+#[async_fn]
+fn read_and_display_data(
     table_url: &Url,
-    engine: DefaultEngine<TokioBackgroundExecutor>,
+    engine: DefaultEngine<DefaultTaskExecutor>,
 ) -> DeltaResult<()> {
     let snapshot = await_!(Snapshot::builder_for(table_url.clone()).build(&engine))?;
     let scan = snapshot.scan_builder().build()?;

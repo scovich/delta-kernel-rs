@@ -24,7 +24,7 @@ use crate::engine::arrow_utils::to_json_bytes;
 use crate::engine_data::FilteredEngineData;
 use crate::schema::SchemaRef;
 use crate::{
-    async_trait, into_async_iter, AsyncIterator, BoxedAsyncIterator, DeltaResult, EngineData, Error,
+    async_trait, BoxedAsyncIterator, DeltaResult, EngineData, Error,
     FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
 };
 
@@ -36,6 +36,7 @@ pub struct DefaultJsonHandler<E: TaskExecutor> {
     /// The object store to read files from
     store: Arc<DynObjectStore>,
     /// The executor to run async tasks on
+    #[cfg_attr(feature = "async", allow(dead_code))]
     task_executor: Arc<E>,
     /// The maximum number of read requests to buffer in memory at once. Note that this actually
     /// controls two things: the number of concurrent requests (done by `buffered`) and the size of
@@ -318,14 +319,11 @@ mod tests {
     use std::task::Waker;
 
     use crate::actions::get_log_schema;
-    use crate::{async_fn, async_test, await_};
-    use crate::arrow::array::{AsArray, Int32Array, RecordBatch, StringArray};
+    use crate::engine::default::executor::default_task_executor;
+    use crate::{async_fn, async_test, await_, into_async_iter};
+    use crate::arrow::array::{AsArray, RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::default::executor::tokio::{
-        TokioBackgroundExecutor, TokioMultiThreadExecutor,
-    };
-    use crate::schema::{DataType as DeltaDataType, Schema, StructField};
     use crate::utils::test_utils::string_array_to_engine_data;
     use crate::AsyncIterator;
     use futures::future;
@@ -547,7 +545,7 @@ mod tests {
     #[test]
     fn test_parse_json() {
         let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let handler = DefaultJsonHandler::new(store, default_task_executor());
 
         let json_strings = StringArray::from(vec![
             r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
@@ -566,7 +564,7 @@ mod tests {
     #[test]
     fn test_parse_json_drop_field() {
         let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let handler = DefaultJsonHandler::new(store, default_task_executor());
         let json_strings = StringArray::from(vec![
             r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":false}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2, "maxRowId": 3}}}"#,
         ]);
@@ -607,7 +605,7 @@ mod tests {
             size: meta.size,
         }];
 
-        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let handler = DefaultJsonHandler::new(store, default_task_executor());
         let iter = await_!(handler
             .read_json_files(files, get_log_schema().clone(), None))
             .unwrap()
@@ -691,7 +689,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    #[cfg(not(feature = "async"))]
     async fn test_read_json_files_ordering() {
+        use crate::arrow::array::Int32Array;
+        use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
+        use crate::schema::{DataType as DeltaDataType, Schema, StructField};
+
         // this test checks that the read_json_files method returns the files in order in the
         // presence of an ObjectStore (OrderedGetStore) that resolves paths in a jumbled order:
         // 1. we set up a list of FileMetas (and some random JSON content) in order
@@ -838,8 +841,7 @@ mod tests {
     #[async_fn]
     fn do_test_write_json_file(overwrite: bool) -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
-        let executor = Arc::new(TokioBackgroundExecutor::new());
-        let handler = DefaultJsonHandler::new(store.clone(), executor);
+        let handler = DefaultJsonHandler::new(store.clone(), default_task_executor());
         let path = Url::parse("memory:///test/data/00000000000000000001.json")?;
         let object_path = Path::from("/test/data/00000000000000000001.json");
 

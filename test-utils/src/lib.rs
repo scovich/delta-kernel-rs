@@ -10,8 +10,8 @@ use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::executor::TaskExecutor;
+use delta_kernel::engine::default::executor::DefaultTaskExecutor;
+use delta_kernel::engine::default::storage::parse_url_opts;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
@@ -194,27 +194,51 @@ pub fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
         .into()
 }
 
-/// Simple extension trait with helpful methods (just constuctor for now) for creating/using
-/// DefaultEngine in our tests.
+/// Create an ObjectStore from a URL and options.
 ///
-/// Note: we implment this extension trait here so that we can import this trait (from test-utils
-/// crate) and get to use all these test-only helper methods from places where we don't have access
-pub trait DefaultEngineExtension {
-    type Executor: TaskExecutor;
-
-    fn new_local() -> Arc<DefaultEngine<Self::Executor>>;
+/// This is a test helper that wraps the engine's URL parsing logic,
+/// allowing you to create a store and then pass it to `DefaultEngine::new()`.
+pub fn create_store_from_url<K, V>(
+    table_root: &url::Url,
+    options: impl IntoIterator<Item = (K, V)>,
+) -> DeltaResult<Arc<dyn ObjectStore>>
+where
+    K: AsRef<str>,
+    V: Into<String>,
+{
+    let (object_store, _) = parse_url_opts(table_root, options)?;
+    Ok(Arc::new(object_store))
 }
 
-impl DefaultEngineExtension for DefaultEngine<TokioBackgroundExecutor> {
-    type Executor = TokioBackgroundExecutor;
+/// Create a default task executor for integration tests (in `kernel/tests`).
+///
+/// Returns an `Arc<DefaultTaskExecutor>` which is:
+/// - In sync mode: `Arc<TokioBackgroundExecutor>`
+/// - In async mode: `Arc<()>`
+///
+/// This helper eliminates clippy warnings in async mode about passing unit values to functions.
+///
+/// **Note**: This helper should only be used in integration tests (`kernel/tests`), not in
+/// unit tests within `kernel/src`. Unit tests should use `Arc::default()` with type annotation
+/// to avoid "multiple versions of delta_kernel" errors.
+pub fn default_task_executor() -> Arc<DefaultTaskExecutor> {
+    Arc::default()
+}
 
-    fn new_local() -> Arc<DefaultEngine<TokioBackgroundExecutor>> {
-        let object_store = Arc::new(LocalFileSystem::new());
-        Arc::new(DefaultEngine::new(
-            object_store,
-            TokioBackgroundExecutor::new().into(),
-        ))
-    }
+/// Helper to create a DefaultEngine with the default executor for the current mode.
+///
+/// In sync mode: Creates a `TokioBackgroundExecutor`
+/// In async mode: Uses the unit type `()` as a no-op executor
+pub fn create_default_engine<K, V>(
+    table_root: &url::Url,
+    options: impl IntoIterator<Item = (K, V)>,
+) -> DeltaResult<Arc<DefaultEngine<DefaultTaskExecutor>>>
+where
+    K: AsRef<str>,
+    V: Into<String>,
+{
+    let store = create_store_from_url(table_root, options)?;
+    Ok(Arc::new(DefaultEngine::new(store)))
 }
 
 // setup default engine with in-memory (local_directory=None) or local fs (local_directory=Some(Url))
@@ -223,7 +247,7 @@ pub fn engine_store_setup(
     local_directory: Option<&Url>,
 ) -> (
     Arc<dyn ObjectStore>,
-    DefaultEngine<TokioBackgroundExecutor>,
+    DefaultEngine<DefaultTaskExecutor>,
     Url,
 ) {
     let (storage, url): (Arc<dyn ObjectStore>, Url) = match local_directory {
@@ -236,8 +260,7 @@ pub fn engine_store_setup(
             Url::parse(format!("{dir}{table_name}/").as_str()).expect("valid url"),
         ),
     };
-    let executor = Arc::new(TokioBackgroundExecutor::new());
-    let engine = DefaultEngine::new(Arc::clone(&storage), executor);
+    let engine = DefaultEngine::new(Arc::clone(&storage));
 
     (storage, engine, url)
 }
@@ -375,7 +398,7 @@ pub async fn setup_test_tables(
 ) -> Result<
     Vec<(
         Url,
-        DefaultEngine<TokioBackgroundExecutor>,
+        DefaultEngine<DefaultTaskExecutor>,
         Arc<dyn ObjectStore>,
         &'static str,
     )>,

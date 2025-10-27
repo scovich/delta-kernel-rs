@@ -1,22 +1,19 @@
 use delta_kernel::arrow::array::RecordBatch;
-use delta_kernel::engine::default::DefaultEngine;
 
 use delta_kernel::{async_fn, async_test, await_, DeltaResult, Snapshot};
 
 mod common;
 
 use itertools::Itertools;
-use test_utils::{load_test_data, DefaultEngineExtension};
-use test_utils::read_scan;
+use test_utils::{load_test_data, read_scan, create_default_engine};
 
 #[async_fn]
 fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> DeltaResult<Vec<RecordBatch>> {
     let test_dir = load_test_data("tests/data", test_name.as_ref()).unwrap();
     let test_path = test_dir.path().join(test_name.as_ref());
 
-    let engine = DefaultEngine::new_local();
-    let url =
-        delta_kernel::try_parse_uri(test_path.to_str().expect("table path to string")).unwrap();
+    let url = delta_kernel::try_parse_uri(test_path.to_str().expect("table path to string")).unwrap();
+    let engine = create_default_engine(&url, std::iter::empty::<(&str, String)>())?;
     let snapshot = await_!(Snapshot::builder_for(url).build(engine.as_ref())).unwrap();
     let scan = snapshot.scan_builder().build()?;
     let batches = await_!(read_scan(&scan, engine))?;

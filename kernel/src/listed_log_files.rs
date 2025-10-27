@@ -394,7 +394,7 @@ mod list_log_files_with_log_tail_tests {
     use object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStore};
     use url::Url;
 
-    use crate::engine::default::executor::{tokio::TokioBackgroundExecutor};
+    use crate::engine::default::executor::default_task_executor;
     use crate::engine::default::filesystem::ObjectStoreStorageHandler;
     use crate::{await_, FileMeta};
 
@@ -449,8 +449,7 @@ mod list_log_files_with_log_tail_tests {
                 .expect("Failed to put test file");
         }
 
-        let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = Box::new(ObjectStoreStorageHandler::new(store, executor));
+        let storage = Box::new(ObjectStoreStorageHandler::new(store, default_task_executor()));
         (storage, log_root)
     }
 

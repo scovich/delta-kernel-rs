@@ -441,8 +441,7 @@ mod tests {
     use crate::arrow::array::StringArray;
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::default::executor::TaskExecutor as _;
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
+    use crate::engine::default::executor::default_task_executor;
     use crate::engine::default::filesystem::ObjectStoreStorageHandler;
     use crate::engine::default::DefaultEngine;
     use crate::engine::sync::SyncEngine;
@@ -638,7 +637,7 @@ mod tests {
         #[async_fn]
         fn test_new_from(store: Arc<InMemory>) -> DeltaResult<()> {
             let url = Url::parse("memory:///")?;
-            let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
+            let engine = DefaultEngine::new(store);
             let base_snapshot = await_!(Snapshot::builder_for(url.clone())
                 .at_version(0)
                 .build(&engine))?;
@@ -688,10 +687,7 @@ mod tests {
         // 3. new version > existing version
         // a. no new log segment
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::new(
-            Arc::new(store.fork()),
-            Arc::new(TokioBackgroundExecutor::new()),
-        );
+        let engine = DefaultEngine::new(Arc::new(store.fork()));
         let base_snapshot = await_!(Snapshot::builder_for(url.clone())
             .at_version(0)
             .build(&engine))?;
@@ -764,7 +760,7 @@ mod tests {
 
         // new commits AND request version > end of log
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::new(store_3c_i, Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(store_3c_i);
         let base_snapshot = await_!(Snapshot::builder_for(url.clone())
             .at_version(0)
             .build(&engine))?;
@@ -808,7 +804,7 @@ mod tests {
     async fn test_snapshot_new_from_crc() -> Result<(), Box<dyn std::error::Error>> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(store.clone());
         let protocol = |reader_version, writer_version| {
             json!({
                 "protocol": {
@@ -938,8 +934,7 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
 
         let store = Arc::new(LocalFileSystem::new());
-        let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor);
+        let storage = ObjectStoreStorageHandler::new(store, default_task_executor());
         let cp = await_!(LastCheckpointHint::try_read(&storage, &url)).unwrap();
         assert!(cp.is_none());
     }
@@ -948,8 +943,8 @@ mod tests {
         r#"{"size":8,"sizeInBytes":21857,"version":1}"#.as_bytes().to_vec()
     }
 
-    #[async_test]
-    fn test_read_table_with_empty_last_checkpoint() {
+    #[tokio::test]
+    async fn test_read_table_with_empty_last_checkpoint() {
         // in memory file system
         let store = Arc::new(InMemory::new());
 
@@ -957,23 +952,20 @@ mod tests {
         let empty = "{}".as_bytes().to_vec();
         let invalid_path = Path::from("invalid/_last_checkpoint");
 
-        let executor = Arc::new(TokioBackgroundExecutor::new());
-        let store_clone = store.clone();
-        executor.block_on(async move {
-            store_clone
-                .put(&invalid_path, empty.into())
-                .await
-                .expect("put _last_checkpoint");
-        });
+        store
+            .put(&invalid_path, empty.into())
+            .await
+            .expect("put _last_checkpoint");
 
-        let storage = ObjectStoreStorageHandler::new(store, executor.clone());
+        let executor = default_task_executor();
+        let storage = ObjectStoreStorageHandler::new(store, executor);
         let url = Url::parse("memory:///invalid/").expect("valid url");
         let invalid = await_!(LastCheckpointHint::try_read(&storage, &url)).expect("read last checkpoint");
         assert!(invalid.is_none())
     }
 
-    #[async_test]
-    fn test_read_table_with_last_checkpoint() {
+    #[tokio::test]
+    async fn test_read_table_with_last_checkpoint() {
         // in memory file system
         let store = Arc::new(InMemory::new());
 
@@ -983,20 +975,16 @@ mod tests {
         let path = Path::from("valid/_last_checkpoint");
         let invalid_path = Path::from("invalid/_last_checkpoint");
 
-        let executor = Arc::new(TokioBackgroundExecutor::new());
-        let store_clone = store.clone();
-        executor.block_on(async move {
-            store_clone
-                .put(&path, data.into())
-                .await
-                .expect("put _last_checkpoint");
-            store_clone
-                .put(&invalid_path, invalid_data.into())
-                .await
-                .expect("put _last_checkpoint");
-        });
+        store
+            .put(&path, data.into())
+            .await
+            .expect("put _last_checkpoint");
+        store
+            .put(&invalid_path, invalid_data.into())
+            .await
+            .expect("put _last_checkpoint");
 
-        let storage = ObjectStoreStorageHandler::new(store, executor);
+        let storage = ObjectStoreStorageHandler::new(store, default_task_executor());
         let url = Url::parse("memory:///valid/").expect("valid url");
         let valid = await_!(LastCheckpointHint::try_read(&storage, &url)).expect("read last checkpoint");
         let url = Url::parse("memory:///invalid/").expect("valid url");
@@ -1050,7 +1038,7 @@ mod tests {
     async fn test_domain_metadata() -> DeltaResult<()> {
         let url = Url::parse("memory:///")?;
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(store.clone());
 
         // commit0
         // - domain1: not removed
@@ -1177,7 +1165,7 @@ mod tests {
     async fn test_timestamp_with_ict_disabled() -> Result<(), Box<dyn std::error::Error>> {
         let store = Arc::new(InMemory::new());
         let url = url::Url::parse("memory://test/")?;
-        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(store.clone());
 
         // Create a basic commit without ICT enabled
         let commit0 = create_basic_commit(false, None);
@@ -1197,7 +1185,7 @@ mod tests {
     {
         let store = Arc::new(InMemory::new());
         let url = url::Url::parse("memory://test/")?;
-        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(store.clone());
 
         // Create initial commit without ICT
         let commit0 = create_basic_commit(false, None);
@@ -1237,7 +1225,7 @@ mod tests {
         // Test invalid state where snapshot has enablement version in the future - should error
         let url = Url::parse("memory:///table2")?;
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(store.clone());
 
         let commit_data = [
             json!({
@@ -1286,7 +1274,7 @@ mod tests {
         // Test missing ICT when it should be present - should error
         let url = Url::parse("memory:///table3")?;
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(store.clone());
 
         let commit_data = [
             create_protocol(true, Some(3)),
@@ -1318,7 +1306,7 @@ mod tests {
 
         let url = Url::parse("memory:///missing_commit_test")?;
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(store.clone());
 
         // Create initial commit with ICT enabled
         let commit_data = [
@@ -1373,7 +1361,7 @@ mod tests {
         // Test the scenario where both checkpoint and commit exist at the same version with ICT enabled.
         let url = Url::parse("memory:///checkpoint_commit_test")?;
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(store.clone());
 
         // Create 00000000000000000000.json with ICT enabled
         let commit0_data = [
@@ -1442,7 +1430,7 @@ mod tests {
     async fn test_try_new_from_empty_log_tail() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(store.clone());
 
         // Create initial commit
         let commit0 = vec![
@@ -1480,7 +1468,7 @@ mod tests {
     async fn test_try_new_from_latest_commit_preservation() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(store.clone());
 
         // Create commits 0-2
         let base_commit = vec![
@@ -1557,7 +1545,7 @@ mod tests {
     async fn test_try_new_from_version_boundary_cases() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(store.clone());
 
         // Create commits
         let base_commit = vec![

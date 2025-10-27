@@ -5,7 +5,7 @@ use std::{collections::HashMap, sync::Arc};
 use clap::{Args, CommandFactory, FromArgMatches};
 use delta_kernel::{
     arrow::array::RecordBatch,
-    engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine},
+    engine::default::{executor::DefaultTaskExecutor, storage::parse_url_opts, DefaultEngine},
     scan::Scan,
     schema::Schema,
     DeltaResult, SnapshotRef,
@@ -118,7 +118,7 @@ where
 pub fn get_engine(
     url: &Url,
     args: &LocationArgs,
-) -> DeltaResult<DefaultEngine<TokioBackgroundExecutor>> {
+) -> DeltaResult<DefaultEngine<DefaultTaskExecutor>> {
     if args.env_creds {
         let (scheme, _path) = ObjectStoreScheme::parse(url).map_err(|e| {
             delta_kernel::Error::Generic(format!("Object store could not parse url: {}", e))
@@ -149,16 +149,14 @@ pub fn get_engine(
                 )));
             }
         };
-        Ok(DefaultEngine::new(
-            store,
-            Arc::new(TokioBackgroundExecutor::new()),
-        ))
+        Ok(DefaultEngine::new(store))
     } else if !args.option.is_empty() {
         let opts = args.option.iter().map(|option| {
             let parts: Vec<&str> = option.split("=").collect();
             (parts[0].to_ascii_lowercase(), parts[1])
         });
-        DefaultEngine::try_new(url, opts, Arc::new(TokioBackgroundExecutor::new()))
+        let (store, _) = parse_url_opts(url, opts)?;
+        Ok(DefaultEngine::new(Arc::new(store)))
     } else {
         let mut options = if let Some(ref region) = args.region {
             HashMap::from([("region", region.clone())])
@@ -168,7 +166,8 @@ pub fn get_engine(
         if args.public {
             options.insert("skip_signature", "true".to_string());
         }
-        DefaultEngine::try_new(url, options, Arc::new(TokioBackgroundExecutor::new()))
+        let (store, _) = parse_url_opts(url, options)?;
+        Ok(DefaultEngine::new(Arc::new(store)))
     }
 }
 

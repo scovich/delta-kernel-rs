@@ -43,14 +43,12 @@ pub struct TableChangesScan {
 /// Construct a [`TableChangesScan`] from `table_changes` with a given schema and predicate
 /// ```rust
 /// # use std::sync::Arc;
-/// # use test_utils::DefaultEngineExtension;
-/// # use delta_kernel::engine::default::DefaultEngine;
 /// # use delta_kernel::expressions::{column_expr, Scalar};
 /// # use delta_kernel::Predicate;
 /// # use delta_kernel::table_changes::TableChanges;
 /// # let path = "./tests/data/table-with-cdf";
-/// # let engine = DefaultEngine::new_local();
 /// # let url = delta_kernel::try_parse_uri(path).unwrap();
+/// # let engine = test_utils::create_default_engine(&url, std::iter::empty::<(&str, String)>()).unwrap();
 /// # let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1)).unwrap();
 /// let schema = table_changes
 ///     .schema()

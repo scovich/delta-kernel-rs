@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::storage::parse_url_opts;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::try_parse_uri;
@@ -42,8 +43,9 @@ fn setup() -> (TempDir, Url, Arc<DefaultEngine<TokioBackgroundExecutor>>) {
     let url = try_parse_uri(table_path.to_str().unwrap()).expect("Failed to parse table path");
     // TODO: use multi-threaded executor
     let executor = Arc::new(TokioBackgroundExecutor::new());
-    let engine = DefaultEngine::try_new(&url, HashMap::<String, String>::new(), executor)
-        .expect("Failed to create engine");
+    let (store, _) = parse_url_opts(&url, HashMap::<String, String>::new())
+        .expect("Failed to parse URL");
+    let engine = DefaultEngine::new_with_executor(Arc::new(store), executor);
 
     (tempdir, url, Arc::new(engine))
 }

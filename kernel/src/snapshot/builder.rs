@@ -116,8 +116,8 @@ impl SnapshotBuilder {
 mod tests {
     use std::sync::Arc;
 
-    use crate::{async_test, await_};
-    use crate::engine::default::{executor::{tokio::TokioBackgroundExecutor, TaskExecutor}, DefaultEngine};
+    use crate::{await_};
+    use crate::engine::default::{executor::DefaultTaskExecutor, DefaultEngine};
 
     use itertools::Itertools;
     use object_store::memory::InMemory;
@@ -127,22 +127,18 @@ mod tests {
     use super::*;
 
     fn setup_test() -> (
-        Arc<DefaultEngine<TokioBackgroundExecutor>>,
+        Arc<DefaultEngine<DefaultTaskExecutor>>,
         Arc<dyn ObjectStore>,
         Url,
     ) {
         let table_root = Url::parse("memory:///test_table").unwrap();
         let store = Arc::new(InMemory::new());
-        let engine = Arc::new(DefaultEngine::new(
-            store.clone(),
-            Arc::new(TokioBackgroundExecutor::new()),
-        ));
+        let engine = Arc::new(DefaultEngine::new(store.clone()));
         (engine, store, table_root)
     }
 
-    fn create_table(
+    async fn create_table(
         store: &Arc<dyn ObjectStore>,
-        executor: &TokioBackgroundExecutor,
         _table_root: &Url,
     ) -> DeltaResult<()> {
         let protocol = json!({
@@ -182,8 +178,7 @@ mod tests {
             .join("\n");
 
         let path = object_store::path::Path::from(format!("_delta_log/{:020}.json", 0).as_str());
-        let store_clone = store.clone();
-        executor.block_on(async move { store_clone.put(&path, commit0_data.into()).await })?;
+        store.put(&path, commit0_data.into()).await?;
 
         // Create commit 1 with a single addFile action
         let commit1 = [json!({
@@ -206,18 +201,16 @@ mod tests {
             .join("\n");
 
         let path = object_store::path::Path::from(format!("_delta_log/{:020}.json", 1).as_str());
-        let store_clone = store.clone();
-        executor.block_on(async move { store_clone.put(&path, commit1_data.into()).await })?;
+        store.put(&path, commit1_data.into()).await?;
 
         Ok(())
     }
 
-    #[async_test]
-    fn test_snapshot_builder() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test]
+    async fn test_snapshot_builder() -> Result<(), Box<dyn std::error::Error>> {
         let (engine, store, table_root) = setup_test();
-        let executor = Arc::new(TokioBackgroundExecutor::new());
         let engine = engine.as_ref();
-        create_table(&store, executor.as_ref(), &table_root)?;
+        create_table(&store, &table_root).await?;
 
         let snapshot = await_!(SnapshotBuilder::new_for(table_root.clone()).build(engine))?;
         assert_eq!(snapshot.version(), 1);

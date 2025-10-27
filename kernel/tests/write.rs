@@ -15,7 +15,7 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::executor::DefaultTaskExecutor;
 use delta_kernel::engine::default::parquet::DefaultParquetHandler;
 use delta_kernel::engine::default::DefaultEngine;
 
@@ -144,7 +144,7 @@ async fn get_and_check_all_parquet_sizes(store: Arc<dyn ObjectStore>, path: &str
 async fn write_data_and_check_result_and_stats(
     table_url: Url,
     schema: SchemaRef,
-    engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    engine: Arc<DefaultEngine<DefaultTaskExecutor>>,
     expected_since_commit: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = await_!(Snapshot::builder_for(table_url.clone()).build(engine.as_ref()))?;
@@ -1008,7 +1008,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     let add_files_metadata = (*engine)
         .parquet_handler()
         .as_any()
-        .downcast_ref::<DefaultParquetHandler<TokioBackgroundExecutor>>()
+        .downcast_ref::<DefaultParquetHandler<DefaultTaskExecutor>>()
         .unwrap()
         .write_parquet_file(
             write_context.target_dir(),
@@ -1180,7 +1180,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     let add_files_metadata = (*engine)
         .parquet_handler()
         .as_any()
-        .downcast_ref::<DefaultParquetHandler<TokioBackgroundExecutor>>()
+        .downcast_ref::<DefaultParquetHandler<DefaultTaskExecutor>>()
         .unwrap()
         .write_parquet_file(
             write_context.target_dir(),
@@ -1421,7 +1421,7 @@ async fn get_ict_at_version(
 /// This simplifies repetitive data generation in tests
 async fn generate_and_add_data_file(
     txn: &mut delta_kernel::transaction::Transaction,
-    engine: &DefaultEngine<TokioBackgroundExecutor>,
+    engine: &DefaultEngine<DefaultTaskExecutor>,
     schema: SchemaRef,
     values: Vec<i32>,
 ) -> Result<(), Box<dyn std::error::Error>> {

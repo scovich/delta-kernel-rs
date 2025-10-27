@@ -8,6 +8,7 @@
 #![cfg(all(feature = "integration-test", not(target_os = "windows")))]
 
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::storage::parse_url_opts;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::Snapshot;
 use hdfs_native::{Client, WriteOptions};
@@ -67,11 +68,9 @@ async fn read_table_version_hdfs() -> Result<(), Box<dyn std::error::Error>> {
     let url_str = format!("{}/my-delta-table", minidfs.url);
     let url = url::Url::parse(&url_str).unwrap();
 
-    let engine = DefaultEngine::try_new(
-        &url,
-        std::iter::empty::<(&str, &str)>(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    )?;
+    let executor = Arc::new(TokioBackgroundExecutor::new());
+    let (store, _) = parse_url_opts(&url, std::iter::empty::<(&str, &str)>())?;
+    let engine = DefaultEngine::new_with_executor(Arc::new(store), executor);
 
     let snapshot = Snapshot::builder_for(url).build(&engine)?;
     assert_eq!(snapshot.version(), 1);

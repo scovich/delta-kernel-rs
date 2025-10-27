@@ -2,10 +2,9 @@
 //! Must run at the root of the crate
 use std::path::PathBuf;
 
-use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::scan::ScanResult;
 use delta_kernel::{async_fn, async_test, await_, AsyncIterator, DeltaResult, Snapshot};
-use test_utils::DefaultEngineExtension;
+use test_utils::create_default_engine;
 
 #[async_fn]
 fn count_total_scan_rows(
@@ -28,7 +27,7 @@ fn count_total_scan_rows(
 fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/"))?;
     let url = url::Url::from_directory_path(path).unwrap();
-    let engine = DefaultEngine::new_local();
+    let engine = create_default_engine(&url, std::iter::empty::<(&str, String)>())?;
 
     let snapshot = await_!(Snapshot::builder_for(url).build(engine.as_ref()))?;
     let scan = snapshot.scan_builder().build()?;
@@ -43,7 +42,7 @@ fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
 fn non_dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/"))?;
     let url = url::Url::from_directory_path(path).unwrap();
-    let engine = DefaultEngine::new_local();
+    let engine = create_default_engine(&url, std::iter::empty::<(&str, String)>())?;
 
     let snapshot = await_!(Snapshot::builder_for(url).build(engine.as_ref()))?;
     let scan = snapshot.scan_builder().build()?;

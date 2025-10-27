@@ -16,6 +16,7 @@ use crate::{async_trait, BoxedAsyncIterator, DeltaResult, Error, FileMeta, FileS
 #[derive(Debug)]
 pub struct ObjectStoreStorageHandler<E: TaskExecutor> {
     inner: Arc<DynObjectStore>,
+    #[cfg_attr(feature = "async", allow(dead_code))]
     task_executor: Arc<E>,
     readahead: usize,
 }
@@ -199,7 +200,7 @@ mod tests {
 
     use test_utils::delta_path_for_version;
 
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
+    use crate::engine::default::executor::default_task_executor;
     use crate::engine::default::DefaultEngine;
     use crate::utils::current_time_duration;
     use crate::{await_, into_async_iter, AsyncIterator as _, Engine as _};
@@ -228,8 +229,7 @@ mod tests {
         let mut url = Url::from_directory_path(tmp.path()).unwrap();
 
         let store = Arc::new(LocalFileSystem::new());
-        let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor);
+        let storage = ObjectStoreStorageHandler::new(store, default_task_executor());
 
         let mut slices: Vec<FileSlice> = Vec::new();
 
@@ -261,7 +261,7 @@ mod tests {
         store.put(&name, data.clone().into()).await.unwrap();
 
         let table_root = Url::parse("memory:///").expect("valid url");
-        let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(store);
         let iter = await_!(engine
             .storage_handler()
             .list_from(&table_root.join("_delta_log").unwrap().join("0").unwrap()))
@@ -290,7 +290,7 @@ mod tests {
 
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(store);
         let files = await_!(engine
             .storage_handler()
             .list_from(&url.join("_delta_log").unwrap().join("0").unwrap()))

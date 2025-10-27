@@ -16,7 +16,8 @@ use delta_kernel::parquet::arrow::async_reader::{
 };
 
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::executor::DefaultTaskExecutor;
+use delta_kernel::engine::default::storage::parse_url_opts;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::{await_, AsyncIterator, DeltaResult, Snapshot};
 
@@ -163,7 +164,7 @@ fn assert_eq(actual: &StructArray, expected: &StructArray) {
 
 // do a full table scan at the latest snapshot of the table and compare with the expected data
 async fn latest_snapshot_test(
-    engine: DefaultEngine<TokioBackgroundExecutor>,
+    engine: DefaultEngine<DefaultTaskExecutor>,
     url: Url,
     expected_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -200,7 +201,7 @@ async fn latest_snapshot_test(
 fn setup_golden_table(
     test_name: &str,
 ) -> (
-    DefaultEngine<TokioBackgroundExecutor>,
+    DefaultEngine<DefaultTaskExecutor>,
     Url,
     Option<PathBuf>,
     tempfile::TempDir,
@@ -210,12 +211,9 @@ fn setup_golden_table(
     let table_path = test_path.join("delta");
     let url = delta_kernel::try_parse_uri(table_path.to_str().expect("table path to string"))
         .expect("table from uri");
-    let engine = DefaultEngine::try_new(
-        &url,
-        std::iter::empty::<(&str, &str)>(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    )
-    .unwrap();
+    let (store, _) = parse_url_opts(&url, std::iter::empty::<(&str, &str)>())
+        .expect("Failed to parse URL");
+    let engine = DefaultEngine::new(Arc::new(store));
     let expected_path = test_path.join("expected");
     let expected_path = expected_path.exists().then_some(expected_path);
     (engine, url, expected_path, test_dir)
@@ -264,7 +262,7 @@ macro_rules! golden_test {
 // TODO use in canonicalized paths tests
 #[allow(dead_code)]
 async fn canonicalized_paths_test(
-    engine: DefaultEngine<TokioBackgroundExecutor>,
+    engine: DefaultEngine<DefaultTaskExecutor>,
     table_root: Url,
     _expected: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -279,7 +277,7 @@ async fn canonicalized_paths_test(
 }
 
 async fn checkpoint_test(
-    engine: DefaultEngine<TokioBackgroundExecutor>,
+    engine: DefaultEngine<DefaultTaskExecutor>,
     table_root: Url,
     _expected: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {

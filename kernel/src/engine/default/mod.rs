@@ -9,7 +9,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use self::storage::parse_url_opts;
 use object_store::DynObjectStore;
 use url::Url;
 
@@ -23,8 +22,8 @@ use super::arrow_expression::ArrowEvaluationHandler;
 use crate::schema::Schema;
 use crate::transaction::WriteContext;
 use crate::{
-    DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler,
-    StorageHandler,
+    async_fn, await_, DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler,
+    ParquetHandler, StorageHandler,
 };
 
 #[cfg(not(feature = "async"))]
@@ -36,6 +35,10 @@ pub mod filesystem;
 pub mod json;
 pub mod parquet;
 pub mod storage;
+
+/// Type alias for DefaultEngine in async mode (no executor needed).
+#[cfg(feature = "async")]
+pub type DefaultEngineAsync = DefaultEngine<()>;
 
 /// Adapter for converting Stream-producing futures to BoxedAsyncIterator
 ///
@@ -86,7 +89,7 @@ where
 }
 
 #[derive(Debug)]
-pub struct DefaultEngine<E: TaskExecutor> {
+pub struct DefaultEngine<E: TaskExecutor = executor::DefaultTaskExecutor> {
     object_store: Arc<DynObjectStore>,
     storage: Arc<ObjectStoreStorageHandler<E>>,
     json: Arc<DefaultJsonHandler<E>>,
@@ -94,35 +97,34 @@ pub struct DefaultEngine<E: TaskExecutor> {
     evaluation: Arc<ArrowEvaluationHandler>,
 }
 
-impl<E: TaskExecutor> DefaultEngine<E> {
-    /// Create a new [`DefaultEngine`] instance
+impl DefaultEngine<executor::DefaultTaskExecutor> {
+    /// Create a new [`DefaultEngine`] instance with the default executor.
+    ///
+    /// Uses the default task executor for the current mode:
+    /// - In sync mode: `TokioBackgroundExecutor`
+    /// - In async mode: no-op executor
+    ///
+    /// For custom executors, use [`DefaultEngine::new_with_executor`].
     ///
     /// # Parameters
     ///
-    /// - `table_root`: The URL of the table within storage.
-    /// - `options`: key/value pairs of options to pass to the object store.
-    /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
-    pub fn try_new<K, V>(
-        table_root: &Url,
-        options: impl IntoIterator<Item = (K, V)>,
-        task_executor: Arc<E>,
-    ) -> DeltaResult<Self>
-    where
-        K: AsRef<str>,
-        V: Into<String>,
-    {
-        // table root is the path of the table in the ObjectStore
-        let (object_store, _table_root) = parse_url_opts(table_root, options)?;
-        Ok(Self::new(Arc::new(object_store), task_executor))
+    /// - `object_store`: The object store to use.
+    pub fn new(object_store: Arc<DynObjectStore>) -> Self {
+        Self::new_with_executor(object_store, Arc::default())
     }
+}
 
-    /// Create a new [`DefaultEngine`] instance
+impl<E: TaskExecutor> DefaultEngine<E> {
+    /// Create a new [`DefaultEngine`] instance with a custom executor.
+    ///
+    /// Most users should use [`DefaultEngine::new`] instead. This method is only
+    /// needed for specialized testing scenarios (e.g., multi-threaded executors).
     ///
     /// # Parameters
     ///
     /// - `object_store`: The object store to use.
     /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
-    pub fn new(object_store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+    pub fn new_with_executor(object_store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
         Self {
             storage: Arc::new(ObjectStoreStorageHandler::new(
                 object_store.clone(),
@@ -145,7 +147,16 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         Some(self.object_store.clone())
     }
 
-    pub async fn write_parquet(
+    /// Write data to a parquet file in the table.
+    ///
+    /// This method transforms logical data to physical layout and writes it as a parquet file.
+    /// 
+    /// # Sync/Async Modes
+    /// 
+    /// - In sync mode: Blocks on the write operation using the task executor
+    /// - In async mode: Awaits the write operation asynchronously
+    #[async_fn]
+    pub fn write_parquet(
         &self,
         data: &ArrowEngineData,
         write_context: &WriteContext,
@@ -161,14 +172,12 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             output_schema.clone().into(),
         );
         let physical_data = logical_to_physical_expr.evaluate(data)?;
-        self.parquet
-            .write_parquet_file(
-                write_context.target_dir(),
-                physical_data,
-                partition_values,
-                data_change,
-            )
-            .await
+        await_!(self.parquet.write_parquet_file(
+            write_context.target_dir(),
+            physical_data,
+            partition_values,
+            data_change,
+        ))
     }
 }
 
@@ -221,7 +230,6 @@ impl UrlExt for Url {
 
 #[cfg(test)]
 mod tests {
-    use super::executor::tokio::TokioBackgroundExecutor;
     use super::*;
     use crate::engine::tests::test_arrow_engine;
     use crate::{async_test, await_};
@@ -232,7 +240,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngine::new(object_store, Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(object_store);
         await_!(test_arrow_engine(&engine, &url));
     }
 

@@ -38,7 +38,8 @@ use crate::{
 #[derive(Debug)]
 pub struct DefaultParquetHandler<E: TaskExecutor> {
     store: Arc<DynObjectStore>,
-    task_executor: Arc<E>,
+    #[cfg_attr(feature = "async", allow(dead_code))]
+    pub(crate) task_executor: Arc<E>,
     readahead: usize,
 }
 
@@ -140,14 +141,16 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         self
     }
 
-    // Write `data` to `{path}/<uuid>.parquet` as parquet using ArrowWriter and return the parquet
-    // metadata (where `<uuid>` is a generated UUIDv4).
-    //
-    // Note: after encoding the data as parquet, this issues a PUT followed by a HEAD to storage in
-    // order to obtain metadata about the object just written.
-    async fn write_parquet(
-        &self,
-        path: &url::Url,
+    /// Native async implementation of write_parquet (shared by both modes).
+    /// 
+    /// Write `data` to `{path}/<uuid>.parquet` as parquet using ArrowWriter and return the parquet
+    /// metadata (where `<uuid>` is a generated UUIDv4).
+    ///
+    /// Note: after encoding the data as parquet, this issues a PUT followed by a HEAD to storage in
+    /// order to obtain metadata about the object just written.
+    async fn write_parquet_impl(
+        store: Arc<DynObjectStore>,
+        path: url::Url,
         data: Box<dyn EngineData>,
     ) -> DeltaResult<DataFileMetadata> {
         let batch: Box<_> = ArrowEngineData::try_from_engine_data(data)?;
@@ -172,11 +175,11 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         }
         let path = path.join(&name)?;
 
-        self.store
+        store
             .put(&Path::from_url_path(path.path())?, buffer.into())
             .await?;
 
-        let metadata = self.store.head(&Path::from_url_path(path.path())?).await?;
+        let metadata = store.head(&Path::from_url_path(path.path())?).await?;
         let modification_time = metadata.last_modified.timestamp_millis();
         if size != metadata.size {
             return Err(Error::generic(format!(
@@ -194,6 +197,36 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     /// is a generated UUIDv4).
     ///
     /// [add file metadata]: crate::transaction::add_files_schema
+    /// 
+    /// # Sync/Async Modes
+    /// 
+    /// - In sync mode: Blocks on the async implementation using the task executor
+    /// - In async mode: Awaits the async implementation directly
+    #[cfg(not(feature = "async"))]
+    pub fn write_parquet_file(
+        &self,
+        path: &url::Url,
+        data: Box<dyn EngineData>,
+        partition_values: HashMap<String, String>,
+        data_change: bool,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        let parquet_metadata = self.task_executor.block_on(
+            Self::write_parquet_impl(self.store.clone(), path.clone(), data)
+        )?;
+        parquet_metadata.as_record_batch(&partition_values, data_change)
+    }
+
+    /// Write `data` to `{path}/<uuid>.parquet` as parquet using ArrowWriter and return the parquet
+    /// metadata as an EngineData batch which matches the [add file metadata] schema (where `<uuid>`
+    /// is a generated UUIDv4).
+    ///
+    /// [add file metadata]: crate::transaction::add_files_schema
+    /// 
+    /// # Sync/Async Modes
+    /// 
+    /// - In sync mode: Blocks on the async implementation using the task executor
+    /// - In async mode: Awaits the async implementation directly
+    #[cfg(feature = "async")]
     pub async fn write_parquet_file(
         &self,
         path: &url::Url,
@@ -201,7 +234,11 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         partition_values: HashMap<String, String>,
         data_change: bool,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        let parquet_metadata = self.write_parquet(path, data).await?;
+        let parquet_metadata = Self::write_parquet_impl(
+            self.store.clone(), 
+            path.clone(), 
+            data
+        ).await?;
         parquet_metadata.as_record_batch(&partition_values, data_change)
     }
 }
@@ -471,7 +508,7 @@ mod tests {
     use crate::await_;
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
+    use crate::engine::default::executor::default_task_executor;
     use crate::EngineData;
     use crate::AsyncIterator;
 
@@ -515,7 +552,7 @@ mod tests {
             size: meta.size,
         }];
 
-        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let handler = DefaultParquetHandler::new(store, default_task_executor());
         let iter = await_!(handler
             .read_parquet_files(
                 files,
@@ -593,7 +630,7 @@ mod tests {
     async fn test_write_parquet() {
         let store = Arc::new(InMemory::new());
         let parquet_handler =
-            DefaultParquetHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+            DefaultParquetHandler::new(store.clone(), default_task_executor());
 
         let data = Box::new(ArrowEngineData::new(
             RecordBatch::try_from_iter(vec![(
@@ -663,7 +700,7 @@ mod tests {
     async fn test_disallow_non_trailing_slash() {
         let store = Arc::new(InMemory::new());
         let parquet_handler =
-            DefaultParquetHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+            DefaultParquetHandler::new(store, default_task_executor());
 
         let data = Box::new(ArrowEngineData::new(
             RecordBatch::try_from_iter(vec![(

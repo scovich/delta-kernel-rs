@@ -1,7 +1,10 @@
 # Async/Sync Unification Using Proc Macros
 
 **Date**: October 18, 2025  
-**Goal**: Eliminate sync/async code duplication using simple proc macros and unified trait
+**Goal**: Eliminate sync/async code duplication using simple proc macros and unified trait  
+**Status**: ✅ Successfully implemented (October 23, 2025)
+
+> **Implementation Update (October 23, 2025)**: All infrastructure components have been implemented and are working in production. The `#[async_test]` macro was also added as a convenience wrapper, successfully converting all 115 mode-agnostic tests and removing 230 lines of boilerplate (67% reduction). See [ASYNC_TEST_CONVERSION_COMPLETE.md](ASYNC_TEST_CONVERSION_COMPLETE.md) for details.
 
 ---
 
@@ -59,6 +62,8 @@ fn read_file(engine: &dyn Engine) -> DeltaResult<Data> {
 | `BoxedAsyncIterator` alias (~5 LOC) | Concrete type for API boundaries |
 | AsyncIterator adapters (~30 LOC) | Conversion helpers between concrete types and AsyncIterator |
 
+**⚠️ Known Gap**: The `StorageHandler` trait has not yet been converted to this pattern (still returns `Box<dyn Iterator>`). See [STORAGE_HANDLER_ASYNC_ANALYSIS.md](STORAGE_HANDLER_ASYNC_ANALYSIS.md) for the fix strategy.
+
 ### Three-Layer Architecture
 
 The approach minimizes duplication by separating concerns:
@@ -85,7 +90,9 @@ The approach minimizes duplication by separating concerns:
 ✅ Full IDE support - go-to-definition, autocomplete, refactoring  
 ✅ Low risk - prototype incrementally, easy fallback
 
-**Note**: The `Engine` trait itself doesn't need modifications - it just returns `Arc<dyn Handler>`. Only the handler traits (like `ParquetHandler`) use `#[async_trait]` + `#[async_fn]` on their I/O methods to maintain dyn-compatibility. No separate `AsyncEngine` trait needed.
+**Note**: The `Engine` trait itself doesn't need modifications - it just returns `Arc<dyn Handler>`. Only the handler traits (like `ParquetHandler`, `JsonHandler`, and `StorageHandler`) use `#[async_trait]` + `#[async_fn]` on their I/O methods to maintain dyn-compatibility. No separate `AsyncEngine` trait needed.
+
+**⚠️ Known Gap**: As of October 23, 2025, the `StorageHandler` trait has NOT been converted to the async-agnostic pattern. It still returns synchronous `Box<dyn Iterator>` instead of `BoxedAsyncIterator`, making it inconsistent with `JsonHandler` and `ParquetHandler`. See [STORAGE_HANDLER_ASYNC_ANALYSIS.md](STORAGE_HANDLER_ASYNC_ANALYSIS.md) for detailed analysis and fix strategy.
 
 ### Why This Matters
 
@@ -368,6 +375,8 @@ The following sections detail each component's implementation.
 ## Infrastructure Components
 
 Each component is detailed below:
+
+> **Note**: A seventh component, `#[async_test]`, was added during implementation as a convenience wrapper for writing mode-agnostic tests. It combines `#[async_fn]` with conditional test attributes (`#[test]`/`#[tokio::test]`) to simplify test definitions. See the Appendix for details.
 
 ---
 
@@ -1160,6 +1169,79 @@ This approach eliminates sync/async duplication using six simple components (~16
 
 ## Appendix
 
+### Component 7: The `#[async_test]` Macro (Added During Implementation)
+
+**Purpose**: Convenience wrapper for writing mode-agnostic tests
+
+**Date Added**: October 23, 2025
+
+**Rationale**: During implementation, we found that converting tests required repeatedly writing the same 3-line pattern:
+```rust
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
+```
+
+This macro wraps that pattern into a single line: `#[async_test]`
+
+**Implementation** (~24 lines of logic):
+```rust
+#[proc_macro_attribute]
+pub fn async_test(
+    attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    let item: proc_macro2::TokenStream = item.into();
+    
+    let (sync_test, async_test) = if attr.is_empty() {
+        (quote! { test }, quote! { ::tokio::test })
+    } else {
+        let wrapper: proc_macro2::TokenStream = attr.into();
+        (quote! { #wrapper }, quote! { #wrapper(::tokio::test) })
+    };
+    
+    let output = quote! {
+        #[async_fn]
+        #[cfg_attr(not(feature = "async"), #sync_test)]
+        #[cfg_attr(feature = "async", #async_test)]
+        #item
+    };
+    
+    output.into()
+}
+```
+
+**Usage**:
+```rust
+// Basic test
+#[async_test]
+fn my_test() {
+    let result = await_!(operation())?;
+    assert_eq!(result, expected);
+}
+
+// With test wrapper (e.g., test_log)
+#[async_test(test_log::test)]
+fn my_logging_test() {
+    log::info!("Test started");
+    let result = await_!(operation())?;
+    assert_eq!(result, expected);
+}
+```
+
+**Expansion**:
+- `#[async_test]` → standard test attributes
+- `#[async_test(wrapper)]` → wrapper-specific attributes (user provides full path)
+
+**Results**: Successfully converted all 115 mode-agnostic tests, removing 230 lines of boilerplate (67% reduction). See [ASYNC_TEST_CONVERSION_COMPLETE.md](ASYNC_TEST_CONVERSION_COMPLETE.md) for full details.
+
+**Export**: Available from `delta_kernel` crate root (no cfg gating needed for integration tests):
+```rust
+pub use delta_kernel_derive::async_test;
+```
+
+---
+
 ### Implementation Note: Closure Wrapping in AsyncIterator
 
 **Discovery during implementation (2025-10-21):**
@@ -1259,6 +1341,60 @@ This works because we define separate traits in separate files - they just happe
 2. `async_closure!` - makes closure async
 3. `await_!` - makes calls async
 4. Mode-specific trait signatures - accept appropriate closure types
+
+---
+
+### Implementation Note: Explicit `Send` Bounds on Async Trait Methods
+
+**Discovery during implementation (2025-10-22):**
+
+**The Problem:** Clippy warned about using `async fn` in public traits:
+
+```
+warning: use of `async fn` in public traits is discouraged as auto trait bounds cannot be specified
+    |
+133 |     async fn async_next(&mut self) -> Option<Self::Item>
+    |     ^^^^^
+    |
+    = note: you can suppress this lint if you plan to use the trait only in your own code, 
+            or do not care about auto traits like `Send` on the `Future`
+```
+
+**Why this matters:** When you write `async fn foo()`, it desugars to `fn foo() -> impl Future<Output = ...>`, but the returned `Future` has **no auto-trait bounds** (like `Send`). This is problematic because:
+
+1. Our codebase spawns futures across threads (e.g., `task_executor.spawn()` in `file_stream.rs`)
+2. Our executors require `Future + Send + 'static` bounds
+3. Without explicit `Send`, someone could write code that compiles but panics at runtime when spawning
+
+**The Solution:** Desugar to explicit `impl Future + Send`:
+
+```rust
+// BEFORE (implicit, no Send bound):
+async fn async_next(&mut self) -> Option<Self::Item>
+where
+    Self: Unpin,
+{
+    self.next().await
+}
+
+// AFTER (explicit Send bound):
+fn async_next(&mut self) -> impl Future<Output = Option<Self::Item>> + Send
+where
+    Self: Unpin,
+{
+    async move { self.next().await }
+}
+```
+
+**Benefits:**
+- ✅ Makes the `Send` requirement explicit and enforced at compile time
+- ✅ Compatible with multi-threaded executors that spawn futures
+- ✅ Prevents runtime panics when futures are sent across threads
+- ✅ Documents the thread-safety contract in the type signature
+
+**Applied to:** `async_next` and `async_try_fold` methods in `AsyncIterator` trait.
+
+**Key insight:** The desugaring isn't a "hack to silence clippy" - it's the **correct** way to write async trait methods that need to be `Send`. The clippy warning exists because this was a real source of bugs in early async Rust code.
 
 ---
 
@@ -1366,6 +1502,506 @@ let summary = await_!(processed.async_try_fold(Summary::new(), |acc, data| {
 
 ---
 
+### Implementation Note: `for` Loops Don't Work with Streams
+
+**Discovery during implementation (2025-10-21):**
+
+In Rust, `for item in collection` is syntactic sugar for `IntoIterator`. However, `Stream` does not implement `IntoIterator` (and cannot, since it's async). This means code like this fails in async mode:
+
+```rust
+#[async_fn]
+fn process_actions(engine: &dyn Engine) -> DeltaResult<()> {
+    let actions = await_!(read_actions(engine))?;  // Returns AsyncIterator
+    
+    // WRONG in async mode - Stream doesn't impl IntoIterator:
+    for action in actions {
+        process(action?)?;
+    }
+}
+```
+
+**Solution:** Use explicit `while let` with `await_!(async_next())`:
+
+```rust
+#[async_fn]
+fn process_actions(engine: &dyn Engine) -> DeltaResult<()> {
+    let mut actions = await_!(read_actions(engine))?;
+    use crate::AsyncIterator as _;
+    
+    // CORRECT - works in both modes:
+    while let Some(action) = await_!(actions.async_next()) {
+        process(action?)?;
+    }
+}
+```
+
+**Why this works:**
+- `async_next()` is a method on the `AsyncIterator` trait
+- **Sync mode**: `async_next()` is synchronous, just calls `Iterator::next()`
+- **Async mode**: `async_next()` is `async`, polls the stream via `StreamExt::next().await`
+- `await_!()` becomes a no-op in sync mode, `.await` in async mode
+
+**Locations fixed:**
+- `kernel/src/actions/domain_metadata.rs`: `scan_domain_metadatas()`
+- `kernel/src/actions/set_transaction.rs`: `scan_application_transactions()`  
+- `kernel/src/log_segment.rs`: `protocol_and_metadata()`
+
+---
+
+### Implementation Note: Macro Ordering and the `#[async_trait_fn]` Solution
+
+**Discovery during implementation (2025-10-21):**
+
+**The Problem:** Procedural macros are applied **outside-in** (from outermost to innermost). When both `#[async_trait]` and `#[async_fn]` are applied to trait methods:
+
+```rust
+#[async_trait]
+pub trait ParquetHandler {
+    #[async_fn]
+    fn read_parquet_files(...) -> ...;
+}
+```
+
+The macro expansion order is:
+1. `#[async_trait]` runs first (outermost)
+2. `#[async_fn]` would run second (but doesn't see the transformed code)
+
+**In async mode**, the real `async-trait` crate expects to see `async fn` in the source. But `#[async_fn]` hasn't added `async` yet! This causes `async-trait` to see a non-async method and fail to make the trait dyn-compatible.
+
+**Solution: The `#[async_trait_fn]` Macro**
+
+We created a complementary macro specifically for trait methods that has inverse behavior to `#[async_fn]`:
+
+| Macro | For | Sync Mode | Async Mode |
+|-------|-----|-----------|------------|
+| `#[async_fn]` | Functions & impls | Removes `async` | Adds `async` |
+| `#[async_trait_fn]` | Trait methods only | Removes `async` | No-op |
+
+**Usage pattern:**
+```rust
+#[async_trait]
+pub trait ParquetHandler {
+    #[async_trait_fn]    // For trait methods
+    async fn read_parquet_files(...) -> ...;
+}
+
+#[async_trait]
+impl ParquetHandler for DefaultParquetHandler {
+    #[async_trait_fn]    // For impl methods too
+    async fn read_parquet_files(...) -> ... {
+        // implementation
+    }
+}
+```
+
+**How it works:**
+
+**Async mode expansion:**
+1. Source code has: `#[async_trait_fn] async fn read_files(...)`
+2. `#[async_trait]` (real crate) sees `async fn`, removes `async`, boxes the future
+3. `#[async_trait_fn]` sees non-async method (already processed), does nothing
+4. Result: `fn read_files(...) -> Pin<Box<dyn Future<...>>>` (dyn-compatible!)
+
+**Sync mode expansion:**
+1. Source code has: `#[async_trait_fn] async fn read_files(...)`  
+2. `#[async_trait]` (our no-op) does nothing, method still has `async`
+3. `#[async_trait_fn]` removes the `async` keyword
+4. Result: `fn read_files(...) -> ...` (regular sync method!)
+
+**Key insight:** Source code is **always** written with `async` keyword. The combination of `#[async_trait]` and `#[async_trait_fn]` ensures the right transformation happens in each mode, despite the fixed macro ordering.
+
+**Implementation** (in derive-macros/src/lib.rs):
+```rust
+#[proc_macro_attribute]
+pub fn async_trait_fn(
+    _attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    // Try trait method definition
+    if let Ok(mut trait_fn) = syn::parse::<TraitItemFn>(item.clone()) {
+        trait_fn.sig.asyncness = None;
+        return quote! { #trait_fn }.into();
+    }
+
+    // Try trait impl method
+    if let Ok(mut impl_fn) = syn::parse::<ImplItemFn>(item.clone()) {
+        impl_fn.sig.asyncness = None;
+        return quote! { #impl_fn }.into();
+    }
+
+    // Neither - error
+}
+```
+
+**Why this is cleaner than alternatives:**
+- No need to combine macros or change macro ordering
+- Source code reads naturally (`async fn` in traits)
+- Each macro has a single, simple responsibility
+- Compile errors are clear (only applies to trait methods)
+
+---
+
+### Implementation Note: Why Two Macros Cannot Be Unified
+
+**Discovery during implementation (2025-10-22):**
+
+**The Problem:** Initially attempted to unify `#[async_fn]` and `#[async_trait_fn]` into a single macro. This failed due to a fundamental limitation of Rust's proc macro system.
+
+**The Issue:**
+
+In syn, there are three item types for functions/methods:
+- **`ItemFn`**: Free functions
+- **`TraitItemFn`**: Trait method definitions (in `trait` blocks)
+- **`ImplItemFn`**: Methods in `impl` blocks (both trait impls AND struct impls)
+
+The problem: **`ImplItemFn` needs different behavior depending on context:**
+
+```rust
+// Trait impl - needs asyncness = None (async-trait handles it)
+#[async_trait]
+impl JsonHandler for DefaultJsonHandler {
+    #[???]  // ← Which macro?
+    async fn read_json_files(...) { ... }
+}
+
+// Struct impl - needs feature flag behavior (no async-trait)
+impl Transaction {
+    #[???]  // ← Which macro?
+    fn generate_adds(...) { ... }
+}
+```
+
+Both parse identically as `ImplItemFn`, but need opposite behaviors:
+- Trait impl: Clear `async` (like `TraitItemFn`)
+- Struct impl: Use feature flag (like `ItemFn`)
+
+**Attempted Solution:** Single macro that handles all three types:
+
+```rust
+pub fn async_fn(...) {
+    if let Ok(mut item_fn) = syn::parse::<ItemFn>(...) {
+        // Feature flag
+    }
+    if let Ok(mut impl_fn) = syn::parse::<ImplItemFn>(...) {
+        // But which behavior? Can't tell if trait impl or struct impl!
+    }
+}
+```
+
+**The Fundamental Limitation:**
+
+**Proc macro attributes on methods cannot see their parent context!**
+
+When `#[async_fn]` is applied to a method, it receives only:
+```rust
+async fn read_json_files(...) { ... }
+```
+
+It does NOT see:
+- Whether this is inside `impl Trait for Type` (trait impl)
+- Whether this is inside `impl Type` (struct impl)
+- Whether the parent `impl` block has `#[async_trait]`
+
+**The Solution: Two Macros Based on User Context**
+
+Since the macro cannot detect context, **the user must indicate it via macro choice:**
+
+**`#[async_fn]`** - For regular functions and struct impl methods:
+- Parses: `ItemFn` + `ImplItemFn`
+- Behavior: Feature flag (add/remove `async`)
+- Use when: No `#[async_trait]` on parent
+
+```rust
+#[async_fn]
+fn helper() { ... }
+
+impl Transaction {
+    #[async_fn]  // ← Struct impl, no #[async_trait]
+    fn generate_adds(...) { ... }
+}
+```
+
+**`#[async_trait_fn]`** - For trait definitions and trait impl methods:
+- Parses: `TraitItemFn` + `ImplItemFn`
+- Behavior: Always clear `async`
+- Use when: Inside `#[async_trait]` trait or impl
+
+```rust
+#[async_trait]
+trait JsonHandler {
+    #[async_trait_fn]  // ← Trait definition
+    async fn read_json_files(...);
+}
+
+#[async_trait]
+impl JsonHandler for DefaultJsonHandler {
+    #[async_trait_fn]  // ← Trait impl, has #[async_trait]
+    async fn read_json_files(...) { ... }
+}
+```
+
+**Why This Works:**
+
+Both macros can parse `ImplItemFn`, but with different behaviors. The macro name encodes the context that the proc macro system cannot detect:
+- `async_fn` = "I'm in a regular context"
+- `async_trait_fn` = "I'm in an #[async_trait] context"
+
+The user chooses the correct macro based on whether their code is inside an `#[async_trait]` block.
+
+**Key Insight:** This is not a design flaw but an **inherent limitation of Rust's proc macro system**. Attribute macros are fundamentally context-blind - they can only see the item they're applied to, not its surroundings.
+
+**The Two-Macro Design is Necessary and Correct.**
+
+---
+
+### Implementation Note: Test Attribute Ordering with `#[async_fn]`
+
+**Discovery during implementation (2025-10-22):**
+
+**The Problem:** When writing mode-agnostic tests, the `#[async_fn]` macro must be applied **before** test attributes, not after:
+
+```rust
+// WRONG - async_fn applied after test attributes:
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async"), tokio::test)]
+#[async_fn]  // ← Applied last, doesn't work!
+fn my_test() { ... }
+```
+
+In this order, the test attributes are applied to a non-async function in async mode, causing `async functions cannot be used for tests` errors.
+
+**The Solution:** Apply `#[async_fn]` **first**:
+
+```rust
+// CORRECT - async_fn applied before test attributes:
+#[async_fn]  // ← Applied first, transforms function signature
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
+fn my_test() { ... }
+```
+
+**Why this works:**
+
+Rust proc macros are applied **outside-in** (outermost to innermost):
+1. `#[async_fn]` runs first → adds/removes `async` keyword based on feature
+2. `#[cfg_attr]` runs second → applies appropriate test attribute based on feature
+3. Result: In async mode, `#[tokio::test]` sees an `async fn` ✅
+
+**Additional requirement: tokio macros feature**
+
+The `#[tokio::test]` attribute macro requires tokio's `macros` feature:
+
+```toml
+# In kernel/Cargo.toml
+tokio = { version = "1.47", optional = true, features = ["rt-multi-thread", "macros"] }
+```
+
+Without the `macros` feature, `#[tokio::test]` is not available and compilation fails.
+
+**Complete test pattern:**
+
+```rust
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test)]
+#[cfg_attr(feature = "async", tokio::test)]
+fn my_test() -> Result<(), Box<dyn std::error::Error>> {
+    let result = await_!(async_operation())?;
+    assert_eq!(result, expected);
+    Ok(())
+}
+```
+
+**In sync mode:**
+- `#[async_fn]` is no-op → `fn my_test()`
+- `#[test]` applied → regular sync test
+
+**In async mode:**
+- `#[async_fn]` adds `async` → `async fn my_test()`
+- `#[tokio::test]` applied → async test with tokio runtime
+
+**Key insight:** Macro ordering matters! The function signature must be transformed (sync/async) **before** test attributes are applied, so the test framework receives the correctly-typed function.
+
+---
+
+### Implementation Note: Mode-Agnostic Tests with `test-log`
+
+**Discovery during implementation (2025-10-23):**
+
+**The Problem:** Some tests use `#[test_log::test]` to automatically initialize logging infrastructure. These tests need to work in both sync and async modes.
+
+**The Solution:** The `test-log` crate supports **parameterized syntax** that combines logging setup with test attributes:
+
+```rust
+// Mode-agnostic test with logging
+#[async_fn]
+#[cfg_attr(not(feature = "async"), test_log::test)]
+#[cfg_attr(feature = "async", test_log::test(tokio::test))]
+fn my_test() {
+    log::info!("Logging works in both modes!");
+    let result = await_!(async_operation())?;
+    assert_eq!(result, expected);
+}
+```
+
+**How it works:**
+
+**Sync mode:**
+1. `#[async_fn]` → no-op, function stays sync
+2. `#[test_log::test]` → wraps with logging setup, applies `#[test]`
+3. Result: `fn my_test()` with logging ✅
+
+**Async mode:**
+1. `#[async_fn]` → adds `async` keyword
+2. `#[test_log::test(tokio::test)]` → wraps with logging setup, applies `#[tokio::test]`
+3. Result: `async fn my_test()` with logging + tokio runtime ✅
+
+**The `test_log::test(tokio::test)` syntax** allows the outer macro (`test_log::test`) to wrap the test with logging initialization, then apply the inner attribute (`tokio::test`) to set up the async runtime. This provides both logging and async execution in a single clean declaration.
+
+**Fixed in codebase:**
+- `kernel/src/scan/mod.rs`: 4 tests converted
+- `kernel/src/snapshot.rs`: 1 test converted
+
+---
+
+### Implementation Note: Native Async Tests Can Use Kernel in Either Mode
+
+**Discovery during implementation (2025-10-23):**
+
+**The Pattern:** Tests that use native async dependencies (like `object_store`, `parquet`) can still use the kernel in either sync or async mode by maintaining a strict separation:
+
+- **Native async code** (external crates): Use `async fn` and `.await`
+- **Kernel code** (delta operations): Use `#[async_fn]` and `await_!()`
+
+**Example from `kernel/src/log_segment/tests.rs`:**
+
+```rust
+#[tokio::test]  // Always async (for object_store)
+async fn test_with_object_store() {
+    let store = Arc::new(InMemory::new());
+    
+    // Native async - uses .await
+    store.put(&path, data).await?;
+    let result = store.get(&path).await?;
+    
+    // Kernel code - uses await_!()
+    let snapshot = await_!(Snapshot::builder_for(url).build(&engine))?;
+    let scan = await_!(snapshot.scan_builder().build())?;
+}
+```
+
+**Why this works:**
+
+The kernel's mode-agnostic API is designed to be callable from any context:
+- **Sync mode**: Kernel functions are synchronous, `await_!()` is no-op
+- **Async mode**: Kernel functions are async, `await_!()` adds `.await`
+
+The test itself is always async (due to object_store requirements), but the kernel adapts to whatever mode it was compiled in. This means we don't need special "mode-agnostic helpers" for native async tests - the existing `#[async_fn]`/`await_!()` pattern already provides the necessary abstraction.
+
+**Key insight:** Native async tests don't need to be made mode-agnostic at the test level. They stay `async fn` with `.await` for their async dependencies, and just use `await_!()` when calling kernel functions. The kernel's mode is determined at compile time by feature flags, not by the caller's context.
+
+---
+
+### Implementation Note: `async_flatten_ok` Semantic Divergence Fixed
+
+**Discovery during implementation (2025-10-21):**
+
+**The Problem:** Initially, `async_flatten_ok` had **different semantics** in sync vs async modes:
+
+**Sync mode** (delegating to `itertools::flatten_ok`):
+```rust
+// Input:  Iterator<Item = Result<I, E>> where I: IntoIterator<Item = T>
+// Output: Iterator<Item = Result<T, E>>
+// Problem: If T is Result<ActionsBatch>, produces Result<Result<ActionsBatch>> ⚠️
+```
+
+**Async mode** (delegating to `TryStreamExt::try_flatten`):
+```rust
+// Input:  TryStream where Ok: TryStream<Ok = T>
+// Output: TryStream<Ok = T>
+// Behavior: Correctly flattens nested Results ✅
+```
+
+This meant identical code produced **different types** in sync vs async mode, breaking the abstraction!
+
+**Root cause:** Our use case has nested Result-yielding iterators/streams:
+```rust
+AsyncIterator<Item = Result<AsyncIterator<Item = Result<T>>, E>>
+```
+
+- `itertools::flatten_ok` only flattens the iterator structure, **not** the Result structure
+- `TryStreamExt::try_flatten` flattens both
+
+**The Fix:** Updated sync implementation to match async semantics:
+
+```rust
+// Sync mode - custom implementation:
+fn async_flatten_ok<T, E, I>(self) -> impl AsyncIterator<Item = Result<T, E>>
+where
+    Self: Iterator<Item = Result<I, E>> + Sized,
+    I: IntoIterator<Item = Result<T, E>> + 'static,  // ← Changed from Item = T
+    // ...
+{
+    self.flat_map(|outer_result| match outer_result {
+        Ok(inner_iter) => itertools::Either::Left(inner_iter.into_iter()),
+        Err(e) => itertools::Either::Right(std::iter::once(Err(e))),
+    })
+}
+```
+
+**Unified semantics:**
+- Input: `AsyncIterator<Item = Result<AsyncIterator<Item = Result<T>>, E>>`
+- Output: `AsyncIterator<Item = Result<T, E>>`
+- **Both** modes now flatten nested Results correctly
+- Any error at any level propagates as `Err`
+
+**Key lesson:** When abstracting over sync/async with different underlying libraries, verify that delegated methods have **identical semantics**, not just similar type signatures!
+
+**Resolution:** Split into two methods:
+- `async_flatten_ok`: Traditional semantics - inner yields `T` (not `Result`)
+- `async_try_flatten`: Nested Result semantics - inner yields `Result<T>`
+
+Both now have consistent behavior across sync/async modes.
+
+---
+
+### Implementation Note: `flatten_ok` Is Essential at I/O Boundaries
+
+**Discovery during implementation (2025-10-21):**
+
+Initially, we planned to exclude `flatten_ok` from `AsyncIterator` and tell users to use `itertools::flatten_ok` directly. However, we discovered it's essential at I/O boundaries where async functions return `Result<Iterator>`:
+
+```rust
+// Common pattern in I/O code:
+let results = actions
+    .async_map(|item| {
+        // This returns Result<Vec<T>> or Result<Iterator<T>>
+        let batch = process(item?)?;
+        Ok(batch)  // Type: DeltaResult<Vec<ScanFile>>
+    })
+    // Now we have AsyncIterator<Item = Result<Vec<T>>>
+    // We need to flatten to AsyncIterator<Item = Result<T>>
+    .async_flatten_ok();  // Essential!
+```
+
+**Why we need it:**
+- `itertools::flatten_ok` only works on `Iterator<Item = Result<I, E>>` where `I: IntoIterator`
+- In async mode, we have `Stream<Item = Result<S, E>>` where `S: Stream`
+- We need `TryStreamExt::try_flatten` instead
+
+**Implementation:**
+- **Sync mode**: Delegates to `itertools::Itertools::flatten_ok`
+- **Async mode**: Uses `futures::stream::TryStreamExt::try_flatten`
+
+**Locations using it:**
+- `kernel/src/scan/mod.rs`: Flattening `Vec<ScanFile>` results (2 uses)
+- `kernel/src/table_changes/scan.rs`: Flattening resolved scan files (2 uses)
+- `kernel/src/table_changes/log_replay.rs`: Flattening scan batches
+- `kernel/src/log_segment.rs`: Flattening checkpoint batches
+
+**Key insight:** Any time an async function returns a collection inside a Result, and you want to iterate over the collection's items, you need `async_flatten_ok`.
+
+---
+
 ### AsyncIterator Method Selection
 
 **Question**: Why does `AsyncIterator` only have 8 methods when there are 100+ iterator usage sites in the codebase?
@@ -1419,20 +2055,25 @@ We analyzed all iterator method usage and categorized by whether it's used at I/
 
 | Method | I/O Boundary Uses | Business Logic Uses | Included? |
 |--------|-------------------|---------------------|-----------|
+| `next` | 3 | N/A | ✅ Yes - iteration*** |
 | `map` | 8+ | 100+ | ✅ Yes - core |
 | `filter` | 2-3 | 30+ | ✅ Yes - data skipping |
 | `flatten` | 3-4 | 10+ | ✅ Yes - nested files |
+| `flatten_ok` | 5-6 | 3-4 | ✅ Yes - I/O boundaries** |
 | `try_fold` | 0 (future) | 5+ | ✅ Yes - reducers* |
 | `map_ok` | 2-3 | 50+ | ✅ Yes - Result mapping |
 | `chain` | 2-3 | 15+ | ✅ Yes - composing I/O |
 | `then` | 2-3 | 10+ | ✅ Yes - async transforms |
 | `into_boxed` | 10-12 | 0 | ✅ Yes - API conversion |
 | **`try_collect`** | **0** | **55** | ❌ No - use itertools |
-| **`flatten_ok`** | **0** | **9** | ❌ No - use itertools |
 | **`enumerate`** | **0** | **30+** | ❌ No - pure logic |
 | **`zip`** | **0** | **30+** | ❌ No - pure logic |
 
 \* `try_fold` is included because it will be critical for two-phase log replay where protocol, metadata, app IDs, and domain metadata extraction all become fold-based reducers over action streams.
+
+\*\* `flatten_ok` was initially planned to use `itertools` directly, but during implementation we discovered it's essential at I/O boundaries where async functions return `Result<Iterator>` that need flattening. In sync mode, delegates to `itertools::flatten_ok`; in async mode, uses `TryStreamExt::try_flatten`.
+
+\*\*\* `next` (as `async_next`) is essential because `Stream` doesn't implement `IntoIterator`, so `for` loops don't work in async mode. The `async_next()` method provides a unified way to iterate: synchronous in sync mode (`Iterator::next()`), async in async mode (`StreamExt::next().await`).
 
 ---
 
@@ -1440,7 +2081,7 @@ We analyzed all iterator method usage and categorized by whether it's used at I/
 
 **Before analysis**: Thought we needed 15+ methods to handle 200+ iterator usage sites.
 
-**After analysis**: Only need 6 methods for the 10-12 I/O boundary sites.
+**After analysis**: Only need 10 methods for the 10-15 I/O boundary sites.
 
 **Impact**:
 - ✅ Smaller API surface
@@ -1634,11 +2275,45 @@ The FFI layer always operates in sync mode. Async mode is incompatible with C FF
 - FFI expects synchronous `next()`, not `async fn poll_next()`
 - Would require FFI to expose and manage a tokio runtime
 
-The FFI crate enforces this with compile guards:
-```rust
-#[cfg(feature = "async")]
-compile_error!("The FFI crate does not support async mode. FFI must use synchronous APIs.");
-```
+**Automatic exclusion strategy:**
+
+The workspace is configured to automatically handle FFI exclusion from async builds:
+
+1. **`default-members`** in root `Cargo.toml` excludes FFI from default builds:
+   ```toml
+   [workspace]
+   members = ["kernel", "ffi", "acceptance", ...]
+   default-members = [
+       "kernel",
+       "acceptance",
+       # ... everything EXCEPT "ffi"
+   ]
+   ```
+
+2. **`compile_error!`** in FFI provides clear error message if async is accidentally enabled:
+   ```rust
+   #[cfg(feature = "async")]
+   compile_error!(
+       "FFI is incompatible with async mode.\n\
+        The FFI crate is sync-only and cannot be built with the async feature.\n\
+        To build the workspace with async, use:\n\
+        cargo build --workspace --exclude delta_kernel_ffi --features async"
+   );
+   ```
+
+**Build behaviors:**
+- `cargo build` → Builds default-members (no FFI) ✅
+- `cargo build -p delta_kernel_ffi` → Builds FFI explicitly ✅
+- `cargo build --workspace` → Builds everything including FFI ✅
+- `cargo build --workspace --features async` → Compile error with helpful message ✅
+- `cargo build --workspace --exclude delta_kernel_ffi --features async` → Works ✅
+
+**Rationale**: The `default-members` approach is cleaner than alternative designs (like mutually exclusive `sync`/`async` features) because:
+- ✅ No extra `sync` feature needed - less complexity
+- ✅ FFI is opt-in - users explicitly request it when needed
+- ✅ Clear error message - explains exactly what to do
+- ✅ No Cargo feature unification issues - `compile_error!` catches conflicts early
+- ✅ Self-documenting - the error message serves as inline documentation
 
 **Note**: The current `default-engine-rustls` uses async I/O internally (via tokio executor) but exposes a synchronous API. This works perfectly for FFI - the executor's `block_on()` bridges async internals to sync API.
 
