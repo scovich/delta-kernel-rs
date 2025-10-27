@@ -1,4 +1,12 @@
-use std::process::ExitCode;
+// This example demonstrates truly synchronous usage of the delta kernel.
+// It works only in sync mode and requires no async runtime (no tokio).
+// For async examples that work in both modes, see read-table.
+#[cfg(feature = "async")]
+compile_error!(
+    "This example only works in sync mode. Use read-table for async-compatible examples. \
+     Build without --features async or use: cargo build --example read-table-sync"
+);
+
 use std::sync::Arc;
 
 use arrow::compute::filter_record_batch;
@@ -6,18 +14,16 @@ use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
 use common::{LocationArgs, ParseWithExamples, ScanArgs};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::{async_fn, await_, AsyncIterator as _, DeltaResult, Snapshot};
+use delta_kernel::{DeltaResult, Snapshot};
 
 use clap::Parser;
 
-/// An example program that dumps out the data of a delta table.
+/// A synchronous example program that dumps out the data of a delta table.
+/// This demonstrates pure sync usage without any async/await machinery.
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
 struct Cli {
-    // today we don't have any args unique to this version, but we keep this as flattened this way
-    // for consistency with the multi-threaded version and to make it easy to add unique options in
-    // the future
     #[command(flatten)]
     location_args: LocationArgs,
 
@@ -25,37 +31,24 @@ struct Cli {
     scan_args: ScanArgs,
 }
 
-fn main() -> ExitCode {
+fn main() -> DeltaResult<()> {
     env_logger::init();
-    #[cfg(not(feature = "async"))]
-    let result = try_main();
-    #[cfg(feature = "async")]
-    let result = tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(try_main());
-    
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            println!("{e:#?}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-#[async_fn]
-fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Read", "read", "");
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
     println!("Reading {url}");
     let engine = common::get_engine(&url, &cli.location_args)?;
-    let snapshot = await_!(Snapshot::builder_for(url).build(&engine))?;
+    
+    // Note: In sync mode, we don't use await_! - just call the methods directly
+    let snapshot = Snapshot::builder_for(url).build(&engine)?;
     let Some(scan) = common::get_scan(snapshot, &cli.scan_args)? else {
         return Ok(());
     };
 
-    let batches: Vec<RecordBatch> = await_!(await_!(scan.execute(Arc::new(engine)))?
-        .async_map(|scan_result| -> DeltaResult<_> {
+    // Execute the scan and collect batches synchronously
+    // Note: In sync mode, we just call standard iterator methods
+    let scan_data = scan.execute(Arc::new(engine))?;
+    let batches: Vec<RecordBatch> = scan_data
+        .map(|scan_result| -> DeltaResult<_> {
             // extract the batches and filter them if they have deletion vectors
             let scan_result = scan_result?;
             let mask = scan_result.full_mask();
@@ -71,7 +64,7 @@ fn try_main() -> DeltaResult<()> {
                 Ok(record_batch)
             }
         })
-        .async_scan(0usize, move |rows_so_far, record_batch| {
+        .scan(0usize, move |rows_so_far, record_batch| {
             // handle truncation if we've specified a limit
             let Ok(batch) = record_batch else {
                 return Some(record_batch); // just forward the error
@@ -92,8 +85,8 @@ fn try_main() -> DeltaResult<()> {
             *rows_so_far += batch_rows;
             Some(result)
         })
-        .async_pin()
-        .async_try_collect())?;
+        .collect::<Result<Vec<_>, _>>()?;
+    
     let rows_so_far = batches.iter().map(|b| b.num_rows()).sum::<usize>();
     if let Some(limit) = cli.scan_args.limit {
         if limit >= rows_so_far {
@@ -105,3 +98,4 @@ fn try_main() -> DeltaResult<()> {
     print_batches(&batches)?;
     Ok(())
 }
+

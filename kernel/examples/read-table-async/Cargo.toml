@@ -1,23 +1,32 @@
 [package]
-name = "inspect-table"
+name = "read-table-async"
 version = "0.1.0"
 edition = "2021"
 publish = false
 
+[[bin]]
+name = "read-table-async"
+path = "src/main.rs"
+required-features = ["async"]
+
 [features]
+# This example only works in async mode
 async = ["delta_kernel/async"]
 
 [dependencies]
+arrow = { version = "56", features = ["prettyprint", "chrono-tz"] }
 clap = { version = "4.5", features = ["derive"] }
 common = { path = "../common" }
 delta_kernel = { path = "../../../kernel", features = [
-  "arrow",
+  "arrow-56",
   "default-engine-rustls",
   "internal-api",
 ] }
 env_logger = "0.11.8"
 tokio = { version = "1", features = ["rt", "macros"] }
+futures = "0.3"
 
 # for cargo-release
 [package.metadata.release]
 release = false
+

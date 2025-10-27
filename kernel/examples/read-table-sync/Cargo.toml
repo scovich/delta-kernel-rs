@@ -1,23 +1,25 @@
 [package]
-name = "inspect-table"
+name = "read-table-sync"
 version = "0.1.0"
 edition = "2021"
 publish = false
 
 [features]
+# This example doesn't work in async mode - the compile_error will trigger
 async = ["delta_kernel/async"]
 
 [dependencies]
+arrow = { version = "56", features = ["prettyprint", "chrono-tz"] }
 clap = { version = "4.5", features = ["derive"] }
 common = { path = "../common" }
 delta_kernel = { path = "../../../kernel", features = [
-  "arrow",
+  "arrow-56",
   "default-engine-rustls",
   "internal-api",
 ] }
 env_logger = "0.11.8"
-tokio = { version = "1", features = ["rt", "macros"] }
 
 # for cargo-release
 [package.metadata.release]
 release = false
+

@@ -15,7 +15,6 @@ use delta_kernel::schema::{ColumnNamesAndTypes, DataType};
 use delta_kernel::{async_fn, await_, AsyncIterator, DeltaResult, Error, ExpressionRef, Snapshot};
 
 use std::collections::HashMap;
-use std::process::ExitCode;
 use std::sync::LazyLock;
 
 use clap::{Parser, Subcommand};
@@ -49,23 +48,12 @@ enum Commands {
     },
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> DeltaResult<()> {
     env_logger::init();
-    #[cfg(not(feature = "async"))]
-    let result = try_main();
-    #[cfg(feature = "async")]
-    let result = tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(try_main());
-    
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            println!("{e:#?}");
-            ExitCode::FAILURE
-        }
-    }
+    await_!(try_main())
 }
+
 
 enum Action {
     Metadata(delta_kernel::actions::Metadata),
@@ -192,7 +180,7 @@ fn try_main() -> DeltaResult<()> {
 
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
     let engine = common::get_engine(&url, &cli.location_args)?;
-    let snapshot = await_!(Snapshot::builder_for(url).build(&engine))?;
+    let snapshot = Snapshot::builder_for(url).build(&engine).async_await()?;
 
     match cli.command {
         Commands::TableVersion => {
@@ -206,24 +194,24 @@ fn try_main() -> DeltaResult<()> {
         }
         Commands::ScanMetadata => {
             let scan = ScanBuilder::new(snapshot).build()?;
-            let mut scan_metadata_iter = await_!(scan.scan_metadata(&engine))?.async_pin();
-            while let Some(res) = await_!(scan_metadata_iter.async_next()) {
+            let mut scan_metadata_iter = scan.scan_metadata(&engine).async_await()?.async_pin();
+            while let Some(res) = scan_metadata_iter.async_next().async_await() {
                 let scan_metadata = res?;
                 scan_metadata.visit_scan_files((), print_scan_file)?;
             }
         }
         Commands::Actions { oldest_first } => {
             let log_schema = get_log_schema();
-            let actions = await_!(snapshot.log_segment().read_actions(
+            let actions = snapshot.log_segment().read_actions(
                 &engine,
                 log_schema.clone(),
                 log_schema.clone(),
                 None,
-            ))?;
+            ).async_await()?;
             let mut actions = actions.async_pin();
 
             let mut visitor = LogVisitor::new();
-            while let Some(action) = await_!(actions.async_next()) {
+            while let Some(action) = actions.async_next().async_await() {
                 visitor.visit_rows_of(action?.actions())?;
             }
 

@@ -1,10 +1,11 @@
 // This example only works in sync mode because it uses OS threads (std::thread)
-// rather than async tasks. For async examples, see read-table-single-threaded.
+// rather than async tasks. For async-compatible examples, see read-table.
+// For truly sync examples without any async machinery, see read-table-sync.
 // In distributed engines (Spark, Ray, etc.), workers are separate processes/machines,
 // making this a fundamentally synchronous workload pattern.
 #[cfg(feature = "async")]
 compile_error!(
-    "This example only works in sync mode. Use read-table-single-threaded for async examples. \
+    "This example only works in sync mode. Use read-table for async-compatible examples. \
      Build without --features async or use: cargo build --example read-table-multi-threaded"
 );
 

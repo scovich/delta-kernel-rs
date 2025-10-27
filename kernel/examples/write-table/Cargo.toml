@@ -4,13 +4,9 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-[[bin]]
-name = "write-table"
-path = "src/main.rs"
-
 [features]
 # Propagate async feature from delta_kernel
-async = ["delta_kernel/async", "tokio"]
+async = ["delta_kernel/async"]
 
 [dependencies]
 arrow = { version = "56", features = ["prettyprint", "chrono-tz"] }
@@ -25,7 +21,7 @@ env_logger = "0.11.8"
 url = "2"
 serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
-tokio = { version = "1.0", features = ["rt", "macros"], optional = true }
+tokio = { version = "1.0", features = ["rt", "macros"] }
 uuid = { version = "1.17.0", features = ["v4"] }
 
 # for cargo-release

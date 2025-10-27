@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::fs::{create_dir_all, write};
 use std::path::Path;
-use std::process::ExitCode;
 use std::sync::Arc;
 
 use arrow::array::{BooleanArray, Float64Array, Int32Array, RecordBatch, StringArray};
 use arrow::util::pretty::print_batches;
 use clap::Parser;
 use common::{LocationArgs, ParseWithExamples};
+use delta_kernel::async_fn;
 use delta_kernel::AsyncIterator as _;
 use serde_json::{json, to_vec};
 use url::Url;
@@ -21,7 +21,7 @@ use delta_kernel::engine::default::storage::store_from_url;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::{CommitResult, RetryableTransaction};
-use delta_kernel::{async_fn, await_, DeltaResult, Engine, Error, Snapshot, SnapshotRef};
+use delta_kernel::{await_, DeltaResult, Engine, Error, Snapshot, SnapshotRef};
 
 /// An example program that writes to a Delta table and creates it if necessary.
 #[derive(Parser)]
@@ -46,33 +46,13 @@ struct Cli {
     // TODO: Support specifying whether the transaction should overwrite, append, or error if the table already exists
 }
 
-/// This example works in both sync and async modes.
-/// - Default (sync): `cargo run --example write-table`
-/// - Async mode: `cargo run --example write-table --features async`
-///
-/// The conditional runtime setup below shows how to write async-agnostic code
-/// that works seamlessly in either mode.
-fn main() -> ExitCode {
+// TODO: Update the example once official write APIs are introduced (issue#1123)
+#[tokio::main]
+async fn main() -> DeltaResult<()> {
     env_logger::init();
-    // Sync mode: call try_main directly (no async runtime needed)
-    #[cfg(not(feature = "async"))]
-    let result = try_main();
-    // Async mode: create a tokio runtime to execute the async function
-    #[cfg(feature = "async")]
-    let result = tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(try_main());
-    
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            println!("{e:#?}");
-            ExitCode::FAILURE
-        }
-    }
+    await_!(try_main())
 }
 
-// TODO: Update the example once official write APIs are introduced (issue#1123)
 #[async_fn]
 fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Write", "write", "");
@@ -95,7 +75,7 @@ fn try_main() -> DeltaResult<()> {
     let engine = DefaultEngine::new(store);
 
     // Create or get the table
-    let snapshot = await_!(create_or_get_base_snapshot(&url, &engine, &cli.schema))?;
+    let snapshot = create_or_get_base_snapshot(&url, &engine, &cli.schema).async_await()?;
 
     // Create sample data based on the schema
     let sample_data = create_sample_data(&snapshot.schema(), cli.num_rows)?;
@@ -108,8 +88,8 @@ fn try_main() -> DeltaResult<()> {
 
     // Write the data using the engine
     let write_context = Arc::new(txn.get_write_context());
-    let file_metadata = await_!(engine
-        .write_parquet(&sample_data, write_context.as_ref(), HashMap::new(), true))?;
+    let file_metadata = engine
+        .write_parquet(&sample_data, write_context.as_ref(), HashMap::new(), true).async_await()?;
 
     // Add the file metadata to the transaction
     txn.add_files(file_metadata);
@@ -122,7 +102,7 @@ fn try_main() -> DeltaResult<()> {
                 "Exceeded maximum 5 retries for committing transaction",
             ));
         }
-        txn = match await_!(txn.commit(&engine))? {
+        txn = match txn.commit(&engine).async_await()? {
             CommitResult::CommittedTransaction(committed) => break committed,
             CommitResult::ConflictedTransaction(conflicted) => {
                 let conflicting_version = conflicted.conflict_version();
@@ -142,7 +122,7 @@ fn try_main() -> DeltaResult<()> {
     println!("✓ Successfully wrote {} rows to the table", cli.num_rows);
 
     // Read and display the data
-    await_!(read_and_display_data(&url, engine))?;
+    read_and_display_data(&url, engine).async_await()?;
     println!("✓ Successfully read data from the table");
 
     Ok(())
@@ -156,7 +136,7 @@ fn create_or_get_base_snapshot(
     schema_str: &str,
 ) -> DeltaResult<SnapshotRef> {
     // Check if table already exists
-    match await_!(Snapshot::builder_for(url.clone()).build(engine)) {
+    match Snapshot::builder_for(url.clone()).build(engine).async_await() {
         Ok(snapshot) => {
             println!("✓ Found existing table at version {}", snapshot.version());
             Ok(snapshot)
@@ -165,8 +145,8 @@ fn create_or_get_base_snapshot(
             // Create new table
             println!("Creating new Delta table...");
             let schema = parse_schema(schema_str)?;
-            await_!(create_table(url, &schema))?;
-            await_!(Snapshot::builder_for(url.clone()).build(engine))
+            create_table(url, &schema).async_await()?;
+            Snapshot::builder_for(url.clone()).build(engine).async_await()
         }
     }
 }
@@ -327,11 +307,11 @@ fn read_and_display_data(
     table_url: &Url,
     engine: DefaultEngine<DefaultTaskExecutor>,
 ) -> DeltaResult<()> {
-    let snapshot = await_!(Snapshot::builder_for(table_url.clone()).build(&engine))?;
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine).async_await()?;
     let scan = snapshot.scan_builder().build()?;
 
-    let batches: Vec<RecordBatch> = await_!(await_!(scan
-        .execute(Arc::new(engine)))?
+    let batches: Vec<RecordBatch> = scan
+        .execute(Arc::new(engine)).async_await()?
         .async_map(|scan_result| -> DeltaResult<_> {
             let scan_result = scan_result?;
             let mask = scan_result.full_mask();
@@ -352,7 +332,7 @@ fn read_and_display_data(
             }
         })
         .async_pin()
-        .async_try_collect())?;
+        .async_try_collect().async_await()?;
 
     print_batches(&batches)?;
     Ok(())

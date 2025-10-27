@@ -10,31 +10,33 @@ members = [
     "mem-test",
     "uc-client", # WIP: this is an experimental UC client for catalog-managed table work
 ]
-# note that in addition to the members above, the workspace includes examples:
-# - inspect-table
-# - read-table-changes
-# - read-table-multi-threaded (sync-only, excluded from default-members)
-# - read-table-single-threaded
-# - write-table
-
-# Default members exclude sync-only components:
-# - FFI: sync-only, will fail with async feature
-# - read-table-multi-threaded: sync-only example using OS threads
+# Examples included in the workspace (kernel/examples/*):
+# - inspect-table: Mode-agnostic, shows table metadata
+# - read-table: Mode-agnostic, uses await_! for kernel calls
+# - read-table-async: Async-only, uses native .await (uses required-features)
+# - read-table-changes: Mode-agnostic, shows CDC functionality
+# - read-table-multi-threaded: Sync-only, demonstrates OS thread parallelism
+# - read-table-sync: Sync-only, demonstrates pure sync API usage
+# - write-table: Mode-agnostic, shows write operations
 #
-# To build ALL components including sync-only ones (sync mode):
-#   cargo build --workspace
-# To build with async mode (must exclude sync-only components):
-#   cargo build --workspace --exclude delta_kernel_ffi --exclude read-table-multi-threaded --features async
-# Or just default members with async:
-#   cargo build --features async
+# Mode-specific components:
+# - Async-only (read-table-async):
+#   * Uses [[bin]] with required-features = ["async"]
+#   * Automatically skipped in sync workspace builds
+#   * Automatically included in async workspace builds
+#
+# - Sync-only (ffi, read-table-multi-threaded, read-table-sync):
+#   * Excluded from default-members
+#   * Use compile_error! to prevent async compilation
+#   * Must use --workspace to build (they're in members but not default-members)
 default-members = [
     "acceptance",
     "derive-macros",
     "kernel",
     "kernel/examples/common",
     "kernel/examples/inspect-table",
+    "kernel/examples/read-table",
     "kernel/examples/read-table-changes",
-    "kernel/examples/read-table-single-threaded",
     "kernel/examples/write-table",
     "test-utils",
     "feature-tests",
@@ -42,6 +44,23 @@ default-members = [
     "uc-client",
 ]
 resolver = "2"
+
+# CI/Build commands:
+#
+# Default members (mode-agnostic components):
+#   cargo build
+#   cargo test --features default-engine-rustls
+#   cargo build --features async
+#   cargo test --features default-engine-rustls,async
+#
+# Full workspace (includes sync-only, which fail with async):
+#   cargo build --workspace
+#   cargo build --workspace --features async  # will fail on sync-only components
+#
+# Build mode-specific examples individually:
+#   cargo build -p read-table-sync               # sync-only
+#   cargo build -p read-table-multi-threaded     # sync-only
+#   cargo build -p read-table-async --features async  # async-only
 
 [workspace.package]
 edition = "2021"
