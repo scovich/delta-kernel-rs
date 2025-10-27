@@ -2275,6 +2275,39 @@ The FFI layer always operates in sync mode. Async mode is incompatible with C FF
 - FFI expects synchronous `next()`, not `async fn poll_next()`
 - Would require FFI to expose and manage a tokio runtime
 
+**Note on `sync` vs `async` flag design (2025-10-27):**
+
+The original design uses an `async` feature flag where async mode is opt-in and sync is default. An alternative design with a `sync` flag (where async is default and sync is opt-in) was explored but rejected due to a fundamental asymmetry in Cargo's feature system.
+
+**The asymmetry:**
+- **Binaries** can use `required-features` to self-exclude from workspace builds
+- **Libraries** cannot use `required-features` - must declare dependencies, which trigger feature unification
+
+**How each design handles mode-exclusive code:**
+
+*With `async` flag (current):*
+- Async-only binary (read-table-async): Uses `required-features = ["async"]` to self-exclude from sync builds ✅
+- Sync-only library (FFI): Uses `compile_error!` to fail if async enabled ✅
+- Default workspace build is sync (compatible with FFI) ✅
+- `cargo build --workspace --features async` fails on FFI with clear error ✅
+
+*With `sync` flag (inverted):*
+- Sync-only library (FFI): Cannot use `required-features`, must require `delta_kernel/sync` in dependencies
+- This forces `sync` globally via feature unification for entire workspace
+- Breaks async-only binaries that are incompatible with sync mode ❌
+- `cargo build --workspace` always forces sync (due to FFI), breaking async-only code ❌
+
+**Why not separate FFI into its own workspace?**
+
+This would eliminate feature unification issues, but adds more problems than it solves:
+- Development: Must build two workspaces separately (`cd ffi && cargo build`)
+- CI: Requires separate pipelines or complex orchestration scripts  
+- Discoverability: FFI becomes "hidden" from main workspace
+- Disk usage: Two separate `target/` directories
+- Benefit: Only solves a rare problem (feature conflicts during async workspace builds)
+
+**Conclusion**: The `async` flag design (async is opt-in) is the only viable approach that keeps FFI in the main workspace while handling mode-exclusive code cleanly. The asymmetry between binaries (can self-exclude) and libraries (cannot self-exclude) makes the `sync` flag design fundamentally incompatible with workspace builds.
+
 **Automatic exclusion strategy:**
 
 The workspace is configured to automatically handle FFI exclusion from async builds:
