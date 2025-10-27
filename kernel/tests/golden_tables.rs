@@ -17,7 +17,7 @@ use delta_kernel::parquet::arrow::async_reader::{
 
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::default::executor::DefaultTaskExecutor;
-use delta_kernel::engine::default::storage::parse_url_opts;
+use delta_kernel::engine::default::storage::store_from_url;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::{await_, AsyncIterator, DeltaResult, Snapshot};
 
@@ -211,9 +211,8 @@ fn setup_golden_table(
     let table_path = test_path.join("delta");
     let url = delta_kernel::try_parse_uri(table_path.to_str().expect("table path to string"))
         .expect("table from uri");
-    let (store, _) = parse_url_opts(&url, std::iter::empty::<(&str, &str)>())
-        .expect("Failed to parse URL");
-    let engine = DefaultEngine::new(Arc::new(store));
+    let store = store_from_url(&url).expect("Failed to create store");
+    let engine = DefaultEngine::new(store);
     let expected_path = test_path.join("expected");
     let expected_path = expected_path.exists().then_some(expected_path);
     (engine, url, expected_path, test_dir)

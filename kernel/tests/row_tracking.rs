@@ -59,22 +59,15 @@ async fn write_data_to_table(
     let snapshot = await_!(Snapshot::builder_for(table_url.clone()).build(engine.as_ref()))?;
     let mut txn = snapshot.transaction()?;
 
-    // Write data out by spawning async tasks to simulate executors
-    let write_context = Arc::new(txn.get_write_context());
-    let tasks = data.into_iter().map(|data| {
-        let engine = engine.clone();
-        let write_context = write_context.clone();
-        tokio::task::spawn(async move {
-            engine
-                .write_parquet(&data, write_context.as_ref(), HashMap::new(), true)
-                .await
-        })
-    });
-
-    let add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
-
-    for meta in add_files_metadata {
-        let metadata = meta?;
+    // Write data sequentially
+    let write_context = txn.get_write_context();
+    for data in data {
+        let metadata = await_!(engine.write_parquet(
+            &data,
+            &write_context,
+            HashMap::new(),
+            true
+        ))?;
         txn.add_files(metadata);
     }
 
@@ -656,23 +649,19 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     let write_context1 = Arc::new(txn1.get_write_context());
     let write_context2 = Arc::new(txn2.get_write_context());
 
-    let metadata1 = engine1
-        .write_parquet(
-            &ArrowEngineData::new(data1),
-            write_context1.as_ref(),
-            HashMap::new(),
-            true,
-        )
-        .await?;
+    let metadata1 = await_!(engine1.write_parquet(
+        &ArrowEngineData::new(data1),
+        &write_context1,
+        HashMap::new(),
+        true,
+    ))?;
 
-    let metadata2 = engine2
-        .write_parquet(
-            &ArrowEngineData::new(data2),
-            write_context2.as_ref(),
-            HashMap::new(),
-            true,
-        )
-        .await?;
+    let metadata2 = await_!(engine2.write_parquet(
+        &ArrowEngineData::new(data2),
+        &write_context2,
+        HashMap::new(),
+        true,
+    ))?;
 
     txn1.add_files(metadata1);
     txn2.add_files(metadata2);

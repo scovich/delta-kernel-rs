@@ -508,7 +508,7 @@ mod tests {
     use crate::await_;
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::default::executor::default_task_executor;
+    use crate::engine::default::executor::{default_task_executor, DefaultTaskExecutor};
     use crate::EngineData;
     use crate::AsyncIterator;
 
@@ -640,8 +640,8 @@ mod tests {
             .unwrap(),
         ));
 
-        let write_metadata = parquet_handler
-            .write_parquet(&Url::parse("memory:///data/").unwrap(), data)
+        let write_metadata = DefaultParquetHandler::<DefaultTaskExecutor>::
+            write_parquet_impl(store.clone(), Url::parse("memory:///data/").unwrap(), data)
             .await
             .unwrap();
 
@@ -698,10 +698,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_disallow_non_trailing_slash() {
-        let store = Arc::new(InMemory::new());
-        let parquet_handler =
-            DefaultParquetHandler::new(store, default_task_executor());
-
         let data = Box::new(ArrowEngineData::new(
             RecordBatch::try_from_iter(vec![(
                 "a",
@@ -711,8 +707,7 @@ mod tests {
         ));
 
         assert_result_error_with_message(
-            parquet_handler
-                .write_parquet(&Url::parse("memory:///data").unwrap(), data)
+            DefaultParquetHandler::<DefaultTaskExecutor>::write_parquet_impl(Arc::new(InMemory::new()), Url::parse("memory:///data").unwrap(), data)
                 .await,
             "Generic delta kernel error: Path must end with a trailing slash: memory:///data",
         );

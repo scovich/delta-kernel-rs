@@ -11,7 +11,7 @@ use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::DefaultTaskExecutor;
-use delta_kernel::engine::default::storage::parse_url_opts;
+use delta_kernel::engine::default::storage::store_from_url_opts;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
@@ -194,22 +194,6 @@ pub fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
         .into()
 }
 
-/// Create an ObjectStore from a URL and options.
-///
-/// This is a test helper that wraps the engine's URL parsing logic,
-/// allowing you to create a store and then pass it to `DefaultEngine::new()`.
-pub fn create_store_from_url<K, V>(
-    table_root: &url::Url,
-    options: impl IntoIterator<Item = (K, V)>,
-) -> DeltaResult<Arc<dyn ObjectStore>>
-where
-    K: AsRef<str>,
-    V: Into<String>,
-{
-    let (object_store, _) = parse_url_opts(table_root, options)?;
-    Ok(Arc::new(object_store))
-}
-
 /// Create a default task executor for integration tests (in `kernel/tests`).
 ///
 /// Returns an `Arc<DefaultTaskExecutor>` which is:
@@ -237,7 +221,7 @@ where
     K: AsRef<str>,
     V: Into<String>,
 {
-    let store = create_store_from_url(table_root, options)?;
+    let store = store_from_url_opts(table_root, options)?;
     Ok(Arc::new(DefaultEngine::new(store)))
 }
 

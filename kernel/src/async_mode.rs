@@ -13,33 +13,27 @@ use std::task::{Context, Poll};
 pub use async_trait::async_trait;
 pub use delta_kernel_derive::{async_fn, async_trait_fn};
 
-/// Placeholder trait for IDE support - DO NOT IMPORT MANUALLY
+/// **DO NOT IMPORT!** Annotate the calling function with `#[async_fn]` instead.
 ///
-/// This trait exists solely to help IDEs recognize `.async_await()` method calls.
-/// The actual transformation is done by the `#[async_fn]` or `#[async_test]` 
-/// proc macros, which will transform `.async_await()` into `.await` in async mode.
+/// This placeholder trait exists to guide you when you forget `#[async_fn]` or `#[async_test]`:
 ///
-/// In async mode, `.async_await()` is transformed to `.await`.
-/// For example: `future.async_await()` becomes `future.await`.
+/// 1. Without `#[async_fn]`, the compiler reports "method not found" and suggests importing this trait
+/// 2. Reading these docs should guide you to add `#[async_fn]` instead
+/// 3. If you ignore the warning and import anyway, the `-> !` return type causes compile errors
 ///
-/// # Usage
+/// # Correct Usage
 ///
 /// ```ignore
 /// #[async_fn]
-/// fn my_function() {
-///     let result = some_future().async_await()?;
-///     // In async mode, becomes: let result = some_future().await?;
+/// fn my_function() -> Result<i32> {
+///     // Transforms to: future()? in sync mode, future().await? in async mode
+///     let result = future().async_await()?;
+///     Ok(result)
 /// }
 /// ```
-///
-/// # Panic Behavior
-///
-/// If you see this panic at runtime, you forgot to annotate your function with
-/// `#[async_fn]` or `#[async_test]`. The proc macro must transform the code
-/// before it runs.
 pub trait AsyncAwaitPlaceholder: Future + Sized {
-    fn async_await(self) -> Self::Output {
-        super::panic_async_await_not_transformed()
+    fn async_await(self) -> ! {
+        unreachable!()
     }
 }
 

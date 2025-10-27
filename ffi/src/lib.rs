@@ -556,11 +556,11 @@ fn get_default_engine_impl(
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
     use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-    use delta_kernel::engine::default::storage::parse_url_opts;
+    use delta_kernel::engine::default::storage::store_from_url_opts;
     use delta_kernel::engine::default::DefaultEngine;
     let executor = Arc::new(TokioBackgroundExecutor::new());
-    let (store, _) = parse_url_opts(&url, options)?;
-    let engine = DefaultEngine::new_with_executor(Arc::new(store), executor);
+    let store = store_from_url_opts(&url, options)?;
+    let engine = DefaultEngine::new_with_executor(store, executor);
     Ok(engine_to_handle(Arc::new(engine), allocate_error))
 }
 

@@ -17,7 +17,7 @@ use delta_kernel::arrow::array::TimestampMicrosecondArray;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::DefaultTaskExecutor;
-use delta_kernel::engine::default::storage::parse_url_opts;
+use delta_kernel::engine::default::storage::store_from_url;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::{CommitResult, RetryableTransaction};
@@ -91,8 +91,8 @@ fn try_main() -> DeltaResult<()> {
     println!("Using Delta table at: {url}");
 
     // Get the engine for local filesystem
-    let (store, _) = parse_url_opts(&url, HashMap::<String, String>::new())?;
-    let engine = DefaultEngine::new(Arc::new(store));
+    let store = store_from_url(&url)?;
+    let engine = DefaultEngine::new(store);
 
     // Create or get the table
     let snapshot = await_!(create_or_get_base_snapshot(&url, &engine, &cli.schema))?;

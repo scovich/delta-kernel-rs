@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::Error as KernelError;
-use delta_kernel::{await_, DeltaResult, Engine, Snapshot, Version};
+use delta_kernel::{await_, DeltaResult, Snapshot, Version};
 use url::Url;
 use uuid::Uuid;
 
@@ -16,7 +16,6 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::DefaultTaskExecutor;
-use delta_kernel::engine::default::parquet::DefaultParquetHandler;
 use delta_kernel::engine::default::DefaultEngine;
 
 use delta_kernel::transaction::CommitResult;
@@ -159,27 +158,16 @@ async fn write_data_and_check_result_and_stats(
         Ok(Box::new(ArrowEngineData::new(data)))
     });
 
-    // write data out by spawning async tasks to simulate executors
-    let write_context = Arc::new(txn.get_write_context());
-    let tasks = append_data.into_iter().map(|data| {
-        // arc clones
-        let engine = engine.clone();
-        let write_context = write_context.clone();
-        tokio::task::spawn(async move {
-            engine
-                .write_parquet(
-                    data.as_ref().unwrap(),
-                    write_context.as_ref(),
-                    HashMap::new(),
-                    true,
-                )
-                .await
-        })
-    });
-
-    let add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
-    for meta in add_files_metadata {
-        txn.add_files(meta?);
+    // Write data sequentially
+    let write_context = txn.get_write_context();
+    for data in append_data {
+        let metadata = await_!(engine.write_parquet(
+            data.as_ref().unwrap(),
+            &write_context,
+            HashMap::new(),
+            true,
+        ))?;
+        txn.add_files(metadata);
     }
 
     // commit!
@@ -449,29 +437,16 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
 
         // write data out by spawning async tasks to simulate executors
         let engine = Arc::new(engine);
-        let write_context = Arc::new(txn.get_write_context());
-        let tasks = append_data
-            .into_iter()
-            .zip(partition_vals)
-            .map(|(data, partition_val)| {
-                // arc clones
-                let engine = engine.clone();
-                let write_context = write_context.clone();
-                tokio::task::spawn(async move {
-                    engine
-                        .write_parquet(
-                            data.as_ref().unwrap(),
-                            write_context.as_ref(),
-                            HashMap::from([(partition_col.to_string(), partition_val.to_string())]),
-                            true,
-                        )
-                        .await
-                })
-            });
-
-        let add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
-        for meta in add_files_metadata {
-            txn.add_files(meta?);
+        // Write data sequentially
+        let write_context = txn.get_write_context();
+        for (data, partition_val) in append_data.into_iter().zip(partition_vals) {
+            let metadata = await_!(engine.write_parquet(
+                data.as_ref().unwrap(),
+                &write_context,
+                HashMap::from([(partition_col.to_string(), partition_val.to_string())]),
+                true,
+            ))?;
+            txn.add_files(metadata);
         }
 
         // commit!
@@ -590,32 +565,26 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
         });
 
         // write data out by spawning async tasks to simulate executors
-        let engine = Arc::new(engine);
-        let write_context = Arc::new(txn.get_write_context());
-        let tasks = append_data.into_iter().map(|data| {
-            // arc clones
-            let engine = engine.clone();
-            let write_context = write_context.clone();
-            tokio::task::spawn(async move {
-                engine
-                    .write_parquet(
-                        data.as_ref().unwrap(),
-                        write_context.as_ref(),
-                        HashMap::new(),
-                        true,
-                    )
-                    .await
-            })
-        });
-
-        let mut add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
-        assert!(add_files_metadata.all(|res| match res {
-            Err(KernelError::Arrow(ArrowError::SchemaError(_))) => true,
-            Err(KernelError::Backtraced { source, .. })
-                if matches!(&*source, KernelError::Arrow(ArrowError::SchemaError(_))) =>
+        // Write data sequentially - we expect schema errors for all writes
+        let write_context = txn.get_write_context();
+        let mut all_schema_errors = true;
+        for data in append_data {
+            let result = await_!(engine.write_parquet(
+                data.as_ref().unwrap(),
+                &write_context,
+                HashMap::new(),
                 true,
-            _ => false,
-        }));
+            ));
+            let is_schema_error = match result {
+                Err(KernelError::Arrow(ArrowError::SchemaError(_))) => true,
+                Err(KernelError::Backtraced { source, .. })
+                    if matches!(&*source, KernelError::Arrow(ArrowError::SchemaError(_))) =>
+                    true,
+                _ => false,
+            };
+            all_schema_errors &= is_schema_error;
+        }
+        assert!(all_schema_errors);
     }
     Ok(())
 }
@@ -802,14 +771,12 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     let engine = Arc::new(engine);
     let write_context = Arc::new(txn.get_write_context());
 
-    let add_files_metadata = engine
-        .write_parquet(
-            &ArrowEngineData::new(data.clone()),
-            write_context.as_ref(),
-            HashMap::new(),
-            true,
-        )
-        .await?;
+    let add_files_metadata = await_!(engine.write_parquet(
+        &ArrowEngineData::new(data.clone()),
+        &write_context,
+        HashMap::new(),
+        true,
+    ))?;
 
     txn.add_files(add_files_metadata);
 
@@ -1005,18 +972,12 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     let engine = Arc::new(engine);
     let write_context = Arc::new(txn.get_write_context());
 
-    let add_files_metadata = (*engine)
-        .parquet_handler()
-        .as_any()
-        .downcast_ref::<DefaultParquetHandler<DefaultTaskExecutor>>()
-        .unwrap()
-        .write_parquet_file(
-            write_context.target_dir(),
-            Box::new(ArrowEngineData::new(data.clone())),
-            HashMap::new(),
-            true,
-        )
-        .await?;
+    let add_files_metadata = await_!(engine.write_parquet(
+        &ArrowEngineData::new(data.clone()),
+        &write_context,
+        HashMap::new(),
+        true,
+    ))?;
 
     txn.add_files(add_files_metadata);
 
@@ -1177,18 +1138,12 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     let engine = Arc::new(engine);
     let write_context = Arc::new(txn.get_write_context());
 
-    let add_files_metadata = (*engine)
-        .parquet_handler()
-        .as_any()
-        .downcast_ref::<DefaultParquetHandler<DefaultTaskExecutor>>()
-        .unwrap()
-        .write_parquet_file(
-            write_context.target_dir(),
-            Box::new(ArrowEngineData::new(data.clone())),
-            HashMap::new(),
-            true,
-        )
-        .await?;
+    let add_files_metadata = await_!(engine.write_parquet(
+        &ArrowEngineData::new(data.clone()),
+        &write_context,
+        HashMap::new(),
+        true,
+    ))?;
 
     txn.add_files(add_files_metadata);
 
@@ -1430,15 +1385,13 @@ async fn generate_and_add_data_file(
         vec![Arc::new(Int32Array::from(values))],
     )?;
 
-    let write_context = Arc::new(txn.get_write_context());
-    let file_meta = engine
-        .write_parquet(
-            &ArrowEngineData::new(data),
-            write_context.as_ref(),
-            HashMap::new(),
-            true,
-        )
-        .await?;
+    let write_context = txn.get_write_context();
+    let file_meta = await_!(engine.write_parquet(
+        &ArrowEngineData::new(data),
+        &write_context,
+        HashMap::new(),
+        true,
+    ))?;
     txn.add_files(file_meta);
     Ok(())
 }

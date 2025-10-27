@@ -87,29 +87,6 @@ pub use async_mode::*;
 // Test helper macro - available for any code that needs mode-agnostic tests
 pub use delta_kernel_derive::async_test;
 
-/// Helper function for async_await placeholder panic message
-///
-/// This message is shown when `.async_await()` is called without the enclosing
-/// function being annotated with `#[async_fn]` or `#[async_test]`.
-#[cold]
-#[inline(never)]
-fn panic_async_await_not_transformed() -> ! {
-    unreachable!(
-        "
-async_await() called without #[async_fn] or #[async_test] annotation.
-
-This method is a placeholder that must be transformed by proc macros.
-Annotate the enclosing function with #[async_fn] or #[async_test].
-
-Example:
-    #[async_fn]
-    fn my_function() {{
-        let result = operation().async_await()?;
-    }}
-"
-    )
-}
-
 use std::any::Any;
 use std::fs::DirEntry;
 use std::sync::Arc;
