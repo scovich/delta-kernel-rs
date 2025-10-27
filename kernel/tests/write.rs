@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::Error as KernelError;
-use delta_kernel::{await_, DeltaResult, Snapshot, Version};
+use delta_kernel::{await_, DeltaResult, Engine, Snapshot, Version};
 use url::Url;
 use uuid::Uuid;
 
@@ -16,6 +16,7 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::DefaultTaskExecutor;
+use delta_kernel::engine::default::parquet::DefaultParquetHandler;
 use delta_kernel::engine::default::DefaultEngine;
 
 use delta_kernel::transaction::CommitResult;
@@ -846,6 +847,10 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
         .add_metadata([("delta.columnMapping.id", 4)]),
     ])?);
 
+    // Note: This test uses physical column names (col1, col2, col3) instead of logical names
+    // because it needs to write a variant with non-standard field order (value, metadata)
+    // which the normal engine.write_parquet() path would reject. The test validates that
+    // the READ path can handle such non-standard variants correctly.
     let write_schema = Arc::new(StructType::try_new(vec![
         StructField::nullable("col1", DataType::unshredded_variant()),
         StructField::nullable("col2", DataType::INTEGER),
@@ -969,15 +974,24 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     .unwrap();
 
     // Write data
+    // Note: This test intentionally bypasses engine.write_parquet() and writes directly to
+    // the parquet handler. This is necessary to write a variant with non-standard field order,
+    // which the normal write path (correctly) rejects. The test validates that the READ path
+    // handles such variants correctly by normalizing the field order.
     let engine = Arc::new(engine);
     let write_context = Arc::new(txn.get_write_context());
 
-    let add_files_metadata = await_!(engine.write_parquet(
-        &ArrowEngineData::new(data.clone()),
-        &write_context,
-        HashMap::new(),
-        true,
-    ))?;
+    let add_files_metadata = await_!((*engine)
+        .parquet_handler()
+        .as_any()
+        .downcast_ref::<DefaultParquetHandler<DefaultTaskExecutor>>()
+        .expect("Expected DefaultParquetHandler")
+        .write_parquet_file(
+            write_context.target_dir(),
+            Box::new(ArrowEngineData::new(data.clone())),
+            HashMap::new(),
+            true,
+        ))?;
 
     txn.add_files(add_files_metadata);
 
@@ -1135,15 +1149,24 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     )
     .unwrap();
 
+    // Note: This test intentionally bypasses engine.write_parquet() and writes directly to
+    // the parquet handler. This is necessary to write a shredded variant (with 3 fields),
+    // which the normal write path (correctly) rejects. The test validates that the READ path
+    // properly rejects shredded variants with an appropriate error message.
     let engine = Arc::new(engine);
     let write_context = Arc::new(txn.get_write_context());
 
-    let add_files_metadata = await_!(engine.write_parquet(
-        &ArrowEngineData::new(data.clone()),
-        &write_context,
-        HashMap::new(),
-        true,
-    ))?;
+    let add_files_metadata = await_!((*engine)
+        .parquet_handler()
+        .as_any()
+        .downcast_ref::<DefaultParquetHandler<DefaultTaskExecutor>>()
+        .expect("Expected DefaultParquetHandler")
+        .write_parquet_file(
+            write_context.target_dir(),
+            Box::new(ArrowEngineData::new(data.clone())),
+            HashMap::new(),
+            true,
+        ))?;
 
     txn.add_files(add_files_metadata);
 
