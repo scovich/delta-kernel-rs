@@ -92,7 +92,7 @@ pub trait KernelPredicateEvaluator {
     fn eval_pred_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Self::Output>;
 
     /// A (possibly inverted) NULL check, e.g. `<expr> IS [NOT] NULL`.
-    fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Self::Output>;
+    fn eval_pred_column_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Self::Output>;
 
     /// A (possibly inverted) less-than comparison, e.g. `<col> < <value>`.
     fn eval_pred_lt(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output>;
@@ -201,9 +201,9 @@ pub trait KernelPredicateEvaluator {
                 // arise e.g. if data skipping encounters a column with missing stats, or if
                 // partition pruning encounters a non-partition column.
                 Expr::Literal(val) => self.eval_pred_scalar_is_null(val, inverted),
-                Expr::Column(col) => self.eval_pred_is_null(col, inverted),
-                Expr::Predicate(_)
-                | Expr::Struct(_)
+                Expr::Column(col) => self.eval_pred_column_is_null(col, inverted),
+                Expr::Predicate(pred) => self.eval_pred_is_null(pred, inverted),
+                Expr::Struct(_)
                 | Expr::Transform(_)
                 | Expr::Unary(_)
                 | Expr::Binary(_)
@@ -215,6 +215,126 @@ pub trait KernelPredicateEvaluator {
                 }
             },
         }
+    }
+
+    /// Evaluates IS [NOT] NULL for a predicate, recursively handling junctions.
+    ///
+    /// This method enables pushing IS_NULL checks through AND/OR operations using the rewrites:
+    /// - `IS_NULL(AND(a, b, ...))` → rewritten to check if all non-null inputs are TRUE
+    /// - `IS_NULL(OR(a, b, ...))` → rewritten to check if all non-null inputs are FALSE
+    /// - `IS_NOT_NULL(AND(...))` → rewritten to check for at least one non-null FALSE or all non-null
+    /// - `IS_NOT_NULL(OR(...))` → rewritten to check for at least one non-null TRUE or all non-null
+    ///
+    /// The nullness of `NOT(x)` is identical to that of `x`, so NOT is transparent.
+    fn eval_pred_is_null(&self, pred: &Pred, inverted: bool) -> Option<Self::Output> {
+        match pred {
+            Pred::Not(inner) => self.eval_pred_is_null(inner, !inverted),
+            Pred::BooleanExpression(expr) => {
+                self.eval_pred_unary(UnaryPredicateOp::IsNull, expr, inverted)
+            }
+            Pred::Junction(JunctionPredicate { op, preds }) => {
+                self.eval_is_null_junction(*op, preds, inverted)
+            }
+            _ => {
+                // Other predicate types are not supported for IS_NULL push-down
+                debug!("Unsupported operand for IS [NOT] NULL: {pred:?}");
+                None
+            }
+        }
+    }
+
+    /// Evaluates IS [NOT] NULL of a junction (AND/OR) by rewriting it into evaluable form.
+    ///
+    /// This implements the boolean logic rewrites:
+    /// ```text
+    /// IS_NULL(AND(a, b, ..., z))
+    /// = AND(
+    ///     AND(
+    ///         OR(IS_NULL(a), a),
+    ///         OR(IS_NULL(b), b),
+    ///         ...,
+    ///         OR(IS_NULL(z), z)
+    ///     ),
+    ///     OR(IS_NULL(a), IS_NULL(b), ..., IS_NULL(z))
+    ///   )
+    ///
+    /// IS_NULL(OR(a, b, ..., z))
+    /// = AND(
+    ///     AND(
+    ///         OR(IS_NULL(a), NOT(a)),
+    ///         OR(IS_NULL(b), NOT(b)),
+    ///         ...,
+    ///         OR(IS_NULL(z), NOT(z))
+    ///     ),
+    ///     OR(IS_NULL(a), IS_NULL(b), ..., IS_NULL(z))
+    ///   )
+    ///
+    /// NOT(IS_NULL(AND(a, b, ..., z)))
+    /// = OR(
+    ///     OR(
+    ///         AND(NOT(IS_NULL(a)), NOT(a)),
+    ///         AND(NOT(IS_NULL(b)), NOT(b)),
+    ///         ...,
+    ///         AND(NOT(IS_NULL(z)), NOT(z))
+    ///     ),
+    ///     AND(NOT(IS_NULL(a)), NOT(IS_NULL(b)), ..., NOT(IS_NULL(z)))
+    ///   )
+    ///
+    /// NOT(IS_NULL(OR(a, b, ..., z)))
+    /// = OR(
+    ///     OR(
+    ///         AND(NOT(IS_NULL(a)), a),
+    ///         AND(NOT(IS_NULL(b)), b),
+    ///         ...,
+    ///         AND(NOT(IS_NULL(z)), z)
+    ///     ),
+    ///     AND(NOT(IS_NULL(a)), NOT(IS_NULL(b)), ..., NOT(IS_NULL(z)))
+    ///   )
+    /// ```
+    ///
+    /// The implementation uses intentional nesting to control evaluation order: the per-variable
+    /// clauses are evaluated first and can short-circuit, avoiding evaluation of the final "all
+    /// null checks" clause.
+    fn eval_is_null_junction(
+        &self,
+        op: JunctionPredicateOp,
+        preds: &[Pred],
+        inverted: bool,
+    ) -> Option<Self::Output> {
+        // Determine the inversion flags for the rewrite pattern. Each per-variable clause checks:
+        // "does this variable allow the junction to be NULL?" For a junction to be NULL, at least
+        // one input must be NULL, and no input can evaluate to the dominating value. So we check
+        // each variable for: `IS_NULL(x) OR x != dominator`, noting that the dominator value itself
+        // is the correct inversion flag to use when evaluating boolean predicate `x`:
+        //
+        // - AND (dominator=false): check for `x != FALSE`, which is just `x` (inverted=false)
+        // - OR (dominator=true): check for `x != TRUE`, which is just `NOT(x)` (inverted=true)
+        let dominator = KernelPredicateEvaluatorDefaults::junction_dominator(op, inverted);
+
+        // Lazy iterator: evaluates per-variable clauses
+        // Each clause is: op(IS_NULL(pred), pred != dominator)
+        let mut per_var_clauses = preds.iter().map(|pred| {
+            let null_check = self.eval_pred_is_null(pred, inverted);
+            let var_clause = self.eval_pred(pred, dominator);
+            let mut pair = [null_check, var_clause].into_iter();
+            self.finish_eval_pred_junction(op, &mut pair, !inverted)
+        });
+
+        // Inner junction: op(clause1, clause2, ..., clauseN) (inner clauses inverted)
+        // This may short-circuit before evaluating all clauses
+        let inner_result = self.finish_eval_pred_junction(op, &mut per_var_clauses, !inverted);
+
+        // Outer junction: op(inner_result, final_clause) with outer inversion
+        // Use lazy evaluation for final_clause so we skip it if inner_result dominates
+        let mut both = std::iter::once(inner_result).chain(std::iter::once_with(|| {
+            // Final clause: op(IS_NULL(a), IS_NULL(b), ..., IS_NULL(z))
+            // This checks whether at least one input is NULL
+            let mut all_null_checks = preds
+                .iter()
+                .map(|pred| self.eval_pred_is_null(pred, inverted));
+            self.finish_eval_pred_junction(op, &mut all_null_checks, !inverted)
+        }));
+        self.finish_eval_pred_junction(op, &mut both, inverted)
     }
 
     /// A (possibly inverted) DISTINCT test, e.g. `[NOT] DISTINCT(<col>, false)`. DISTINCT can be
@@ -229,10 +349,10 @@ pub trait KernelPredicateEvaluator {
         inverted: bool,
     ) -> Option<Self::Output> {
         if let Scalar::Null(_) = val {
-            self.eval_pred_is_null(col, !inverted)
+            self.eval_pred_column_is_null(col, !inverted)
         } else {
             let mut args = [
-                self.eval_pred_is_null(col, inverted),
+                self.eval_pred_column_is_null(col, inverted),
                 self.eval_pred_eq(col, val, !inverted),
             ]
             .into_iter();
@@ -446,7 +566,7 @@ pub trait KernelPredicateEvaluator {
             BooleanExpression(Expr::Column(col)) => {
                 // Perform a nullsafe comparison instead of the usual `eval_pred_column`
                 let mut preds = [
-                    self.eval_pred_is_null(col, true),
+                    self.eval_pred_column_is_null(col, true),
                     self.eval_pred_column(col, inverted),
                 ]
                 .into_iter();
@@ -555,10 +675,7 @@ impl KernelPredicateEvaluatorDefaults {
         preds: &mut dyn Iterator<Item = Option<bool>>,
         inverted: bool,
     ) -> Option<bool> {
-        let dominator = match op {
-            JunctionPredicateOp::And => inverted,
-            JunctionPredicateOp::Or => !inverted,
-        };
+        let dominator = Self::junction_dominator(op, inverted);
         let mut found_null = false;
         for val in preds {
             match val {
@@ -568,6 +685,18 @@ impl KernelPredicateEvaluatorDefaults {
             }
         }
         (!found_null).then_some(!dominator)
+    }
+
+    /// Returns the dominating value for a junction operation: FALSE dominates AND, while TRUE
+    /// dominates OR. Inversion flips the dominator, following de Morgan's laws.
+    ///
+    /// NOTE: The "default" value of an empty junction is just the inverted dominator: AND() = TRUE,
+    /// while OR() = FALSE.
+    fn junction_dominator(op: JunctionPredicateOp, inverted: bool) -> bool {
+        match op {
+            JunctionPredicateOp::And => inverted,
+            JunctionPredicateOp::Or => !inverted,
+        }
     }
 }
 
@@ -658,7 +787,7 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
         KernelPredicateEvaluatorDefaults::eval_pred_scalar_is_null(val, inverted)
     }
 
-    fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<bool> {
+    fn eval_pred_column_is_null(&self, col: &ColumnName, inverted: bool) -> Option<bool> {
         let col = self.resolve_column(col)?;
         self.eval_pred_scalar_is_null(&col, inverted)
     }
@@ -921,7 +1050,7 @@ impl<T: DataSkippingPredicateEvaluator + ?Sized> KernelPredicateEvaluator for T 
         self.eval_pred_scalar_is_null(val, inverted)
     }
 
-    fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Self::Output> {
+    fn eval_pred_column_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Self::Output> {
         self.eval_pred_is_null(col, inverted)
     }
 
