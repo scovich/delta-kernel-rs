@@ -279,6 +279,18 @@ pub trait KernelPredicateEvaluator {
         inverted: bool,
     ) -> Option<Self::Output>;
 
+    /// Evaluates a (possibly inverted) Let predicate by binding the given predicates and
+    /// evaluating the body with those bindings available.
+    ///
+    /// Each binding can reference previous bindings in the same Let node. The bindings are
+    /// stored in implementation-specific ways (e.g., RefCell for direct evaluators).
+    fn eval_pred_let(
+        &self,
+        bindings: &[(String, Pred)],
+        body: &Pred,
+        inverted: bool,
+    ) -> Option<Self::Output>;
+
     // ==================== PROVIDED METHODS ====================
 
     /// A (possibly inverted) boolean column access, e.g. `[NOT] <col>`.
@@ -355,12 +367,25 @@ pub trait KernelPredicateEvaluator {
     /// The nullness of `NOT(x)` is identical to that of `x`, so NOT is transparent.
     fn eval_pred_is_null(&self, pred: &Pred, inverted: bool) -> Option<Self::Output> {
         match pred {
-            Pred::Not(inner) => self.eval_pred_is_null(inner, !inverted),
+            Pred::Not(inner) => {
+                // IS_NULL(NOT(x)) requires handling both NOT and IS_NULL simultaneously.
+                // We can only do this if x is a junction (which we know how to push into).
+                match inner.as_ref() {
+                    Pred::Junction(JunctionPredicate { op, preds }) => {
+                        self.eval_is_null_junction(*op, preds, true, inverted)
+                    }
+                    _ => {
+                        // Can't rewrite IS_NULL(NOT(non-junction))
+                        debug!("Unsupported operand for IS [NOT] NULL: NOT({inner:?})");
+                        None
+                    }
+                }
+            }
             Pred::BooleanExpression(expr) => {
                 self.eval_pred_unary(UnaryPredicateOp::IsNull, expr, inverted)
             }
             Pred::Junction(JunctionPredicate { op, preds }) => {
-                self.eval_is_null_junction(*op, preds, inverted)
+                self.eval_is_null_junction(*op, preds, false, inverted)
             }
             _ => {
                 // Other predicate types are not supported for IS_NULL push-down
@@ -375,10 +400,7 @@ pub trait KernelPredicateEvaluator {
     /// Returns a [`FusedEvalResult`] containing names to reference the computed values.
     /// The bindings are accumulated in the provided `bindings` parameter.
     ///
-    /// For direct evaluation, bindings are stored in a local cache and the names are handles.
-    /// For indirect evaluation, bindings accumulate into an AST and the names are binding identifiers.
-    ///
-    /// The two `inverted` parameters allow different inversions for the value and null check,
+    /// The two `inverted` parameters allow independent inversions for the value and null check,
     /// which is needed for the junction null-check pushdown optimization.
     fn eval_pred_with_null_check(
         &self,
@@ -387,34 +409,39 @@ pub trait KernelPredicateEvaluator {
         value_inverted: bool,
         null_inverted: bool,
     ) -> FusedEvalResult {
-        match pred {
+        let (value, is_null) = match pred {
             Pred::Not(inner) => {
-                // NOT affects value but is transparent to nullness (IS_NULL(NOT(x)) = IS_NULL(x))
-                self.eval_pred_with_null_check(inner, bindings, !value_inverted, null_inverted)
-            }
-            Pred::Junction(JunctionPredicate { op, preds }) => {
-                // Use fused junction evaluation to avoid redundant child evaluations
-                self.eval_is_null_junction_fused(
-                    *op,
-                    preds,
+                // NOT affects value but is transparent to nullness
+                return self.eval_pred_with_null_check(
+                    inner,
                     bindings,
-                    value_inverted,
+                    !value_inverted,
                     null_inverted,
-                )
+                );
             }
+            // Use fused junction evaluation to avoid redundant child evaluations
+            Pred::Junction(JunctionPredicate { op, preds }) => self.eval_is_null_junction_fused(
+                *op,
+                preds,
+                bindings,
+                value_inverted,
+                null_inverted,
+            ),
             _ => {
                 // For other predicates, evaluate separately (no optimization yet)
                 let value = self.eval_pred(pred, value_inverted);
                 let is_null = self.eval_pred_is_null(pred, null_inverted);
-                FusedEvalResult {
-                    value_name: bindings.store(value),
-                    is_null_name: bindings.store(is_null),
-                }
+                (value, is_null)
             }
+        };
+
+        FusedEvalResult {
+            value_name: bindings.store(value),
+            is_null_name: bindings.store(is_null),
         }
     }
 
-    /// Evaluates IS [NOT] NULL of a junction (AND/OR) by rewriting it into evaluable form.
+    /// Core implementation of IS [NOT] NULL junction evaluation.
     ///
     /// This implements the boolean logic rewrites:
     /// ```text
@@ -470,34 +497,32 @@ pub trait KernelPredicateEvaluator {
     /// To avoid exponential blow-up from evaluating each child predicate multiple times, we use
     /// [`LetBindings`] to manage intermediate results. For direct evaluation, results are cached
     /// locally. For indirect evaluation, Let nodes are created in the output predicate tree.
-    fn eval_is_null_junction(
+    ///
+    /// If `value_handles` is provided, the value handles from each child evaluation are captured
+    /// for later reuse (needed by the fused version to compute the junction's original value).
+    fn eval_is_null_junction_impl(
         &self,
         op: JunctionPredicateOp,
         preds: &[Pred],
-        inverted: bool,
+        bindings: &mut Self::Bindings,
+        value_inverted: bool,
+        null_inverted: bool,
+        mut value_handles: Option<&mut Vec<String>>,
     ) -> Option<Self::Output> {
-        // Determine the inversion flags for the rewrite pattern. Each per-variable clause checks:
-        // "does this variable allow the junction to be NULL?" For a junction to be NULL, at least
-        // one input must be NULL, and no input can evaluate to the dominating value. So we check
-        // each variable for: `IS_NULL(x) OR x != dominator`, noting that the dominator value itself
-        // is the correct inversion flag to use when evaluating boolean predicate `x`:
-        //
-        // - AND (dominator=false): check for `x != FALSE`, which is just `x` (inverted=false)
-        // - OR (dominator=true): check for `x != TRUE`, which is just `NOT(x)` (inverted=true)
-        let dominator = KernelPredicateEvaluatorDefaults::junction_dominator(op, inverted);
+        // Determine the dominating value for the junction type and null inversion.
+        // The per-variable clauses need to check against the dominator (the value that would
+        // prevent the junction from being NULL even if some of its children are NULL).
+        let dominator = KernelPredicateEvaluatorDefaults::junction_dominator(op, null_inverted);
 
-        // Create let-bindings for reusing child evaluation results
-        let mut bindings = Self::Bindings::default();
-
-        // Determine junction types for the rewrite (depends on inverted, not input op):
+        // Determine junction types for the rewrite (depends on null_inverted, not input op):
         //
-        // IS_NULL (inverted=false):
+        // IS_NULL (null_inverted=false):
         //   - Per-var clauses: OR(IS_NULL(pred), pred != dominator)
         //   - Inner junction: AND of all per-var clauses
         //   - Final clause: OR(IS_NULL(a), IS_NULL(b), ...)
         //   - Outer junction: AND(inner, final)
         //
-        // IS_NOT_NULL (inverted=true):
+        // IS_NOT_NULL (null_inverted=true):
         //   - Per-var clauses: AND(NOT(IS_NULL(pred)), pred != dominator)
         //   - Inner junction: OR of all per-var clauses
         //   - Final clause: AND(NOT(IS_NULL(a)), NOT(IS_NULL(b)), ...)
@@ -505,7 +530,7 @@ pub trait KernelPredicateEvaluator {
         //
         // Note: Inner and outer use the same junction type (both AND or both OR), ensuring
         // short-circuit alignment. Per-var and final clauses use the opposite type.
-        let (outer_op, per_var_op) = match inverted {
+        let (outer_op, per_var_op) = match null_inverted {
             true => (JunctionPredicateOp::Or, JunctionPredicateOp::And),
             false => (JunctionPredicateOp::And, JunctionPredicateOp::Or),
         };
@@ -517,11 +542,20 @@ pub trait KernelPredicateEvaluator {
             let FusedEvalResult {
                 value_name,
                 is_null_name,
-            } = self.eval_pred_with_null_check(pred, &mut bindings, dominator, inverted);
+            } = self.eval_pred_with_null_check(pred, bindings, value_inverted, null_inverted);
 
-            // Retrieve both bindings, and remember the null check's name for later
-            let var_clause = bindings.retrieve(&value_name);
+            // Build the per-variable clause. We need the value with `dominator` inversion.
+            // Check if we stored the right inversion or need to evaluate with opposite flag.
+            let var_clause = if value_inverted == dominator {
+                bindings.retrieve(&value_name)
+            } else {
+                self.eval_pred(pred, dominator)
+            };
+
             let is_null_clause = bindings.retrieve(&is_null_name);
+            if let Some(handles) = value_handles.as_mut() {
+                handles.push(value_name);
+            }
             null_handles.push(is_null_name);
 
             let mut pair = [is_null_clause, var_clause].into_iter();
@@ -541,11 +575,33 @@ pub trait KernelPredicateEvaluator {
         // the final clause might be a dominating value (e.g., AND(None, FALSE) = FALSE).
         let mut both = std::iter::once(inner_result).chain(std::iter::once_with(|| {
             let mut all_null_checks = null_handles
-                .into_iter()
-                .map(|null_handle| bindings.retrieve(&null_handle));
+                .iter()
+                .map(|null_handle| bindings.retrieve(null_handle));
             self.finish_eval_pred_junction(per_var_op, &mut all_null_checks, false)
         }));
-        let result = self.finish_eval_pred_junction(outer_op, &mut both, false);
+        self.finish_eval_pred_junction(outer_op, &mut both, false)
+    }
+
+    /// Evaluates IS [NOT] NULL of a junction (AND/OR) by rewriting it into evaluable form.
+    ///
+    /// This is a thin wrapper around [`eval_is_null_junction_impl`] that creates local bindings,
+    /// evaluates the IS_NULL rewrite, and finalizes the result.
+    fn eval_is_null_junction(
+        &self,
+        op: JunctionPredicateOp,
+        preds: &[Pred],
+        value_inverted: bool,
+        null_inverted: bool,
+    ) -> Option<Self::Output> {
+        let mut bindings = Self::Bindings::default();
+        let result = self.eval_is_null_junction_impl(
+            op,
+            preds,
+            &mut bindings,
+            value_inverted,
+            null_inverted,
+            None,
+        );
         bindings.finalize(result)
     }
 
@@ -554,10 +610,12 @@ pub trait KernelPredicateEvaluator {
     /// This computes `(junction_value, IS_NULL(junction))` in a single pass by evaluating each child
     /// only once and reusing the results for both the value and null-check computations via let-bindings.
     ///
-    /// Returns a [`FusedEvalResult`] with names to reference the computed values. All bindings are
-    /// accumulated in the provided `bindings` parameter.
+    /// This is a thin wrapper around [`eval_is_null_junction_impl`] that uses the caller's bindings
+    /// (for accumulation), captures value handles, and then computes the junction's original value
+    /// from those handles.
     ///
-    /// TODO: Consider consolidating with `eval_is_null_junction` to reduce code duplication.
+    /// Returns a tuple of (value, is_null) results. All bindings are accumulated in the
+    /// provided `bindings` parameter.
     fn eval_is_null_junction_fused(
         &self,
         op: JunctionPredicateOp,
@@ -565,62 +623,24 @@ pub trait KernelPredicateEvaluator {
         bindings: &mut Self::Bindings,
         value_inverted: bool,
         null_inverted: bool,
-    ) -> FusedEvalResult {
-        let dominator = KernelPredicateEvaluatorDefaults::junction_dominator(op, null_inverted);
-
-        let (outer_op, per_var_op) = match null_inverted {
-            true => (JunctionPredicateOp::Or, JunctionPredicateOp::And),
-            false => (JunctionPredicateOp::And, JunctionPredicateOp::Or),
-        };
-
-        // Evaluate each child with fused evaluation, accumulating bindings
-        let mut null_handles = Vec::with_capacity(preds.len());
+    ) -> (Option<Self::Output>, Option<Self::Output>) {
         let mut value_handles = Vec::with_capacity(preds.len());
-        let mut per_var_clauses = preds.iter().map(|pred| {
-            // Recursively use fused evaluation for children (bindings accumulate)
-            let FusedEvalResult {
-                value_name,
-                is_null_name,
-            } = self.eval_pred_with_null_check(pred, bindings, value_inverted, null_inverted);
 
-            // Build per-variable clause: op(IS_NULL(pred), pred != dominator)
-            // We need the value with `dominator` inversion for the var clause
-            // Check if we can reuse the stored value or need to evaluate separately
-            let var_clause = if value_inverted == dominator {
-                // value_inverted == dominator means we already have the right inversion
-                bindings.retrieve(&value_name)
-            } else {
-                // Need opposite inversion, evaluate separately
-                self.eval_pred(pred, dominator)
-            };
+        // Evaluate IS_NULL rewrite, capturing value handles
+        let is_null_result = self.eval_is_null_junction_impl(
+            op,
+            preds,
+            bindings,
+            value_inverted,
+            null_inverted,
+            Some(&mut value_handles),
+        );
 
-            let is_null_clause = bindings.retrieve(&is_null_name);
-            value_handles.push(value_name);
-            null_handles.push(is_null_name);
-
-            let mut pair = [is_null_clause, var_clause].into_iter();
-            self.finish_eval_pred_junction(per_var_op, &mut pair, false)
-        });
-
-        // Evaluate inner junction for null-check rewrite
-        let inner_result = self.finish_eval_pred_junction(outer_op, &mut per_var_clauses, false);
-
-        // Build final null-check clause
-        let mut both = std::iter::once(inner_result).chain(std::iter::once_with(|| {
-            let mut all_null_checks = null_handles.iter().map(|handle| bindings.retrieve(handle));
-            self.finish_eval_pred_junction(per_var_op, &mut all_null_checks, false)
-        }));
-        let is_null_result = self.finish_eval_pred_junction(outer_op, &mut both, false);
-
-        // Compute the junction's value from stored child values
+        // Compute the junction's original value from captured child value handles
         let mut value_clauses = value_handles.iter().map(|handle| bindings.retrieve(handle));
         let value_result = self.finish_eval_pred_junction(op, &mut value_clauses, value_inverted);
 
-        // Store both results and return their names
-        FusedEvalResult {
-            value_name: bindings.store(value_result),
-            is_null_name: bindings.store(is_null_result),
-        }
+        (value_result, is_null_result)
     }
 
     /// A (possibly inverted) DISTINCT test, e.g. `[NOT] DISTINCT(<col>, false)`. DISTINCT can be
@@ -721,6 +741,7 @@ pub trait KernelPredicateEvaluator {
             Junction(JunctionPredicate { op, preds }) => {
                 self.eval_pred_junction(*op, preds, inverted)
             }
+            Let(let_pred) => self.eval_pred_let(&let_pred.bindings, &let_pred.body, inverted),
             Opaque(OpaquePredicate { op, exprs }) => self.eval_pred_opaque(op, exprs, inverted),
             Unknown(_) => None, // not supported by definition
         }
@@ -1019,11 +1040,73 @@ impl ResolveColumnAsScalar for std::collections::HashMap<ColumnName, Scalar> {
 /// result. Column resolution is handled by an embedded [`ResolveColumnAsScalar`] instance.
 pub(crate) struct DefaultKernelPredicateEvaluator<R: ResolveColumnAsScalar> {
     resolver: R,
+    // TODO: Using String as key precludes drilling into struct bindings (e.g., binding.field).
+    // Need to design a better solution for nested access in the future.
+    bindings: std::cell::RefCell<indexmap::IndexMap<String, Scalar>>,
 }
+
+/// RAII guard for managing let-binding scope in DefaultKernelPredicateEvaluator
+struct BindingScope<'a> {
+    bindings: &'a std::cell::RefCell<indexmap::IndexMap<String, Scalar>>,
+    saved_len: usize,
+}
+
+impl<'a> BindingScope<'a> {
+    fn insert(&mut self, name: String, value: Scalar) {
+        // Short-lived borrow for insertion
+        self.bindings.borrow_mut().insert(name, value);
+    }
+}
+
+impl Drop for BindingScope<'_> {
+    fn drop(&mut self) {
+        // Truncate bindings back to saved length when scope ends
+        // Panic if we can't borrow - indicates a bug that would be caught by
+        // the compiler when we switch to &mut self
+        self.bindings.borrow_mut().truncate(self.saved_len);
+    }
+}
+
 impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
-    // Convenient thin wrapper
+    /// Get a binding by name, checking the let-binding stack first
+    /// TODO: This only checks the first path segment - need better design for nested access
+    fn get_binding(&self, col: &ColumnName) -> Option<Scalar> {
+        let binding_name = col.as_ref().first()?;
+        self.bindings
+            .try_borrow()
+            .ok()?
+            .get(binding_name.as_str())
+            .cloned()
+    }
+
+    /// Create a new binding scope for evaluating a Let node
+    fn binding_scope(&self) -> BindingScope<'_> {
+        let saved_len = self.bindings.borrow().len();
+        BindingScope {
+            bindings: &self.bindings,
+            saved_len,
+        }
+    }
+
+    /// Helper to evaluate and bind all predicates in a Let node
+    fn bind_all_preds(&self, bindings: &[(String, Pred)]) -> Option<BindingScope<'_>> {
+        let mut scope = self.binding_scope();
+        for (name, pred) in bindings {
+            // Bindings can evaluate to None (e.g., when min/max stats are NULL for all-null columns).
+            // We store None values so they can be retrieved later, but actual use of None bindings
+            // should be guarded by short-circuiting in the parent expression.
+            if let Some(value) = self.eval_pred(pred, false) {
+                scope.insert(name.clone(), Scalar::from(value));
+            }
+            // If None, we simply don't insert the binding (represented by absence in the map)
+        }
+        Some(scope)
+    }
+
+    // Convenient thin wrapper - checks bindings first, then falls back to resolver
     fn resolve_column(&self, col: &ColumnName) -> Option<Scalar> {
-        self.resolver.resolve_column(col)
+        self.get_binding(col)
+            .or_else(|| self.resolver.resolve_column(col))
     }
 
     pub(crate) fn eval_expr(&self, expr: &Expr) -> Option<Scalar> {
@@ -1055,7 +1138,10 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
 
 impl<R: ResolveColumnAsScalar + 'static> From<R> for DefaultKernelPredicateEvaluator<R> {
     fn from(resolver: R) -> Self {
-        Self { resolver }
+        Self {
+            resolver,
+            bindings: std::cell::RefCell::new(indexmap::IndexMap::new()),
+        }
     }
 }
 
@@ -1065,6 +1151,20 @@ impl<R: ResolveColumnAsScalar + 'static> From<R> for DefaultKernelPredicateEvalu
 impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredicateEvaluator<R> {
     type Output = bool;
     type Bindings = DirectLetBindings<bool>;
+
+    fn eval_pred_let(
+        &self,
+        bindings: &[(String, Pred)],
+        body: &Pred,
+        inverted: bool,
+    ) -> Option<Self::Output> {
+        // Evaluate and bind all predicates, creating a scope guard
+        let _scope = self.bind_all_preds(bindings)?;
+
+        // Evaluate the body with all bindings available
+        // The scope guard ensures bindings are cleaned up when it drops
+        self.eval_pred(body, inverted)
+    }
 
     fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<bool> {
         KernelPredicateEvaluatorDefaults::eval_pred_scalar(val, inverted)
@@ -1403,5 +1503,18 @@ impl<T: DataSkippingPredicateEvaluator + ?Sized> KernelPredicateEvaluator for T 
         inverted: bool,
     ) -> Option<Self::Output> {
         self.finish_eval_pred_junction(op, preds, inverted)
+    }
+
+    fn eval_pred_let(
+        &self,
+        _bindings: &[(String, Pred)],
+        _body: &Pred,
+        _inverted: bool,
+    ) -> Option<Self::Output> {
+        // TODO: Indirect data skipping evaluation should recursively rewrite Let bindings and body.
+        // For now, return None since Let nodes aren't expected in non-rewritten predicates.
+        // Direct data skipping never produces Let nodes, and rewritten predicates (which contain
+        // Let nodes) should be evaluated with DefaultKernelPredicateEvaluator, not data skipping.
+        None
     }
 }

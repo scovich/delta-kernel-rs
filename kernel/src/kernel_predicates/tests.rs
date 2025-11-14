@@ -1009,15 +1009,16 @@ fn test_sql_where() {
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 }
 
-/// Test helper to evaluate a predicate with a set of column values for data skipping.
-/// This creates a stats provider where all columns have the same min/max values and null count.
-struct UniformStatsProvider {
+/// Test helper that resolves stats columns for evaluating rewritten data skipping predicates.
+/// After indirect evaluation rewrites a predicate (creating Let nodes with min/max/nullcount checks),
+/// we need a resolver that provides those stat columns so DefaultKernelPredicateEvaluator can evaluate it.
+struct UniformStatsResolver {
     value: Scalar,
     nullcount: i64,
     rowcount: i64,
 }
 
-impl UniformStatsProvider {
+impl UniformStatsResolver {
     fn new(value: Scalar, nullcount: i64, rowcount: i64) -> Self {
         Self {
             value,
@@ -1027,32 +1028,35 @@ impl UniformStatsProvider {
     }
 }
 
-impl ParquetStatsProvider for UniformStatsProvider {
-    fn get_parquet_min_stat(&self, _col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
-        (self.value.data_type() == *data_type).then(|| self.value.clone())
-    }
-
-    fn get_parquet_max_stat(&self, _col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
-        (self.value.data_type() == *data_type).then(|| self.value.clone())
-    }
-
-    fn get_parquet_nullcount_stat(&self, _col: &ColumnName) -> Option<i64> {
-        Some(self.nullcount)
-    }
-
-    fn get_parquet_rowcount_stat(&self) -> i64 {
-        self.rowcount
+impl ResolveColumnAsScalar for UniformStatsResolver {
+    fn resolve_column(&self, col: &ColumnName) -> Option<Scalar> {
+        let path = col.as_ref();
+        match path {
+            // minValues/maxValues are NULL when all rows are NULL (nullcount == rowcount)
+            [first, _] if first == "minValues" && self.nullcount != self.rowcount => {
+                Some(self.value.clone())
+            }
+            [first, _] if first == "maxValues" && self.nullcount != self.rowcount => {
+                Some(self.value.clone())
+            }
+            [first, _] if first == "nullCount" => Some(Scalar::from(self.nullcount)),
+            [first] if first == "numRecords" => Some(Scalar::from(self.rowcount)),
+            _ => None,
+        }
     }
 }
 
-/// Helper to test that a rewritten predicate produces the same results as direct evaluation
+/// Helper to test that a rewritten predicate produces the expected results.
+/// The rewritten predicate contains Let nodes and references to stats columns (minValues, maxValues, etc.).
+/// We evaluate it using DefaultKernelPredicateEvaluator with a resolver that provides those stats.
 fn test_rewrite_equivalence(pred: &Pred, test_cases: &[(Scalar, i64, i64, Option<bool>)]) {
     let rewritten = as_data_skipping_predicate(pred)
         .unwrap_or_else(|| panic!("Expected rewrite to succeed for: {}", pred));
 
     for (value, nullcount, rowcount, expected) in test_cases {
-        let stats = UniformStatsProvider::new(value.clone(), *nullcount, *rowcount);
-        let result = stats.eval(&rewritten);
+        let resolver = UniformStatsResolver::new(value.clone(), *nullcount, *rowcount);
+        let evaluator = DefaultKernelPredicateEvaluator::from(resolver);
+        let result = evaluator.eval(&rewritten);
         assert_eq!(
             result, *expected,
             "Rewrite mismatch for {}: value={:?}, nullcount={}, rowcount={}\nRewritten: {}",
@@ -1076,10 +1080,12 @@ fn test_let_binding_is_null_and() {
     test_rewrite_equivalence(
         &Pred::is_null(three_term_junction(JunctionPredicateOp::And)),
         &[
-            (Scalar::Boolean(true), 0, 10, Some(false)), // All true, none null -> FALSE
-            (Scalar::Boolean(true), 5, 10, Some(true)),  // All true, some null -> TRUE
-            (Scalar::Boolean(false), 0, 10, Some(false)), // Some false, none null -> FALSE
-            (Scalar::Boolean(false), 5, 10, Some(false)), // Some false, some null -> FALSE (false dominates)
+            (Scalar::Boolean(true), 0, 10, Some(false)), // All true, none null -> AND=true, IS_NULL=false -> CAN skip
+            (Scalar::Boolean(true), 5, 10, Some(true)), // All true, some null -> mixed (false and NULL) -> CAN'T skip
+            (Scalar::Boolean(true), 10, 10, Some(true)), // All null -> AND=NULL, IS_NULL=true -> CAN'T skip
+            (Scalar::Boolean(false), 0, 10, Some(false)), // All false, none null -> AND=false, IS_NULL=false -> CAN skip
+            (Scalar::Boolean(false), 5, 10, Some(true)), // All false, some null -> mixed (false and NULL rows, NULL produces true) -> CAN'T skip
+            (Scalar::Boolean(false), 10, 10, Some(true)), // All null -> AND=NULL, IS_NULL=true -> CAN'T skip
         ],
     );
 }
@@ -1090,10 +1096,12 @@ fn test_let_binding_is_null_or() {
     test_rewrite_equivalence(
         &Pred::is_null(three_term_junction(JunctionPredicateOp::Or)),
         &[
-            (Scalar::Boolean(false), 0, 10, Some(false)), // All false, none null -> FALSE
-            (Scalar::Boolean(false), 5, 10, Some(true)),  // All false, some null -> TRUE
-            (Scalar::Boolean(true), 0, 10, Some(false)),  // Some true, none null -> FALSE
-            (Scalar::Boolean(true), 5, 10, Some(false)), // Some true, some null -> FALSE (true dominates)
+            (Scalar::Boolean(false), 0, 10, Some(false)), // All false, none null -> OR=false, IS_NULL=false -> CAN skip
+            (Scalar::Boolean(false), 5, 10, Some(true)), // All false, some null -> all-NULL rows produce TRUE -> CAN'T skip
+            (Scalar::Boolean(false), 10, 10, Some(true)), // All null -> OR=NULL, IS_NULL=true -> CAN'T skip
+            (Scalar::Boolean(true), 0, 10, Some(false)), // All true, none null -> OR=true, IS_NULL=false -> CAN skip
+            (Scalar::Boolean(true), 5, 10, Some(true)), // All true, some null -> mixed (all-NULL rows produce TRUE) -> CAN'T skip
+            (Scalar::Boolean(true), 10, 10, Some(true)), // All null -> OR=NULL, IS_NULL=true -> CAN'T skip
         ],
     );
 }
@@ -1104,10 +1112,12 @@ fn test_let_binding_is_not_null_and() {
     test_rewrite_equivalence(
         &Pred::is_not_null(three_term_junction(JunctionPredicateOp::And)),
         &[
-            (Scalar::Boolean(true), 0, 10, Some(true)), // All true, none null -> TRUE
-            (Scalar::Boolean(true), 5, 10, Some(false)), // All true, some null -> FALSE
-            (Scalar::Boolean(false), 0, 10, Some(true)), // Some false, none null -> TRUE
-            (Scalar::Boolean(false), 5, 10, Some(true)), // Some false, some null -> TRUE (false dominates)
+            (Scalar::Boolean(true), 0, 10, Some(true)), // All true, none null -> AND=true, IS_NOT_NULL=true -> CAN'T skip
+            (Scalar::Boolean(true), 5, 10, Some(true)), // All true, some null -> all-non-null rows produce TRUE -> CAN'T skip
+            (Scalar::Boolean(true), 10, 10, Some(false)), // All null -> AND=NULL, IS_NOT_NULL=false -> CAN skip
+            (Scalar::Boolean(false), 0, 10, Some(true)), // All false, none null -> AND=false, IS_NOT_NULL=true -> CAN'T skip
+            (Scalar::Boolean(false), 5, 10, Some(true)), // All false, some null -> AND=false, IS_NOT_NULL=true (false dominates) -> CAN'T skip
+            (Scalar::Boolean(false), 10, 10, Some(false)), // All null -> AND=NULL, IS_NOT_NULL=false -> CAN skip
         ],
     );
 }
@@ -1118,10 +1128,12 @@ fn test_let_binding_is_not_null_or() {
     test_rewrite_equivalence(
         &Pred::is_not_null(three_term_junction(JunctionPredicateOp::Or)),
         &[
-            (Scalar::Boolean(false), 0, 10, Some(true)), // All false, none null -> TRUE
-            (Scalar::Boolean(false), 5, 10, Some(false)), // All false, some null -> FALSE
-            (Scalar::Boolean(true), 0, 10, Some(true)),  // Some true, none null -> TRUE
-            (Scalar::Boolean(true), 5, 10, Some(true)), // Some true, some null -> TRUE (true dominates)
+            (Scalar::Boolean(false), 0, 10, Some(true)), // All false, none null -> OR=false, IS_NOT_NULL=true -> CAN'T skip
+            (Scalar::Boolean(false), 5, 10, Some(true)), // All false, some null -> all-non-null rows produce TRUE -> CAN'T skip
+            (Scalar::Boolean(false), 10, 10, Some(false)), // All null -> OR=NULL, IS_NOT_NULL=false -> CAN skip
+            (Scalar::Boolean(true), 0, 10, Some(true)), // All true, none null -> OR=true, IS_NOT_NULL=true -> CAN'T skip
+            (Scalar::Boolean(true), 5, 10, Some(true)), // All true, some null -> OR=true, IS_NOT_NULL=true (true dominates) -> CAN'T skip
+            (Scalar::Boolean(true), 10, 10, Some(false)), // All null -> OR=NULL, IS_NOT_NULL=false -> CAN skip
         ],
     );
 }
@@ -1137,8 +1149,10 @@ fn test_let_binding_nested_and_and() {
         &[
             (Scalar::Boolean(true), 0, 10, Some(false)),
             (Scalar::Boolean(true), 5, 10, Some(true)),
+            (Scalar::Boolean(true), 10, 10, Some(true)),
             (Scalar::Boolean(false), 0, 10, Some(false)),
-            (Scalar::Boolean(false), 5, 10, Some(false)),
+            (Scalar::Boolean(false), 5, 10, Some(true)),
+            (Scalar::Boolean(false), 10, 10, Some(true)),
         ],
     );
 }
@@ -1154,7 +1168,10 @@ fn test_let_binding_nested_and_or() {
         &[
             (Scalar::Boolean(true), 0, 10, Some(false)),
             (Scalar::Boolean(true), 5, 10, Some(true)),
+            (Scalar::Boolean(true), 10, 10, Some(true)),
+            (Scalar::Boolean(false), 0, 10, Some(false)),
             (Scalar::Boolean(false), 5, 10, Some(true)),
+            (Scalar::Boolean(false), 10, 10, Some(true)),
         ],
     );
 }
@@ -1170,7 +1187,10 @@ fn test_let_binding_nested_or_and() {
         &[
             (Scalar::Boolean(false), 0, 10, Some(false)),
             (Scalar::Boolean(false), 5, 10, Some(true)),
-            (Scalar::Boolean(true), 5, 10, Some(false)),
+            (Scalar::Boolean(false), 10, 10, Some(true)),
+            (Scalar::Boolean(true), 0, 10, Some(false)),
+            (Scalar::Boolean(true), 5, 10, Some(true)),
+            (Scalar::Boolean(true), 10, 10, Some(true)),
         ],
     );
 }
@@ -1186,8 +1206,10 @@ fn test_let_binding_nested_or_or() {
         &[
             (Scalar::Boolean(false), 0, 10, Some(false)),
             (Scalar::Boolean(false), 5, 10, Some(true)),
+            (Scalar::Boolean(false), 10, 10, Some(true)),
             (Scalar::Boolean(true), 0, 10, Some(false)),
-            (Scalar::Boolean(true), 5, 10, Some(false)),
+            (Scalar::Boolean(true), 5, 10, Some(true)),
+            (Scalar::Boolean(true), 10, 10, Some(true)),
         ],
     );
 }
@@ -1199,10 +1221,12 @@ fn test_let_binding_with_not_junction() {
     test_rewrite_equivalence(
         &pred,
         &[
-            (Scalar::Boolean(true), 0, 10, Some(false)), // IS_NULL(NOT(TRUE)) = FALSE
-            (Scalar::Boolean(true), 5, 10, Some(true)),  // IS_NULL(NOT(AND)) can be TRUE
-            (Scalar::Boolean(false), 0, 10, Some(false)), // IS_NULL(NOT(FALSE)) = FALSE
-            (Scalar::Boolean(false), 5, 10, Some(false)), // false dominates
+            (Scalar::Boolean(true), 0, 10, Some(false)),
+            (Scalar::Boolean(true), 5, 10, Some(true)),
+            (Scalar::Boolean(true), 10, 10, Some(true)),
+            (Scalar::Boolean(false), 0, 10, Some(false)),
+            (Scalar::Boolean(false), 5, 10, Some(true)),
+            (Scalar::Boolean(false), 10, 10, Some(true)),
         ],
     );
 }
@@ -1217,9 +1241,11 @@ fn test_let_binding_nested_is_not_null_and_and() {
         &pred,
         &[
             (Scalar::Boolean(true), 0, 10, Some(true)),
-            (Scalar::Boolean(true), 5, 10, Some(false)),
+            (Scalar::Boolean(true), 5, 10, Some(true)),
+            (Scalar::Boolean(true), 10, 10, Some(false)),
             (Scalar::Boolean(false), 0, 10, Some(true)),
             (Scalar::Boolean(false), 5, 10, Some(true)),
+            (Scalar::Boolean(false), 10, 10, Some(false)),
         ],
     );
 }
@@ -1234,9 +1260,11 @@ fn test_let_binding_nested_is_not_null_or_or() {
         &pred,
         &[
             (Scalar::Boolean(false), 0, 10, Some(true)),
-            (Scalar::Boolean(false), 5, 10, Some(false)),
+            (Scalar::Boolean(false), 5, 10, Some(true)),
+            (Scalar::Boolean(false), 10, 10, Some(false)),
             (Scalar::Boolean(true), 0, 10, Some(true)),
             (Scalar::Boolean(true), 5, 10, Some(true)),
+            (Scalar::Boolean(true), 10, 10, Some(false)),
         ],
     );
 }
@@ -1254,8 +1282,10 @@ fn test_let_binding_with_not_operand() {
         &[
             (Scalar::Boolean(true), 0, 10, Some(false)),
             (Scalar::Boolean(true), 5, 10, Some(true)),
+            (Scalar::Boolean(true), 10, 10, Some(true)),
             (Scalar::Boolean(false), 0, 10, Some(false)),
-            (Scalar::Boolean(false), 5, 10, Some(false)),
+            (Scalar::Boolean(false), 5, 10, Some(true)),
+            (Scalar::Boolean(false), 10, 10, Some(true)),
         ],
     );
 }
