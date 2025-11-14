@@ -1008,3 +1008,254 @@ fn test_sql_where() {
     expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 }
+
+/// Test helper to evaluate a predicate with a set of column values for data skipping.
+/// This creates a stats provider where all columns have the same min/max values and null count.
+struct UniformStatsProvider {
+    value: Scalar,
+    nullcount: i64,
+    rowcount: i64,
+}
+
+impl UniformStatsProvider {
+    fn new(value: Scalar, nullcount: i64, rowcount: i64) -> Self {
+        Self {
+            value,
+            nullcount,
+            rowcount,
+        }
+    }
+}
+
+impl ParquetStatsProvider for UniformStatsProvider {
+    fn get_parquet_min_stat(&self, _col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
+        (self.value.data_type() == *data_type).then(|| self.value.clone())
+    }
+
+    fn get_parquet_max_stat(&self, _col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
+        (self.value.data_type() == *data_type).then(|| self.value.clone())
+    }
+
+    fn get_parquet_nullcount_stat(&self, _col: &ColumnName) -> Option<i64> {
+        Some(self.nullcount)
+    }
+
+    fn get_parquet_rowcount_stat(&self) -> i64 {
+        self.rowcount
+    }
+}
+
+/// Helper to test that a rewritten predicate produces the same results as direct evaluation
+fn test_rewrite_equivalence(pred: &Pred, test_cases: &[(Scalar, i64, i64, Option<bool>)]) {
+    let rewritten = as_data_skipping_predicate(pred)
+        .unwrap_or_else(|| panic!("Expected rewrite to succeed for: {}", pred));
+
+    for (value, nullcount, rowcount, expected) in test_cases {
+        let stats = UniformStatsProvider::new(value.clone(), *nullcount, *rowcount);
+        let result = stats.eval(&rewritten);
+        assert_eq!(
+            result, *expected,
+            "Rewrite mismatch for {}: value={:?}, nullcount={}, rowcount={}\nRewritten: {}",
+            pred, value, nullcount, rowcount, rewritten
+        );
+    }
+}
+
+/// Helper to build a 3-term junction predicate using and_from/or_from
+fn three_term_junction(op: JunctionPredicateOp) -> Pred {
+    let terms = vec![column_pred!("a"), column_pred!("b"), column_pred!("c")];
+    match op {
+        JunctionPredicateOp::And => Pred::and_from(terms),
+        JunctionPredicateOp::Or => Pred::or_from(terms),
+    }
+}
+
+#[test]
+fn test_let_binding_is_null_and() {
+    // IS_NULL(AND) is true iff at least one operand is null AND all non-null operands are true
+    test_rewrite_equivalence(
+        &Pred::is_null(three_term_junction(JunctionPredicateOp::And)),
+        &[
+            (Scalar::Boolean(true), 0, 10, Some(false)), // All true, none null -> FALSE
+            (Scalar::Boolean(true), 5, 10, Some(true)),  // All true, some null -> TRUE
+            (Scalar::Boolean(false), 0, 10, Some(false)), // Some false, none null -> FALSE
+            (Scalar::Boolean(false), 5, 10, Some(false)), // Some false, some null -> FALSE (false dominates)
+        ],
+    );
+}
+
+#[test]
+fn test_let_binding_is_null_or() {
+    // IS_NULL(OR) is true iff at least one operand is null AND all non-null operands are false
+    test_rewrite_equivalence(
+        &Pred::is_null(three_term_junction(JunctionPredicateOp::Or)),
+        &[
+            (Scalar::Boolean(false), 0, 10, Some(false)), // All false, none null -> FALSE
+            (Scalar::Boolean(false), 5, 10, Some(true)),  // All false, some null -> TRUE
+            (Scalar::Boolean(true), 0, 10, Some(false)),  // Some true, none null -> FALSE
+            (Scalar::Boolean(true), 5, 10, Some(false)), // Some true, some null -> FALSE (true dominates)
+        ],
+    );
+}
+
+#[test]
+fn test_let_binding_is_not_null_and() {
+    // IS_NOT_NULL(AND) is true iff all operands are non-null OR at least one is false
+    test_rewrite_equivalence(
+        &Pred::is_not_null(three_term_junction(JunctionPredicateOp::And)),
+        &[
+            (Scalar::Boolean(true), 0, 10, Some(true)), // All true, none null -> TRUE
+            (Scalar::Boolean(true), 5, 10, Some(false)), // All true, some null -> FALSE
+            (Scalar::Boolean(false), 0, 10, Some(true)), // Some false, none null -> TRUE
+            (Scalar::Boolean(false), 5, 10, Some(true)), // Some false, some null -> TRUE (false dominates)
+        ],
+    );
+}
+
+#[test]
+fn test_let_binding_is_not_null_or() {
+    // IS_NOT_NULL(OR) is true iff all operands are non-null OR at least one is true
+    test_rewrite_equivalence(
+        &Pred::is_not_null(three_term_junction(JunctionPredicateOp::Or)),
+        &[
+            (Scalar::Boolean(false), 0, 10, Some(true)), // All false, none null -> TRUE
+            (Scalar::Boolean(false), 5, 10, Some(false)), // All false, some null -> FALSE
+            (Scalar::Boolean(true), 0, 10, Some(true)),  // Some true, none null -> TRUE
+            (Scalar::Boolean(true), 5, 10, Some(true)), // Some true, some null -> TRUE (true dominates)
+        ],
+    );
+}
+
+#[test]
+fn test_let_binding_nested_and_and() {
+    let pred = Pred::is_null(Pred::and(
+        Pred::and(column_pred!("a"), column_pred!("b")),
+        column_pred!("c"),
+    ));
+    test_rewrite_equivalence(
+        &pred,
+        &[
+            (Scalar::Boolean(true), 0, 10, Some(false)),
+            (Scalar::Boolean(true), 5, 10, Some(true)),
+            (Scalar::Boolean(false), 0, 10, Some(false)),
+            (Scalar::Boolean(false), 5, 10, Some(false)),
+        ],
+    );
+}
+
+#[test]
+fn test_let_binding_nested_and_or() {
+    let pred = Pred::is_null(Pred::and(
+        Pred::or(column_pred!("a"), column_pred!("b")),
+        column_pred!("c"),
+    ));
+    test_rewrite_equivalence(
+        &pred,
+        &[
+            (Scalar::Boolean(true), 0, 10, Some(false)),
+            (Scalar::Boolean(true), 5, 10, Some(true)),
+            (Scalar::Boolean(false), 5, 10, Some(true)),
+        ],
+    );
+}
+
+#[test]
+fn test_let_binding_nested_or_and() {
+    let pred = Pred::is_null(Pred::or(
+        Pred::and(column_pred!("a"), column_pred!("b")),
+        column_pred!("c"),
+    ));
+    test_rewrite_equivalence(
+        &pred,
+        &[
+            (Scalar::Boolean(false), 0, 10, Some(false)),
+            (Scalar::Boolean(false), 5, 10, Some(true)),
+            (Scalar::Boolean(true), 5, 10, Some(false)),
+        ],
+    );
+}
+
+#[test]
+fn test_let_binding_nested_or_or() {
+    let pred = Pred::is_null(Pred::or(
+        Pred::or(column_pred!("a"), column_pred!("b")),
+        column_pred!("c"),
+    ));
+    test_rewrite_equivalence(
+        &pred,
+        &[
+            (Scalar::Boolean(false), 0, 10, Some(false)),
+            (Scalar::Boolean(false), 5, 10, Some(true)),
+            (Scalar::Boolean(true), 0, 10, Some(false)),
+            (Scalar::Boolean(true), 5, 10, Some(false)),
+        ],
+    );
+}
+
+#[test]
+fn test_let_binding_with_not_junction() {
+    // NOT is transparent to nullness but affects value inversion
+    let pred = Pred::is_null(Pred::not(three_term_junction(JunctionPredicateOp::And)));
+    test_rewrite_equivalence(
+        &pred,
+        &[
+            (Scalar::Boolean(true), 0, 10, Some(false)), // IS_NULL(NOT(TRUE)) = FALSE
+            (Scalar::Boolean(true), 5, 10, Some(true)),  // IS_NULL(NOT(AND)) can be TRUE
+            (Scalar::Boolean(false), 0, 10, Some(false)), // IS_NULL(NOT(FALSE)) = FALSE
+            (Scalar::Boolean(false), 5, 10, Some(false)), // false dominates
+        ],
+    );
+}
+
+#[test]
+fn test_let_binding_nested_is_not_null_and_and() {
+    let pred = Pred::is_not_null(Pred::and(
+        Pred::and(column_pred!("a"), column_pred!("b")),
+        column_pred!("c"),
+    ));
+    test_rewrite_equivalence(
+        &pred,
+        &[
+            (Scalar::Boolean(true), 0, 10, Some(true)),
+            (Scalar::Boolean(true), 5, 10, Some(false)),
+            (Scalar::Boolean(false), 0, 10, Some(true)),
+            (Scalar::Boolean(false), 5, 10, Some(true)),
+        ],
+    );
+}
+
+#[test]
+fn test_let_binding_nested_is_not_null_or_or() {
+    let pred = Pred::is_not_null(Pred::or(
+        Pred::or(column_pred!("a"), column_pred!("b")),
+        column_pred!("c"),
+    ));
+    test_rewrite_equivalence(
+        &pred,
+        &[
+            (Scalar::Boolean(false), 0, 10, Some(true)),
+            (Scalar::Boolean(false), 5, 10, Some(false)),
+            (Scalar::Boolean(true), 0, 10, Some(true)),
+            (Scalar::Boolean(true), 5, 10, Some(true)),
+        ],
+    );
+}
+
+#[test]
+fn test_let_binding_with_not_operand() {
+    // NOT on operand is transparent to nullness
+    let pred = Pred::is_null(Pred::and_from(vec![
+        Pred::not(column_pred!("a")),
+        column_pred!("b"),
+        column_pred!("c"),
+    ]));
+    test_rewrite_equivalence(
+        &pred,
+        &[
+            (Scalar::Boolean(true), 0, 10, Some(false)),
+            (Scalar::Boolean(true), 5, 10, Some(true)),
+            (Scalar::Boolean(false), 0, 10, Some(false)),
+            (Scalar::Boolean(false), 5, 10, Some(false)),
+        ],
+    );
+}

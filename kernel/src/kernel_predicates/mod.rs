@@ -514,8 +514,10 @@ pub trait KernelPredicateEvaluator {
         let mut null_handles = Vec::with_capacity(preds.len());
         let mut per_var_clauses = preds.iter().map(|pred| {
             // Evaluate both null check and var clause for this child in one fused call
-            let FusedEvalResult { value_name, is_null_name } =
-                self.eval_pred_with_null_check(pred, &mut bindings, dominator, inverted);
+            let FusedEvalResult {
+                value_name,
+                is_null_name,
+            } = self.eval_pred_with_null_check(pred, &mut bindings, dominator, inverted);
 
             // Retrieve both bindings, and remember the null check's name for later
             let var_clause = bindings.retrieve(&value_name);
@@ -576,9 +578,10 @@ pub trait KernelPredicateEvaluator {
         let mut value_handles = Vec::with_capacity(preds.len());
         let mut per_var_clauses = preds.iter().map(|pred| {
             // Recursively use fused evaluation for children (bindings accumulate)
-            let FusedEvalResult { value_name, is_null_name } =
-                self.eval_pred_with_null_check(pred, bindings, value_inverted, null_inverted);
-
+            let FusedEvalResult {
+                value_name,
+                is_null_name,
+            } = self.eval_pred_with_null_check(pred, bindings, value_inverted, null_inverted);
 
             // Build per-variable clause: op(IS_NULL(pred), pred != dominator)
             // We need the value with `dominator` inversion for the var clause
