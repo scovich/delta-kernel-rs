@@ -242,6 +242,56 @@ pub struct JunctionPredicate {
     pub preds: Vec<Predicate>,
 }
 
+/// A let-binding expression that binds sub-expressions to names for reuse.
+///
+/// Bindings are evaluated sequentially: each binding can reference all previous bindings in the
+/// same Let (and any outer scope bindings), and the body can reference all bindings.
+///
+/// Binding names use the `$__kernel_` prefix to avoid collisions with normal column names.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LetExpression {
+    pub bindings: Vec<(String, Expression)>,
+    pub body: Box<Expression>,
+}
+
+impl LetExpression {
+    pub fn new(
+        bindings: impl IntoIterator<Item = (String, impl Into<Expression>)>,
+        body: impl Into<Expression>,
+    ) -> Self {
+        let bindings = bindings.into_iter().map(|(name, expr)| (name, expr.into()));
+        Self {
+            bindings: bindings.collect(),
+            body: Box::new(body.into()),
+        }
+    }
+}
+
+/// A let-binding predicate that binds sub-predicates to names for reuse.
+///
+/// Bindings are evaluated sequentially: each binding can reference all previous bindings in the
+/// same Let (and any outer scope bindings), and the body can reference all bindings.
+///
+/// Binding names use the `$__kernel_` prefix to avoid collisions with normal column names.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LetPredicate {
+    pub bindings: Vec<(String, Predicate)>,
+    pub body: Box<Predicate>,
+}
+
+impl LetPredicate {
+    pub fn new(
+        bindings: impl IntoIterator<Item = (String, impl Into<Predicate>)>,
+        body: impl Into<Predicate>,
+    ) -> Self {
+        let bindings = bindings.into_iter().map(|(name, pred)| (name, pred.into()));
+        Self {
+            bindings: bindings.collect(),
+            body: Box::new(body.into()),
+        }
+    }
+}
+
 // NOTE: We have to use `Arc<dyn OpaquePredicateOp>` instead of `Box<dyn OpaquePredicateOp>` because
 // we cannot require `OpaquePredicateOp: Clone` (not a dyn-compatible trait). Instead, we must rely
 // on cheap `Arc` clone, which does not duplicate the inner object.
@@ -392,6 +442,8 @@ pub enum Expression {
     Binary(BinaryExpression),
     /// An expression that takes a variable number of expressions as input.
     Variadic(VariadicExpression),
+    /// A let-binding expression that binds sub-expressions to names for reuse within a body.
+    Let(LetExpression),
     /// An expression that the engine defines and implements. Kernel interacts with the expression
     /// only through methods provided by the [`OpaqueExpressionOp`] trait.
     Opaque(OpaqueExpression),
@@ -428,6 +480,8 @@ pub enum Predicate {
     Binary(BinaryPredicate),
     /// A junction operation (AND/OR).
     Junction(JunctionPredicate),
+    /// A let-binding predicate that binds sub-predicates to names for reuse within a body.
+    Let(LetPredicate),
     /// A predicate that the engine defines and implements. Kernel interacts with the predicate
     /// only through methods provided by the [`OpaquePredicateOp`] trait.
     Opaque(OpaquePredicate),
@@ -894,6 +948,15 @@ impl Display for Expression {
             Variadic(VariadicExpression { op, exprs }) => {
                 write!(f, "{op}({})", format_child_list(exprs))
             }
+            Let(LetExpression { bindings, body }) => {
+                write!(f, "LET(")?;
+                let mut sep = "";
+                for (name, expr) in bindings {
+                    write!(f, "{sep}{} = {}", name, expr)?;
+                    sep = ", ";
+                }
+                write!(f, " IN {})", body)
+            }
             Opaque(OpaqueExpression { op, exprs }) => {
                 write!(f, "{op:?}({})", format_child_list(exprs))
             }
@@ -923,6 +986,15 @@ impl Display for Predicate {
                     JunctionPredicateOp::Or => "OR",
                 };
                 write!(f, "{op}({})", format_child_list(preds))
+            }
+            Let(LetPredicate { bindings, body }) => {
+                write!(f, "LET(")?;
+                let mut sep = "";
+                for (name, pred) in bindings {
+                    write!(f, "{sep}{} = {}", name, pred)?;
+                    sep = ", ";
+                }
+                write!(f, " IN {})", body)
             }
             Opaque(OpaquePredicate { op, exprs }) => {
                 write!(f, "{op:?}({})", format_child_list(exprs))

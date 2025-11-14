@@ -1,4 +1,5 @@
-use crate::arrow::array::{ArrayRef, BooleanArray, RecordBatch};
+use crate::arrow::array::{ArrayRef, BooleanArray};
+use crate::engine::arrow_expression::evaluate_expression::EvaluationContext;
 use crate::expressions::{
     Expression, OpaqueExpressionOp, OpaquePredicateOp, Predicate, Scalar, ScalarExpressionEvaluator,
 };
@@ -18,11 +19,15 @@ use crate::{DeltaResult, DynPartialEq};
 /// [`ArrowOpaqueExpression::arrow_opaque`] to safely convert it to an [`OpaqueExpressionOp`].
 pub trait ArrowOpaqueExpressionOp: DynPartialEq + std::fmt::Debug {
     /// Evaluates this expression over the provided input expressions, returning `Err` in case of an
-    /// incorrect or unsupported invocation (e.g. wrong number and/or types of arguments.
-    fn eval_expr(
+    /// incorrect or unsupported invocation (e.g. wrong number and/or types of arguments).
+    ///
+    /// The evaluation context provides access to both the record batch and any let-bindings that
+    /// are currently in scope. Use [`crate::engine::arrow_expression::evaluate_expression::evaluate_expression_impl`]
+    /// to evaluate child expressions with full binding support.
+    fn eval_expr<'a>(
         &self,
-        args: &[Expression],
-        batch: &RecordBatch,
+        args: &'a [Expression],
+        context: &mut EvaluationContext<'a>,
         result_type: Option<&DataType>,
     ) -> DeltaResult<ArrayRef>;
 
@@ -47,11 +52,16 @@ pub trait ArrowOpaqueExpressionOp: DynPartialEq + std::fmt::Debug {
 pub trait ArrowOpaquePredicateOp: DynPartialEq + std::fmt::Debug {
     /// Evaluates this (possibly inverted) predicate over the provided input args, returning `Err`
     /// in case of an incorrect or unsupported invocation (e.g. wrong number and/or types of
-    /// arguments.
-    fn eval_pred(
+    /// arguments).
+    ///
+    /// The evaluation context provides access to both the record batch and any let-bindings that
+    /// are currently in scope. Use [`crate::engine::arrow_expression::evaluate_expression::evaluate_expression_impl`]
+    /// and [`crate::engine::arrow_expression::evaluate_expression::evaluate_predicate_impl`]
+    /// to evaluate child expressions/predicates with full binding support.
+    fn eval_pred<'a>(
         &self,
-        args: &[Expression],
-        batch: &RecordBatch,
+        args: &'a [Expression],
+        context: &mut EvaluationContext<'a>,
         inverted: bool,
     ) -> DeltaResult<BooleanArray>;
 

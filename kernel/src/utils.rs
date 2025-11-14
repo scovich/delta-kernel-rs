@@ -132,9 +132,11 @@ impl<T: ToOwned + ?Sized> CowExt<T> for Cow<'_, T> {
     }
 }
 
-// Additional implementation for a pair of Cow values
-impl<'a, T: ToOwned + ?Sized> CowExt<(Cow<'a, T>, Cow<'a, T>)> for (Cow<'a, T>, Cow<'a, T>) {
-    type Owned = (T::Owned, T::Owned);
+// Additional implementation for a pair of Cow values (with potentially different types)
+impl<'a, T: ToOwned + ?Sized, U: ToOwned + ?Sized> CowExt<(Cow<'a, T>, Cow<'a, U>)>
+    for (Cow<'a, T>, Cow<'a, U>)
+{
+    type Owned = (T::Owned, U::Owned);
 
     fn map_owned_or_else<S: Clone>(self, s: &S, f: impl FnOnce(Self::Owned) -> S) -> Cow<'_, S> {
         match self {

@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use crate::expressions::{
     BinaryExpression, BinaryPredicate, ColumnName, Expression, ExpressionRef, JunctionPredicate,
-    OpaqueExpression, OpaquePredicate, Predicate, Scalar, Transform, UnaryExpression,
-    UnaryPredicate, VariadicExpression,
+    LetExpression, LetPredicate, OpaqueExpression, OpaquePredicate, Predicate, Scalar, Transform,
+    UnaryExpression, UnaryPredicate, VariadicExpression,
 };
 use crate::utils::CowExt as _;
 
@@ -136,6 +136,18 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_pred_junction(pred)
     }
 
+    /// Called for each [`LetExpression`] encountered during the traversal. Implementations can
+    /// call [`Self::recurse_into_expr_let`] if they wish to recursively transform the children.
+    fn transform_expr_let(&mut self, expr: &'a LetExpression) -> Option<Cow<'a, LetExpression>> {
+        self.recurse_into_expr_let(expr)
+    }
+
+    /// Called for each [`LetPredicate`] encountered during the traversal. Implementations can
+    /// call [`Self::recurse_into_pred_let`] if they wish to recursively transform the children.
+    fn transform_pred_let(&mut self, pred: &'a LetPredicate) -> Option<Cow<'a, LetPredicate>> {
+        self.recurse_into_pred_let(pred)
+    }
+
     /// Called for each [`OpaquePredicate`] encountered during the traversal. Implementations can
     /// call [`Self::recurse_into_pred_opaque`] if they wish to recursively transform the children.
     fn transform_pred_opaque(
@@ -179,6 +191,9 @@ pub trait ExpressionTransform<'a> {
             Expression::Variadic(v) => self
                 .transform_expr_variadic(v)?
                 .map_owned_or_else(expr, Expression::Variadic),
+            Expression::Let(l) => self
+                .transform_expr_let(l)?
+                .map_owned_or_else(expr, Expression::Let),
             Expression::Opaque(o) => self
                 .transform_expr_opaque(o)?
                 .map_owned_or_else(expr, Expression::Opaque),
@@ -207,6 +222,9 @@ pub trait ExpressionTransform<'a> {
             Predicate::Junction(j) => self
                 .transform_pred_junction(j)?
                 .map_owned_or_else(pred, Predicate::Junction),
+            Predicate::Let(l) => self
+                .transform_pred_let(l)?
+                .map_owned_or_else(pred, Predicate::Let),
             Predicate::Opaque(o) => self
                 .transform_pred_opaque(o)?
                 .map_owned_or_else(pred, Predicate::Opaque),
@@ -321,6 +339,36 @@ pub trait ExpressionTransform<'a> {
     ) -> Option<Cow<'a, JunctionPredicate>> {
         let nested_result = recurse_into_children(&j.preds, |p| self.transform_pred(p))?;
         Some(nested_result.map_owned_or_else(j, |preds| JunctionPredicate::new(j.op, preds)))
+    }
+
+    /// Recursively transforms the children of a [`LetExpression`]. Returns `None` if any binding or
+    /// the body was removed, `Some(Cow::Owned)` if at least one binding or the body was changed,
+    /// and `Some(Cow::Borrowed)` otherwise.
+    fn recurse_into_expr_let(&mut self, l: &'a LetExpression) -> Option<Cow<'a, LetExpression>> {
+        let bindings = recurse_into_children(&l.bindings, |binding| {
+            let (name, expr) = binding;
+            let expr = self.transform_expr(expr)?;
+            Some(expr.map_owned_or_else(binding, |expr| (name.clone(), expr)))
+        })?;
+
+        let result = (bindings, self.transform_expr(&l.body)?)
+            .map_owned_or_else(l, |(bindings, body)| LetExpression::new(bindings, body));
+        Some(result)
+    }
+
+    /// Recursively transforms the children of a [`LetPredicate`]. Returns `None` if any binding or
+    /// the body was removed, `Some(Cow::Owned)` if at least one binding or the body was changed,
+    /// and `Some(Cow::Borrowed)` otherwise.
+    fn recurse_into_pred_let(&mut self, l: &'a LetPredicate) -> Option<Cow<'a, LetPredicate>> {
+        let bindings = recurse_into_children(&l.bindings, |binding| {
+            let (name, pred) = binding;
+            let pred = self.transform_pred(pred)?;
+            Some(pred.map_owned_or_else(binding, |pred| (name.clone(), pred)))
+        })?;
+
+        let result = (bindings, self.transform_pred(&l.body)?)
+            .map_owned_or_else(l, |(bindings, body)| LetPredicate::new(bindings, body));
+        Some(result)
     }
 
     /// Recursively transforms the children of an [`OpaquePredicate`]. Returns `None` if all

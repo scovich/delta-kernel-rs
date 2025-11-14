@@ -520,10 +520,10 @@ impl OpaqueLessThanOp {
         "less_than"
     }
 
-    fn eval_pred(
+    fn eval_pred<'a>(
         &self,
-        args: &[Expression],
-        batch: &RecordBatch,
+        args: &'a [Expression],
+        context: &mut crate::engine::arrow_expression::evaluate_expression::EvaluationContext<'a>,
         inverted: bool,
     ) -> DeltaResult<BooleanArray> {
         let op_fn = match inverted {
@@ -535,7 +535,8 @@ impl OpaqueLessThanOp {
             panic!("Invalid arg count: {}", args.len());
         };
 
-        let eval = |arg| evaluate_expression(arg, batch, Some(&KernelDataType::BOOLEAN));
+        use crate::engine::arrow_expression::evaluate_expression::evaluate_expression_impl;
+        let mut eval = |arg| evaluate_expression_impl(arg, context, Some(&KernelDataType::BOOLEAN));
         Ok(op_fn(&eval(left)?, &eval(right)?)?)
     }
 }
@@ -553,14 +554,14 @@ impl ArrowOpaqueExpressionOp for OpaqueLessThanOp {
         unimplemented!() // OpaqueExpressionOp is already tested
     }
 
-    fn eval_expr(
+    fn eval_expr<'a>(
         &self,
-        args: &[Expression],
-        batch: &RecordBatch,
+        args: &'a [Expression],
+        context: &mut crate::engine::arrow_expression::evaluate_expression::EvaluationContext<'a>,
         result_type: Option<&KernelDataType>,
     ) -> DeltaResult<ArrayRef> {
         assert!(matches!(result_type, None | Some(&KernelDataType::BOOLEAN)));
-        let result = self.eval_pred(args, batch, false)?;
+        let result = self.eval_pred(args, context, false)?;
         Ok(Arc::new(result))
     }
 }
@@ -570,13 +571,13 @@ impl ArrowOpaquePredicateOp for OpaqueLessThanOp {
         self.name()
     }
 
-    fn eval_pred(
+    fn eval_pred<'a>(
         &self,
-        args: &[Expression],
-        batch: &RecordBatch,
+        args: &'a [Expression],
+        context: &mut crate::engine::arrow_expression::evaluate_expression::EvaluationContext<'a>,
         inverted: bool,
     ) -> DeltaResult<BooleanArray> {
-        self.eval_pred(args, batch, inverted)
+        self.eval_pred(args, context, inverted)
     }
 
     fn eval_pred_scalar(

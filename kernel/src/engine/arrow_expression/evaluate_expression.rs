@@ -28,9 +28,9 @@ use crate::engine::arrow_utils::prim_array_cmp;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
-    ExpressionRef, JunctionPredicate, JunctionPredicateOp, OpaqueExpression, OpaquePredicate,
-    Predicate, Scalar, Transform, UnaryExpression, UnaryExpressionOp, UnaryPredicate,
-    UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
+    ExpressionRef, JunctionPredicate, JunctionPredicateOp, LetExpression, LetPredicate,
+    OpaqueExpression, OpaquePredicate, Predicate, Scalar, Transform, UnaryExpression,
+    UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::schema::{DataType, StructType};
 
@@ -54,6 +54,108 @@ impl ProvidesColumnByName for StructArray {
     }
     fn column_by_name(&self, name: &str) -> Option<&ArrayRef> {
         self.column_by_name(name)
+    }
+}
+
+/// Evaluation context that provides access to both RecordBatch columns and let-bound values.
+///
+/// Let-bindings are stored in a single IndexMap. When entering a Let scope, we remember the
+/// current map length and truncate back to that length when exiting the scope. This is more
+/// efficient than pushing/popping separate HashMaps.
+///
+/// Note: Binding names are pre-assigned in `LetExpression`/`LetPredicate` structures (generated
+/// during kernel predicate construction). The engine evaluates expressions and binds them to these
+/// pre-existing names - it never generates new names itself.
+pub struct EvaluationContext<'a> {
+    pub(super) batch: &'a RecordBatch,
+    /// Flat map of all active bindings. Earlier bindings come first (can be referenced by later ones).
+    /// Keys are borrowed from the `LetExpression`/`LetPredicate` being evaluated.
+    bindings: indexmap::IndexMap<&'a str, ArrayRef>,
+}
+
+/// RAII guard for managing let-binding scopes. Automatically truncates bindings when dropped,
+/// ensuring cleanup even with early returns (e.g. from `?` operator).
+///
+/// This is the only way to add bindings to the context, preventing misuse.
+pub(crate) struct LetScope<'scope, 'batch> {
+    context: &'scope mut EvaluationContext<'batch>,
+    saved_len: usize,
+}
+
+impl<'scope, 'batch> LetScope<'scope, 'batch> {
+    /// Creates a new let-binding scope, saving the current binding count.
+    fn new(context: &'scope mut EvaluationContext<'batch>) -> Self {
+        let saved_len = context.bindings.len();
+        Self { context, saved_len }
+    }
+
+    /// Binds a value to a pre-existing name in the current scope.
+    ///
+    /// The name must already exist in the `LetExpression`/`LetPredicate` being evaluated.
+    /// We borrow the name string rather than cloning it.
+    pub fn bind(&mut self, name: &'batch str, value: ArrayRef) {
+        self.context.bindings.insert(name, value);
+    }
+
+    /// Returns a mutable reference to the underlying context for evaluation.
+    pub fn context(&mut self) -> &mut EvaluationContext<'batch> {
+        self.context
+    }
+}
+
+impl Drop for LetScope<'_, '_> {
+    fn drop(&mut self) {
+        self.context.bindings.truncate(self.saved_len);
+    }
+}
+
+impl<'a> EvaluationContext<'a> {
+    /// Creates a new evaluation context with no bindings.
+    pub fn new(batch: &'a RecordBatch) -> Self {
+        let bindings = indexmap::IndexMap::new();
+        Self { batch, bindings }
+    }
+
+    /// Creates a new let-binding scope. Bindings added via the returned [`LetScope`] will be
+    /// automatically removed when the scope is dropped, even on early returns.
+    pub(crate) fn let_scope(&mut self) -> LetScope<'_, 'a> {
+        LetScope::new(self)
+    }
+
+    /// Creates a let-binding scope and evaluates/binds all items in one operation.
+    ///
+    /// The provided closure evaluates each item and returns an `ArrayRef` to bind. The returned
+    /// [`LetScope`] guard will automatically clean up all bindings when dropped.
+    ///
+    /// # Lifetime Parameters
+    ///
+    /// The signature uses a Higher-Rank Trait Bound (HRTB) `for<'b>` to allow the closure to be
+    /// called multiple times in the loop with fresh mutable borrows (`'b`) of the context, while
+    /// working with long-lived items (`'a`) from the expression tree.
+    pub(crate) fn bind_all<T>(
+        &mut self,
+        items: &'a [(String, T)],
+        mut eval: impl for<'b> FnMut(&'a T, &'b mut EvaluationContext<'a>) -> DeltaResult<ArrayRef>,
+    ) -> DeltaResult<LetScope<'_, 'a>> {
+        let mut scope = self.let_scope();
+        for (name, item) in items {
+            let value = eval(item, scope.context())?;
+            scope.bind(name.as_str(), value);
+        }
+        Ok(scope)
+    }
+}
+
+impl ProvidesColumnByName for EvaluationContext<'_> {
+    fn schema_fields(&self) -> &ArrowFields {
+        self.batch.schema_ref().fields()
+    }
+
+    fn column_by_name(&self, name: &str) -> Option<&ArrayRef> {
+        // Prefer a binding if it exists, otherwise check the batch columns
+        self.bindings
+            .get(name)
+            .or_else(|| self.batch.column_by_name(name))
     }
 }
 
@@ -97,15 +199,15 @@ pub(super) fn extract_column(
 }
 
 /// Evaluates a struct expression with given field expressions and output schema
-fn evaluate_struct_expression(
-    fields: &[ExpressionRef],
-    batch: &RecordBatch,
+fn evaluate_struct_expression<'a>(
+    fields: &'a [ExpressionRef],
+    context: &mut EvaluationContext<'a>,
     output_schema: &StructType,
 ) -> DeltaResult<ArrayRef> {
     let output_cols: Vec<ArrayRef> = fields
         .iter()
         .zip(output_schema.fields())
-        .map(|(expr, field)| evaluate_expression(expr, batch, Some(field.data_type())))
+        .map(|(expr, field)| evaluate_expression_impl(expr, context, Some(field.data_type())))
         .try_collect()?;
     let output_fields: Vec<ArrowField> = output_cols
         .iter()
@@ -123,9 +225,9 @@ fn evaluate_struct_expression(
 }
 
 /// Evaluates a transform expression by building expressions in input schema order
-fn evaluate_transform_expression(
-    transform: &Transform,
-    batch: &RecordBatch,
+fn evaluate_transform_expression<'a>(
+    transform: &'a Transform,
+    context: &mut EvaluationContext<'a>,
     output_schema: &StructType,
 ) -> DeltaResult<ArrayRef> {
     let mut used_field_transforms = 0;
@@ -144,13 +246,18 @@ fn evaluate_transform_expression(
 
     // Handle prepends (insertions before any field)
     for expr in &transform.prepended_fields {
-        output_cols.push(evaluate_expression(expr, batch, Some(next_output_type()?))?);
+        let output_type = Some(next_output_type()?);
+        output_cols.push(evaluate_expression_impl(expr, context, output_type)?);
     }
 
     // Extract the input path, if any
+    //
+    // NOTE: We use context.batch directly here, not context, because transforms should only
+    // see real columns from the batch, not let-bindings. Bindings are only visible when
+    // evaluating the transform's field expressions (prepended_fields and field_transforms.exprs).
     let source_data = transform
         .input_path()
-        .map(|path| extract_column(batch, path))
+        .map(|path| extract_column(context.batch, path))
         .transpose()?;
 
     let source_data: &dyn ProvidesColumnByName = match source_data {
@@ -158,7 +265,7 @@ fn evaluate_transform_expression(
             .as_any()
             .downcast_ref::<StructArray>()
             .ok_or_else(|| Error::generic("Input path must point to a struct"))?,
-        None => batch,
+        None => context.batch,
     };
 
     // Process each input field in order
@@ -175,7 +282,8 @@ fn evaluate_transform_expression(
         // Process any insertions that come after this field
         if let Some(field_transform) = field_transform {
             for expr in &field_transform.exprs {
-                output_cols.push(evaluate_expression(expr, batch, Some(next_output_type()?))?);
+                let output_type = Some(next_output_type()?);
+                output_cols.push(evaluate_expression_impl(expr, context, output_type)?);
             }
             used_field_transforms += 1;
         }
@@ -215,27 +323,43 @@ pub fn evaluate_expression(
     batch: &RecordBatch,
     result_type: Option<&DataType>,
 ) -> DeltaResult<ArrayRef> {
+    evaluate_expression_impl(expression, &mut EvaluationContext::new(batch), result_type)
+}
+
+/// Internal helper that evaluates a kernel expression with a mutable evaluation context.
+/// This allows Let expressions to manage bindings across recursive calls.
+///
+/// This function is public so that [`ArrowOpaqueExpressionOp`] implementations can use it
+/// to evaluate child expressions with full let-binding support.
+///
+/// The expression and context must share the same lifetime because Let bindings borrow
+/// their names from the expression tree.
+pub(crate) fn evaluate_expression_impl<'a>(
+    expression: &'a Expression,
+    context: &mut EvaluationContext<'a>,
+    result_type: Option<&DataType>,
+) -> DeltaResult<ArrayRef> {
     use BinaryExpressionOp::*;
     use Expression::*;
     use UnaryExpressionOp::*;
     use VariadicExpressionOp::*;
     match (expression, result_type) {
-        (Literal(scalar), _) => Ok(scalar.to_array(batch.num_rows())?),
-        (Column(name), _) => extract_column(batch, name),
+        (Literal(scalar), _) => Ok(scalar.to_array(context.batch.num_rows())?),
+        (Column(name), _) => extract_column(context, name),
         (Struct(fields), Some(DataType::Struct(output_schema))) => {
-            evaluate_struct_expression(fields, batch, output_schema)
+            evaluate_struct_expression(fields, context, output_schema)
         }
         (Struct(_), _) => Err(Error::generic(
             "Data type is required to evaluate struct expressions",
         )),
         (Transform(transform), Some(DataType::Struct(output_schema))) => {
-            evaluate_transform_expression(transform, batch, output_schema)
+            evaluate_transform_expression(transform, context, output_schema)
         }
         (Transform(_), _) => Err(Error::generic(
             "Data type is required to evaluate transform expressions",
         )),
         (Predicate(pred), None | Some(&DataType::BOOLEAN)) => {
-            let result = evaluate_predicate(pred, batch, false)?;
+            let result = evaluate_predicate_impl(pred, context, false)?;
             Ok(Arc::new(result))
         }
         (Predicate(_), Some(data_type)) => Err(Error::generic(format!(
@@ -243,7 +367,7 @@ pub fn evaluate_expression(
         ))),
         (Unary(UnaryExpression { op: ToJson, expr }), result_type) => match result_type {
             None | Some(&DataType::STRING) => {
-                let input = evaluate_expression(expr, batch, None)?;
+                let input = evaluate_expression_impl(expr, context, None)?;
                 Ok(to_json(&input)?)
             }
             Some(data_type) => Err(Error::generic(format!(
@@ -251,8 +375,8 @@ pub fn evaluate_expression(
             ))),
         },
         (Binary(BinaryExpression { op, left, right }), _) => {
-            let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
-            let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
+            let left_arr = evaluate_expression_impl(left.as_ref(), context, None)?;
+            let right_arr = evaluate_expression_impl(right.as_ref(), context, None)?;
 
             type Operation = fn(&dyn Datum, &dyn Datum) -> Result<ArrayRef, ArrowError>;
             let eval: Operation = match op {
@@ -273,7 +397,7 @@ pub fn evaluate_expression(
         ) => {
             let arrays: Vec<ArrayRef> = exprs
                 .iter()
-                .map(|expr| evaluate_expression(expr, batch, None))
+                .map(|expr| evaluate_expression_impl(expr, context, None))
                 .try_collect()?;
             Ok(coalesce_arrays(&arrays, result_type)?)
         }
@@ -282,11 +406,17 @@ pub fn evaluate_expression(
                 .any_ref()
                 .downcast_ref::<ArrowOpaqueExpressionOpAdaptor>()
             {
-                Some(op) => op.eval_expr(exprs, batch, result_type),
+                Some(op) => op.eval_expr(exprs, context, result_type),
                 None => Err(Error::unsupported(format!(
                     "Unsupported opaque expression: {op:?}"
                 ))),
             }
+        }
+        (Let(LetExpression { bindings, body }), result_type) => {
+            let mut scope = context.bind_all(bindings, |expr, ctx| {
+                evaluate_expression_impl(expr, ctx, None)
+            })?;
+            evaluate_expression_impl(body, scope.context(), result_type)
         }
         (Unknown(name), _) => Err(Error::unsupported(format!("Unknown expression: {name:?}"))),
     }
@@ -296,6 +426,22 @@ pub fn evaluate_expression(
 pub fn evaluate_predicate(
     predicate: &Predicate,
     batch: &RecordBatch,
+    inverted: bool,
+) -> DeltaResult<BooleanArray> {
+    evaluate_predicate_impl(predicate, &mut EvaluationContext::new(batch), inverted)
+}
+
+/// Internal helper that evaluates a kernel predicate with a mutable evaluation context.
+/// This allows Let predicates to manage bindings across recursive calls.
+///
+/// This function is public so that [`ArrowOpaquePredicateOp`] implementations can use it
+/// to evaluate child predicates with full let-binding support.
+///
+/// The predicate and context must share the same lifetime because Let bindings borrow
+/// their names from the predicate tree.
+pub(crate) fn evaluate_predicate_impl<'a>(
+    predicate: &'a Predicate,
+    context: &mut EvaluationContext<'a>,
     inverted: bool,
 ) -> DeltaResult<BooleanArray> {
     use BinaryPredicateOp::*;
@@ -312,15 +458,15 @@ pub fn evaluate_predicate(
             // Grr -- there's no way to cast an `Arc<dyn Array>` back to its native type, so we
             // can't use `Arc::into_inner` here and must clone instead. At least the inner `Buffer`
             // instances are still cheaply clonable.
-            let arr = evaluate_expression(expr, batch, Some(&DataType::BOOLEAN))?;
+            let arr = evaluate_expression_impl(expr, context, Some(&DataType::BOOLEAN))?;
             match arr.as_any().downcast_ref::<BooleanArray>() {
                 Some(arr) => Ok(maybe_inverted(Cow::Borrowed(arr))?),
                 None => Err(Error::generic("expected boolean array")),
             }
         }
-        Not(pred) => evaluate_predicate(pred, batch, !inverted),
+        Not(pred) => evaluate_predicate_impl(pred, context, !inverted),
         Unary(UnaryPredicate { op, expr }) => {
-            let arr = evaluate_expression(expr.as_ref(), batch, None)?;
+            let arr = evaluate_expression_impl(expr.as_ref(), context, None)?;
             let eval_op_fn = match (op, inverted) {
                 (UnaryPredicateOp::IsNull, false) => is_null,
                 (UnaryPredicateOp::IsNull, true) => is_not_null,
@@ -333,10 +479,10 @@ pub fn evaluate_predicate(
             // IN is different from all the others, and also quite complex, so factor it out.
             //
             // TODO: Factor out as a stand-alone function instead of a closure?
-            let eval_in = || match (left, right) {
+            let mut eval_in = || match (left, right) {
                 (Expression::Literal(_), Expression::Column(_)) => {
-                    let left = evaluate_expression(left, batch, None)?;
-                    let right = evaluate_expression(right, batch, None)?;
+                    let left = evaluate_expression_impl(left, context, None)?;
+                    let right = evaluate_expression_impl(right, context, None)?;
                     if let Some(string_arr) = left.as_string_opt::<i32>() {
                         if let Some(list_arr) = right.as_list_opt::<i32>() {
                             let result = in_list_utf8(string_arr, list_arr)?;
@@ -401,8 +547,8 @@ pub fn evaluate_predicate(
                 (In, _) => return Ok(maybe_inverted(Cow::Owned(eval_in()?))?),
             };
 
-            let left = evaluate_expression(left, batch, None)?;
-            let right = evaluate_expression(right, batch, None)?;
+            let left = evaluate_expression_impl(left, context, None)?;
+            let right = evaluate_expression_impl(right, context, None)?;
             Ok(eval_fn(&left, &right)?)
         }
         Junction(JunctionPredicate { op, preds }) => {
@@ -420,17 +566,23 @@ pub fn evaluate_predicate(
             };
             preds
                 .iter()
-                .map(|pred| evaluate_predicate(pred, batch, inverted))
+                .map(|pred| evaluate_predicate_impl(pred, context, inverted))
                 .reduce(|l, r| Ok(reducer(&l?, &r?)?))
-                .unwrap_or_else(|| Ok(BooleanArray::from(vec![default; batch.num_rows()])))
+                .unwrap_or_else(|| Ok(BooleanArray::from(vec![default; context.batch.num_rows()])))
         }
         Opaque(OpaquePredicate { op, exprs }) => {
             match op.any_ref().downcast_ref::<ArrowOpaquePredicateOpAdaptor>() {
-                Some(op) => op.eval_pred(exprs, batch, inverted),
+                Some(op) => op.eval_pred(exprs, context, inverted),
                 None => Err(Error::unsupported(format!(
                     "Unsupported opaque predicate: {op:?}"
                 ))),
             }
+        }
+        Let(LetPredicate { bindings, body }) => {
+            let mut scope = context.bind_all(bindings, |pred, ctx| {
+                Ok(Arc::new(evaluate_predicate_impl(pred, ctx, false)?))
+            })?;
+            evaluate_predicate_impl(body, scope.context(), inverted)
         }
         Unknown(name) => Err(Error::unsupported(format!("Unknown predicate: {name:?}"))),
     }
