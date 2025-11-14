@@ -5,19 +5,121 @@
 //! references with stats column references, which log replay will instruct the engine to evaluate.
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, ColumnName,
-    Expression as Expr, JunctionPredicate, JunctionPredicateOp, OpaqueExpression,
+    Expression as Expr, JunctionPredicate, JunctionPredicateOp, LetPredicate, OpaqueExpression,
     OpaqueExpressionOpRef, OpaquePredicate, OpaquePredicateOpRef, Predicate as Pred, Scalar,
     UnaryPredicate, UnaryPredicateOp,
 };
 use crate::schema::DataType;
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use tracing::{debug, warn};
 
 pub(crate) mod parquet_stats_skipping;
 
 #[cfg(test)]
 mod tests;
+
+// ==================== Let Bindings Infrastructure ====================
+
+/// Manages let-bindings for predicate evaluation to avoid redundant computation.
+///
+/// During predicate rewrites (e.g., IS_NULL junction pushdowns), child predicates may need to be
+/// referenced multiple times. Without let-bindings, this causes exponential blow-up for nested
+/// structures. Two strategies are provided:
+///
+/// - **Direct evaluation**: Cache results locally in a HashMap and retrieve copies
+/// - **Indirect evaluation**: Store results as Let nodes in the output AST and retrieve column references
+///
+/// Let-bindings capture `Option<Output>` rather than just `Output` to properly handle missing
+/// results (e.g., from unsupported operations or missing stats).
+pub trait LetBindings: Default {
+    type Output;
+
+    /// Store an evaluation result (which may be None) and return its handle/name
+    fn store(&mut self, output: Option<Self::Output>) -> String;
+
+    /// Retrieve a reference to a previously stored result (which may be None)
+    fn retrieve(&self, name: &str) -> Option<Self::Output>;
+
+    /// Transform the final result (identity for direct eval, wrap in Let for indirect)
+    fn finalize(self, result: Option<Self::Output>) -> Option<Self::Output>;
+}
+
+/// Direct let-bindings: caches results locally and returns copies.
+///
+/// Used by direct predicate evaluators (scalar and parquet stats) where `Output` is a simple
+/// value type (`bool` or `Scalar`) that can be cloned. Bindings are stored in a local HashMap
+/// and discarded after evaluation completes.
+#[derive(Default)]
+pub struct DirectLetBindings<T: Clone + Default> {
+    cache: HashMap<String, T>,
+    counter: usize,
+}
+
+impl<T: Clone + Default> LetBindings for DirectLetBindings<T> {
+    type Output = T;
+
+    fn store(&mut self, output: Option<T>) -> String {
+        let name = format!("${}", self.counter);
+        self.counter += 1;
+        // Only store successful results; None is represented by absence from the map
+        if let Some(value) = output {
+            self.cache.insert(name.clone(), value);
+        }
+        name
+    }
+
+    fn retrieve(&self, name: &str) -> Option<T> {
+        self.cache.get(name).cloned()
+    }
+
+    fn finalize(self, result: Option<T>) -> Option<T> {
+        result // Identity - no wrapping needed
+    }
+}
+
+/// Indirect let-bindings: creates Let nodes in the output AST and returns column references.
+///
+/// Used by indirect data skipping evaluators where `Output = Pred`. Stored results become
+/// bindings in a Let node that wraps the final result. Retrievals return column references
+/// that will resolve to those bindings during evaluation.
+#[derive(Default)]
+pub struct IndirectLetBindings {
+    bindings: indexmap::IndexMap<String, Pred>,
+    counter: usize,
+}
+
+impl LetBindings for IndirectLetBindings {
+    type Output = Pred;
+
+    fn store(&mut self, output: Option<Pred>) -> String {
+        let name = format!("$__kernel_pred_{}", self.counter);
+        self.counter += 1;
+        // Only store successful results; None is represented by absence from the map
+        if let Some(pred) = output {
+            self.bindings.insert(name.clone(), pred);
+        }
+        name
+    }
+
+    fn retrieve(&self, name: &str) -> Option<Pred> {
+        // Return a column reference that will resolve to the binding during evaluation.
+        // If the name doesn't exist in the map, return None (the evaluation was unsuccessful).
+        self.bindings
+            .get(name)
+            .map(|_| Pred::BooleanExpression(Expr::Column(ColumnName::new([name]))))
+    }
+
+    fn finalize(self, result: Option<Pred>) -> Option<Pred> {
+        // Emit a Let with the accumulated bindings, if any exist.
+        let mut result = result?;
+        if !self.bindings.is_empty() {
+            result = Pred::Let(LetPredicate::new(self.bindings, result));
+        }
+        Some(result)
+    }
+}
 
 // NOTE: When creating `&dyn Foo` for some `impl<'a> Bar<'a>`, the compiler infers `&'r dyn Foo +
 // 'a` (and then elides the lifetimes because `'a: 'r`). Creating a type alias for `dyn Foo` causes
@@ -27,18 +129,26 @@ mod tests;
 // generic lifetimes cannot be hidden, so we end up with `&DynFoo<'_>` at every use site.
 
 /// A predicate evaluator that directly evaluates predicates, resolving column references to scalar values.
-pub type DirectPredicateEvaluator<'a> = dyn KernelPredicateEvaluator<Output = bool> + 'a;
+pub type DirectPredicateEvaluator<'a> =
+    dyn KernelPredicateEvaluator<Output = bool, Bindings = DirectLetBindings<bool>> + 'a;
 
 /// A data skipping predicate evaluator that directly applies data skipping, resolving column
 /// references to scalar stats values such as those provided by parquet footer stats.
-pub type DirectDataSkippingPredicateEvaluator<'a> =
-    dyn DataSkippingPredicateEvaluator<Output = bool, ColumnStat = Scalar> + 'a;
+pub type DirectDataSkippingPredicateEvaluator<'a> = dyn DataSkippingPredicateEvaluator<
+        Output = bool,
+        ColumnStat = Scalar,
+        Bindings = DirectLetBindings<bool>,
+    > + 'a;
 
 /// A data skipping predicate evaluator that rewrites the input to a predicate that performs data
 /// skipping over column stats for all referenced columns. The resulting predicate can be evaluated
 /// against batches of column stats at some future point.
-pub type IndirectDataSkippingPredicateEvaluator<'a> =
-    dyn DataSkippingPredicateEvaluator<Output = Pred, ColumnStat = Expr> + 'a;
+#[rustfmt::skip] // for some reason this type alias ends up as a single very long line??
+pub type IndirectDataSkippingPredicateEvaluator<'a> = dyn DataSkippingPredicateEvaluator<
+        Output = Pred,
+    	ColumnStat = Expr,
+    	Bindings = IndirectLetBindings,
+    > + 'a;
 
 /// Uses kernel (not engine) logic to evaluate a predicate tree against column names that resolve as
 /// scalars. Useful for testing/debugging but also serves as a reference implementation that
@@ -84,6 +194,12 @@ pub type IndirectDataSkippingPredicateEvaluator<'a> =
 /// necessary type information to reliably detect all type errors.
 pub trait KernelPredicateEvaluator {
     type Output;
+
+    /// Let-bindings strategy for managing intermediate results during evaluation.
+    ///
+    /// Direct evaluators use [`DirectLetBindings`] to cache results locally.
+    /// Indirect evaluators use [`IndirectLetBindings`] to create Let nodes in the output AST.
+    type Bindings: LetBindings<Output = Self::Output>;
 
     /// A (possibly inverted) boolean scalar value, e.g. `[NOT] <value>`.
     fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<Self::Output>;
@@ -295,6 +411,10 @@ pub trait KernelPredicateEvaluator {
     /// The implementation uses intentional nesting to control evaluation order: the per-variable
     /// clauses are evaluated first and can short-circuit, avoiding evaluation of the final "all
     /// null checks" clause.
+    ///
+    /// To avoid exponential blow-up from evaluating each child predicate multiple times, we use
+    /// [`LetBindings`] to manage intermediate results. For direct evaluation, results are cached
+    /// locally. For indirect evaluation, Let nodes are created in the output predicate tree.
     fn eval_is_null_junction(
         &self,
         op: JunctionPredicateOp,
@@ -311,30 +431,66 @@ pub trait KernelPredicateEvaluator {
         // - OR (dominator=true): check for `x != TRUE`, which is just `NOT(x)` (inverted=true)
         let dominator = KernelPredicateEvaluatorDefaults::junction_dominator(op, inverted);
 
-        // Lazy iterator: evaluates per-variable clauses
-        // Each clause is: op(IS_NULL(pred), pred != dominator)
+        // Create let-bindings for reusing child evaluation results
+        let mut bindings = Self::Bindings::default();
+
+        // Determine junction types for the rewrite (depends on inverted, not input op):
+        //
+        // IS_NULL (inverted=false):
+        //   - Per-var clauses: OR(IS_NULL(pred), pred != dominator)
+        //   - Inner junction: AND of all per-var clauses
+        //   - Final clause: OR(IS_NULL(a), IS_NULL(b), ...)
+        //   - Outer junction: AND(inner, final)
+        //
+        // IS_NOT_NULL (inverted=true):
+        //   - Per-var clauses: AND(NOT(IS_NULL(pred)), pred != dominator)
+        //   - Inner junction: OR of all per-var clauses
+        //   - Final clause: AND(NOT(IS_NULL(a)), NOT(IS_NULL(b)), ...)
+        //   - Outer junction: OR(inner, final)
+        //
+        // Note: Inner and outer use the same junction type (both AND or both OR), ensuring
+        // short-circuit alignment. Per-var and final clauses use the opposite type.
+        let (outer_op, per_var_op) = match inverted {
+            true => (JunctionPredicateOp::Or, JunctionPredicateOp::And),
+            false => (JunctionPredicateOp::And, JunctionPredicateOp::Or),
+        };
+
+        // Lazily evaluate children and build per-variable clauses
+        let mut null_handles = Vec::with_capacity(preds.len());
         let mut per_var_clauses = preds.iter().map(|pred| {
+            // Evaluate null check and var clause for this child
+            // TODO: Replace with fused eval_pred_with_null_check() to compute both in one pass
             let null_check = self.eval_pred_is_null(pred, inverted);
             let var_clause = self.eval_pred(pred, dominator);
-            let mut pair = [null_check, var_clause].into_iter();
-            self.finish_eval_pred_junction(op, &mut pair, !inverted)
+
+            // Store null check for reuse in the final guard clause
+            null_handles.push(bindings.store(null_check));
+            #[allow(clippy::expect_used)]
+            let null_check_handle = null_handles.last().expect("just pushed, not empty");
+
+            let mut pair = [bindings.retrieve(null_check_handle), var_clause].into_iter();
+            self.finish_eval_pred_junction(per_var_op, &mut pair, false)
         });
 
-        // Inner junction: op(clause1, clause2, ..., clauseN) (inner clauses inverted)
-        // This may short-circuit before evaluating all clauses
-        let inner_result = self.finish_eval_pred_junction(op, &mut per_var_clauses, !inverted);
+        // Evaluate inner junction (may short-circuit before evaluating all children)
+        let inner_result = self.finish_eval_pred_junction(outer_op, &mut per_var_clauses, false);
 
-        // Outer junction: op(inner_result, final_clause) with outer inversion
-        // Use lazy evaluation for final_clause so we skip it if inner_result dominates
+        // Evaluate outer junction combining inner result with final null-check clause.
+        //
+        // NOTE: `all_null_checks` is incomplete if `inner_result` short circuited. But in
+        // that case, the final junction (same op) will _also_ short circuit on `inner_result` and
+        // the final guard clause will never be evaluated.
+        //
+        // NOTE: We must evaluate the outer junction even if inner_result is None, because
+        // the final clause might be a dominating value (e.g., AND(None, FALSE) = FALSE).
         let mut both = std::iter::once(inner_result).chain(std::iter::once_with(|| {
-            // Final clause: op(IS_NULL(a), IS_NULL(b), ..., IS_NULL(z))
-            // This checks whether at least one input is NULL
-            let mut all_null_checks = preds
+            let mut all_null_checks = null_handles
                 .iter()
-                .map(|pred| self.eval_pred_is_null(pred, inverted));
-            self.finish_eval_pred_junction(op, &mut all_null_checks, !inverted)
+                .map(|null_handle| bindings.retrieve(null_handle));
+            self.finish_eval_pred_junction(per_var_op, &mut all_null_checks, false)
         }));
-        self.finish_eval_pred_junction(op, &mut both, inverted)
+        let result = self.finish_eval_pred_junction(outer_op, &mut both, false);
+        bindings.finalize(result)
     }
 
     /// A (possibly inverted) DISTINCT test, e.g. `[NOT] DISTINCT(<col>, false)`. DISTINCT can be
@@ -778,6 +934,7 @@ impl<R: ResolveColumnAsScalar + 'static> From<R> for DefaultKernelPredicateEvalu
 /// produce a boolean output.
 impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredicateEvaluator<R> {
     type Output = bool;
+    type Bindings = DirectLetBindings<bool>;
 
     fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<bool> {
         KernelPredicateEvaluatorDefaults::eval_pred_scalar(val, inverted)
@@ -885,6 +1042,8 @@ pub trait DataSkippingPredicateEvaluator {
     type Output;
     /// The type for column stats consumed by this predicate evaluator
     type ColumnStat;
+    /// Let-bindings strategy for managing intermediate results during evaluation
+    type Bindings: LetBindings<Output = Self::Output>;
 
     /// Retrieves the minimum value of a column, if it exists and has the requested type.
     fn get_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Self::ColumnStat>;
@@ -1041,6 +1200,7 @@ pub trait DataSkippingPredicateEvaluator {
 
 impl<T: DataSkippingPredicateEvaluator + ?Sized> KernelPredicateEvaluator for T {
     type Output = T::Output;
+    type Bindings = T::Bindings;
 
     fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<Self::Output> {
         self.eval_pred_scalar(val, inverted)

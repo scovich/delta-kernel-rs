@@ -197,6 +197,7 @@ struct DataSkippingPredicateCreator;
 impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
     type Output = Pred;
     type ColumnStat = Expr;
+    type Bindings = crate::kernel_predicates::IndirectLetBindings;
 
     /// Retrieves the minimum value of a column, if it exists and has the requested type.
     fn get_min_stat(&self, col: &ColumnName, _data_type: &DataType) -> Option<Expr> {

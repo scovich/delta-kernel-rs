@@ -34,6 +34,7 @@ pub(crate) trait ParquetStatsProvider {
 impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for T {
     type Output = bool;
     type ColumnStat = Scalar;
+    type Bindings = crate::kernel_predicates::DirectLetBindings<bool>;
 
     fn get_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
         self.get_parquet_min_stat(col, data_type)
