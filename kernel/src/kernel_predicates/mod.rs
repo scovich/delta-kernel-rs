@@ -321,6 +321,7 @@ pub trait KernelPredicateEvaluator {
             | Expr::Unary(_)
             | Expr::Binary(_)
             | Expr::Variadic(_)
+            | Expr::Let(_)
             | Expr::Unknown(_) => None,
         }
     }
@@ -347,6 +348,7 @@ pub trait KernelPredicateEvaluator {
                 | Expr::Unary(_)
                 | Expr::Binary(_)
                 | Expr::Variadic(_)
+                | Expr::Let(_)
                 | Expr::Opaque(_)
                 | Expr::Unknown(_) => {
                     debug!("Unsupported operand: IS [NOT] NULL: {expr:?}");
@@ -1115,6 +1117,13 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
             Expr::Column(name) => self.resolve_column(name),
             Expr::Predicate(pred) => self.eval_pred(pred, false).map(Scalar::from),
             Expr::Struct(_) | Expr::Transform(_) | Expr::Unary(_) => None, // TODO?
+            Expr::Let(_) => {
+                // TODO: Evaluate Let bindings for scalar expression evaluation.
+                // A Let node evaluates its bindings in order (each can reference previous bindings),
+                // then evaluates the body with all bindings available. For scalar evaluation, we
+                // need a local HashMap<String, Scalar> to store binding results.
+                None
+            }
             Expr::Binary(BinaryExpression { op, left, right }) => {
                 let op_fn = match op {
                     BinaryExpressionOp::Plus => Scalar::try_add,
