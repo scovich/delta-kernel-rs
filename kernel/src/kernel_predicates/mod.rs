@@ -46,6 +46,17 @@ pub trait LetBindings: Default {
     fn finalize(self, result: Option<Self::Output>) -> Option<Self::Output>;
 }
 
+/// Result of fused predicate evaluation, containing names to reference the computed values.
+///
+/// For direct evaluation, these are handles into the local cache. For indirect evaluation,
+/// these are binding names that can be used as Column references.
+pub struct FusedEvalResult {
+    /// Name/handle for the computed value result
+    pub value_name: String,
+    /// Name/handle for the IS_NULL check result
+    pub is_null_name: String,
+}
+
 /// Direct let-bindings: caches results locally and returns copies.
 ///
 /// Used by direct predicate evaluators (scalar and parquet stats) where `Output` is a simple
@@ -359,6 +370,50 @@ pub trait KernelPredicateEvaluator {
         }
     }
 
+    /// Evaluates both a predicate and its nullness in a single call.
+    ///
+    /// Returns a [`FusedEvalResult`] containing names to reference the computed values.
+    /// The bindings are accumulated in the provided `bindings` parameter.
+    ///
+    /// For direct evaluation, bindings are stored in a local cache and the names are handles.
+    /// For indirect evaluation, bindings accumulate into an AST and the names are binding identifiers.
+    ///
+    /// The two `inverted` parameters allow different inversions for the value and null check,
+    /// which is needed for the junction null-check pushdown optimization.
+    fn eval_pred_with_null_check(
+        &self,
+        pred: &Pred,
+        bindings: &mut Self::Bindings,
+        value_inverted: bool,
+        null_inverted: bool,
+    ) -> FusedEvalResult {
+        match pred {
+            Pred::Not(inner) => {
+                // NOT affects value but is transparent to nullness (IS_NULL(NOT(x)) = IS_NULL(x))
+                self.eval_pred_with_null_check(inner, bindings, !value_inverted, null_inverted)
+            }
+            Pred::Junction(JunctionPredicate { op, preds }) => {
+                // Use fused junction evaluation to avoid redundant child evaluations
+                self.eval_is_null_junction_fused(
+                    *op,
+                    preds,
+                    bindings,
+                    value_inverted,
+                    null_inverted,
+                )
+            }
+            _ => {
+                // For other predicates, evaluate separately (no optimization yet)
+                let value = self.eval_pred(pred, value_inverted);
+                let is_null = self.eval_pred_is_null(pred, null_inverted);
+                FusedEvalResult {
+                    value_name: bindings.store(value),
+                    is_null_name: bindings.store(is_null),
+                }
+            }
+        }
+    }
+
     /// Evaluates IS [NOT] NULL of a junction (AND/OR) by rewriting it into evaluable form.
     ///
     /// This implements the boolean logic rewrites:
@@ -458,17 +513,16 @@ pub trait KernelPredicateEvaluator {
         // Lazily evaluate children and build per-variable clauses
         let mut null_handles = Vec::with_capacity(preds.len());
         let mut per_var_clauses = preds.iter().map(|pred| {
-            // Evaluate null check and var clause for this child
-            // TODO: Replace with fused eval_pred_with_null_check() to compute both in one pass
-            let null_check = self.eval_pred_is_null(pred, inverted);
-            let var_clause = self.eval_pred(pred, dominator);
+            // Evaluate both null check and var clause for this child in one fused call
+            let FusedEvalResult { value_name, is_null_name } =
+                self.eval_pred_with_null_check(pred, &mut bindings, dominator, inverted);
 
-            // Store null check for reuse in the final guard clause
-            null_handles.push(bindings.store(null_check));
-            #[allow(clippy::expect_used)]
-            let null_check_handle = null_handles.last().expect("just pushed, not empty");
+            // Retrieve both bindings, and remember the null check's name for later
+            let var_clause = bindings.retrieve(&value_name);
+            let is_null_clause = bindings.retrieve(&is_null_name);
+            null_handles.push(is_null_name);
 
-            let mut pair = [bindings.retrieve(null_check_handle), var_clause].into_iter();
+            let mut pair = [is_null_clause, var_clause].into_iter();
             self.finish_eval_pred_junction(per_var_op, &mut pair, false)
         });
 
@@ -485,12 +539,85 @@ pub trait KernelPredicateEvaluator {
         // the final clause might be a dominating value (e.g., AND(None, FALSE) = FALSE).
         let mut both = std::iter::once(inner_result).chain(std::iter::once_with(|| {
             let mut all_null_checks = null_handles
-                .iter()
-                .map(|null_handle| bindings.retrieve(null_handle));
+                .into_iter()
+                .map(|null_handle| bindings.retrieve(&null_handle));
             self.finish_eval_pred_junction(per_var_op, &mut all_null_checks, false)
         }));
         let result = self.finish_eval_pred_junction(outer_op, &mut both, false);
         bindings.finalize(result)
+    }
+
+    /// Fused version of [`eval_is_null_junction`] that returns both the junction value and its nullness.
+    ///
+    /// This computes `(junction_value, IS_NULL(junction))` in a single pass by evaluating each child
+    /// only once and reusing the results for both the value and null-check computations via let-bindings.
+    ///
+    /// Returns a [`FusedEvalResult`] with names to reference the computed values. All bindings are
+    /// accumulated in the provided `bindings` parameter.
+    ///
+    /// TODO: Consider consolidating with `eval_is_null_junction` to reduce code duplication.
+    fn eval_is_null_junction_fused(
+        &self,
+        op: JunctionPredicateOp,
+        preds: &[Pred],
+        bindings: &mut Self::Bindings,
+        value_inverted: bool,
+        null_inverted: bool,
+    ) -> FusedEvalResult {
+        let dominator = KernelPredicateEvaluatorDefaults::junction_dominator(op, null_inverted);
+
+        let (outer_op, per_var_op) = match null_inverted {
+            true => (JunctionPredicateOp::Or, JunctionPredicateOp::And),
+            false => (JunctionPredicateOp::And, JunctionPredicateOp::Or),
+        };
+
+        // Evaluate each child with fused evaluation, accumulating bindings
+        let mut null_handles = Vec::with_capacity(preds.len());
+        let mut value_handles = Vec::with_capacity(preds.len());
+        let mut per_var_clauses = preds.iter().map(|pred| {
+            // Recursively use fused evaluation for children (bindings accumulate)
+            let FusedEvalResult { value_name, is_null_name } =
+                self.eval_pred_with_null_check(pred, bindings, value_inverted, null_inverted);
+
+
+            // Build per-variable clause: op(IS_NULL(pred), pred != dominator)
+            // We need the value with `dominator` inversion for the var clause
+            // Check if we can reuse the stored value or need to evaluate separately
+            let var_clause = if value_inverted == dominator {
+                // value_inverted == dominator means we already have the right inversion
+                bindings.retrieve(&value_name)
+            } else {
+                // Need opposite inversion, evaluate separately
+                self.eval_pred(pred, dominator)
+            };
+
+            let is_null_clause = bindings.retrieve(&is_null_name);
+            value_handles.push(value_name);
+            null_handles.push(is_null_name);
+
+            let mut pair = [is_null_clause, var_clause].into_iter();
+            self.finish_eval_pred_junction(per_var_op, &mut pair, false)
+        });
+
+        // Evaluate inner junction for null-check rewrite
+        let inner_result = self.finish_eval_pred_junction(outer_op, &mut per_var_clauses, false);
+
+        // Build final null-check clause
+        let mut both = std::iter::once(inner_result).chain(std::iter::once_with(|| {
+            let mut all_null_checks = null_handles.iter().map(|handle| bindings.retrieve(handle));
+            self.finish_eval_pred_junction(per_var_op, &mut all_null_checks, false)
+        }));
+        let is_null_result = self.finish_eval_pred_junction(outer_op, &mut both, false);
+
+        // Compute the junction's value from stored child values
+        let mut value_clauses = value_handles.iter().map(|handle| bindings.retrieve(handle));
+        let value_result = self.finish_eval_pred_junction(op, &mut value_clauses, value_inverted);
+
+        // Store both results and return their names
+        FusedEvalResult {
+            value_name: bindings.store(value_result),
+            is_null_name: bindings.store(is_null_result),
+        }
     }
 
     /// A (possibly inverted) DISTINCT test, e.g. `[NOT] DISTINCT(<col>, false)`. DISTINCT can be
