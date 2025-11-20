@@ -36,10 +36,19 @@ mod tests;
 pub trait LetBindings: Default {
     type Output;
 
+    /// Type representing column statistics or stored values for comparison operations.
+    /// For direct eval: Scalar. For indirect eval: Expr.
+    type ColumnStat;
+
     /// Store an evaluation result (which may be None) and return its handle/name
     fn store(&mut self, output: Option<Self::Output>) -> String;
 
-    /// Retrieve a reference to a previously stored result (which may be None)
+    /// Retrieve a previously stored result as ColumnStat for use in comparison operations.
+    /// This is the primitive operation; retrieve() is typically implemented in terms of this.
+    fn retrieve_as_stat(&self, name: &str) -> Option<Self::ColumnStat>;
+
+    /// Retrieve a previously stored result as Output (which may be None).
+    /// Default implementation converts ColumnStat to Output.
     fn retrieve(&self, name: &str) -> Option<Self::Output>;
 
     /// Transform the final result (identity for direct eval, wrap in Let for indirect)
@@ -57,21 +66,22 @@ pub struct FusedEvalResult {
     pub is_null_name: String,
 }
 
-/// Direct let-bindings: caches results locally and returns copies.
+/// Direct let-bindings: caches boolean results locally.
 ///
-/// Used by direct predicate evaluators (scalar and parquet stats) where `Output` is a simple
-/// value type (`bool` or `Scalar`) that can be cloned. Bindings are stored in a local HashMap
-/// and discarded after evaluation completes.
+/// Used by direct predicate evaluators where Output is bool. Bindings are stored in a local
+/// HashMap and discarded after evaluation completes. Stores raw bool values and can provide
+/// them either as bool (Output) or as Scalar (ColumnStat) for comparisons.
 #[derive(Default)]
-pub struct DirectLetBindings<T: Clone + Default> {
-    cache: HashMap<String, T>,
+pub struct DirectLetBindings {
+    cache: HashMap<String, bool>,
     counter: usize,
 }
 
-impl<T: Clone + Default> LetBindings for DirectLetBindings<T> {
-    type Output = T;
+impl LetBindings for DirectLetBindings {
+    type Output = bool;
+    type ColumnStat = Scalar;
 
-    fn store(&mut self, output: Option<T>) -> String {
+    fn store(&mut self, output: Option<bool>) -> String {
         let name = format!("${}", self.counter);
         self.counter += 1;
         // Only store successful results; None is represented by absence from the map
@@ -81,20 +91,25 @@ impl<T: Clone + Default> LetBindings for DirectLetBindings<T> {
         name
     }
 
-    fn retrieve(&self, name: &str) -> Option<T> {
-        self.cache.get(name).cloned()
+    fn retrieve_as_stat(&self, name: &str) -> Option<Scalar> {
+        // Wrap the boolean value as a Scalar
+        self.retrieve(name).map(Scalar::from)
     }
 
-    fn finalize(self, result: Option<T>) -> Option<T> {
+    fn retrieve(&self, name: &str) -> Option<bool> {
+        self.cache.get(name).copied()
+    }
+
+    fn finalize(self, result: Option<bool>) -> Option<bool> {
         result // Identity - no wrapping needed
     }
 }
 
 /// Indirect let-bindings: creates Let nodes in the output AST and returns column references.
 ///
-/// Used by indirect data skipping evaluators where `Output = Pred`. Stored results become
-/// bindings in a Let node that wraps the final result. Retrievals return column references
-/// that will resolve to those bindings during evaluation.
+/// Used by indirect data skipping evaluators where `Output = Pred`. Stored results (as Pred)
+/// become bindings in a Let node that wraps the final result. Retrievals return column
+/// references (as Expr) that will resolve to those bindings during evaluation.
 #[derive(Default)]
 pub struct IndirectLetBindings {
     bindings: indexmap::IndexMap<String, Pred>,
@@ -103,6 +118,7 @@ pub struct IndirectLetBindings {
 
 impl LetBindings for IndirectLetBindings {
     type Output = Pred;
+    type ColumnStat = Expr;
 
     fn store(&mut self, output: Option<Pred>) -> String {
         let name = format!("$__kernel_pred_{}", self.counter);
@@ -114,19 +130,25 @@ impl LetBindings for IndirectLetBindings {
         name
     }
 
-    fn retrieve(&self, name: &str) -> Option<Pred> {
-        // Return a column reference that will resolve to the binding during evaluation.
+    fn retrieve_as_stat(&self, name: &str) -> Option<Expr> {
+        // Return a column reference to the binding.
         // If the name doesn't exist in the map, return None (the evaluation was unsuccessful).
         self.bindings
             .get(name)
-            .map(|_| Pred::BooleanExpression(Expr::Column(ColumnName::new([name]))))
+            .map(|_| Expr::Column(ColumnName::new([name])))
+    }
+
+    fn retrieve(&self, name: &str) -> Option<Pred> {
+        // Wrap the column reference as a BooleanExpression predicate
+        self.retrieve_as_stat(name).map(Pred::BooleanExpression)
     }
 
     fn finalize(self, result: Option<Pred>) -> Option<Pred> {
         // Emit a Let with the accumulated bindings, if any exist.
         let mut result = result?;
         if !self.bindings.is_empty() {
-            result = Pred::Let(LetPredicate::new(self.bindings, result));
+            let pred_bindings: Vec<(String, Pred)> = self.bindings.into_iter().collect();
+            result = Pred::Let(LetPredicate::new(pred_bindings, result));
         }
         Some(result)
     }
@@ -141,15 +163,12 @@ impl LetBindings for IndirectLetBindings {
 
 /// A predicate evaluator that directly evaluates predicates, resolving column references to scalar values.
 pub type DirectPredicateEvaluator<'a> =
-    dyn KernelPredicateEvaluator<Output = bool, Bindings = DirectLetBindings<bool>> + 'a;
+    dyn KernelPredicateEvaluator<Output = bool, Bindings = DirectLetBindings> + 'a;
 
 /// A data skipping predicate evaluator that directly applies data skipping, resolving column
 /// references to scalar stats values such as those provided by parquet footer stats.
-pub type DirectDataSkippingPredicateEvaluator<'a> = dyn DataSkippingPredicateEvaluator<
-        Output = bool,
-        ColumnStat = Scalar,
-        Bindings = DirectLetBindings<bool>,
-    > + 'a;
+pub type DirectDataSkippingPredicateEvaluator<'a> = dyn DataSkippingPredicateEvaluator<Output = bool, ColumnStat = Scalar, Bindings = DirectLetBindings>
+    + 'a;
 
 /// A data skipping predicate evaluator that rewrites the input to a predicate that performs data
 /// skipping over column stats for all referenced columns. The resulting predicate can be evaluated
@@ -291,6 +310,17 @@ pub trait KernelPredicateEvaluator {
         inverted: bool,
     ) -> Option<Self::Output>;
 
+    /// Evaluates DISTINCT on a predicate (implementation-specific).
+    ///
+    /// This is called by [`Self::eval_pred_distinct`] when the left operand is a predicate.
+    /// Implementations can choose whether to use fused evaluation or simple direct evaluation.
+    fn eval_pred_distinct_pred(
+        &self,
+        pred: &Pred,
+        val: &Scalar,
+        inverted: bool,
+    ) -> Option<Self::Output>;
+
     // ==================== PROVIDED METHODS ====================
 
     /// A (possibly inverted) boolean column access, e.g. `[NOT] <col>`.
@@ -367,6 +397,11 @@ pub trait KernelPredicateEvaluator {
     /// - `IS_NOT_NULL(OR(...))` → rewritten to check for at least one non-null TRUE or all non-null
     ///
     /// The nullness of `NOT(x)` is identical to that of `x`, so NOT is transparent.
+    ///
+    /// Binary comparison predicates (`<`, `>`, `=`) are null-intolerant: they return NULL if either
+    /// operand is NULL. Therefore:
+    /// - `IS_NULL(a < b)` → `OR(IS_NULL(a), IS_NULL(b))`
+    /// - `IS_NOT_NULL(a < b)` → `AND(IS_NOT_NULL(a), IS_NOT_NULL(b))`
     fn eval_pred_is_null(&self, pred: &Pred, inverted: bool) -> Option<Self::Output> {
         match pred {
             Pred::Not(inner) => {
@@ -388,6 +423,24 @@ pub trait KernelPredicateEvaluator {
             }
             Pred::Junction(JunctionPredicate { op, preds }) => {
                 self.eval_is_null_junction(*op, preds, false, inverted)
+            }
+            Pred::Binary(BinaryPredicate { op, left, right }) if op.is_null_intolerant() => {
+                // Null-intolerant binary predicates return NULL iff at least one operand is NULL.
+                // Therefore: IS_NULL(left OP right) = OR(IS_NULL(left), IS_NULL(right))
+                //        and IS_NOT_NULL(left OP right) = AND(IS_NOT_NULL(left), IS_NOT_NULL(right))
+                let junction_op = if inverted {
+                    JunctionPredicateOp::And // IS_NOT_NULL requires both operands non-null
+                } else {
+                    JunctionPredicateOp::Or // IS_NULL if either operand is null
+                };
+
+                let mut null_checks = [
+                    self.eval_pred_unary(UnaryPredicateOp::IsNull, left, inverted),
+                    self.eval_pred_unary(UnaryPredicateOp::IsNull, right, inverted),
+                ]
+                .into_iter();
+
+                self.finish_eval_pred_junction(junction_op, &mut null_checks, false)
             }
             _ => {
                 // Other predicate types are not supported for IS_NULL push-down
@@ -645,26 +698,51 @@ pub trait KernelPredicateEvaluator {
         (value_result, is_null_result)
     }
 
-    /// A (possibly inverted) DISTINCT test, e.g. `[NOT] DISTINCT(<col>, false)`. DISTINCT can be
+    /// A (possibly inverted) DISTINCT test, e.g. `[NOT] DISTINCT(<expr>, <value>)`. DISTINCT can be
     /// seen as one of two operations, depending on the input:
     ///
-    /// 1. `DISTINCT(<col>, NULL)` is equivalent to `<col> IS NOT NULL`
-    /// 2. `DISTINCT(<col>, <value>)` is equivalent to `OR(<col> IS NULL, <col> != <value>)`
+    /// 1. `DISTINCT(<expr>, NULL)` is equivalent to `<expr> IS NOT NULL`
+    /// 2. `DISTINCT(<expr>, <value>)` is equivalent to `OR(<expr> IS NULL, <expr> != <value>)`
+    ///
+    /// For predicates, delegates to [`Self::eval_pred_distinct_pred`] for implementation-specific
+    /// handling (which may use fused evaluation to avoid redundant computation).
     fn eval_pred_distinct(
         &self,
-        col: &ColumnName,
+        expr: &Expr,
         val: &Scalar,
         inverted: bool,
     ) -> Option<Self::Output> {
+        // Fast path: DISTINCT(expr, NULL) = expr IS NOT NULL
         if let Scalar::Null(_) = val {
-            self.eval_pred_column_is_null(col, !inverted)
-        } else {
-            let mut args = [
-                self.eval_pred_column_is_null(col, inverted),
-                self.eval_pred_eq(col, val, !inverted),
-            ]
-            .into_iter();
-            self.finish_eval_pred_junction(JunctionPredicateOp::Or, &mut args, inverted)
+            return self.eval_pred_unary(UnaryPredicateOp::IsNull, expr, !inverted);
+        }
+
+        match expr {
+            // Optimized path for columns - same for all implementations
+            Expr::Column(col) => {
+                let mut args = [
+                    self.eval_pred_column_is_null(col, inverted),
+                    self.eval_pred_eq(col, val, !inverted),
+                ]
+                .into_iter();
+                self.finish_eval_pred_junction(JunctionPredicateOp::Or, &mut args, inverted)
+            }
+
+            // Delegate to implementation-specific method for predicates
+            Expr::Predicate(pred) => self.eval_pred_distinct_pred(pred, val, inverted),
+
+            // Literals: compare directly
+            Expr::Literal(lit) => {
+                let mut args = [
+                    self.eval_pred_unary(UnaryPredicateOp::IsNull, expr, inverted),
+                    self.eval_pred_binary_scalars(BinaryPredicateOp::Equal, lit, val, !inverted),
+                ]
+                .into_iter();
+                self.finish_eval_pred_junction(JunctionPredicateOp::Or, &mut args, inverted)
+            }
+
+            // Other expression types unsupported
+            _ => None,
         }
     }
 
@@ -700,7 +778,7 @@ pub trait KernelPredicateEvaluator {
                 LessThan => self.eval_pred_lt(col, val, inverted),
                 GreaterThan => self.eval_pred_gt(col, val, inverted),
                 Equal => self.eval_pred_eq(col, val, inverted),
-                Distinct => self.eval_pred_distinct(col, val, inverted),
+                Distinct => self.eval_pred_distinct(left, val, inverted),
                 In => self.eval_pred_in(col, val, inverted),
             },
             (Literal(val), Column(col)) => match op {
@@ -708,7 +786,7 @@ pub trait KernelPredicateEvaluator {
                 LessThan => self.eval_pred_gt(col, val, inverted),
                 GreaterThan => self.eval_pred_lt(col, val, inverted),
                 Equal => self.eval_pred_eq(col, val, inverted),
-                Distinct => self.eval_pred_distinct(col, val, inverted),
+                Distinct => self.eval_pred_distinct(right, val, inverted),
                 In => None, // arg order is semantically important
             },
             _ => {
@@ -1053,7 +1131,7 @@ struct BindingScope<'a> {
     saved_len: usize,
 }
 
-impl<'a> BindingScope<'a> {
+impl BindingScope<'_> {
     fn insert(&mut self, name: String, value: Scalar) {
         // Short-lived borrow for insertion
         self.bindings.borrow_mut().insert(name, value);
@@ -1159,7 +1237,7 @@ impl<R: ResolveColumnAsScalar + 'static> From<R> for DefaultKernelPredicateEvalu
 /// produce a boolean output.
 impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredicateEvaluator<R> {
     type Output = bool;
-    type Bindings = DirectLetBindings<bool>;
+    type Bindings = DirectLetBindings;
 
     fn eval_pred_let(
         &self,
@@ -1270,6 +1348,25 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
     ) -> Option<bool> {
         KernelPredicateEvaluatorDefaults::finish_eval_pred_junction(op, preds, inverted)
     }
+
+    fn eval_pred_distinct_pred(&self, pred: &Pred, val: &Scalar, inverted: bool) -> Option<bool> {
+        // DISTINCT(pred, val) = OR(IS_NULL(pred), pred != val)
+        // Note: We can't rely on eval_pred returning None to mean NULL, because it also
+        // returns None for unsupported predicates. So we need proper pushdown.
+
+        // Evaluate IS_NULL(pred)
+        let is_null_result = self.eval_pred_is_null(pred, inverted);
+
+        // Evaluate pred != val (or pred == val if NOT DISTINCT)
+        let comparison_result = self.eval_pred(pred, false).and_then(|pred_bool| {
+            let pred_scalar = Scalar::from(pred_bool);
+            self.eval_pred_binary_scalars(BinaryPredicateOp::Equal, &pred_scalar, val, !inverted)
+        });
+
+        // Combine: OR(IS_NULL, !=)
+        let mut args = [is_null_result, comparison_result].into_iter();
+        self.finish_eval_pred_junction(JunctionPredicateOp::Or, &mut args, inverted)
+    }
 }
 
 /// A predicate evaluator that implements data skipping semantics over various column stats. For
@@ -1282,7 +1379,7 @@ pub trait DataSkippingPredicateEvaluator {
     /// The type for column stats consumed by this predicate evaluator
     type ColumnStat;
     /// Let-bindings strategy for managing intermediate results during evaluation
-    type Bindings: LetBindings<Output = Self::Output>;
+    type Bindings: LetBindings<Output = Self::Output, ColumnStat = Self::ColumnStat>;
 
     /// Retrieves the minimum value of a column, if it exists and has the requested type.
     fn get_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Self::ColumnStat>;
@@ -1512,6 +1609,38 @@ impl<T: DataSkippingPredicateEvaluator + ?Sized> KernelPredicateEvaluator for T 
         inverted: bool,
     ) -> Option<Self::Output> {
         self.finish_eval_pred_junction(op, preds, inverted)
+    }
+
+    fn eval_pred_distinct_pred(
+        &self,
+        pred: &Pred,
+        val: &Scalar,
+        inverted: bool,
+    ) -> Option<Self::Output> {
+        // Fused evaluation to avoid redundant computation
+        let mut bindings = Self::Bindings::default();
+
+        // Evaluate pred once, get both value and IS_NULL in a single pass
+        let FusedEvalResult {
+            value_name,
+            is_null_name,
+        } = self.eval_pred_with_null_check(pred, &mut bindings, false, inverted);
+
+        // Retrieve IS_NULL result
+        let is_null = bindings.retrieve(&is_null_name);
+
+        // Retrieve the stored value as a ColumnStat (Scalar for direct, Expr for indirect)
+        let value_stat = bindings.retrieve_as_stat(&value_name)?;
+
+        // Compare stored value to scalar using eval_partial_cmp
+        // Equal with inverted=true gives us NotEqual
+        let not_equal = self.eval_partial_cmp(Ordering::Equal, value_stat, val, !inverted)?;
+
+        // DISTINCT = OR(IS_NULL, !=)
+        let mut args = [is_null, Some(not_equal)].into_iter();
+        let result = self.finish_eval_pred_junction(JunctionPredicateOp::Or, &mut args, inverted);
+
+        bindings.finalize(result)
     }
 
     fn eval_pred_let(

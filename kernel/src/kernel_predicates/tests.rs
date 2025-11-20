@@ -504,7 +504,7 @@ fn test_eval_distinct() {
     let two = &Scalar::from(2);
     let null = &Scalar::Null(DataType::INTEGER);
     let filter = DefaultKernelPredicateEvaluator::from(one.clone());
-    let col = &column_name!("x");
+    let col = &column_expr!("x");
     expect_eq!(
         filter.eval_pred_distinct(col, one, true),
         Some(true),
@@ -556,6 +556,122 @@ fn test_eval_distinct() {
         filter.eval_pred_distinct(col, null, false),
         Some(false),
         "DISTINCT(x, NULL) (x = NULL)"
+    );
+}
+
+#[test]
+fn test_eval_distinct_predicate() {
+    // Test DISTINCT with boolean predicates as the left-hand side
+    let true_val = &Scalar::from(true);
+    let false_val = &Scalar::from(false);
+    let null_val = &Scalar::Null(DataType::BOOLEAN);
+
+    // Test with a predicate that evaluates to TRUE
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(5));
+    let pred_expr = Expr::Predicate(Box::new(Pred::lt(column_expr!("x"), Expr::literal(10))));
+
+    // DISTINCT(5 < 10, TRUE) = DISTINCT(TRUE, TRUE) = FALSE
+    expect_eq!(
+        filter.eval_pred_distinct(&pred_expr, true_val, false),
+        Some(false),
+        "DISTINCT(5 < 10, TRUE) where 5 < 10 = TRUE"
+    );
+
+    // DISTINCT(5 < 10, FALSE) = DISTINCT(TRUE, FALSE) = TRUE
+    expect_eq!(
+        filter.eval_pred_distinct(&pred_expr, false_val, false),
+        Some(true),
+        "DISTINCT(5 < 10, FALSE) where 5 < 10 = TRUE"
+    );
+
+    // NOT DISTINCT(5 < 10, TRUE) = NOT DISTINCT(TRUE, TRUE) = TRUE
+    expect_eq!(
+        filter.eval_pred_distinct(&pred_expr, true_val, true),
+        Some(true),
+        "NOT DISTINCT(5 < 10, TRUE) where 5 < 10 = TRUE"
+    );
+
+    // Test with a predicate that evaluates to FALSE
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(15));
+
+    // DISTINCT(15 < 10, FALSE) = DISTINCT(FALSE, FALSE) = FALSE
+    expect_eq!(
+        filter.eval_pred_distinct(&pred_expr, false_val, false),
+        Some(false),
+        "DISTINCT(15 < 10, FALSE) where 15 < 10 = FALSE"
+    );
+
+    // DISTINCT(15 < 10, TRUE) = DISTINCT(FALSE, TRUE) = TRUE
+    expect_eq!(
+        filter.eval_pred_distinct(&pred_expr, true_val, false),
+        Some(true),
+        "DISTINCT(15 < 10, TRUE) where 15 < 10 = FALSE"
+    );
+
+    // Test with a predicate that evaluates to NULL
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::Null(DataType::INTEGER));
+
+    // DISTINCT(NULL < 10, TRUE) = DISTINCT(NULL, TRUE) = TRUE (NULL is distinct from TRUE)
+    expect_eq!(
+        filter.eval_pred_distinct(&pred_expr, true_val, false),
+        Some(true),
+        "DISTINCT(NULL < 10, TRUE) where NULL < 10 = NULL"
+    );
+
+    // DISTINCT(NULL < 10, FALSE) = DISTINCT(NULL, FALSE) = TRUE (NULL is distinct from FALSE)
+    expect_eq!(
+        filter.eval_pred_distinct(&pred_expr, false_val, false),
+        Some(true),
+        "DISTINCT(NULL < 10, FALSE) where NULL < 10 = NULL"
+    );
+
+    // DISTINCT(NULL < 10, NULL) = DISTINCT(NULL, NULL) = FALSE (NULL not distinct from NULL)
+    expect_eq!(
+        filter.eval_pred_distinct(&pred_expr, null_val, false),
+        Some(false),
+        "DISTINCT(NULL < 10, NULL) where NULL < 10 = NULL"
+    );
+}
+
+#[test]
+fn test_eval_distinct_junction() {
+    // Test DISTINCT with junctions - useful for null-safe comparisons
+    let true_val = &Scalar::from(true);
+    let false_val = &Scalar::from(false);
+
+    // All TRUE, no nulls
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::Boolean(true));
+    let and_expr = Expr::Predicate(Box::new(Pred::and(column_pred!("a"), column_pred!("b"))));
+
+    // DISTINCT(AND(TRUE, TRUE), FALSE) = DISTINCT(TRUE, FALSE) = TRUE
+    expect_eq!(
+        filter.eval_pred_distinct(&and_expr, false_val, false),
+        Some(true),
+        "DISTINCT(AND(TRUE, TRUE), FALSE)"
+    );
+
+    // DISTINCT(AND(TRUE, TRUE), TRUE) = DISTINCT(TRUE, TRUE) = FALSE
+    expect_eq!(
+        filter.eval_pred_distinct(&and_expr, true_val, false),
+        Some(false),
+        "DISTINCT(AND(TRUE, TRUE), TRUE)"
+    );
+
+    // All FALSE, no nulls
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::Boolean(false));
+
+    // DISTINCT(AND(FALSE, FALSE), FALSE) = DISTINCT(FALSE, FALSE) = FALSE
+    expect_eq!(
+        filter.eval_pred_distinct(&and_expr, false_val, false),
+        Some(false),
+        "DISTINCT(AND(FALSE, FALSE), FALSE)"
+    );
+
+    // DISTINCT(AND(FALSE, FALSE), TRUE) = DISTINCT(FALSE, TRUE) = TRUE
+    expect_eq!(
+        filter.eval_pred_distinct(&and_expr, true_val, false),
+        Some(true),
+        "DISTINCT(AND(FALSE, FALSE), TRUE)"
     );
 }
 
@@ -1287,5 +1403,171 @@ fn test_let_binding_with_not_operand() {
             (Scalar::Boolean(false), 5, 10, Some(true)),
             (Scalar::Boolean(false), 10, 10, Some(true)),
         ],
+    );
+}
+
+// ==================== Binary Predicate IS_NULL Tests ====================
+
+#[test]
+fn test_is_null_binary_pred_column_literal() {
+    // IS_NULL(a < 10) should reduce to IS_NULL(a)
+    // When column has no nulls -> comparison is non-null -> IS_NULL returns false
+    // When column has some nulls -> comparison can be null -> IS_NULL can be true for null rows
+    // When column is all nulls -> comparison is always null -> IS_NULL returns true
+
+    let pred = Pred::is_null(Pred::lt(column_expr!("a"), Expr::literal(10)));
+    test_rewrite_equivalence(
+        &pred,
+        &[
+            (Scalar::from(5), 0, 10, Some(false)), // No nulls: IS_NULL(5 < 10) = IS_NULL(FALSE) = false -> can skip
+            (Scalar::from(5), 5, 10, Some(true)),  // Some nulls: mixed results -> can't skip
+            (Scalar::from(5), 10, 10, Some(true)), // All nulls: IS_NULL(NULL < 10) = IS_NULL(NULL) = true -> can't skip
+        ],
+    );
+}
+
+#[test]
+fn test_is_not_null_binary_pred_column_literal() {
+    // IS_NOT_NULL(a > 20) should reduce to IS_NOT_NULL(a) AND IS_NOT_NULL(20)
+    // Since IS_NOT_NULL(20) = true, this reduces to IS_NOT_NULL(a)
+
+    let pred = Pred::is_not_null(Pred::gt(column_expr!("a"), Expr::literal(20)));
+    test_rewrite_equivalence(
+        &pred,
+        &[
+            (Scalar::from(25), 0, 10, Some(true)), // No nulls: IS_NOT_NULL(25 > 20) = IS_NOT_NULL(TRUE) = true -> can't skip
+            (Scalar::from(25), 5, 10, Some(true)), // Some nulls: non-null rows produce true -> can't skip
+            (Scalar::from(25), 10, 10, Some(false)), // All nulls: IS_NOT_NULL(NULL > 20) = IS_NOT_NULL(NULL) = false -> can skip
+        ],
+    );
+}
+
+#[test]
+fn test_is_null_binary_pred_equal() {
+    // IS_NULL(a = 5) should reduce to IS_NULL(a)
+
+    let pred = Pred::is_null(Pred::eq(column_expr!("a"), Expr::literal(5)));
+    test_rewrite_equivalence(
+        &pred,
+        &[
+            (Scalar::from(5), 0, 10, Some(false)),  // No nulls -> can skip
+            (Scalar::from(5), 5, 10, Some(true)),   // Some nulls -> can't skip
+            (Scalar::from(5), 10, 10, Some(true)),  // All nulls -> can't skip
+            (Scalar::from(10), 0, 10, Some(false)), // No nulls (different value) -> can skip
+            (Scalar::from(10), 5, 10, Some(true)),  // Some nulls (different value) -> can't skip
+        ],
+    );
+}
+
+#[test]
+fn test_is_null_binary_pred_literal_column() {
+    // IS_NULL(100 > b) should reduce to OR(IS_NULL(100), IS_NULL(b)) = IS_NULL(b)
+
+    let pred = Pred::is_null(Pred::gt(Expr::literal(100), column_expr!("b")));
+    test_rewrite_equivalence(
+        &pred,
+        &[
+            (Scalar::from(50), 0, 10, Some(false)), // No nulls -> can skip
+            (Scalar::from(50), 5, 10, Some(true)),  // Some nulls -> can't skip
+            (Scalar::from(50), 10, 10, Some(true)), // All nulls -> can't skip
+        ],
+    );
+}
+
+#[test]
+fn test_is_null_binary_pred_nested_in_and() {
+    // IS_NULL(AND(a < 10, b > 20)) with binary predicates in the junction
+    // The AND rewrite will recursively handle IS_NULL checks on each binary predicate
+
+    let pred = Pred::is_null(Pred::and(
+        Pred::lt(column_expr!("a"), Expr::literal(10)),
+        Pred::gt(column_expr!("b"), Expr::literal(20)),
+    ));
+
+    // This tests that the rewrite correctly handles binary predicates within junctions
+    test_rewrite_equivalence(
+        &pred,
+        &[
+            (Scalar::Boolean(true), 0, 10, Some(false)), // All TRUE, no nulls -> AND=TRUE, IS_NULL=false
+            (Scalar::Boolean(true), 5, 10, Some(true)),  // All TRUE, some nulls -> mixed
+            (Scalar::Boolean(true), 10, 10, Some(true)), // All nulls -> AND=NULL, IS_NULL=true
+            (Scalar::Boolean(false), 0, 10, Some(false)), // All FALSE, no nulls -> AND=FALSE, IS_NULL=false
+            (Scalar::Boolean(false), 5, 10, Some(true)),  // All FALSE, some nulls -> mixed
+            (Scalar::Boolean(false), 10, 10, Some(true)), // All nulls -> AND=NULL, IS_NULL=true
+        ],
+    );
+}
+
+#[test]
+fn test_is_not_null_binary_pred_nested_in_or() {
+    // IS_NOT_NULL(OR(a < 10, b > 20)) with binary predicates in the junction
+
+    let pred = Pred::is_not_null(Pred::or(
+        Pred::lt(column_expr!("a"), Expr::literal(10)),
+        Pred::gt(column_expr!("b"), Expr::literal(20)),
+    ));
+
+    test_rewrite_equivalence(
+        &pred,
+        &[
+            (Scalar::Boolean(false), 0, 10, Some(true)), // All FALSE, no nulls -> OR=FALSE, IS_NOT_NULL=true
+            (Scalar::Boolean(false), 5, 10, Some(true)), // All FALSE, some nulls -> non-null rows produce TRUE
+            (Scalar::Boolean(false), 10, 10, Some(false)), // All nulls -> OR=NULL, IS_NOT_NULL=false
+            (Scalar::Boolean(true), 0, 10, Some(true)), // All TRUE, no nulls -> OR=TRUE, IS_NOT_NULL=true
+            (Scalar::Boolean(true), 5, 10, Some(true)), // All TRUE, some nulls -> true dominates
+            (Scalar::Boolean(true), 10, 10, Some(false)), // All nulls -> OR=NULL, IS_NOT_NULL=false
+        ],
+    );
+}
+
+#[test]
+fn test_direct_eval_is_null_binary_pred() {
+    // Test direct evaluation (not rewrite) of IS_NULL on binary predicates
+
+    // Test with non-null column value
+    let non_null_col = Scalar::from(5);
+    let filter = DefaultKernelPredicateEvaluator::from(non_null_col);
+
+    let less_than_pred = Pred::lt(column_expr!("x"), Expr::literal(10));
+    expect_eq!(
+        filter.eval_pred_is_null(&less_than_pred, false),
+        Some(false),
+        "IS_NULL(5 < 10) with non-null column"
+    );
+    expect_eq!(
+        filter.eval_pred_is_null(&less_than_pred, true),
+        Some(true),
+        "IS_NOT_NULL(5 < 10) with non-null column"
+    );
+
+    // Test with null column value
+    let null_col = Scalar::Null(DataType::INTEGER);
+    let filter = DefaultKernelPredicateEvaluator::from(null_col);
+
+    expect_eq!(
+        filter.eval_pred_is_null(&less_than_pred, false),
+        Some(true),
+        "IS_NULL(NULL < 10) with null column"
+    );
+    expect_eq!(
+        filter.eval_pred_is_null(&less_than_pred, true),
+        Some(false),
+        "IS_NOT_NULL(NULL < 10) with null column"
+    );
+
+    // Test equality predicate
+    let equal_pred = Pred::eq(column_expr!("x"), Expr::literal(5));
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(5));
+    expect_eq!(
+        filter.eval_pred_is_null(&equal_pred, false),
+        Some(false),
+        "IS_NULL(5 = 5) with non-null column"
+    );
+
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::Null(DataType::INTEGER));
+    expect_eq!(
+        filter.eval_pred_is_null(&equal_pred, false),
+        Some(true),
+        "IS_NULL(NULL = 5) with null column"
     );
 }

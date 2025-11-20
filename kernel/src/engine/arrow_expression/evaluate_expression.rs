@@ -93,12 +93,12 @@ impl<'scope, 'batch> LetScope<'scope, 'batch> {
     ///
     /// The name must already exist in the `LetExpression`/`LetPredicate` being evaluated.
     /// We borrow the name string rather than cloning it.
-    pub fn bind(&mut self, name: &'batch str, value: ArrayRef) {
+    pub(crate) fn bind(&mut self, name: &'batch str, value: ArrayRef) {
         self.context.bindings.insert(name, value);
     }
 
     /// Returns a mutable reference to the underlying context for evaluation.
-    pub fn context(&mut self) -> &mut EvaluationContext<'batch> {
+    pub(crate) fn context(&mut self) -> &mut EvaluationContext<'batch> {
         self.context
     }
 }
