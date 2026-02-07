@@ -4,12 +4,15 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
+use indexmap::IndexSet;
+use std::fmt::Debug;
+
 use self::deletion_vector::DeletionVectorDescriptor;
 use crate::expressions::{MapData, Scalar, StructData};
 use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::table_features::{
-    FeatureType, IntoTableFeature, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
-    TABLE_FEATURES_MIN_WRITER_VERSION,
+    FeatureType, IntoTableFeature, TableFeature, MAX_VALID_READER_VERSION,
+    MAX_VALID_WRITER_VERSION, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
@@ -405,7 +408,7 @@ pub(crate) struct Protocol {
 /// otherwise infallible (unrecognized names become `TableFeature::Unknown`).
 fn parse_features(
     features: Option<impl IntoIterator<Item = impl IntoTableFeature>>,
-) -> Option<Vec<TableFeature>> {
+) -> Option<IndexSet<TableFeature>> {
     let features = features?.into_iter().map(|f| f.into_table_feature());
     Some(features.collect())
 }
@@ -429,8 +432,8 @@ impl Protocol {
         Ok(Protocol {
             min_reader_version,
             min_writer_version,
-            reader_features,
-            writer_features,
+            reader_features: reader_features.map(Vec::from_iter),
+            writer_features: writer_features.map(Vec::from_iter),
         })
     }
 
@@ -468,116 +471,120 @@ impl Protocol {
 
     /// Validates the relationship between reader features and writer features in the protocol.
     #[allow(unused)]
-    pub(crate) fn validate_table_features(&self) -> DeltaResult<()> {
+    pub(crate) fn validate(&self) -> DeltaResult<()> {
         Self::validate_impl(
             self.min_reader_version,
             self.min_writer_version,
-            &self.reader_features,
-            &self.writer_features,
+            &parse_features(self.reader_features()),
+            &parse_features(self.writer_features()),
         )
     }
 
     fn validate_impl(
         min_reader_version: i32,
         min_writer_version: i32,
-        reader_features: &Option<Vec<TableFeature>>,
-        writer_features: &Option<Vec<TableFeature>>,
+        reader_features: &Option<IndexSet<TableFeature>>,
+        writer_features: &Option<IndexSet<TableFeature>>,
     ) -> DeltaResult<()> {
-        // The protocol states that Reader features may be present if and only if
-        // min_reader_version == TABLE_FEATURES_MIN_READER_VERSION (currently 3)
-        if min_reader_version == TABLE_FEATURES_MIN_READER_VERSION {
-            require!(
-                reader_features.is_some(),
-                Error::invalid_protocol(
-                    "Reader features must be present when minimum reader version = 3"
-                )
-            );
-        } else {
-            require!(
-                reader_features.is_none(),
-                Error::invalid_protocol(
-                    "Reader features must not be present when minimum reader version != 3"
-                )
-            );
+        // Version range checks
+        require!(
+            (1..=MAX_VALID_READER_VERSION).contains(&min_reader_version),
+            Error::invalid_protocol(format!(
+                "Unsupported minimum reader version {min_reader_version}"
+            ))
+        );
+        require!(
+            (1..=MAX_VALID_WRITER_VERSION).contains(&min_writer_version),
+            Error::invalid_protocol(format!(
+                "Unsupported minimum writer version {min_writer_version}"
+            ))
+        );
+
+        // Legacy reader version compatibility check
+        if min_reader_version == 2 && min_writer_version < 5 {
+            return Err(Error::invalid_protocol(
+                "Reader protocol version 2 requires writer version 5 or higher",
+            ));
         }
 
-        // The protocol states that Writer features may be present if and only if
-        // min_writer_version == TABLE_FEATURES_MIN_WRITER_VERSION (currently 7)
-        if min_writer_version == TABLE_FEATURES_MIN_WRITER_VERSION {
-            require!(
-                writer_features.is_some(),
-                Error::invalid_protocol(
-                    "Writer features must be present when minimum writer version = 7"
-                )
-            );
-        } else {
-            require!(
-                writer_features.is_none(),
-                Error::invalid_protocol(
-                    "Writer features must not be present when minimum writer version != 7"
-                )
-            );
-        }
-
-        match (reader_features, writer_features) {
-            (Some(reader_features), Some(writer_features)) => {
-                // Check all reader features are ReaderWriter and present in writer features.
-                // Unknown features are treated as potentially ReaderWriter for forward compatibility.
-                let check_r = reader_features.iter().all(|feature| {
-                    matches!(
-                        feature.feature_type(),
-                        FeatureType::ReaderWriter | FeatureType::Unknown
-                    ) && writer_features.contains(feature)
-                });
-                require!(
-                    check_r,
-                    Error::invalid_protocol(
-                        "Reader features must contain only ReaderWriter features that are also listed in writer features"
-                    )
-                );
-
-                // Check all writer features that are ReaderWriter must also be in reader features
-                // Unknown features are treated as potentially Writer-only for forward compatibility.
-                let check_w = writer_features
-                    .iter()
-                    .all(|feature| match feature.feature_type() {
-                        FeatureType::WriterOnly | FeatureType::Unknown => true,
-                        FeatureType::ReaderWriter => reader_features.contains(feature),
-                    });
-                require!(
-                    check_w,
-                    Error::invalid_protocol(
-                        "Writer features must be Writer-only or also listed in reader features"
-                    )
-                );
-                Ok(())
-            }
-            (None, None) => Ok(()),
-            (None, Some(writer_features)) => {
-                // Special case: reader version 2 implies ColumnMapping support.
-                // All other ReaderWriter features require explicit reader_features list (reader version 3).
-                // Unknown features are treated as potentially Writer-only for forward compatibility.
-                let is_valid = writer_features.iter().all(|feature| {
-                    match feature.feature_type() {
-                        FeatureType::WriterOnly | FeatureType::Unknown => true,
-                        FeatureType::ReaderWriter => {
-                            // ColumnMapping is allowed when reader version is 2 (implied support)
-                            min_reader_version == 2 && feature == &TableFeature::ColumnMapping
-                        }
+        // Validate feature list presence against protocol versions. Only three valid combos exist.
+        match (
+            min_reader_version >= TABLE_FEATURES_MIN_READER_VERSION,
+            min_writer_version >= TABLE_FEATURES_MIN_WRITER_VERSION,
+            reader_features,
+            writer_features,
+        ) {
+            // Full table features protocol. The writer feature list is authoritative:
+            // * reader-writer features on the writer list must also be present on the reader list
+            // * no legacy features may be discovered by presence later
+            // * the reader list must not include any writer-only features
+            // * unknown features are treated as reader-writer if they appear on the reader list
+            (true, true, Some(rf), Some(wf)) => {
+                for feature in rf {
+                    if feature.feature_type() == FeatureType::WriterOnly {
+                        return Err(Error::invalid_protocol(format!(
+                            "Reader feature list contains writer-only feature {feature}"
+                        )));
                     }
-                });
+                    if !wf.contains(feature) {
+                        return Err(Error::invalid_protocol(format!(
+                            "Reader-writer feature {feature} is only on the reader feature list"
+                        )));
+                    }
+                }
 
-                require!(
-                    is_valid,
-                    Error::invalid_protocol(
-                        "Writer features must be Writer-only or also listed in reader features"
-                    )
-                );
+                if let Some(f) = IndexSet::iter(wf)
+                    .filter(|f| f.feature_type() == FeatureType::ReaderWriter)
+                    .find(|f| !rf.contains(*f))
+                {
+                    return Err(Error::invalid_protocol(format!(
+                        "Reader-writer feature {f} is only on the writer feature list"
+                    )));
+                }
                 Ok(())
             }
-            (Some(_), None) => Err(Error::invalid_protocol(
-                "Reader features should be present in writer features",
-            )),
+
+            // Writer table features with legacy reader. The writer feature list is authoritative:
+            // * all legacy reader-writer features must be valid at the indicated legacy protocol
+            // * no additional legacy features may be discovered by presence later
+            // * all unknown features are assumed to be writer-only (no unknown legacy features)
+            (false, true, None, Some(wf)) => {
+                if let Some(f) = IndexSet::iter(wf)
+                    .filter(|f| f.feature_type() == FeatureType::ReaderWriter)
+                    .find(|f| !f.is_valid_for_legacy_reader(min_reader_version))
+                {
+                    return Err(Error::invalid_protocol(format!(
+                        "Reader protocol version {} does not support table feature {f}",
+                        min_reader_version
+                    )));
+                }
+                Ok(())
+            }
+
+            // Legacy protocol — no feature lists. All features will be detected by presence later.
+            (false, false, None, None) => Ok(()),
+
+            // Reader requires table features but writer version too low
+            (true, false, _, _) => Err(Error::invalid_protocol(format!(
+                "Reader protocol version {min_reader_version} requires writer version {}",
+                TABLE_FEATURES_MIN_WRITER_VERSION
+            ))),
+
+            // Feature list present but version too low to support it
+            (_, false, _, Some(_)) => Err(Error::invalid_protocol(format!(
+                "Writer version {min_writer_version} does not support table features"
+            ))),
+            (false, _, Some(_), _) => Err(Error::invalid_protocol(format!(
+                "Reader version {min_reader_version} does not support table features"
+            ))),
+
+            // Feature list missing but version requires it
+            (_, true, _, None) => Err(Error::invalid_protocol(format!(
+                "Writer version {min_writer_version} requires a table feature list"
+            ))),
+            (true, _, None, _) => Err(Error::invalid_protocol(format!(
+                "Reader version {min_reader_version} requires a table feature list"
+            ))),
         }
     }
 }
@@ -1269,24 +1276,32 @@ mod tests {
             (
                 Some(vec![TableFeature::DeletionVectors]),
                 Some(vec![TableFeature::AppendOnly]),
-                "Reader features must contain only ReaderWriter features that are also listed in writer features",
+                "Reader-writer feature deletionVectors is only on the reader feature list",
             ),
-            (Some(vec![TableFeature::DeletionVectors]), Some(vec![]), "Reader features must contain only ReaderWriter features that are also listed in writer features"),
+            (
+                Some(vec![TableFeature::DeletionVectors]),
+                Some(vec![]),
+                "Reader-writer feature deletionVectors is only on the reader feature list",
+            ),
             // ReaderWriter feature not present in reader features
-            (Some(vec![]), Some(vec![TableFeature::DeletionVectors]), "Writer features must be Writer-only or also listed in reader features"),
+            (
+                Some(vec![]),
+                Some(vec![TableFeature::DeletionVectors]),
+                "Reader-writer feature deletionVectors is only on the writer feature list",
+            ),
             (
                 Some(vec![TableFeature::VariantType]),
                 Some(vec![
                     TableFeature::VariantType,
                     TableFeature::DeletionVectors,
                 ]),
-                "Writer features must be Writer-only or also listed in reader features",
+                "Reader-writer feature deletionVectors is only on the writer feature list",
             ),
             // Writer only feature present in reader features
             (
                 Some(vec![TableFeature::AppendOnly]),
                 Some(vec![TableFeature::AppendOnly]),
-                "Reader features must contain only ReaderWriter features that are also listed in writer features",
+                "Reader feature list contains writer-only feature appendOnly",
             ),
         ];
 

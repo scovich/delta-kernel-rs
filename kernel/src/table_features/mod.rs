@@ -1,22 +1,29 @@
+use std::collections::HashSet;
+
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumIter, EnumString};
+use strum::{
+    AsRefStr, Display as StrumDisplay, EnumCount, EnumIter, EnumString, IntoEnumIterator as _,
+};
 
 use crate::actions::Protocol;
 use crate::expressions::Scalar;
 use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::DataType;
 use crate::table_properties::TableProperties;
+use crate::utils::require;
 use crate::{DeltaResult, Error};
 use delta_kernel_derive::internal_api;
 
-pub(crate) use column_mapping::validate_column_mapping;
+pub(crate) use column_mapping::column_mapping_presence;
 pub use column_mapping::ColumnMappingMode;
-pub(crate) use timestamp_ntz::validate_timestamp_ntz_feature_support;
+pub(crate) use timestamp_ntz::schema_uses_timestamp_ntz;
 mod column_mapping;
 #[cfg(test)]
 mod feature_tests;
 mod timestamp_ntz;
+
+use crate::schema::Schema;
 
 /// Maximum reader protocol version that the kernel can handle.
 pub const MAX_VALID_READER_VERSION: i32 = 3;
@@ -149,24 +156,6 @@ pub(crate) enum TableFeature {
     Unknown(String),
 }
 
-/// ReaderWriter features that can be supported by legacy readers (min_reader_version < 3).
-/// Only ColumnMapping qualifies with min_reader_version = 2.
-pub(crate) static LEGACY_READER_FEATURES: [TableFeature; 1] = [TableFeature::ColumnMapping];
-
-/// Writer and ReaderWriter features that can be supported by legacy writers (min_writer_version < 7).
-/// These are features with min_writer_version in range [1, 6].
-pub(crate) static LEGACY_WRITER_FEATURES: [TableFeature; 7] = [
-    // Writer-only features (min_writer < 7)
-    TableFeature::AppendOnly,       // min_writer = 2
-    TableFeature::Invariants,       // min_writer = 2
-    TableFeature::CheckConstraints, // min_writer = 3
-    TableFeature::ChangeDataFeed,   // min_writer = 4
-    TableFeature::GeneratedColumns, // min_writer = 4
-    TableFeature::IdentityColumns,  // min_writer = 6
-    // ReaderWriter features (min_writer < 7)
-    TableFeature::ColumnMapping, // min_writer = 5
-];
-
 /// Classifies table features by their type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FeatureType {
@@ -178,9 +167,111 @@ pub(crate) enum FeatureType {
     Unknown,
 }
 
+/// Build a single effective feature list from protocol + schema + properties.
+///
+/// This is the **narrow waist** for feature validation: it builds the canonical list of
+/// supported features AND validates consistency between protocol and metadata in one pass.
+///
+/// For protocols with feature lists (writer v7+), the writer list is authoritative: A feature's
+/// presence in metadata (if a presence checker is defined) must match its presence in the list. An
+/// AlwaysIfSupported feature has no obvious metadata footprint and requires no validation here.
+///
+/// For legacy protocols (no feature lists), features with presence checkers are inferred from
+/// metadata and cross-validated against protocol versions. Legacy features without presence
+/// checkers are assumed to be enabled in any version that supports them.
+pub(crate) fn build_effective_features(
+    protocol: &Protocol,
+    schema: &Schema,
+    properties: &TableProperties,
+) -> DeltaResult<HashSet<TableFeature>> {
+    // Step 1: Seed from protocol writer feature list (if any).
+    let mut features = match protocol.writer_features() {
+        Some(writer_list) => HashSet::from_iter(writer_list.iter().cloned()),
+        None => HashSet::new(),
+    };
+
+    // `Protocol::try_new` rejects reader-writer features that appear only on the reader list, so we
+    // don't need to add them here. But we do need to reject unknown reader-writer features, because
+    // the effective feature list cannot distinguish them from writer-only unknown features.
+    if let Some(reader_list) = protocol.reader_features() {
+        for feature in reader_list {
+            if feature.feature_type() == FeatureType::Unknown {
+                return Err(Error::unsupported(format!(
+                    "Unknown reader feature '{feature}'"
+                )));
+            }
+        }
+    }
+
+    let min_writer_version = protocol.min_writer_version();
+    let min_reader_version = protocol.min_reader_version();
+
+    // Step 2: Detect features from metadata presence and/or legacy version inference.
+    //
+    // Features already in the set (from the writer list) are skipped. For the rest:
+    // - If a presence checker is defined and reports true, validate and add the feature.
+    // - If no presence checker is defined, fall back to legacy version inference.
+    //
+    // NOTE: TableFeature::Unknown has no presence checker and no legacy version, so is skipped.
+    let has_writer_list = protocol.writer_features().is_some();
+    for feature in TableFeature::iter() {
+        // Listing a feature in the protocol does not require it to be present, but we still have
+        // to invoke the presence checker in case it finds invalid metadata.
+        let known_present = feature.check_presence(schema, properties)?.unwrap_or(false);
+        if features.contains(&feature) {
+            continue;
+        }
+
+        // Feature-list protocol: not allowed to infer legacy feature presence.
+        let desc = feature.metadata_description();
+        if has_writer_list {
+            if known_present {
+                return Err(Error::invalid_protocol(format!(
+                    "Table has {desc} but '{feature}' is not in the protocol",
+                )));
+            }
+            continue;
+        }
+
+        // Legacy protocol: validate version compatibility.
+        // known_present features MUST match (error if not); inferred features skip if not.
+        if !feature.is_valid_for_legacy_writer(min_writer_version) {
+            if known_present {
+                return Err(Error::invalid_protocol(format!(
+                    "Table has {desc} but writer version \
+                     {min_writer_version} does not support '{feature}'"
+                )));
+            }
+            continue;
+        }
+        if feature.feature_type() == FeatureType::ReaderWriter
+            && !feature.is_valid_for_legacy_reader(min_reader_version)
+        {
+            if known_present {
+                return Err(Error::invalid_protocol(format!(
+                    "Table has {desc} but reader version \
+                     {min_reader_version} does not support '{feature}'"
+                )));
+            }
+            continue;
+        }
+
+        features.insert(feature);
+    }
+
+    // Step 3: Validate groups of related features with overlapping metadata presence (such as
+    // preview vs. final versions of a feature). We cannot validate them independently because
+    // unused group member(s) would appear to have orphaned metadata.
+    for group in FEATURE_GROUPS {
+        group.validate(&features, schema, properties)?;
+    }
+
+    Ok(features)
+}
+
 /// Defines how a feature's enablement is determined
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum EnablementCheck {
+enum EnablementCheck {
     /// Feature is enabled if it's supported (appears in protocol feature lists)
     AlwaysIfSupported,
     /// Feature is enabled if supported AND the provided function returns true when checking table properties
@@ -199,11 +290,21 @@ pub(crate) enum Operation {
 }
 
 /// Defines whether the Rust kernel has implementation support for a feature's operation
-pub(crate) enum KernelSupport {
+enum KernelSupport {
     /// Kernel has full support for any operation on this feature
     Supported,
     /// Kernel does not support this operation on this feature
     NotSupported,
+    /// Kernel can handle the feature only if its metadata is not actively present.
+    ///
+    /// At capability-check time, consults the feature's `presence_check`:
+    /// - `Some(check)` returning `false` → Ok (feature is dormant)
+    /// - `Some(check)` returning `true` → Err (feature is active, kernel can't handle it)
+    /// - `None` → Err (can't prove inactive, must reject)
+    ///
+    /// Example: Invariants — kernel can handle tables that *declare* invariant support,
+    /// but cannot enforce invariant expressions if they actually exist in the schema.
+    NotSupportedIfPresent,
     /// Custom logic to determine support based on operation type and table properties.
     /// For example: Column Mapping may support Scan but not CDF, or CDF writes may only
     /// be supported when AppendOnly is true.
@@ -221,16 +322,73 @@ pub(crate) enum FeatureRequirement {
     NotSupported(TableFeature),
     /// Feature must NOT be enabled (may be supported but property must not activate it)
     NotEnabled(TableFeature),
-    /// Custom validation logic
-    Custom(fn(&Protocol, &TableProperties) -> DeltaResult<()>),
 }
+
+/// Signature for presence checkers registered in [`FeatureInfo`].
+///
+/// Takes schema and table properties (some features only need one or the other).
+/// Returns:
+/// - `Ok(true)` if the feature's metadata traces are present and valid
+/// - `Ok(false)` if the feature's metadata traces are absent
+/// - `Err` if the feature's metadata traces are present but malformed
+type PresenceCheckFn = fn(&Schema, &TableProperties) -> DeltaResult<bool>;
+
+/// A group of features that share metadata traces and cannot be distinguished from each
+/// other by metadata alone. If the shared metadata is present, at least one group member
+/// must be in the effective feature set. Individual members should have
+/// `presence_check: None` in their [`FeatureInfo`].
+///
+/// Validation direction: metadata present → at least one member supported. NOT the
+/// reverse — a feature can be listed without its metadata being present ("supported" ≠
+/// "active").
+struct FeatureGroup {
+    /// The features in this group.
+    members: &'static [TableFeature],
+    /// Detects whether the group's shared metadata is present.
+    presence_check: PresenceCheckFn,
+    /// Human-readable description of the shared metadata (e.g. "VARIANT columns").
+    metadata_description: &'static str,
+}
+
+impl FeatureGroup {
+    fn validate(
+        &self,
+        features: &HashSet<TableFeature>,
+        schema: &Schema,
+        props: &TableProperties,
+    ) -> DeltaResult<()> {
+        if (self.presence_check)(schema, props)? {
+            require!(
+                self.members.iter().any(|f| features.contains(f)),
+                Error::invalid_protocol(format!(
+                    "Table has {} but none of [{}] are in the protocol",
+                    self.metadata_description,
+                    self.members.iter().map(|f| f.as_ref()).format(", ")
+                ))
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Feature groups with shared metadata traces. Validated after building the effective
+/// feature set, when we have full context to check cross-feature relationships.
+static FEATURE_GROUPS: &[FeatureGroup] = &[
+    // VariantType and VariantTypePreview share the same schema metadata (variant columns).
+    // Neither can be distinguished from the other by metadata alone.
+    FeatureGroup {
+        members: &[TableFeature::VariantType, TableFeature::VariantTypePreview],
+        presence_check: |s, _p| Ok(crate::schema::variant_utils::schema_uses_variant(s)),
+        metadata_description: "VARIANT columns",
+    },
+];
 
 /// Minimum protocol versions for legacy (pre-feature-list) inference.
 /// Fields are (min_reader_version, min_writer_version).
-pub(crate) struct MinReaderWriterVersion(pub i32, pub i32);
+struct MinReaderWriterVersion(i32, i32);
 
 /// Rich metadata about a table feature including version requirements, dependencies, and support status
-pub(crate) struct FeatureInfo {
+struct FeatureInfo {
     /// The type of feature (WriterOnly, ReaderWriter, or Unknown)
     pub feature_type: FeatureType,
     /// Minimum legacy protocol versions for version-based feature inference.
@@ -241,12 +399,41 @@ pub(crate) struct FeatureInfo {
     pub feature_requirements: &'static [FeatureRequirement],
     /// Rust kernel's support for this feature (may vary by Operation type)
     ///
-    /// Note: `kernel_support` validation depends on `feature_type`:
-    /// Writer features: Only checked during `Operation::Write`
-    /// ReaderWriter features: Checked during all operations (Scan/Write/CDF)
-    /// Read operations (Scan/CDF) only validate reader features, so `kernel_support` for
-    /// Writer-only features is never invoked for Scan/CDF regardless of the custom check logic.
+    /// Note: `kernel_support` is only checked for features that are relevant to the
+    /// current operation. Writer-only features are skipped for read operations.
+    /// See `check_kernel_capabilities` for the filtering logic.
     pub kernel_support: KernelSupport,
+    /// Optional presence checker: detects whether the feature's metadata traces exist.
+    ///
+    /// When `Some`, `build_effective_features` uses this for two-way validation:
+    /// - Legacy inference: metadata present → validate protocol version allows it
+    /// - Feature-list protocols: metadata present but feature not listed → error
+    ///   (orphaned metadata that could cause corruption if feature is re-enabled)
+    ///
+    /// When `None`, the feature is not checkable — either because the feature has no
+    /// metadata traces (protocol behavior flags like DomainMetadata, VacuumProtocolCheck),
+    /// or because the kernel doesn't parse its metadata yet (CheckConstraints,
+    /// GeneratedColumns, IdentityColumns). In the latter case, the presence checker
+    /// should be added alongside the capability implementation.
+    ///
+    /// Note: this field is orthogonal to `kernel_support` and `enablement_check`. A feature
+    /// can be `NotSupported` yet still have a presence checker (e.g. IcebergCompat — kernel
+    /// can detect the toggle property even though it can't handle the feature's semantics).
+    /// Likewise, `AlwaysIfSupported` features can have presence checkers for schema-intrinsic
+    /// metadata (e.g. TimestampNtz, Variant — columns of that type must be detectable).
+    ///
+    /// Three common patterns:
+    /// - **Bool-toggle property**: `presence_check` uses `property.is_some()`,
+    ///   `enablement_check` uses `property == Some(true)` (e.g. AppendOnly, DeletionVectors)
+    /// - **Schema-intrinsic**: `presence_check` traverses the schema for specific types or
+    ///   annotations, `enablement_check` is `AlwaysIfSupported` (e.g. TimestampNtz, Variant)
+    /// - **Complex/named**: a named function validates metadata consistency and may return
+    ///   `Err` for malformed state (e.g. ColumnMapping, RowTracking)
+    pub presence_check: Option<PresenceCheckFn>,
+    /// Human-readable description of what metadata this feature leaves in a table.
+    /// Used in orphaned-metadata error messages, e.g. "TIMESTAMP_NTZ columns",
+    /// "column mapping annotations", "row tracking properties".
+    pub metadata_description: &'static str,
     /// How to check if this feature is enabled in a table
     pub enablement_check: EnablementCheck,
 }
@@ -257,17 +444,18 @@ static APPEND_ONLY_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: Some(MinReaderWriterVersion(1, 2)),
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
+    presence_check: None,
+    metadata_description: "",
     enablement_check: EnablementCheck::EnabledIf(|props| props.append_only == Some(true)),
 };
 
-// Although kernel marks invariants as "Supported", invariants must NOT actually be present in the table schema.
-// Kernel will fail to write to any table that actually uses invariants (see check in TableConfiguration::ensure_write_supported).
-// This is to allow legacy tables with the Invariants feature enabled but not in use.
 static INVARIANTS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: Some(MinReaderWriterVersion(1, 2)),
     feature_requirements: &[],
-    kernel_support: KernelSupport::Supported,
+    kernel_support: KernelSupport::NotSupportedIfPresent,
+    presence_check: Some(|s, _p| Ok(crate::schema::InvariantChecker::has_invariants(s))),
+    metadata_description: "column invariants",
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -276,6 +464,9 @@ static CHECK_CONSTRAINTS_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: Some(MinReaderWriterVersion(1, 3)),
     feature_requirements: &[],
     kernel_support: KernelSupport::NotSupported,
+    // TODO: Add presence checker for delta.constraints.* properties and upgrade to NotSupportedIfPresent.
+    presence_check: None,
+    metadata_description: "",
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -284,6 +475,8 @@ static CHANGE_DATA_FEED_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: Some(MinReaderWriterVersion(1, 4)),
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
+    presence_check: None,
+    metadata_description: "",
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_change_data_feed == Some(true)
     }),
@@ -294,6 +487,9 @@ static GENERATED_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: Some(MinReaderWriterVersion(1, 4)),
     feature_requirements: &[],
     kernel_support: KernelSupport::NotSupported,
+    // TODO: Add presence checker for delta.generationExpression metadata and upgrade to NotSupportedIfPresent.
+    presence_check: None,
+    metadata_description: "",
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -302,6 +498,9 @@ static IDENTITY_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: Some(MinReaderWriterVersion(1, 6)),
     feature_requirements: &[],
     kernel_support: KernelSupport::NotSupported,
+    // TODO: Add presence checker for delta.identity.* column metadata and upgrade to NotSupportedIfPresent.
+    presence_check: None,
+    metadata_description: "",
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -312,6 +511,8 @@ static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
     kernel_support: KernelSupport::Custom(|_protocol, _properties, operation| match operation {
         Operation::Scan | Operation::Write | Operation::Cdf => Ok(()),
     }),
+    presence_check: None,
+    metadata_description: "",
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_in_commit_timestamps == Some(true)
     }),
@@ -322,6 +523,8 @@ static ROW_TRACKING_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[FeatureRequirement::Supported(TableFeature::DomainMetadata)],
     kernel_support: KernelSupport::Supported,
+    presence_check: None,
+    metadata_description: "",
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_row_tracking == Some(true) && props.row_tracking_suspended != Some(true)
     }),
@@ -332,6 +535,9 @@ static DOMAIN_METADATA_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
+    // No metadata traces to check — DomainMetadata is a protocol behavior, not a schema/property.
+    presence_check: None,
+    metadata_description: "",
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -345,21 +551,11 @@ static ICEBERG_COMPAT_V1_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[
         FeatureRequirement::Enabled(TableFeature::ColumnMapping),
-        FeatureRequirement::Custom(|_protocol, properties| {
-            let mode = properties.column_mapping_mode;
-            if !matches!(
-                mode,
-                Some(ColumnMappingMode::Name) | Some(ColumnMappingMode::Id)
-            ) {
-                return Err(Error::generic(
-                    "IcebergCompatV1 requires Column Mapping in 'name' or 'id' mode",
-                ));
-            }
-            Ok(())
-        }),
         FeatureRequirement::NotSupported(TableFeature::DeletionVectors),
     ],
     kernel_support: KernelSupport::NotSupported,
+    presence_check: None,
+    metadata_description: "",
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_iceberg_compat_v1 == Some(true)
     }),
@@ -376,22 +572,12 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[
         FeatureRequirement::Enabled(TableFeature::ColumnMapping),
-        FeatureRequirement::Custom(|_protocol, properties| {
-            let mode = properties.column_mapping_mode;
-            if !matches!(
-                mode,
-                Some(ColumnMappingMode::Name) | Some(ColumnMappingMode::Id)
-            ) {
-                return Err(Error::generic(
-                    "IcebergCompatV2 requires Column Mapping in 'name' or 'id' mode",
-                ));
-            }
-            Ok(())
-        }),
         FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV1),
         FeatureRequirement::NotEnabled(TableFeature::DeletionVectors),
     ],
     kernel_support: KernelSupport::NotSupported,
+    presence_check: None,
+    metadata_description: "",
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_iceberg_compat_v2 == Some(true)
     }),
@@ -402,6 +588,9 @@ static CLUSTERED_TABLE_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[FeatureRequirement::Supported(TableFeature::DomainMetadata)],
     kernel_support: KernelSupport::NotSupported,
+    // TODO: Add presence checker when DomainMetadata access allows checking for delta.clustering domain.
+    presence_check: None,
+    metadata_description: "",
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -410,6 +599,9 @@ static MATERIALIZE_PARTITION_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
+    // No metadata traces to check — this is a write behavior flag.
+    presence_check: None,
+    metadata_description: "",
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -426,6 +618,9 @@ static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     }),
     #[cfg(not(feature = "catalog-managed"))]
     kernel_support: KernelSupport::NotSupported,
+    // No metadata traces — catalog management is external.
+    presence_check: None,
+    metadata_description: "",
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -442,6 +637,9 @@ static CATALOG_OWNED_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     }),
     #[cfg(not(feature = "catalog-managed"))]
     kernel_support: KernelSupport::NotSupported,
+    // No metadata traces — catalog management is external.
+    presence_check: None,
+    metadata_description: "",
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -455,6 +653,8 @@ static COLUMN_MAPPING_INFO: FeatureInfo = FeatureInfo {
             "Feature 'columnMapping' is not supported for writes",
         )),
     }),
+    presence_check: Some(column_mapping_presence),
+    metadata_description: "column mapping annotations",
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.column_mapping_mode.is_some()
             && props.column_mapping_mode != Some(ColumnMappingMode::None)
@@ -468,6 +668,8 @@ static DELETION_VECTORS_INFO: FeatureInfo = FeatureInfo {
     // We support writing to tables with DeletionVectors enabled, but we never write DV files
     // ourselves (no DML). The kernel only performs append operations.
     kernel_support: KernelSupport::Supported,
+    presence_check: None,
+    metadata_description: "",
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_deletion_vectors == Some(true)
     }),
@@ -478,19 +680,26 @@ static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
+    presence_check: Some(|s, _p| Ok(schema_uses_timestamp_ntz(s))),
+    metadata_description: "TIMESTAMP_NTZ columns",
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
 static TYPE_WIDENING_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
-    feature_requirements: &[],
+    feature_requirements: &[FeatureRequirement::NotSupported(
+        TableFeature::TypeWideningPreview,
+    )],
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
         Operation::Scan | Operation::Cdf => Ok(()),
         Operation::Write => Err(Error::unsupported(
             "Feature 'typeWidening' is not supported for writes",
         )),
     }),
+    // Metadata presence validated by FeatureGroup global validation (shared with TypeWideningPreview).
+    presence_check: None,
+    metadata_description: "",
     enablement_check: EnablementCheck::EnabledIf(|props| props.enable_type_widening == Some(true)),
 };
 
@@ -504,6 +713,9 @@ static TYPE_WIDENING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
             "Feature 'typeWidening-preview' is not supported for writes",
         )),
     }),
+    // Metadata presence validated by FeatureGroup global validation (shared with TypeWidening).
+    presence_check: None,
+    metadata_description: "",
     enablement_check: EnablementCheck::EnabledIf(|props| props.enable_type_widening == Some(true)),
 };
 
@@ -512,6 +724,9 @@ static V2_CHECKPOINT_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
+    // No metadata traces — checkpoint format is not a schema/property concern.
+    presence_check: None,
+    metadata_description: "",
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -520,14 +735,22 @@ static VACUUM_PROTOCOL_CHECK_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
+    // No metadata traces — purely a protocol behavior flag.
+    presence_check: None,
+    metadata_description: "",
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
 static VARIANT_TYPE_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
-    feature_requirements: &[],
+    feature_requirements: &[FeatureRequirement::NotSupported(
+        TableFeature::VariantTypePreview,
+    )],
     kernel_support: KernelSupport::Supported,
+    // Metadata presence validated by FeatureGroup global validation (shared with VariantTypePreview).
+    presence_check: None,
+    metadata_description: "",
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -536,6 +759,9 @@ static VARIANT_TYPE_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
+    // Metadata presence validated by FeatureGroup global validation (shared with VariantType).
+    presence_check: None,
+    metadata_description: "",
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -544,49 +770,87 @@ static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
+    // Shredding is a physical encoding detail, no schema/property metadata to check.
+    presence_check: None,
+    metadata_description: "",
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-/// Unknown features are not supported by the kernel but are tolerated for forward compatibility.
-/// They cannot be inferred from legacy protocol versions.
+/// Unknown features: kernel doesn't support them, can't check their metadata, and
+/// can't infer them from legacy versions. See [`TableFeature::category`].
 static UNKNOWN_FEATURE_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::Unknown,
     min_legacy_version: None,
     feature_requirements: &[],
     kernel_support: KernelSupport::NotSupported,
+    presence_check: None,
+    metadata_description: "",
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
 impl TableFeature {
+    /// Classifies this feature as writer-only, reader-writer, or unknown.
+    ///
+    /// Unknown features are likely newer legitimate features, not invalid input. They display as
+    /// the raw feature name (via strum `#[strum(default)]`), so error messages read naturally
+    /// (e.g. "Feature 'futureFeature' is not supported").
+    ///
+    /// ## How unknown features are handled
+    ///
+    /// Unknown features have `KernelSupport::NotSupported`, no presence checker, no feature
+    /// requirements, and no legacy version — so they cannot be inferred from metadata or protocol
+    /// versions. They enter the effective feature set only from explicit protocol feature lists.
+    ///
+    /// Because the feature type is unknown, they require special handling at several points:
+    ///
+    /// 1. **Protocol validation** (`Protocol::validate_impl`): Unknown features that appear only on
+    ///    the writer list are validated as writer-only. Unknown features on the reader list are
+    ///    validated as reader-writer and therefore must appear on the writer list as well.
+    ///
+    /// 2. **Effective feature construction** (`build_effective_features`): Unknown *reader*
+    ///    features are rejected before the reader/writer lists merge. The merge destroys list
+    ///    provenance, and `FeatureType::Unknown` can't reconstruct it. Early rejection ensures
+    ///    that the effective set does not contain any unknown feature from the reader list.
+    ///
+    /// 3. **Capability checking** (`check_kernel_capabilities`): Read operations check only
+    ///    `ReaderWriter` features. Unknown features are skipped — they're guaranteed writer-only
+    ///    after point 2. Write operations check all features, rejecting unknown features because
+    ///    they are `KernelSupport::NotSupported`.
+    ///
     pub(crate) fn feature_type(&self) -> FeatureType {
-        match self {
-            TableFeature::CatalogManaged
-            | TableFeature::CatalogOwnedPreview
-            | TableFeature::ColumnMapping
-            | TableFeature::DeletionVectors
-            | TableFeature::TimestampWithoutTimezone
-            | TableFeature::TypeWidening
-            | TableFeature::TypeWideningPreview
-            | TableFeature::V2Checkpoint
-            | TableFeature::VacuumProtocolCheck
-            | TableFeature::VariantType
-            | TableFeature::VariantTypePreview
-            | TableFeature::VariantShreddingPreview => FeatureType::ReaderWriter,
-            TableFeature::AppendOnly
-            | TableFeature::DomainMetadata
-            | TableFeature::Invariants
-            | TableFeature::RowTracking
-            | TableFeature::CheckConstraints
-            | TableFeature::ChangeDataFeed
-            | TableFeature::GeneratedColumns
-            | TableFeature::IdentityColumns
-            | TableFeature::InCommitTimestamp
-            | TableFeature::IcebergCompatV1
-            | TableFeature::IcebergCompatV2
-            | TableFeature::ClusteredTable
-            | TableFeature::MaterializePartitionColumns => FeatureType::WriterOnly,
-            TableFeature::Unknown(_) => FeatureType::Unknown,
+        self.info().feature_type
+    }
+
+    /// Returns true if this feature is enabled given the table properties.
+    /// A feature is "enabled" if its enablement check passes (e.g. the toggle property is true).
+    /// This does NOT check whether the feature is supported — the caller must check that separately.
+    pub(crate) fn is_enabled(&self, props: &TableProperties) -> bool {
+        match self.info().enablement_check {
+            EnablementCheck::AlwaysIfSupported => true,
+            EnablementCheck::EnabledIf(f) => f(props),
         }
+    }
+
+    /// Check if this feature's metadata traces are present in the table.
+    ///
+    /// Returns `Ok(None)` if the feature has no presence checker (not checkable).
+    /// Returns `Ok(Some(true))` if present, `Ok(Some(false))` if absent,
+    /// `Err(...)` if the metadata is malformed.
+    fn check_presence(
+        &self,
+        schema: &Schema,
+        props: &TableProperties,
+    ) -> DeltaResult<Option<bool>> {
+        self.info()
+            .presence_check
+            .map(|check| check(schema, props))
+            .transpose()
+    }
+
+    /// Human-readable description of this feature's metadata traces.
+    /// Used in error messages for orphaned metadata detection.
+    fn metadata_description(&self) -> &'static str {
+        self.info().metadata_description
     }
 
     /// Returns true if this feature can be inferred from a legacy reader protocol version.
@@ -600,11 +864,15 @@ impl TableFeature {
 
     /// Returns true if this feature can be inferred from a legacy writer protocol version.
     /// Always returns false for non-legacy (feature-list-only) features.
-    pub(crate) fn is_valid_for_legacy_writer(&self, writer_version: i32) -> bool {
+    fn is_valid_for_legacy_writer(&self, writer_version: i32) -> bool {
         matches!(
             self.info().min_legacy_version,
             Some(MinReaderWriterVersion(_, min_writer)) if writer_version >= min_writer
         )
+    }
+
+    pub(crate) fn feature_requirements(&self) -> &[FeatureRequirement] {
+        self.info().feature_requirements
     }
 
     /// Check if the kernel supports this feature for the given operation.
@@ -615,6 +883,7 @@ impl TableFeature {
     pub(crate) fn check_kernel_support(
         &self,
         protocol: &Protocol,
+        schema: &Schema,
         props: &TableProperties,
         operation: Operation,
     ) -> DeltaResult<()> {
@@ -623,21 +892,29 @@ impl TableFeature {
         match &self.info().kernel_support {
             KernelSupport::Supported => return Ok(()),
             KernelSupport::Custom(check) => return check(protocol, props, operation),
+            KernelSupport::NotSupportedIfPresent => {
+                if let Some(false) = self.check_presence(schema, props)? {
+                    return Ok(());
+                }
+            }
             KernelSupport::NotSupported => {}
         }
 
-        // Feature is not supported, but readers don't care about unsupported writer-only features.
+        // Feature is not supported (or present when it shouldn't be).
+        // Writer-only features are irrelevant for non-write operations. Unknown features
+        // are safe to skip because build_effective_features rejects unknown reader features
+        // at construction time, so any unknown in the effective set is guaranteed writer-only.
         match (operation, self.feature_type()) {
-            (Operation::Write, _) | (_, FeatureType::ReaderWriter | FeatureType::Unknown) => Err(
-                Error::unsupported(format!("Feature '{self}' is not supported when enabled")),
-            ),
-            (Operation::Scan | Operation::Cdf, FeatureType::WriterOnly) => Ok(()),
+            (Operation::Write, _) | (_, FeatureType::ReaderWriter) => Err(Error::unsupported(
+                format!("Feature '{self}' is not supported when enabled"),
+            )),
+            (Operation::Scan | Operation::Cdf, _) => Ok(()),
         }
     }
 
     /// Returns rich metadata about this table feature including version requirements,
-    /// dependencies, and support status. Unknown features return UNKNOWN_FEATURE_INFO.
-    pub(crate) fn info(&self) -> &FeatureInfo {
+    /// dependencies, and support status.
+    fn info(&self) -> &FeatureInfo {
         match self {
             // Writer-only features
             TableFeature::AppendOnly => &APPEND_ONLY_INFO,

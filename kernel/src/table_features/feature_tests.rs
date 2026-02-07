@@ -616,15 +616,13 @@ fn test_invariants() {
         name: "invariants",
         spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: Some(MinReaderWriterVersion(1, 2)),
-        // TODO: infer enablement by metadata presence, not just protocol version
         legacy_enablement_by_presence: false,
         presence_schema: Some(invariants_schema),
         required_deps: &[],
         anti_deps: &[],
         // No toggle property. TODO: Enabled when delta.invariants column metadata is present in schema.
         prop_cases: &[],
-        // TODO: reject metadata presence when feature not in protocol
-        expected_orphan: OpExpect::Ok,
+        expected_orphan: OpExpect::Err,
         capability: READS_ONLY,
     });
 }
@@ -703,8 +701,7 @@ fn test_column_mapping() {
         name: "columnMapping",
         spec_type: FeatureType::ReaderWriter,
         spec_legacy_versions: Some(MinReaderWriterVersion(2, 5)),
-        // TODO: infer enablement by metadata presence, not just protocol version
-        legacy_enablement_by_presence: false,
+        legacy_enablement_by_presence: true,
         presence_schema: Some(column_mapping_schema()),
         required_deps: &[],
         anti_deps: &[],

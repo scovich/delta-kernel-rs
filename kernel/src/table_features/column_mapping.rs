@@ -1,10 +1,8 @@
 //! Code to handle column mapping, including modes and schema transforms
-use super::TableFeature;
 use crate::schema::{
     ColumnName, DataType, MetadataValue, Schema, SchemaTransform, StructField, StructType,
 };
-use crate::table_configuration::TableConfiguration;
-use crate::utils::require;
+use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error};
 
 use std::borrow::Cow;
@@ -25,26 +23,6 @@ pub enum ColumnMappingMode {
     Name,
 }
 
-/// Validates that the column mapping mode declared by table properties is supported by the
-/// protocol, and that the schema annotations are consistent with that mode.
-pub(crate) fn validate_column_mapping(tc: &TableConfiguration) -> DeltaResult<()> {
-    let mode = tc.column_mapping_mode();
-    if mode != ColumnMappingMode::None {
-        let supported = match tc.protocol().min_reader_version() {
-            2 => true,
-            3 => tc.is_feature_supported(&TableFeature::ColumnMapping),
-            _ => false,
-        };
-        require!(
-            supported,
-            Error::invalid_column_mapping_mode(format!(
-                "Column mapping mode '{mode:?}' is set but the protocol does not support column mapping"
-            ))
-        );
-    }
-    validate_schema_column_mapping(&tc.schema(), mode)
-}
-
 /// When column mapping mode is enabled, verify that each field in the schema is annotated with a
 /// physical name and field_id; when not enabled, verify that no fields are annotated.
 fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) -> DeltaResult<()> {
@@ -57,6 +35,33 @@ fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) -> D
     match validator.err {
         Some(err) => Err(err),
         None => Ok(()),
+    }
+}
+
+/// Determine whether column mapping metadata is present and valid.
+///
+/// Returns:
+/// - Ok(true) if column mapping is declared (mode = id/name) and schema annotations are valid.
+/// - Ok(false) if column mapping is not declared (missing/none) and schema has no CM annotations.
+/// - Err if declared mode is inconsistent with schema annotations.
+///
+/// Strict two-way validation: mode=none requires annotations ABSENT because downstream code
+/// consumes schema annotations directly without re-checking mode. Disabling CM is dangerous
+/// (physical/logical name divergence causes data corruption), and no known client supports it.
+/// Strict checking catches buggy deactivation attempts.
+pub(crate) fn column_mapping_presence(
+    schema: &Schema,
+    table_properties: &TableProperties,
+) -> DeltaResult<bool> {
+    match table_properties.column_mapping_mode {
+        None | Some(ColumnMappingMode::None) => {
+            validate_schema_column_mapping(schema, ColumnMappingMode::None)?;
+            Ok(false)
+        }
+        Some(mode) => {
+            validate_schema_column_mapping(schema, mode)?;
+            Ok(true)
+        }
     }
 }
 
@@ -167,6 +172,8 @@ mod tests {
     use super::*;
     use crate::actions::{Metadata, Protocol};
     use crate::schema::StructType;
+    use crate::table_configuration::TableConfiguration;
+    use crate::table_features::TableFeature;
     use crate::utils::test_utils::assert_result_error_with_message;
     use std::collections::HashMap;
 
@@ -215,7 +222,7 @@ mod tests {
         .unwrap();
         assert_result_error_with_message(
             TableConfiguration::try_new(metadata, protocol, table_root.clone(), 0),
-            "Column mapping mode",
+            "column mapping annotations but 'columnMapping' is not in the protocol",
         );
 
         // v3 + wrong feature only + property=id → error
@@ -230,7 +237,7 @@ mod tests {
         .unwrap();
         assert_result_error_with_message(
             TableConfiguration::try_new(metadata, protocol, table_root, 0),
-            "Column mapping mode",
+            "column mapping annotations but 'columnMapping' is not in the protocol",
         );
     }
 

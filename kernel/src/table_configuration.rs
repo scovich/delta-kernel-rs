@@ -8,6 +8,7 @@
 //! [`TableProperties`].
 //!
 //! [`Schema`]: crate::schema::Schema
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use url::Url;
@@ -17,13 +18,9 @@ use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, PhysicalStatsSchemaTransform,
 };
-use crate::schema::variant_utils::validate_variant_type_feature_support;
-use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructType};
+use crate::schema::{SchemaRef, SchemaTransform, StructType};
 use crate::table_features::{
-    validate_column_mapping, validate_timestamp_ntz_feature_support, ColumnMappingMode,
-    EnablementCheck, FeatureInfo, FeatureRequirement, FeatureType, Operation, TableFeature,
-    LEGACY_READER_FEATURES, LEGACY_WRITER_FEATURES, MAX_VALID_READER_VERSION,
-    MAX_VALID_WRITER_VERSION,
+    build_effective_features, ColumnMappingMode, FeatureRequirement, Operation, TableFeature,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
@@ -77,6 +74,15 @@ pub(crate) struct TableConfiguration {
     schema: SchemaRef,
     table_properties: TableProperties,
     column_mapping_mode: ColumnMappingMode,
+    /// Effective feature list derived from protocol lists (if present) and/or legacy
+    /// version inference with presence checks. Downstream code should use this list
+    /// via `is_feature_supported` rather than inspecting protocol lists directly.
+    ///
+    /// NOTE: This is the deduplicated union of reader and writer lists, so reader vs. writer
+    /// provenance is lost. We rely on `feature_type()` to reconstruct it: `WriterOnly` and
+    /// `ReaderWriter` are static, and unknown reader features are rejected at build
+    /// time (see [`TableFeature::feature_type`]).
+    effective_features: HashSet<TableFeature>,
     table_root: Url,
     version: Version,
 }
@@ -110,6 +116,11 @@ impl TableConfiguration {
     ) -> DeltaResult<Self> {
         let schema = Arc::new(metadata.parse_schema()?);
         let table_properties = metadata.parse_table_properties();
+        let effective_features = build_effective_features(&protocol, &schema, &table_properties)?;
+
+        // Safe to read the property directly: if column mapping mode is set to id/name but the
+        // ColumnMapping feature is not in the effective set, build_effective_features would have
+        // already rejected the table as an orphaned metadata violation.
         let column_mapping_mode = table_properties
             .column_mapping_mode
             .unwrap_or(ColumnMappingMode::None);
@@ -120,13 +131,15 @@ impl TableConfiguration {
             protocol,
             table_properties,
             column_mapping_mode,
+            effective_features,
             table_root,
             version,
         };
 
-        validate_column_mapping(&table_config)?;
-        validate_timestamp_ntz_feature_support(&table_config)?;
-        validate_variant_type_feature_support(&table_config)?;
+        // Now that we have the effective feature set, validate requirements.
+        for feature in &table_config.effective_features {
+            table_config.validate_feature_requirements(feature)?;
+        }
 
         Ok(table_config)
     }
@@ -291,9 +304,7 @@ impl TableConfiguration {
         &self.table_properties
     }
 
-    /// Whether this table is catalog-managed (has the CatalogManaged or CatalogOwnedPreview
-    /// table feature).
-    #[internal_api]
+    /// True if this table is catalog-managed (either stable or preview feature).
     pub(crate) fn is_catalog_managed(&self) -> bool {
         self.is_feature_supported(&TableFeature::CatalogManaged)
             || self.is_feature_supported(&TableFeature::CatalogOwnedPreview)
@@ -319,7 +330,7 @@ impl TableConfiguration {
 
     /// Validates that all feature requirements for a given feature are satisfied.
     fn validate_feature_requirements(&self, feature: &TableFeature) -> DeltaResult<()> {
-        for req in feature.info().feature_requirements {
+        for req in feature.feature_requirements() {
             match req {
                 FeatureRequirement::Supported(dep) => {
                     require!(
@@ -353,129 +364,27 @@ impl TableConfiguration {
                         ))
                     );
                 }
-                FeatureRequirement::Custom(check) => {
-                    check(&self.protocol, &self.table_properties)?;
-                }
             }
         }
         Ok(())
-    }
-
-    /// Checks that kernel supports a feature for the given operation.
-    /// Returns an error if the feature is unknown, not supported, or fails validation.
-    fn check_feature_support(
-        &self,
-        feature: &TableFeature,
-        operation: Operation,
-    ) -> DeltaResult<()> {
-        feature.check_kernel_support(&self.protocol, &self.table_properties, operation)?;
-        self.validate_feature_requirements(feature)
-    }
-
-    /// Returns all reader features enabled for this table based on protocol version.
-    /// For table features protocol (v3), returns the explicit reader_features list.
-    /// For legacy protocol (v1-2), infers features from the version number.
-    fn get_enabled_reader_features(&self) -> Vec<TableFeature> {
-        match self.protocol.min_reader_version() {
-            3 => {
-                // Table features reader: use explicit reader_features list
-                self.protocol
-                    .reader_features()
-                    .map(|f| f.to_vec())
-                    .unwrap_or_default()
-            }
-            v if (1..=2).contains(&v) => {
-                // Legacy reader: infer features from version
-                LEGACY_READER_FEATURES
-                    .iter()
-                    .filter(|f| f.is_valid_for_legacy_reader(v))
-                    .cloned()
-                    .collect()
-            }
-            _ => Vec::new(),
-        }
-    }
-
-    /// Returns all writer features enabled for this table based on protocol version.
-    /// For table features protocol (v7), returns the explicit writer_features list.
-    /// For legacy protocol (v1-6), infers features from the version number.
-    fn get_enabled_writer_features(&self) -> Vec<TableFeature> {
-        match self.protocol.min_writer_version() {
-            7 => {
-                // Table features writer: use explicit writer_features list
-                self.protocol
-                    .writer_features()
-                    .map(|f| f.to_vec())
-                    .unwrap_or_default()
-            }
-            v if (1..=6).contains(&v) => {
-                // Legacy writer: infer features from version
-                LEGACY_WRITER_FEATURES
-                    .iter()
-                    .filter(|f| f.is_valid_for_legacy_writer(v))
-                    .cloned()
-                    .collect()
-            }
-            _ => Vec::new(),
-        }
     }
 
     /// Returns `Ok` if the kernel supports the given operation on this table. This checks that
     /// the protocol's features are all supported for the requested operation type.
     ///
-    /// - For `Scan` and `Cdf` operations: checks reader version and reader features
-    /// - For `Write` operations: checks writer version and writer features
+    /// Feature requirements (dependencies between features) are validated at construction
+    /// time by [`build_effective_features`], not here. This only checks kernel capability.
+    ///
+    /// Write operations must check all features, and all operations must check reader-writer
+    /// features, but readers can skip unknown features — see [`TableFeature::feature_type`].
     #[internal_api]
     pub(crate) fn check_kernel_capabilities(&self, operation: Operation) -> DeltaResult<()> {
-        match operation {
-            Operation::Scan | Operation::Cdf => self.ensure_read_supported(operation),
-            Operation::Write => self.ensure_write_supported(),
+        let protocol = &self.protocol;
+        let schema = self.schema();
+        let props = &self.table_properties;
+        for feature in &self.effective_features {
+            feature.check_kernel_support(protocol, schema.as_ref(), props, operation)?;
         }
-    }
-
-    /// Internal helper for read operations (Scan, Cdf)
-    fn ensure_read_supported(&self, operation: Operation) -> DeltaResult<()> {
-        // Version check: kernel supports reader versions 1..=MAX_VALID_READER_VERSION
-        if self.protocol.min_reader_version() > MAX_VALID_READER_VERSION {
-            return Err(Error::unsupported(format!(
-                "Unsupported minimum reader version {}",
-                self.protocol.min_reader_version()
-            )));
-        }
-
-        // Check all enabled reader features have kernel support
-        for feature in self.get_enabled_reader_features() {
-            self.check_feature_support(&feature, operation)?;
-        }
-
-        Ok(())
-    }
-
-    /// Internal helper for write operations
-    fn ensure_write_supported(&self) -> DeltaResult<()> {
-        // Version check: kernel supports writer versions 1..=MAX_VALID_WRITER_VERSION
-        if self.protocol.min_writer_version() > MAX_VALID_WRITER_VERSION {
-            return Err(Error::unsupported(format!(
-                "Unsupported minimum writer version {}",
-                self.protocol.min_writer_version()
-            )));
-        }
-
-        // Check all enabled writer features have kernel support
-        for feature in self.get_enabled_writer_features() {
-            self.check_feature_support(&feature, Operation::Write)?;
-        }
-
-        // Schema-dependent validation for Invariants (can't be in FeatureInfo)
-        // TODO: Better story for schema validation for Invariants and other features
-        if self.is_feature_supported(&TableFeature::Invariants)
-            && InvariantChecker::has_invariants(self.schema().as_ref())
-        {
-            return Err(Error::unsupported(
-                "Column invariants are not yet supported",
-            ));
-        }
-
         Ok(())
     }
 
@@ -550,86 +459,22 @@ impl TableConfiguration {
         self.protocol.min_writer_version() < 7
     }
 
-    /// Helper to check if a feature is present in a feature list.
-    fn has_feature(features: Option<&[TableFeature]>, feature: &TableFeature) -> bool {
-        features
-            .map(|features| features.contains(feature))
-            .unwrap_or(false)
-    }
-
-    /// Helper method to check if a feature is supported based on its FeatureInfo.
-    /// This checks protocol versions and feature lists but does NOT check enablement properties.
-    #[allow(dead_code)]
-    fn is_feature_info_supported(&self, feature: &TableFeature, info: &FeatureInfo) -> bool {
-        // NOTE: This method uses the passed-in `info` (not feature.info()) because tests
-        // construct custom FeatureInfo instances with different version thresholds.
-        let min_legacy_version = info.min_legacy_version.as_ref();
-        let min_reader_version = min_legacy_version.map_or(3, |v| v.0);
-        let min_writer_version = min_legacy_version.map_or(7, |v| v.1);
-        match info.feature_type {
-            FeatureType::WriterOnly => {
-                if self.is_legacy_writer_version() {
-                    // Legacy writer: protocol writer version meets minimum requirement
-                    self.protocol.min_writer_version() >= min_writer_version
-                } else {
-                    // Table features writer: feature is in writer_features list
-                    Self::has_feature(self.protocol.writer_features(), feature)
-                }
-            }
-            FeatureType::ReaderWriter => {
-                let reader_supported = if self.is_legacy_reader_version() {
-                    // Legacy reader: protocol reader version meets minimum requirement
-                    self.protocol.min_reader_version() >= min_reader_version
-                } else {
-                    // Table features reader: feature is in reader_features list
-                    Self::has_feature(self.protocol.reader_features(), feature)
-                };
-
-                let writer_supported = if self.is_legacy_writer_version() {
-                    // Legacy writer: protocol writer version meets minimum requirement
-                    self.protocol.min_writer_version() >= min_writer_version
-                } else {
-                    // Table features writer: feature is in writer_features list
-                    Self::has_feature(self.protocol.writer_features(), feature)
-                };
-
-                reader_supported && writer_supported
-            }
-            FeatureType::Unknown => false,
-        }
-    }
-
-    /// Helper method to check if a feature is enabled based on its FeatureInfo.
-    /// This checks both protocol support and enablement via table properties.
-    #[allow(dead_code)]
-    fn is_feature_info_enabled(&self, feature: &TableFeature, info: &FeatureInfo) -> bool {
-        if !self.is_feature_info_supported(feature, info) {
-            return false;
-        }
-
-        match info.enablement_check {
-            EnablementCheck::AlwaysIfSupported => true,
-            EnablementCheck::EnabledIf(check_fn) => check_fn(&self.table_properties),
-        }
-    }
-
-    /// Generic method to check if a feature is supported in the protocol.
-    /// This does NOT check if the feature is enabled via table properties.
+    /// Check if a feature is in the effective feature list. The effective list is built at
+    /// construction time from protocol lists and/or legacy version inference with presence
+    /// checks, so this is a simple lookup.
     #[internal_api]
     pub(crate) fn is_feature_supported(&self, feature: &TableFeature) -> bool {
-        let info = feature.info();
-        self.is_feature_info_supported(feature, info)
+        self.effective_features.contains(feature)
     }
 
-    /// Generic method to check if a feature is enabled.
+    /// Check if a feature is enabled.
     ///
     /// A feature is enabled if:
-    /// 1. It is supported in the protocol
-    /// 2. The enablement check passes
+    /// 1. It is in the effective feature list (i.e. supported)
+    /// 2. The enablement check passes (e.g. table property is set)
     #[internal_api]
     pub(crate) fn is_feature_enabled(&self, feature: &TableFeature) -> bool {
-        let info = feature.info();
-        self.is_feature_info_enabled(feature, info)
+        self.is_feature_supported(feature) && feature.is_enabled(&self.table_properties)
     }
 }
 
@@ -646,8 +491,7 @@ mod test {
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_features::ColumnMappingMode;
     use crate::table_features::{
-        EnablementCheck, FeatureInfo, FeatureType, KernelSupport, MinReaderWriterVersion,
-        Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
+        FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
         TABLE_FEATURES_MIN_WRITER_VERSION,
     };
     use crate::table_properties::TableProperties;
@@ -799,11 +643,6 @@ mod test {
                 ),
                 Ok(()),
             ),
-            (
-                // Writer version > 7 is not supported
-                create_mock_table_config_with_version(&["delta.enableChangeDataFeed"], None, 1, 8),
-                Err(Error::unsupported("Unsupported minimum writer version 8")),
-            ),
             // NOTE: The following cases should be updated if column mapping for writes is
             // supported before cdc is.
             (
@@ -848,6 +687,10 @@ mod test {
                 }
             }
         }
+
+        // Writer version > 7 is rejected at protocol construction time
+        let result = Protocol::try_new(1, 8, None::<Vec<String>>, None::<Vec<String>>);
+        assert_result_error_with_message(result, "Unsupported minimum writer version 8");
     }
     #[test]
     fn ict_enabled_from_table_creation() {
@@ -984,15 +827,34 @@ mod test {
         assert_eq!(info, InCommitTimestampEnablement::NotEnabled);
     }
     #[test]
-    fn fails_on_unsupported_feature() {
+    fn unknown_reader_feature_rejected_at_construction() {
+        // Unknown reader features are rejected by build_effective_features, before the
+        // reader/writer list merge destroys provenance (see NOTE on build_effective_features).
         let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol = Protocol::try_new(3, 7, Some(["unknown"]), Some(["unknown"])).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
+        TableConfiguration::try_new(metadata, protocol, table_root, 0)
+            .expect_err("Unknown reader feature should be rejected");
+    }
+
+    #[test]
+    fn unknown_writer_feature_allows_reads() {
+        // Unknown features only on the writer list survive into the effective set.
+        // Reads succeed (unknown writer features don't affect reads); writes fail
+        // (KernelSupport::NotSupported).
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let protocol =
+            Protocol::try_new(3, 7, Some(Vec::<String>::new()), Some(["unknown"])).unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         table_config
             .check_kernel_capabilities(Operation::Scan)
-            .expect_err("Unknown feature is not supported in kernel");
+            .expect("Unknown writer feature should not block reads");
+        table_config
+            .check_kernel_capabilities(Operation::Write)
+            .expect_err("Unknown writer feature should block writes");
     }
     #[test]
     fn dv_not_supported() {
@@ -1135,7 +997,10 @@ mod test {
             table_root.clone(),
             0,
         );
-        assert_result_error_with_message(result, "Unsupported: Table contains TIMESTAMP_NTZ columns but does not have the required 'timestampNtz' feature in reader and writer features");
+        assert_result_error_with_message(
+            result,
+            "Table has TIMESTAMP_NTZ columns but 'timestampNtz' is not in the protocol",
+        );
 
         let result = TableConfiguration::try_new(
             metadata,
@@ -1180,7 +1045,7 @@ mod test {
             table_root.clone(),
             0,
         );
-        assert_result_error_with_message(result, "Unsupported: Table contains VARIANT columns but does not have the required 'variantType' feature in reader and writer features");
+        assert_result_error_with_message(result, "Table has VARIANT columns but none of [variantType, variantType-preview] are in the protocol");
 
         let result =
             TableConfiguration::try_new(metadata, protocol_with_variant_features, table_root, 0);
@@ -1205,154 +1070,98 @@ mod test {
     }
 
     #[test]
-    fn test_is_feature_info_supported_writer() {
-        // Use ColumnMapping (a ReaderWriter feature) with custom FeatureInfo as Writer type
-        let feature = TableFeature::ColumnMapping;
+    fn test_is_feature_supported_writer_only() {
+        // AppendOnly: writer-only, min_writer=2, presence_check on delta.appendOnly property
+        let feature = TableFeature::AppendOnly;
 
-        // Custom FeatureInfo that treats ColumnMapping as Writer-only with min_writer_version = 2
-        let custom_feature_info = FeatureInfo {
-            feature_type: FeatureType::WriterOnly,
-            min_legacy_version: Some(MinReaderWriterVersion(1, 2)),
-            feature_requirements: &[],
-            kernel_support: KernelSupport::Supported,
-            enablement_check: EnablementCheck::AlwaysIfSupported,
-        };
+        // Non-legacy (3,7): AppendOnly in feature list → supported
+        let config = create_mock_table_config(&[], &[TableFeature::AppendOnly]);
+        assert!(config.is_feature_supported(&feature));
 
-        // Test with legacy protocol writer v2 - should be supported
+        // Non-legacy (3,7): AppendOnly NOT in list → not supported
+        let config = create_mock_table_config(&[], &[TableFeature::DeletionVectors]);
+        assert!(!config.is_feature_supported(&feature));
+
+        // Legacy (1,2) with presence (property set) → inferred from version, supported
+        let config = create_mock_table_config_with_version(&["delta.appendOnly"], None, 1, 2);
+        assert!(config.is_feature_supported(&feature));
+
+        // Legacy (1,2) without presence → still inferred from version alone (no presence checker)
         let config = create_mock_table_config_with_version(&[], None, 1, 2);
-        assert!(config.is_feature_info_supported(&feature, &custom_feature_info));
+        assert!(config.is_feature_supported(&feature));
 
-        // Test with legacy protocol writer v1 - should NOT be supported
-        let config = create_mock_table_config_with_version(&[], None, 1, 1);
-        assert!(!config.is_feature_info_supported(&feature, &custom_feature_info));
-
-        // Test with asymmetric: reader=2 (legacy), writer=7 (non-legacy)
-        // For this to work with a Writer-only FeatureInfo, we need a real Writer-only feature
-        // Use AppendOnly instead of ColumnMapping for the 2,7 test cases
-        let writer_only_feature = TableFeature::AppendOnly;
-        let writer_only_info = FeatureInfo {
-            feature_type: FeatureType::WriterOnly,
-            min_legacy_version: Some(MinReaderWriterVersion(1, 2)),
-            feature_requirements: &[],
-            kernel_support: KernelSupport::Supported,
-            enablement_check: EnablementCheck::AlwaysIfSupported,
-        };
-
-        // reader=2 (legacy), writer=7 (non-legacy) - feature in list, should be supported
+        // Asymmetric (2,7): AppendOnly in writer list → supported
         let config =
             create_mock_table_config_with_version(&[], Some(&[TableFeature::AppendOnly]), 2, 7);
-        assert!(config.is_feature_info_supported(&writer_only_feature, &writer_only_info));
+        assert!(config.is_feature_supported(&feature));
 
-        // reader=2 (legacy), writer=7 (non-legacy) - feature NOT in list, should NOT be supported
-        // Use ChangeDataFeed which is also a Writer-only feature
+        // Asymmetric (2,7): AppendOnly NOT in writer list → not supported
         let config =
             create_mock_table_config_with_version(&[], Some(&[TableFeature::ChangeDataFeed]), 2, 7);
-        assert!(!config.is_feature_info_supported(&writer_only_feature, &writer_only_info));
-
-        // Test with protocol reader=3, writer=7 (both non-legacy) - feature in list, should be supported
-        let config = create_mock_table_config(&[], &[TableFeature::ColumnMapping]);
-        assert!(config.is_feature_info_supported(&feature, &custom_feature_info));
-
-        // Test with protocol reader=3, writer=7 (both non-legacy) - feature NOT in list, should NOT be supported
-        let config = create_mock_table_config(&[], &[TableFeature::DeletionVectors]);
-        assert!(!config.is_feature_info_supported(&feature, &custom_feature_info));
+        assert!(!config.is_feature_supported(&feature));
     }
 
     #[test]
-    fn test_is_feature_info_supported_reader_writer() {
-        // Use ColumnMapping (a real ReaderWriter feature) with custom FeatureInfo
-        // ColumnMapping is a legacy feature (reader=2, writer=5) which makes it ideal for
-        // testing both legacy mode (version checks) and non-legacy mode (feature list checks)
+    fn test_is_feature_supported_reader_writer() {
+        // ColumnMapping: reader-writer (not writer_only), min_reader=2, min_writer=5
         let feature = TableFeature::ColumnMapping;
 
-        // Custom FeatureInfo that requires reader=2, writer=5
-        let custom_feature_info = FeatureInfo {
-            feature_type: FeatureType::ReaderWriter,
-            min_legacy_version: Some(MinReaderWriterVersion(2, 5)),
-            feature_requirements: &[],
-            kernel_support: KernelSupport::Supported,
-            enablement_check: EnablementCheck::AlwaysIfSupported,
-        };
+        // Non-legacy (3,7): ColumnMapping in feature list → supported
+        let config = create_mock_table_config(&[], &[TableFeature::ColumnMapping]);
+        assert!(config.is_feature_supported(&feature));
 
-        // Test with sufficient versions (legacy mode) - should be supported
-        let config = create_mock_table_config_with_version(&[], None, 2, 5);
-        assert!(config.is_feature_info_supported(&feature, &custom_feature_info));
+        // Non-legacy (3,7): ColumnMapping NOT in list → not supported
+        let config = create_mock_table_config(&[], &[TableFeature::DeletionVectors]);
+        assert!(!config.is_feature_supported(&feature));
 
-        // Test with insufficient reader version - should NOT be supported
-        let config = create_mock_table_config_with_version(&[], None, 1, 5);
-        assert!(!config.is_feature_info_supported(&feature, &custom_feature_info));
+        // Asymmetric: reader=2 (legacy), writer=7 with ColumnMapping in writer list
+        // ColumnMapping seeded from writer list → in effective set
+        let config =
+            create_mock_table_config_with_version(&[], Some(&[TableFeature::ColumnMapping]), 2, 7);
+        assert!(config.is_feature_supported(&feature));
 
-        // Test with insufficient writer version - should NOT be supported
-        let config = create_mock_table_config_with_version(&[], None, 2, 4);
-        assert!(!config.is_feature_info_supported(&feature, &custom_feature_info));
-
-        // Test with asymmetric: reader=2 (legacy), writer=7 (non-legacy)
-        // ReaderWriter features CANNOT be enabled in this protocol state (protocol validation)
-        // But we still need to test that the code correctly identifies them as NOT supported
-        // Create a table with only Writer-only features (e.g., AppendOnly)
+        // Asymmetric: reader=2, writer=7 with only AppendOnly in writer list
+        // ColumnMapping not seeded, no CM metadata present → not inferred → not supported
         let config =
             create_mock_table_config_with_version(&[], Some(&[TableFeature::AppendOnly]), 2, 7);
-        // ColumnMapping (ReaderWriter) should NOT be supported because:
-        // - reader=2 (legacy) checks version: 2 >= 2 ✓ (reader_supported = true)
-        // - writer=7 (non-legacy) checks list: ColumnMapping not in writer_features ✗ (writer_supported = false)
-        // - Result: false (requires BOTH to be true)
-        assert!(!config.is_feature_info_supported(&feature, &custom_feature_info));
+        assert!(!config.is_feature_supported(&feature));
+    }
 
-        // Test with non-legacy mode (3,7) - feature in list, should be supported
-        let config = create_mock_table_config(&[], &[TableFeature::ColumnMapping]);
-        assert!(config.is_feature_info_supported(&feature, &custom_feature_info));
+    #[test]
+    fn test_is_feature_enabled_with_enablement_check() {
+        // AppendOnly: writer-only, EnabledIf(append_only == Some(true))
+        let feature = TableFeature::AppendOnly;
 
-        // Test with non-legacy mode (3,7) - feature NOT in list, should NOT be supported
+        // Supported (in list) but property NOT set → supported but NOT enabled
+        let config = create_mock_table_config(&[], &[TableFeature::AppendOnly]);
+        assert!(config.is_feature_supported(&feature));
+        assert!(!config.is_feature_enabled(&feature));
+
+        // Supported (in list) AND property set → supported AND enabled
+        let config = create_mock_table_config(&["delta.appendOnly"], &[TableFeature::AppendOnly]);
+        assert!(config.is_feature_supported(&feature));
+        assert!(config.is_feature_enabled(&feature));
+
+        // Not supported (not in list) → neither supported nor enabled
         let config = create_mock_table_config(&[], &[TableFeature::DeletionVectors]);
-        assert!(!config.is_feature_info_supported(&feature, &custom_feature_info));
+        assert!(!config.is_feature_supported(&feature));
+        assert!(!config.is_feature_enabled(&feature));
     }
 
     #[test]
-    fn test_is_feature_info_enabled_with_custom_property_check() {
-        // Create a custom feature with a property check function
-        let custom_feature_info = FeatureInfo {
-            feature_type: FeatureType::WriterOnly,
-            min_legacy_version: Some(MinReaderWriterVersion(1, 2)),
-            feature_requirements: &[],
-            kernel_support: KernelSupport::Supported,
-            enablement_check: EnablementCheck::EnabledIf(|props| props.append_only == Some(true)),
-        };
+    fn test_is_feature_enabled_always_if_supported() {
+        // V2Checkpoint: reader-writer, AlwaysIfSupported
+        let feature = TableFeature::V2Checkpoint;
 
-        let feature = TableFeature::unknown("customPropertyFeature");
+        // Supported (in list) → automatically enabled
+        let config = create_mock_table_config(&[], &[TableFeature::V2Checkpoint]);
+        assert!(config.is_feature_supported(&feature));
+        assert!(config.is_feature_enabled(&feature));
 
-        // Test when property check fails - should be supported but not enabled
-        let config = create_mock_table_config_with_version(&[], None, 1, 2);
-        assert!(config.is_feature_info_supported(&feature, &custom_feature_info));
-        assert!(!config.is_feature_info_enabled(&feature, &custom_feature_info));
-
-        // Test when property check passes - should be both supported and enabled
-        let config = create_mock_table_config_with_version(&["delta.appendOnly"], None, 1, 2);
-        assert!(config.is_feature_info_supported(&feature, &custom_feature_info));
-        assert!(config.is_feature_info_enabled(&feature, &custom_feature_info));
-    }
-
-    #[test]
-    fn test_is_feature_info_enabled_always_if_supported() {
-        // Create a custom feature that's always enabled if supported
-        let custom_feature_info = FeatureInfo {
-            feature_type: FeatureType::WriterOnly,
-            min_legacy_version: Some(MinReaderWriterVersion(1, 3)),
-            feature_requirements: &[],
-            kernel_support: KernelSupport::Supported,
-            enablement_check: EnablementCheck::AlwaysIfSupported,
-        };
-
-        let feature = TableFeature::unknown("alwaysEnabledFeature");
-
-        // Test when supported - should be both supported and enabled
-        let config = create_mock_table_config_with_version(&[], None, 1, 3);
-        assert!(config.is_feature_info_supported(&feature, &custom_feature_info));
-        assert!(config.is_feature_info_enabled(&feature, &custom_feature_info));
-
-        // Test when not supported - should be neither supported nor enabled
-        let config = create_mock_table_config_with_version(&[], None, 1, 2);
-        assert!(!config.is_feature_info_supported(&feature, &custom_feature_info));
-        assert!(!config.is_feature_info_enabled(&feature, &custom_feature_info));
+        // Not supported (not in list) → neither supported nor enabled
+        let config = create_mock_table_config(&[], &[TableFeature::DeletionVectors]);
+        assert!(!config.is_feature_supported(&feature));
+        assert!(!config.is_feature_enabled(&feature));
     }
 
     #[test]
@@ -1409,9 +1218,8 @@ mod test {
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
-        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert_result_error_with_message(
-            config.check_kernel_capabilities(Operation::Write),
+            TableConfiguration::try_new(metadata, protocol, table_root, 0),
             "Feature 'rowTracking' requires 'domainMetadata' to be supported",
         );
     }

@@ -116,6 +116,32 @@ fn assert_midstream_failure(engine: Arc<dyn Engine>, mock_table: &LocalMockTable
     );
 }
 
+/// Like assert_midstream_failure, but for unknown reader features which are rejected
+/// at TableConfiguration construction time (not as ChangeDataFeedUnsupported).
+fn assert_midstream_unknown_reader_failure(engine: Arc<dyn Engine>, mock_table: &LocalMockTable) {
+    // Reading just the first commit (0 to 0) should succeed
+    let res_v0 = execute_table_changes(engine.clone(), mock_table, 0, Some(0));
+    assert!(res_v0.is_ok(), "Reading version 0 alone should succeed");
+
+    // Reading commits 0-1 should fail with unsupported unknown reader feature
+    let res_v0_v1 = execute_table_changes(engine.clone(), mock_table, 0, Some(1));
+    let err = res_v0_v1.err().expect("Reading versions 0-1 should fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Unknown reader feature"),
+        "Expected 'Unknown reader feature' error, got: {msg}"
+    );
+
+    // Reading just commit 1 should also fail
+    let res_v1 = execute_table_changes(engine, mock_table, 1, Some(1));
+    let err = res_v1.err().expect("Reading version 1 alone should fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Unknown reader feature"),
+        "Expected 'Unknown reader feature' error, got: {msg}"
+    );
+}
+
 fn get_segment(
     engine: &dyn Engine,
     path: &Path,
@@ -217,6 +243,7 @@ async fn cdf_not_enabled() {
 async fn unsupported_reader_feature() {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
+    // Unknown reader features are rejected during TableConfiguration construction.
     mock_table
         .commit([Action::Protocol(
             Protocol::try_new(
@@ -247,7 +274,15 @@ async fn unsupported_reader_feature() {
             .unwrap()
             .try_collect();
 
-    assert!(matches!(res, Err(Error::ChangeDataFeedUnsupported(_))));
+    // Unknown reader features are now rejected at construction time, not at CDF time
+    let err = res
+        .err()
+        .expect("Expected error for unknown reader feature");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Unknown reader feature"),
+        "Expected 'Unknown reader feature' error, got: {msg}"
+    );
 }
 
 #[tokio::test]
@@ -364,7 +399,8 @@ async fn unsupported_protocol_feature_midstream() {
         ])
         .await;
 
-    // Second commit: Protocol update with unsupported feature
+    // Second commit: Protocol update with unknown feature on reader list.
+    // Unknown reader features are rejected during TableConfiguration construction.
     mock_table
         .commit([protocol_action(
             3,
@@ -377,7 +413,7 @@ async fn unsupported_protocol_feature_midstream() {
         )])
         .await;
 
-    assert_midstream_failure(engine, &mock_table);
+    assert_midstream_unknown_reader_failure(engine, &mock_table);
 }
 
 #[tokio::test]
@@ -876,6 +912,8 @@ async fn failing_protocol() {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
 
+    // Unknown feature on both lists — triggers unknown reader feature rejection
+    // at build_effective_features time during TableConfiguration reconstruction.
     let protocol = Protocol::try_new(
         3,
         7,
@@ -911,10 +949,7 @@ async fn failing_protocol() {
             .unwrap()
             .try_collect();
 
-    assert_result_error_with_message(
-        res,
-        "Change data feed is unsupported for the table at version 0",
-    );
+    assert_result_error_with_message(res, "Unknown reader feature 'fake_feature'");
 }
 
 #[tokio::test]

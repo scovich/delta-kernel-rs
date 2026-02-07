@@ -1,32 +1,14 @@
-//! Validation for TIMESTAMP_NTZ feature support
+//! TIMESTAMP_NTZ schema detection
 
-use super::TableFeature;
 use crate::schema::{PrimitiveType, Schema, SchemaTransform};
-use crate::table_configuration::TableConfiguration;
-use crate::utils::require;
-use crate::{DeltaResult, Error};
 
 use std::borrow::Cow;
 
-/// Returns true if the schema (or any nested schema) contains a TIMESTAMP_NTZ column.
+/// Returns true if the schema contains any TIMESTAMP_NTZ columns.
 pub(crate) fn schema_uses_timestamp_ntz(schema: &Schema) -> bool {
     let mut checker = UsesTimestampNtz(false);
     let _ = checker.transform_struct(schema);
     checker.0
-}
-
-/// Validates that if a table schema contains TIMESTAMP_NTZ columns, the table must have the
-/// TimestampWithoutTimezone feature in both reader and writer features.
-pub(crate) fn validate_timestamp_ntz_feature_support(tc: &TableConfiguration) -> DeltaResult<()> {
-    if !tc.is_feature_supported(&TableFeature::TimestampWithoutTimezone) {
-        require!(
-            !schema_uses_timestamp_ntz(&tc.schema()),
-            Error::unsupported(
-                "Table contains TIMESTAMP_NTZ columns but does not have the required 'timestampNtz' feature in reader and writer features"
-            )
-        );
-    }
-    Ok(())
 }
 
 /// Schema visitor that checks if any column in the schema uses TIMESTAMP_NTZ type
@@ -43,9 +25,9 @@ impl<'a> SchemaTransform<'a> for UsesTimestampNtz {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::actions::Protocol;
     use crate::schema::{DataType, PrimitiveType, StructField, StructType};
+    use crate::table_features::TableFeature;
     use crate::utils::test_utils::{assert_result_error_with_message, make_test_tc};
 
     #[test]
@@ -60,7 +42,6 @@ mod tests {
             StructField::new("name", DataType::STRING, true),
         ]);
 
-        // Protocol with TimestampWithoutTimezone features
         let protocol_with_features = Protocol::try_new(
             3,
             7,
@@ -69,7 +50,6 @@ mod tests {
         )
         .unwrap();
 
-        // Protocol without TimestampWithoutTimezone features
         let protocol_without_features = Protocol::try_new(
             3,
             7,
@@ -93,18 +73,15 @@ mod tests {
         .expect("Should succeed when no TIMESTAMP_NTZ columns are present");
 
         // Schema without TIMESTAMP_NTZ + Protocol with features = OK
-        make_test_tc(
-            schema_without_timestamp_ntz.clone(),
-            protocol_with_features.clone(),
-        )
-        .expect("Should succeed when no TIMESTAMP_NTZ columns are present, even with features");
+        make_test_tc(schema_without_timestamp_ntz, protocol_with_features)
+            .expect("Should succeed when no TIMESTAMP_NTZ columns are present, even with features");
 
         // Schema with TIMESTAMP_NTZ + Protocol without features = ERROR
-        let result = make_test_tc(
-            schema_with_timestamp_ntz.clone(),
-            protocol_without_features.clone(),
+        let result = make_test_tc(schema_with_timestamp_ntz, protocol_without_features.clone());
+        assert_result_error_with_message(
+            result,
+            "Table has TIMESTAMP_NTZ columns but 'timestampNtz' is not in the protocol",
         );
-        assert_result_error_with_message(result, "Unsupported: Table contains TIMESTAMP_NTZ columns but does not have the required 'timestampNtz' feature in reader and writer features");
 
         // Nested schema with TIMESTAMP_NTZ
         let nested_schema_with_timestamp_ntz = StructType::new_unchecked([
@@ -121,6 +98,9 @@ mod tests {
         ]);
 
         let result = make_test_tc(nested_schema_with_timestamp_ntz, protocol_without_features);
-        assert_result_error_with_message(result, "Unsupported: Table contains TIMESTAMP_NTZ columns but does not have the required 'timestampNtz' feature in reader and writer features");
+        assert_result_error_with_message(
+            result,
+            "Table has TIMESTAMP_NTZ columns but 'timestampNtz' is not in the protocol",
+        );
     }
 }
