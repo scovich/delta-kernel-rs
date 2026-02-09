@@ -18,6 +18,13 @@ impl<'a> SchemaTransform<'a> for UsesVariant {
     }
 }
 
+/// Returns true if the schema (or any nested schema) contains a VARIANT column.
+pub(crate) fn schema_uses_variant(schema: &Schema) -> bool {
+    let mut checker = UsesVariant::default();
+    let _ = checker.transform_struct(schema);
+    checker.0
+}
+
 pub(crate) fn validate_variant_type_feature_support(
     schema: &Schema,
     protocol: &Protocol,
@@ -27,10 +34,8 @@ pub(crate) fn validate_variant_type_feature_support(
     if !protocol.has_table_feature(&TableFeature::VariantType)
         && !protocol.has_table_feature(&TableFeature::VariantTypePreview)
     {
-        let mut uses_variant = UsesVariant::default();
-        let _ = uses_variant.transform_struct(schema);
         require!(
-            !uses_variant.0,
+            !schema_uses_variant(schema),
             Error::unsupported(
                 "Table contains VARIANT columns but does not have the required 'variantType' feature in reader and writer features"
             )

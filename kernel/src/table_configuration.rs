@@ -291,6 +291,14 @@ impl TableConfiguration {
         &self.table_properties
     }
 
+    /// Whether this table is catalog-managed (has the CatalogManaged or CatalogOwnedPreview
+    /// table feature).
+    #[internal_api]
+    pub(crate) fn is_catalog_managed(&self) -> bool {
+        self.is_feature_supported(&TableFeature::CatalogManaged)
+            || self.is_feature_supported(&TableFeature::CatalogOwnedPreview)
+    }
+
     /// The [`ColumnMappingMode`] for this table at this version.
     #[internal_api]
     pub(crate) fn column_mapping_mode(&self) -> ColumnMappingMode {

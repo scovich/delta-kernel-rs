@@ -506,7 +506,6 @@ impl Transaction {
             && self
                 .read_snapshot
                 .table_configuration()
-                .protocol()
                 .is_catalog_managed()
         {
             return Err(Error::generic(

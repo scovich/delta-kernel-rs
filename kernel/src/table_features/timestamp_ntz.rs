@@ -8,6 +8,13 @@ use crate::{DeltaResult, Error};
 
 use std::borrow::Cow;
 
+/// Returns true if the schema (or any nested schema) contains a TIMESTAMP_NTZ column.
+pub(crate) fn schema_uses_timestamp_ntz(schema: &Schema) -> bool {
+    let mut checker = UsesTimestampNtz(false);
+    let _ = checker.transform_struct(schema);
+    checker.0
+}
+
 /// Validates that if a table schema contains TIMESTAMP_NTZ columns, the table must have the
 /// TimestampWithoutTimezone feature in both reader and writer features.
 pub(crate) fn validate_timestamp_ntz_feature_support(
@@ -15,10 +22,8 @@ pub(crate) fn validate_timestamp_ntz_feature_support(
     protocol: &Protocol,
 ) -> DeltaResult<()> {
     if !protocol.has_table_feature(&TableFeature::TimestampWithoutTimezone) {
-        let mut uses_timestamp_ntz = UsesTimestampNtz(false);
-        let _ = uses_timestamp_ntz.transform_struct(schema);
         require!(
-            !uses_timestamp_ntz.0,
+            !schema_uses_timestamp_ntz(schema),
             Error::unsupported(
                 "Table contains TIMESTAMP_NTZ columns but does not have the required 'timestampNtz' feature in reader and writer features"
             )

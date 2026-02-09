@@ -565,11 +565,6 @@ impl Protocol {
             )),
         }
     }
-
-    pub(crate) fn is_catalog_managed(&self) -> bool {
-        self.has_table_feature(&TableFeature::CatalogManaged)
-            || self.has_table_feature(&TableFeature::CatalogOwnedPreview)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
