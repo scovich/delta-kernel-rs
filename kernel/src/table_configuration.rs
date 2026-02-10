@@ -22,7 +22,8 @@ use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructType};
 use crate::table_features::{
     validate_column_mapping, validate_timestamp_ntz_feature_support, ColumnMappingMode,
     EnablementCheck, FeatureInfo, FeatureRequirement, FeatureType, KernelSupport, Operation,
-    TableFeature, LEGACY_READER_FEATURES, LEGACY_WRITER_FEATURES,
+    TableFeature, LEGACY_READER_FEATURES, LEGACY_WRITER_FEATURES, MAX_VALID_READER_VERSION,
+    MAX_VALID_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
@@ -466,8 +467,8 @@ impl TableConfiguration {
 
     /// Internal helper for read operations (Scan, Cdf)
     fn ensure_read_supported(&self, operation: Operation) -> DeltaResult<()> {
-        // Version check: kernel supports reader versions 1-3
-        if self.protocol.min_reader_version() > 3 {
+        // Version check: kernel supports reader versions 1..=MAX_VALID_READER_VERSION
+        if self.protocol.min_reader_version() > MAX_VALID_READER_VERSION {
             return Err(Error::unsupported(format!(
                 "Unsupported minimum reader version {}",
                 self.protocol.min_reader_version()
@@ -484,8 +485,8 @@ impl TableConfiguration {
 
     /// Internal helper for write operations
     fn ensure_write_supported(&self) -> DeltaResult<()> {
-        // Version check: kernel supports writer versions 1-7
-        if self.protocol.min_writer_version() > 7 {
+        // Version check: kernel supports writer versions 1..=MAX_VALID_WRITER_VERSION
+        if self.protocol.min_writer_version() > MAX_VALID_WRITER_VERSION {
             return Err(Error::unsupported(format!(
                 "Unsupported minimum writer version {}",
                 self.protocol.min_writer_version()
@@ -677,6 +678,7 @@ mod test {
     use crate::table_features::ColumnMappingMode;
     use crate::table_features::{
         EnablementCheck, FeatureInfo, FeatureType, KernelSupport, Operation, TableFeature,
+        TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
     };
     use crate::table_properties::TableProperties;
     use crate::utils::test_utils::assert_result_error_with_message;
@@ -726,9 +728,10 @@ mod test {
                 .filter(|f| f.feature_type() == FeatureType::ReaderWriter);
             (
                 // Only add reader_features if reader >= 3 (non-legacy reader mode)
-                (min_reader_version >= 3).then_some(reader_features),
+                (min_reader_version >= TABLE_FEATURES_MIN_READER_VERSION)
+                    .then_some(reader_features),
                 // Only add writer_features if writer >= 7 (non-legacy writer mode)
-                (min_writer_version >= 7).then_some(features),
+                (min_writer_version >= TABLE_FEATURES_MIN_WRITER_VERSION).then_some(features),
             )
         } else {
             (None, None)

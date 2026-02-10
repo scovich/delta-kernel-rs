@@ -7,7 +7,10 @@ use std::sync::{Arc, LazyLock};
 use self::deletion_vector::DeletionVectorDescriptor;
 use crate::expressions::{MapData, Scalar, StructData};
 use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _};
-use crate::table_features::{FeatureType, IntoTableFeature, TableFeature};
+use crate::table_features::{
+    FeatureType, IntoTableFeature, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
+    TABLE_FEATURES_MIN_WRITER_VERSION,
+};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{
@@ -463,8 +466,9 @@ impl Protocol {
 
     /// Validates the relationship between reader features and writer features in the protocol.
     pub(crate) fn validate_table_features(&self) -> DeltaResult<()> {
-        // The protocol states that Reader features may be present if and only if the min_reader_version is 3
-        if self.min_reader_version == 3 {
+        // The protocol states that Reader features may be present if and only if
+        // min_reader_version == TABLE_FEATURES_MIN_READER_VERSION (currently 3)
+        if self.min_reader_version == TABLE_FEATURES_MIN_READER_VERSION {
             require!(
                 self.reader_features.is_some(),
                 Error::invalid_protocol(
@@ -480,8 +484,9 @@ impl Protocol {
             );
         }
 
-        // The protocol states that Writer features may be present if and only if the min_writer_version is 7
-        if self.min_writer_version == 7 {
+        // The protocol states that Writer features may be present if and only if
+        // min_writer_version == TABLE_FEATURES_MIN_WRITER_VERSION (currently 7)
+        if self.min_writer_version == TABLE_FEATURES_MIN_WRITER_VERSION {
             require!(
                 self.writer_features.is_some(),
                 Error::invalid_protocol(

@@ -18,6 +18,12 @@ mod column_mapping;
 mod feature_tests;
 mod timestamp_ntz;
 
+/// Maximum reader protocol version that the kernel can handle.
+pub const MAX_VALID_READER_VERSION: i32 = 3;
+
+/// Maximum writer protocol version that the kernel can handle.
+pub const MAX_VALID_WRITER_VERSION: i32 = 7;
+
 /// Minimum reader version for tables that use table features.
 /// When set to 3, the protocol requires an explicit `readerFeatures` array.
 pub const TABLE_FEATURES_MIN_READER_VERSION: i32 = 3;
