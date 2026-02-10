@@ -1301,7 +1301,7 @@ mod tests {
     #[test]
     fn test_validate_table_features_unknown() {
         // Unknown features are allowed during validation for forward compatibility,
-        // but will be rejected when trying to use the protocol (ensure_operation_supported)
+        // but will be rejected when trying to use the protocol (check_kernel_capabilities)
 
         // Test unknown features in reader - validation passes
         let protocol = Protocol::try_new(

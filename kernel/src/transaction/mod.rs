@@ -308,7 +308,7 @@ impl Transaction {
         // important! before writing to the table we must check it is supported
         read_snapshot
             .table_configuration()
-            .ensure_operation_supported(Operation::Write)?;
+            .check_kernel_capabilities(Operation::Write)?;
 
         // Read clustering columns from snapshot (returns None if clustering not enabled)
         let clustering_columns = read_snapshot.get_clustering_columns(engine)?;

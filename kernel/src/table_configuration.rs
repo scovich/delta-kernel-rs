@@ -67,7 +67,7 @@ pub(crate) enum InCommitTimestampEnablement {
 ///
 /// [`TableConfiguration`] performs checks upon construction with `TableConfiguration::try_new`
 /// to validate that Metadata and Protocol are correctly formatted and mutually compatible.
-/// After construction, call `ensure_operation_supported` to verify that the kernel supports the
+/// After construction, call `check_kernel_capabilities` to verify that the kernel supports the
 /// required operations for the table's protocol features.
 #[internal_api]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -458,7 +458,7 @@ impl TableConfiguration {
     /// - For `Scan` and `Cdf` operations: checks reader version and reader features
     /// - For `Write` operations: checks writer version and writer features
     #[internal_api]
-    pub(crate) fn ensure_operation_supported(&self, operation: Operation) -> DeltaResult<()> {
+    pub(crate) fn check_kernel_capabilities(&self, operation: Operation) -> DeltaResult<()> {
         match operation {
             Operation::Scan | Operation::Cdf => self.ensure_read_supported(operation),
             Operation::Write => self.ensure_write_supported(),
@@ -866,7 +866,7 @@ mod test {
 
         for (table_configuration, result) in cases {
             match (
-                table_configuration.ensure_operation_supported(Operation::Write),
+                table_configuration.check_kernel_capabilities(Operation::Write),
                 result,
             ) {
                 (Ok(()), Ok(())) => { /* Correct result */ }
@@ -1021,7 +1021,7 @@ mod test {
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         table_config
-            .ensure_operation_supported(Operation::Scan)
+            .check_kernel_capabilities(Operation::Scan)
             .expect_err("Unknown feature is not supported in kernel");
     }
     #[test]
@@ -1396,15 +1396,15 @@ mod test {
     }
 
     #[test]
-    fn test_ensure_operation_supported_reads() {
+    fn test_check_kernel_capabilities_reads() {
         let config = create_mock_table_config(&[], &[]);
-        assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
+        assert!(config.check_kernel_capabilities(Operation::Scan).is_ok());
 
         let config = create_mock_table_config(&[], &[TableFeature::V2Checkpoint]);
-        assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
+        assert!(config.check_kernel_capabilities(Operation::Scan).is_ok());
 
         let config = create_mock_table_config_with_version(&[], None, 1, 2);
-        assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
+        assert!(config.check_kernel_capabilities(Operation::Scan).is_ok());
 
         let config = create_mock_table_config_with_version(
             &[],
@@ -1412,11 +1412,11 @@ mod test {
             2,
             7,
         );
-        assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
+        assert!(config.check_kernel_capabilities(Operation::Scan).is_ok());
     }
 
     #[test]
-    fn test_ensure_operation_supported_writes() {
+    fn test_check_kernel_capabilities_writes() {
         let config = create_mock_table_config(
             &[],
             &[
@@ -1427,12 +1427,12 @@ mod test {
                 TableFeature::RowTracking,
             ],
         );
-        assert!(config.ensure_operation_supported(Operation::Write).is_ok());
+        assert!(config.check_kernel_capabilities(Operation::Write).is_ok());
 
         // Type Widening is not supported for writes
         let config = create_mock_table_config(&[], &[TableFeature::TypeWidening]);
         assert_result_error_with_message(
-            config.ensure_operation_supported(Operation::Write),
+            config.check_kernel_capabilities(Operation::Write),
             r#"Feature 'typeWidening' is not supported for writes"#,
         );
     }
@@ -1451,7 +1451,7 @@ mod test {
         let table_root = Url::try_from("file:///").unwrap();
         let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert_result_error_with_message(
-            config.ensure_operation_supported(Operation::Write),
+            config.check_kernel_capabilities(Operation::Write),
             "rowTracking requires domainMetadata to be supported",
         );
     }
@@ -1473,7 +1473,7 @@ mod test {
         let table_root = Url::try_from("file:///").unwrap();
         let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(
-            config.ensure_operation_supported(Operation::Write).is_ok(),
+            config.check_kernel_capabilities(Operation::Write).is_ok(),
             "RowTracking with DomainMetadata should be supported for writes"
         );
     }
@@ -1482,10 +1482,10 @@ mod test {
     #[test]
     fn test_catalog_managed_writes() {
         let config = create_mock_table_config(&[], &[TableFeature::CatalogManaged]);
-        assert!(config.ensure_operation_supported(Operation::Write).is_ok());
+        assert!(config.check_kernel_capabilities(Operation::Write).is_ok());
 
         let config = create_mock_table_config(&[], &[TableFeature::CatalogOwnedPreview]);
-        assert!(config.ensure_operation_supported(Operation::Write).is_ok());
+        assert!(config.check_kernel_capabilities(Operation::Write).is_ok());
     }
 
     /// Helper to create a schema with column mapping metadata using JSON deserialization

@@ -432,7 +432,7 @@ fn run_battery(fixture: &FeatureFixture) {
                 Operation::Write => fixture.capability.write,
             };
 
-            let result = tc.ensure_operation_supported(op);
+            let result = tc.check_kernel_capabilities(op);
             match expected {
                 OpExpect::Ok => {
                     assert!(
@@ -507,7 +507,7 @@ fn assert_dep_violation(
         };
         if checks_feature {
             assert!(
-                tc.ensure_operation_supported(op).is_err(),
+                tc.check_kernel_capabilities(op).is_err(),
                 "{label}: expected {op:?} to fail"
             );
         }

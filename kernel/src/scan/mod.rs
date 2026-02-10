@@ -159,7 +159,7 @@ impl ScanBuilder {
 
         self.snapshot
             .table_configuration()
-            .ensure_operation_supported(Operation::Scan)?;
+            .check_kernel_capabilities(Operation::Scan)?;
 
         let state_info = StateInfo::try_new(
             logical_schema,

@@ -151,7 +151,7 @@ impl TableChanges {
             .build(engine)?;
         start_snapshot
             .table_configuration()
-            .ensure_operation_supported(Operation::Cdf)?;
+            .check_kernel_capabilities(Operation::Cdf)?;
 
         let end_snapshot = match end_version {
             Some(version) => Snapshot::builder_from(start_snapshot.clone())
@@ -161,7 +161,7 @@ impl TableChanges {
         };
         end_snapshot
             .table_configuration()
-            .ensure_operation_supported(Operation::Cdf)?;
+            .check_kernel_capabilities(Operation::Cdf)?;
 
         // Verify CDF is enabled at the beginning and end of the interval using
         // [`check_cdf_table_properties`] to fail early. This also ensures that column mapping is

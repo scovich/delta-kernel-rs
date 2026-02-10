@@ -253,7 +253,7 @@ impl LogReplayScanner {
             // If protocol is updated, check if Change Data Feed is supported
             if has_protocol_update {
                 table_configuration
-                    .ensure_operation_supported(Operation::Cdf)
+                    .check_kernel_capabilities(Operation::Cdf)
                     .map_err(|_| Error::change_data_feed_unsupported(commit_file.version))?;
             }
         }
