@@ -21,8 +21,8 @@ use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructType};
 use crate::table_features::{
     validate_column_mapping, validate_timestamp_ntz_feature_support, ColumnMappingMode,
-    EnablementCheck, FeatureInfo, FeatureRequirement, FeatureType, KernelSupport, Operation,
-    TableFeature, LEGACY_READER_FEATURES, LEGACY_WRITER_FEATURES, MAX_VALID_READER_VERSION,
+    EnablementCheck, FeatureInfo, FeatureRequirement, FeatureType, Operation, TableFeature,
+    LEGACY_READER_FEATURES, LEGACY_WRITER_FEATURES, MAX_VALID_READER_VERSION,
     MAX_VALID_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
@@ -368,19 +368,7 @@ impl TableConfiguration {
         feature: &TableFeature,
         operation: Operation,
     ) -> DeltaResult<()> {
-        let info = feature.info();
-        match &info.kernel_support {
-            KernelSupport::Supported => {}
-            KernelSupport::NotSupported => {
-                return Err(Error::unsupported(format!(
-                    "Feature '{feature}' is not supported"
-                )))
-            }
-            KernelSupport::Custom(check) => {
-                check(&self.protocol, &self.table_properties, operation)?;
-            }
-        };
-
+        feature.check_kernel_support(&self.protocol, &self.table_properties, operation)?;
         self.validate_feature_requirements(feature)
     }
 

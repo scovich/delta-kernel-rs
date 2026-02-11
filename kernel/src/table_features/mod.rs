@@ -607,6 +607,34 @@ impl TableFeature {
         )
     }
 
+    /// Check if the kernel supports this feature for the given operation.
+    ///
+    /// Custom checks always receive the operation and decide for themselves. Standard checks
+    /// (Supported/NotSupported) skip known writer-only features for read operations, because
+    /// writer-only features don't affect readers. Unknown features are conservatively checked.
+    pub(crate) fn check_kernel_support(
+        &self,
+        protocol: &Protocol,
+        props: &TableProperties,
+        operation: Operation,
+    ) -> DeltaResult<()> {
+        // Determine whether this feature is problematic for the requested operation.
+        // The "no problem" cases return early; unsupported cases fall through.
+        match &self.info().kernel_support {
+            KernelSupport::Supported => return Ok(()),
+            KernelSupport::Custom(check) => return check(protocol, props, operation),
+            KernelSupport::NotSupported => {}
+        }
+
+        // Feature is not supported, but readers don't care about unsupported writer-only features.
+        match (operation, self.feature_type()) {
+            (Operation::Write, _) | (_, FeatureType::ReaderWriter | FeatureType::Unknown) => Err(
+                Error::unsupported(format!("Feature '{self}' is not supported when enabled")),
+            ),
+            (Operation::Scan | Operation::Cdf, FeatureType::WriterOnly) => Ok(()),
+        }
+    }
+
     /// Returns rich metadata about this table feature including version requirements,
     /// dependencies, and support status. Unknown features return UNKNOWN_FEATURE_INFO.
     pub(crate) fn info(&self) -> &FeatureInfo {
