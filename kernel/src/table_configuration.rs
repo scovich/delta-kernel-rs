@@ -20,9 +20,9 @@ use crate::scan::data_skipping::stats_schema::{
 use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructType};
 use crate::table_features::{
-    column_mapping_mode, validate_schema_column_mapping, validate_timestamp_ntz_feature_support,
-    ColumnMappingMode, EnablementCheck, FeatureInfo, FeatureRequirement, FeatureType,
-    KernelSupport, Operation, TableFeature, LEGACY_READER_FEATURES, LEGACY_WRITER_FEATURES,
+    validate_column_mapping, validate_timestamp_ntz_feature_support, ColumnMappingMode,
+    EnablementCheck, FeatureInfo, FeatureRequirement, FeatureType, KernelSupport, Operation,
+    TableFeature, LEGACY_READER_FEATURES, LEGACY_WRITER_FEATURES,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
@@ -109,14 +109,9 @@ impl TableConfiguration {
     ) -> DeltaResult<Self> {
         let schema = Arc::new(metadata.parse_schema()?);
         let table_properties = metadata.parse_table_properties();
-        let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
-
-        // validate column mapping mode -- all schema fields should be correctly (un)annotated
-        validate_schema_column_mapping(&schema, column_mapping_mode)?;
-
-        validate_timestamp_ntz_feature_support(&schema, &protocol)?;
-
-        validate_variant_type_feature_support(&schema, &protocol)?;
+        let column_mapping_mode = table_properties
+            .column_mapping_mode
+            .unwrap_or(ColumnMappingMode::None);
 
         let table_config = Self {
             schema,
@@ -127,6 +122,10 @@ impl TableConfiguration {
             table_root,
             version,
         };
+
+        validate_column_mapping(&table_config)?;
+        validate_timestamp_ntz_feature_support(&table_config)?;
+        validate_variant_type_feature_support(&table_config)?;
 
         Ok(table_config)
     }

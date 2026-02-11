@@ -10,8 +10,8 @@ use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error};
 use delta_kernel_derive::internal_api;
 
-pub(crate) use column_mapping::column_mapping_mode;
-pub use column_mapping::{validate_schema_column_mapping, ColumnMappingMode};
+pub(crate) use column_mapping::validate_column_mapping;
+pub use column_mapping::ColumnMappingMode;
 pub(crate) use timestamp_ntz::validate_timestamp_ntz_feature_support;
 mod column_mapping;
 #[cfg(test)]

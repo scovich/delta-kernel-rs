@@ -293,6 +293,25 @@ pub(crate) mod test_utils {
         }
     }
 
+    /// Helper to construct a [`TableConfiguration`] from a schema and protocol, for use in tests
+    /// that need to validate table construction behavior.
+    pub(crate) fn make_test_tc(
+        schema: crate::schema::StructType,
+        protocol: Protocol,
+    ) -> DeltaResult<crate::table_configuration::TableConfiguration> {
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec![],
+            0,
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
+        let table_root = Url::parse("file:///").unwrap();
+        crate::table_configuration::TableConfiguration::try_new(metadata, protocol, table_root, 0)
+    }
+
     /// Helper to get a field from a StructType by name, panicking if not found.
     pub(crate) fn get_schema_field(struct_type: &StructType, name: &str) -> StructField {
         struct_type

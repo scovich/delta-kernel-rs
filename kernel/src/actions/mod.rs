@@ -461,13 +461,6 @@ impl Protocol {
         self.writer_features.as_deref()
     }
 
-    /// True if this protocol has the requested feature
-    pub(crate) fn has_table_feature(&self, feature: &TableFeature) -> bool {
-        // Since each reader features is a subset of writer features, we only check writer feature
-        self.writer_features()
-            .is_some_and(|features| features.contains(feature))
-    }
-
     /// Validates the relationship between reader features and writer features in the protocol.
     pub(crate) fn validate_table_features(&self) -> DeltaResult<()> {
         // The protocol states that Reader features may be present if and only if the min_reader_version is 3

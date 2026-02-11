@@ -575,8 +575,7 @@ impl Snapshot {
     ) -> DeltaResult<Option<Vec<ColumnName>>> {
         if self
             .table_configuration
-            .protocol()
-            .has_table_feature(&TableFeature::ClusteredTable)
+            .is_feature_supported(&TableFeature::ClusteredTable)
         {
             get_clustering_columns(&self.log_segment, engine)
         } else {

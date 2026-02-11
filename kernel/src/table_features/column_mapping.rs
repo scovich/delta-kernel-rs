@@ -1,10 +1,10 @@
 //! Code to handle column mapping, including modes and schema transforms
 use super::TableFeature;
-use crate::actions::Protocol;
 use crate::schema::{
     ColumnName, DataType, MetadataValue, Schema, SchemaTransform, StructField, StructType,
 };
-use crate::table_properties::TableProperties;
+use crate::table_configuration::TableConfiguration;
+use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 use std::borrow::Cow;
@@ -25,27 +25,29 @@ pub enum ColumnMappingMode {
     Name,
 }
 
-/// Determine the column mapping mode for a table based on the [`Protocol`] and [`TableProperties`]
-pub(crate) fn column_mapping_mode(
-    protocol: &Protocol,
-    table_properties: &TableProperties,
-) -> ColumnMappingMode {
-    match (
-        table_properties.column_mapping_mode,
-        protocol.min_reader_version(),
-    ) {
-        // NOTE: The table property is optional even when the feature is supported, and is allowed
-        // (but should be ignored) even when the feature is not supported. For details see
-        // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping
-        (Some(mode), 2) => mode,
-        (Some(mode), 3) if protocol.has_table_feature(&TableFeature::ColumnMapping) => mode,
-        _ => ColumnMappingMode::None,
+/// Validates that the column mapping mode declared by table properties is supported by the
+/// protocol, and that the schema annotations are consistent with that mode.
+pub(crate) fn validate_column_mapping(tc: &TableConfiguration) -> DeltaResult<()> {
+    let mode = tc.column_mapping_mode();
+    if mode != ColumnMappingMode::None {
+        let supported = match tc.protocol().min_reader_version() {
+            2 => true,
+            3 => tc.is_feature_supported(&TableFeature::ColumnMapping),
+            _ => false,
+        };
+        require!(
+            supported,
+            Error::invalid_column_mapping_mode(format!(
+                "Column mapping mode '{mode:?}' is set but the protocol does not support column mapping"
+            ))
+        );
     }
+    validate_schema_column_mapping(&tc.schema(), mode)
 }
 
 /// When column mapping mode is enabled, verify that each field in the schema is annotated with a
 /// physical name and field_id; when not enabled, verify that no fields are annotated.
-pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) -> DeltaResult<()> {
+fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) -> DeltaResult<()> {
     let mut validator = ValidateColumnMappings {
         mode,
         path: vec![],
@@ -163,44 +165,27 @@ impl<'a> SchemaTransform<'a> for ValidateColumnMappings<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actions::{Metadata, Protocol};
     use crate::schema::StructType;
+    use crate::utils::test_utils::assert_result_error_with_message;
     use std::collections::HashMap;
 
     #[test]
-    fn test_column_mapping_mode() {
-        let table_properties: HashMap<_, _> =
-            [("delta.columnMapping.mode".to_string(), "id".to_string())]
-                .into_iter()
-                .collect();
-        let table_properties = TableProperties::from(table_properties.iter());
-        let empty_table_properties = TableProperties::from([] as [(String, String); 0]);
+    fn test_column_mapping_mode_requires_protocol_support() {
+        let annotated_schema = create_schema("5", "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
+        let cmm_props = HashMap::from([("delta.columnMapping.mode".to_string(), "id".to_string())]);
+        let table_root = url::Url::parse("file:///").unwrap();
 
-        let protocol = Protocol::try_new(2, 5, None::<Vec<String>>, None::<Vec<String>>).unwrap();
-
-        assert_eq!(
-            column_mapping_mode(&protocol, &table_properties),
-            ColumnMappingMode::Id
-        );
-
-        assert_eq!(
-            column_mapping_mode(&protocol, &empty_table_properties),
-            ColumnMappingMode::None
-        );
-
-        let empty_features = Some::<[String; 0]>([]);
-        let protocol =
-            Protocol::try_new(3, 7, empty_features.clone(), empty_features.clone()).unwrap();
-
-        assert_eq!(
-            column_mapping_mode(&protocol, &table_properties),
-            ColumnMappingMode::None
-        );
-
-        assert_eq!(
-            column_mapping_mode(&protocol, &empty_table_properties),
-            ColumnMappingMode::None
-        );
-
+        // v3 + ColumnMapping feature + property=id → succeeds
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            annotated_schema.clone(),
+            vec![],
+            0,
+            cmm_props.clone(),
+        )
+        .unwrap();
         let protocol = Protocol::try_new(
             3,
             7,
@@ -208,17 +193,34 @@ mod tests {
             Some([TableFeature::ColumnMapping]),
         )
         .unwrap();
+        let tc = TableConfiguration::try_new(metadata, protocol, table_root.clone(), 0).unwrap();
+        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::Id);
 
-        assert_eq!(
-            column_mapping_mode(&protocol, &table_properties),
-            ColumnMappingMode::Id
+        // v3 + no ColumnMapping feature + property=id → error
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            annotated_schema.clone(),
+            vec![],
+            0,
+            cmm_props.clone(),
+        )
+        .unwrap();
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some::<Vec<String>>(vec![]),
+        )
+        .unwrap();
+        assert_result_error_with_message(
+            TableConfiguration::try_new(metadata, protocol, table_root.clone(), 0),
+            "Column mapping mode",
         );
 
-        assert_eq!(
-            column_mapping_mode(&protocol, &empty_table_properties),
-            ColumnMappingMode::None
-        );
-
+        // v3 + wrong feature only + property=id → error
+        let metadata =
+            Metadata::try_new(None, None, annotated_schema, vec![], 0, cmm_props).unwrap();
         let protocol = Protocol::try_new(
             3,
             7,
@@ -226,33 +228,9 @@ mod tests {
             Some([TableFeature::DeletionVectors]),
         )
         .unwrap();
-
-        assert_eq!(
-            column_mapping_mode(&protocol, &table_properties),
-            ColumnMappingMode::None
-        );
-
-        assert_eq!(
-            column_mapping_mode(&protocol, &empty_table_properties),
-            ColumnMappingMode::None
-        );
-
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
-            Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
-        )
-        .unwrap();
-
-        assert_eq!(
-            column_mapping_mode(&protocol, &table_properties),
-            ColumnMappingMode::Id
-        );
-
-        assert_eq!(
-            column_mapping_mode(&protocol, &empty_table_properties),
-            ColumnMappingMode::None
+        assert_result_error_with_message(
+            TableConfiguration::try_new(metadata, protocol, table_root, 0),
+            "Column mapping mode",
         );
     }
 

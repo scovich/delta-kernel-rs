@@ -1910,8 +1910,7 @@ mod tests {
         // Verify the table does not have the materializePartitionColumns feature
         let has_feature_without = snapshot_without
             .table_configuration()
-            .protocol()
-            .has_table_feature(&TableFeature::MaterializePartitionColumns);
+            .is_feature_supported(&TableFeature::MaterializePartitionColumns);
         assert!(
             !has_feature_without,
             "basic_partitioned should not have materializePartitionColumns feature"
@@ -1961,8 +1960,7 @@ mod tests {
         // Verify the table HAS the materializePartitionColumns feature
         let has_feature_with = snapshot_with
             .table_configuration()
-            .protocol()
-            .has_table_feature(&TableFeature::MaterializePartitionColumns);
+            .is_feature_supported(&TableFeature::MaterializePartitionColumns);
         assert!(
             has_feature_with,
             "partitioned_with_materialize_feature should have materializePartitionColumns feature"
