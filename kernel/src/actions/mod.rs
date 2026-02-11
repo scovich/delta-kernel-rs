@@ -541,7 +541,7 @@ impl Protocol {
                 let check_w = writer_features
                     .iter()
                     .all(|feature| match feature.feature_type() {
-                        FeatureType::Writer | FeatureType::Unknown => true,
+                        FeatureType::WriterOnly | FeatureType::Unknown => true,
                         FeatureType::ReaderWriter => reader_features.contains(feature),
                     });
                 require!(
@@ -559,7 +559,7 @@ impl Protocol {
                 // Unknown features are treated as potentially Writer-only for forward compatibility.
                 let is_valid = writer_features.iter().all(|feature| {
                     match feature.feature_type() {
-                        FeatureType::Writer | FeatureType::Unknown => true,
+                        FeatureType::WriterOnly | FeatureType::Unknown => true,
                         FeatureType::ReaderWriter => {
                             // ColumnMapping is allowed when reader version is 2 (implied support)
                             min_reader_version == 2 && feature == &TableFeature::ColumnMapping

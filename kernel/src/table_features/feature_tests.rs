@@ -587,7 +587,7 @@ const ALL_UNSUPPORTED: CapabilityExpect = CapabilityExpect {
 fn test_append_only() {
     run_battery(&FeatureFixture {
         name: "appendOnly",
-        spec_type: FeatureType::Writer,
+        spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: Some(MinReaderWriterVersion(1, 2)),
         // TODO: infer enablement by metadata presence, not just protocol version
         legacy_enablement_by_presence: false,
@@ -614,7 +614,7 @@ fn test_invariants() {
             )])]);
     run_battery(&FeatureFixture {
         name: "invariants",
-        spec_type: FeatureType::Writer,
+        spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: Some(MinReaderWriterVersion(1, 2)),
         // TODO: infer enablement by metadata presence, not just protocol version
         legacy_enablement_by_presence: false,
@@ -633,7 +633,7 @@ fn test_invariants() {
 fn test_check_constraints() {
     run_battery(&FeatureFixture {
         name: "checkConstraints",
-        spec_type: FeatureType::Writer,
+        spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: Some(MinReaderWriterVersion(1, 3)),
         // TODO: infer enablement by metadata presence, not just protocol version
         legacy_enablement_by_presence: false,
@@ -654,7 +654,7 @@ fn test_check_constraints() {
 fn test_change_data_feed() {
     run_battery(&FeatureFixture {
         name: "changeDataFeed",
-        spec_type: FeatureType::Writer,
+        spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: Some(MinReaderWriterVersion(1, 4)),
         // TODO: infer enablement by metadata presence, not just protocol version
         legacy_enablement_by_presence: false,
@@ -682,7 +682,7 @@ fn test_generated_columns() {
     ]);
     run_battery(&FeatureFixture {
         name: "generatedColumns",
-        spec_type: FeatureType::Writer,
+        spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: Some(MinReaderWriterVersion(1, 4)),
         // TODO: infer enablement by metadata presence, not just protocol version
         legacy_enablement_by_presence: false,
@@ -729,7 +729,7 @@ fn test_identity_columns() {
         ])]);
     run_battery(&FeatureFixture {
         name: "identityColumns",
-        spec_type: FeatureType::Writer,
+        spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: Some(MinReaderWriterVersion(1, 6)),
         // TODO: infer enablement by metadata presence, not just protocol version
         legacy_enablement_by_presence: false,
@@ -772,7 +772,7 @@ fn test_deletion_vectors() {
 fn test_row_tracking() {
     run_battery(&FeatureFixture {
         name: "rowTracking",
-        spec_type: FeatureType::Writer,
+        spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
         presence_schema: None,
@@ -838,7 +838,7 @@ fn test_timestamp_ntz() {
 fn test_domain_metadata() {
     run_battery(&FeatureFixture {
         name: "domainMetadata",
-        spec_type: FeatureType::Writer,
+        spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
         presence_schema: None,
@@ -876,7 +876,7 @@ fn test_v2_checkpoint() {
 fn test_iceberg_compat_v1() {
     run_battery(&FeatureFixture {
         name: "icebergCompatV1",
-        spec_type: FeatureType::Writer,
+        spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
         presence_schema: Some(column_mapping_schema()),
@@ -904,7 +904,7 @@ fn test_iceberg_compat_v1() {
 fn test_iceberg_compat_v2() {
     run_battery(&FeatureFixture {
         name: "icebergCompatV2",
-        spec_type: FeatureType::Writer,
+        spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
         presence_schema: Some(column_mapping_schema()),
@@ -932,7 +932,7 @@ fn test_iceberg_compat_v2() {
 fn test_clustered_table() {
     run_battery(&FeatureFixture {
         name: "clustering",
-        spec_type: FeatureType::Writer,
+        spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
         presence_schema: None,
@@ -966,7 +966,7 @@ fn test_vacuum_protocol_check() {
 fn test_in_commit_timestamp() {
     run_battery(&FeatureFixture {
         name: "inCommitTimestamp",
-        spec_type: FeatureType::Writer,
+        spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
         presence_schema: None,
@@ -1110,7 +1110,7 @@ fn test_type_widening_preview() {
 fn test_materialize_partition_columns() {
     run_battery(&FeatureFixture {
         name: "materializePartitionColumns",
-        spec_type: FeatureType::Writer,
+        spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
         presence_schema: None,
@@ -1174,7 +1174,7 @@ fn test_allow_column_defaults() {
     // Kernel should reject operations on tables with unknown features.
     run_battery(&FeatureFixture {
         name: "allowColumnDefaults",
-        spec_type: FeatureType::Writer,
+        spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
         presence_schema: None,
