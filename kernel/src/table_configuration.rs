@@ -1070,7 +1070,7 @@ mod test {
         let config = create_mock_table_config_with_version(&["delta.appendOnly"], None, 1, 2);
         assert!(config.is_feature_supported(&feature));
 
-        // Legacy (1,2) without presence → still inferred from version alone (no presence checker)
+        // Legacy (1,2) without presence → still supported (version is sufficient)
         let config = create_mock_table_config_with_version(&[], None, 1, 2);
         assert!(config.is_feature_supported(&feature));
 

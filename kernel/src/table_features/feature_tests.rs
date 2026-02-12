@@ -608,8 +608,7 @@ fn test_append_only() {
         name: "appendOnly",
         spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: Some(MinReaderWriterVersion(1, 2)),
-        // TODO: infer enablement by metadata presence, not just protocol version
-        legacy_enablement_by_presence: false,
+        legacy_enablement_by_presence: true,
         presence_schema: None,
         required_deps: &[],
         anti_deps: &[],
@@ -617,8 +616,7 @@ fn test_append_only() {
             PropCase::Enabled(&["delta.appendOnly=true"]),
             PropCase::Disabled(&["delta.appendOnly=false"]),
         ],
-        // TODO: reject metadata presence when feature not in protocol
-        expected_orphan: OpExpect::Ok,
+        expected_orphan: OpExpect::Err,
         capability: ALL_SUPPORTED,
     });
 }
@@ -662,7 +660,7 @@ fn test_check_constraints() {
             PropCase::Enabled(&["delta.constraints.valueInRange=value > 0"]),
             PropCase::Enabled(&[]), // TODO: Should be Disabled
         ],
-        expected_orphan: OpExpect::Ok,
+        expected_orphan: OpExpect::Err,
         capability: READS_ONLY,
     });
 }
@@ -673,8 +671,7 @@ fn test_change_data_feed() {
         name: "changeDataFeed",
         spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: Some(MinReaderWriterVersion(1, 4)),
-        // TODO: infer enablement by metadata presence, not just protocol version
-        legacy_enablement_by_presence: false,
+        legacy_enablement_by_presence: true,
         presence_schema: None,
         required_deps: &[],
         anti_deps: &[],
@@ -682,8 +679,7 @@ fn test_change_data_feed() {
             PropCase::Enabled(&["delta.enableChangeDataFeed=true"]),
             PropCase::Disabled(&["delta.enableChangeDataFeed=false"]),
         ],
-        // TODO: reject metadata presence when feature not in protocol
-        expected_orphan: OpExpect::Ok,
+        expected_orphan: OpExpect::Err,
         capability: ALL_SUPPORTED,
     });
 }
@@ -708,8 +704,7 @@ fn test_generated_columns() {
         anti_deps: &[],
         // No toggle property. Enabled when delta.generationExpression column metadata is present.
         prop_cases: &[],
-        // TODO: reject metadata presence when feature not in protocol
-        expected_orphan: OpExpect::Ok,
+        expected_orphan: OpExpect::Err,
         capability: READS_ONLY,
     });
 }
@@ -754,8 +749,7 @@ fn test_identity_columns() {
         anti_deps: &[],
         // No toggle property. Enabled when delta.identity.* column metadata is present in schema.
         prop_cases: &[],
-        // TODO: reject metadata presence when feature not in protocol
-        expected_orphan: OpExpect::Ok,
+        expected_orphan: OpExpect::Err,
         capability: READS_ONLY,
     });
 }

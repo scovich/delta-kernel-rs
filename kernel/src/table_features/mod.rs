@@ -443,8 +443,8 @@ static APPEND_ONLY_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: Some(MinReaderWriterVersion(1, 2)),
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
-    presence_check: None,
-    metadata_description: "",
+    presence_check: Some(|_s, p| Ok(p.append_only.is_some())),
+    metadata_description: "append-only property",
     enablement_check: EnablementCheck::EnabledIf(|props| props.append_only == Some(true)),
 };
 
@@ -462,10 +462,12 @@ static CHECK_CONSTRAINTS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: Some(MinReaderWriterVersion(1, 3)),
     feature_requirements: &[],
-    kernel_support: KernelSupport::NotSupported,
-    // TODO: Add presence checker for delta.constraints.* properties and upgrade to NotSupportedIfPresent.
-    presence_check: None,
-    metadata_description: "",
+    kernel_support: KernelSupport::NotSupportedIfPresent,
+    presence_check: Some(|_s, p| {
+        let mut keys = p.unknown_properties.keys();
+        Ok(keys.any(|k| k.starts_with("delta.constraints.")))
+    }),
+    metadata_description: "check constraint properties",
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -474,8 +476,8 @@ static CHANGE_DATA_FEED_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: Some(MinReaderWriterVersion(1, 4)),
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
-    presence_check: None,
-    metadata_description: "",
+    presence_check: Some(|_s, p| Ok(p.enable_change_data_feed.is_some())),
+    metadata_description: "change data feed property",
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_change_data_feed == Some(true)
     }),
@@ -485,10 +487,9 @@ static GENERATED_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: Some(MinReaderWriterVersion(1, 4)),
     feature_requirements: &[],
-    kernel_support: KernelSupport::NotSupported,
-    // TODO: Add presence checker for delta.generationExpression metadata and upgrade to NotSupportedIfPresent.
-    presence_check: None,
-    metadata_description: "",
+    kernel_support: KernelSupport::NotSupportedIfPresent,
+    presence_check: Some(|s, _p| Ok(crate::schema::has_generation_expressions(s))),
+    metadata_description: "generation expression annotations",
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -496,10 +497,9 @@ static IDENTITY_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: Some(MinReaderWriterVersion(1, 6)),
     feature_requirements: &[],
-    kernel_support: KernelSupport::NotSupported,
-    // TODO: Add presence checker for delta.identity.* column metadata and upgrade to NotSupportedIfPresent.
-    presence_check: None,
-    metadata_description: "",
+    kernel_support: KernelSupport::NotSupportedIfPresent,
+    presence_check: Some(|s, _p| Ok(crate::schema::has_identity_columns(s))),
+    metadata_description: "identity column annotations",
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 

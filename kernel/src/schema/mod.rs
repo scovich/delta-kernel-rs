@@ -1099,6 +1099,56 @@ impl InvariantChecker {
     }
 }
 
+/// Schema visitor that checks for `delta.generationExpression` field metadata.
+#[derive(Debug, Default)]
+struct GenerationExpressionChecker(bool);
+
+impl<'a> SchemaTransform<'a> for GenerationExpressionChecker {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+        if !self.0 {
+            let key = ColumnMetadataKey::GenerationExpression.as_ref();
+            if field.metadata.contains_key(key) {
+                self.0 = true;
+            } else {
+                let _ = self.recurse_into_struct_field(field);
+            }
+        }
+        Some(Cow::Borrowed(field))
+    }
+}
+
+/// Returns true if any column in the schema has a generation expression annotation.
+pub(crate) fn has_generation_expressions(schema: &Schema) -> bool {
+    let mut checker = GenerationExpressionChecker::default();
+    let _ = checker.transform_struct(schema);
+    checker.0
+}
+
+/// Schema visitor that checks for `delta.identity.*` field metadata.
+#[derive(Debug, Default)]
+struct IdentityColumnChecker(bool);
+
+impl<'a> SchemaTransform<'a> for IdentityColumnChecker {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+        if !self.0 {
+            let mut keys = field.metadata.keys();
+            if keys.any(|k| k.starts_with("delta.identity.")) {
+                self.0 = true;
+            } else {
+                let _ = self.recurse_into_struct_field(field);
+            }
+        }
+        Some(Cow::Borrowed(field))
+    }
+}
+
+/// Returns true if any column in the schema has identity column annotations.
+pub(crate) fn has_identity_columns(schema: &Schema) -> bool {
+    let mut checker = IdentityColumnChecker::default();
+    let _ = checker.transform_struct(schema);
+    checker.0
+}
+
 /// Helper for RowVisitor implementations
 #[internal_api]
 #[derive(Clone, Default)]
