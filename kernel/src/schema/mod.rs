@@ -1149,6 +1149,30 @@ pub(crate) fn has_identity_columns(schema: &Schema) -> bool {
     checker.0
 }
 
+/// Schema visitor that checks for `delta.typeChanges` field metadata.
+#[derive(Debug, Default)]
+struct TypeChangesChecker(bool);
+
+impl<'a> SchemaTransform<'a> for TypeChangesChecker {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+        if !self.0 {
+            if field.metadata.contains_key("delta.typeChanges") {
+                self.0 = true;
+            } else {
+                let _ = self.recurse_into_struct_field(field);
+            }
+        }
+        Some(Cow::Borrowed(field))
+    }
+}
+
+/// Returns true if any column in the schema has type widening change annotations.
+pub(crate) fn has_type_changes(schema: &Schema) -> bool {
+    let mut checker = TypeChangesChecker::default();
+    let _ = checker.transform_struct(schema);
+    checker.0
+}
+
 /// Helper for RowVisitor implementations
 #[internal_api]
 #[derive(Clone, Default)]

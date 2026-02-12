@@ -686,9 +686,7 @@ impl Snapshot {
     /// - `Err(...)` - ICT is enabled but cannot be read, or enablement version is invalid
     pub(crate) fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
         // Get ICT enablement info and check if we should read ICT for this version
-        let enablement = self
-            .table_configuration()
-            .in_commit_timestamp_enablement()?;
+        let enablement = self.table_configuration().in_commit_timestamp_enablement();
 
         // Return None if ICT is not enabled at all
         if matches!(enablement, InCommitTimestampEnablement::NotEnabled) {

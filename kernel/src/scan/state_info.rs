@@ -663,7 +663,7 @@ pub(crate) mod tests {
         );
         assert_result_error_with_message(res, "Unsupported: Row ids are not enabled on this table");
 
-        // Row tracking enabled but missing materializedRowIdColumnName → error
+        // Row tracking enabled but missing materialized column names → error
         let res = get_state_info_with_features(
             schema,
             vec![],
@@ -674,7 +674,7 @@ pub(crate) mod tests {
         );
         assert_result_error_with_message(
             res,
-            "Generic delta kernel error: No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration",
+            "Row tracking toggle and materialized column names must be present together",
         );
     }
 

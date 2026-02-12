@@ -167,6 +167,85 @@ pub(crate) enum FeatureType {
     Unknown,
 }
 
+// -- Named presence checker functions --
+// Complex checkers that warrant a named function use the full PresenceCheckFn signature.
+// Trivial one-liners are registered as inline closures directly in FeatureInfo.
+
+/// Determine whether row tracking metadata is present.
+///
+/// Returns:
+/// - Ok(true) if any row tracking properties exist (primary toggle or auxiliary configs)
+/// - Ok(false) if no row tracking properties exist
+/// - Err if metadata is malformed:
+///   - Auxiliary configs without the primary toggle (orphaned metadata)
+///   - Materialized column names missing when row tracking is enabled (both are required)
+// TODO: Requires DomainMetadata access, which TableConfiguration doesn't have yet.
+fn row_tracking_presence(_schema: &Schema, props: &TableProperties) -> DeltaResult<bool> {
+    let has_toggle = props.enable_row_tracking.is_some();
+    let has_materialized_id = props.materialized_row_id_column_name.is_some();
+    if has_materialized_id != props.materialized_row_commit_version_column_name.is_some() {
+        return Err(Error::invalid_protocol(
+            "Row tracking materializedRowIdColumnName and \
+             materializedRowCommitVersionColumnName must both be present or both be absent",
+        ));
+    }
+    if has_materialized_id != has_toggle {
+        return Err(Error::invalid_protocol(
+            "Row tracking toggle and materialized column names must be present together",
+        ));
+    }
+    if !has_toggle && props.row_tracking_suspended.is_some() {
+        return Err(Error::invalid_protocol(
+            "Table has delta.rowTrackingSuspended without delta.enableRowTracking",
+        ));
+    }
+    Ok(has_toggle)
+}
+
+/// Determine whether in-commit timestamp metadata is present.
+///
+/// Returns:
+/// - Ok(true) if any ICT properties exist (primary toggle or auxiliary configs)
+/// - Ok(false) if no ICT properties exist
+/// - Err if metadata is malformed:
+///   - Auxiliary configs without the primary toggle (orphaned metadata)
+///   - Only one of enablementVersion/enablementTimestamp present (must be paired)
+fn ict_presence(_schema: &Schema, props: &TableProperties) -> DeltaResult<bool> {
+    let has_toggle = props.enable_in_commit_timestamps.is_some();
+    let has_version = props.in_commit_timestamp_enablement_version.is_some();
+    if has_version != props.in_commit_timestamp_enablement_timestamp.is_some() {
+        return Err(Error::invalid_protocol(
+            "In-commit timestamp enablementVersion and enablementTimestamp must both be \
+             present or both be absent",
+        ));
+    }
+    if has_version && !has_toggle {
+        return Err(Error::invalid_protocol(
+            "Table has in-commit timestamp auxiliary properties \
+             (enablementVersion/enablementTimestamp) without delta.enableInCommitTimestamps",
+        ));
+    }
+
+    Ok(has_toggle)
+}
+
+/// Determine whether type widening metadata is present.
+///
+/// Returns:
+/// - Ok(true) if the delta.enableTypeWidening property or delta.typeChanges annotations exist
+/// - Ok(false) if neither is present
+/// - Err if schema has typeChanges annotations but the property is absent (orphaned annotations)
+fn type_widening_presence(schema: &Schema, props: &TableProperties) -> DeltaResult<bool> {
+    let has_property = props.enable_type_widening.is_some();
+    let has_annotations = crate::schema::has_type_changes(schema);
+    if has_annotations && !has_property {
+        return Err(Error::invalid_protocol(
+            "Table has delta.typeChanges schema annotations without delta.enableTypeWidening",
+        ));
+    }
+    Ok(has_property || has_annotations)
+}
+
 /// Build a single effective feature list from protocol + schema + properties.
 ///
 /// This is the **narrow waist** for feature validation: it builds the canonical list of
@@ -380,6 +459,15 @@ static FEATURE_GROUPS: &[FeatureGroup] = &[
         presence_check: |s, _p| Ok(crate::schema::variant_utils::schema_uses_variant(s)),
         metadata_description: "VARIANT columns",
     },
+    // TypeWidening and TypeWideningPreview share the delta.enableTypeWidening property.
+    FeatureGroup {
+        members: &[
+            TableFeature::TypeWidening,
+            TableFeature::TypeWideningPreview,
+        ],
+        presence_check: type_widening_presence,
+        metadata_description: "type widening property",
+    },
 ];
 
 /// Minimum protocol versions for legacy (pre-feature-list) inference.
@@ -510,8 +598,8 @@ static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
     kernel_support: KernelSupport::Custom(|_protocol, _properties, operation| match operation {
         Operation::Scan | Operation::Write | Operation::Cdf => Ok(()),
     }),
-    presence_check: None,
-    metadata_description: "",
+    presence_check: Some(ict_presence),
+    metadata_description: "in-commit timestamp properties",
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_in_commit_timestamps == Some(true)
     }),
@@ -522,8 +610,8 @@ static ROW_TRACKING_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[FeatureRequirement::Enabled(TableFeature::DomainMetadata)],
     kernel_support: KernelSupport::Supported,
-    presence_check: None,
-    metadata_description: "",
+    presence_check: Some(row_tracking_presence),
+    metadata_description: "row tracking properties",
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_row_tracking == Some(true) && props.row_tracking_suspended != Some(true)
     }),
@@ -552,9 +640,9 @@ static ICEBERG_COMPAT_V1_INFO: FeatureInfo = FeatureInfo {
         FeatureRequirement::Enabled(TableFeature::ColumnMapping),
         FeatureRequirement::NotSupported(TableFeature::DeletionVectors),
     ],
-    kernel_support: KernelSupport::NotSupported,
-    presence_check: None,
-    metadata_description: "",
+    kernel_support: KernelSupport::NotSupportedIfPresent,
+    presence_check: Some(|_s, p| Ok(p.enable_iceberg_compat_v1.is_some())),
+    metadata_description: "iceberg compat v1 property",
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_iceberg_compat_v1 == Some(true)
     }),
@@ -574,9 +662,9 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
         FeatureRequirement::NotSupported(TableFeature::IcebergCompatV1),
         FeatureRequirement::NotSupported(TableFeature::DeletionVectors),
     ],
-    kernel_support: KernelSupport::NotSupported,
-    presence_check: None,
-    metadata_description: "",
+    kernel_support: KernelSupport::NotSupportedIfPresent,
+    presence_check: Some(|_s, p| Ok(p.enable_iceberg_compat_v2.is_some())),
+    metadata_description: "iceberg compat v2 property",
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_iceberg_compat_v2 == Some(true)
     }),
@@ -667,8 +755,8 @@ static DELETION_VECTORS_INFO: FeatureInfo = FeatureInfo {
     // We support writing to tables with DeletionVectors enabled, but we never write DV files
     // ourselves (no DML). The kernel only performs append operations.
     kernel_support: KernelSupport::Supported,
-    presence_check: None,
-    metadata_description: "",
+    presence_check: Some(|_s, p| Ok(p.enable_deletion_vectors.is_some())),
+    metadata_description: "deletion vector metadata",
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_deletion_vectors == Some(true)
     }),
@@ -723,9 +811,8 @@ static V2_CHECKPOINT_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
-    // No metadata traces — checkpoint format is not a schema/property concern.
-    presence_check: None,
-    metadata_description: "",
+    presence_check: Some(|_s, p| Ok(p.checkpoint_policy.is_some())),
+    metadata_description: "checkpoint policy property",
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 

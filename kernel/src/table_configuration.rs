@@ -73,7 +73,6 @@ pub(crate) struct TableConfiguration {
     protocol: Protocol,
     schema: SchemaRef,
     table_properties: TableProperties,
-    column_mapping_mode: ColumnMappingMode,
     /// Effective feature list derived from protocol lists (if present) and/or legacy
     /// version inference with presence checks. Downstream code should use this list
     /// via `is_feature_supported` rather than inspecting protocol lists directly.
@@ -118,19 +117,11 @@ impl TableConfiguration {
         let table_properties = metadata.parse_table_properties();
         let effective_features = build_effective_features(&protocol, &schema, &table_properties)?;
 
-        // Safe to read the property directly: if column mapping mode is set to id/name but the
-        // ColumnMapping feature is not in the effective set, build_effective_features would have
-        // already rejected the table as an orphaned metadata violation.
-        let column_mapping_mode = table_properties
-            .column_mapping_mode
-            .unwrap_or(ColumnMappingMode::None);
-
         let table_config = Self {
             schema,
             metadata,
             protocol,
             table_properties,
-            column_mapping_mode,
             effective_features,
             table_root,
             version,
@@ -313,7 +304,11 @@ impl TableConfiguration {
     /// The [`ColumnMappingMode`] for this table at this version.
     #[internal_api]
     pub(crate) fn column_mapping_mode(&self) -> ColumnMappingMode {
-        self.column_mapping_mode
+        // This is safe to compute from the property alone because `build_effective_features`
+        // already validated that the column mapping metadata is consistent with the protocol.
+        self.table_properties
+            .column_mapping_mode
+            .unwrap_or(ColumnMappingMode::None)
     }
 
     /// The [`Url`] of the table this [`TableConfiguration`] belongs to
@@ -373,15 +368,12 @@ impl TableConfiguration {
     }
 
     /// Returns information about in-commit timestamp enablement state.
-    ///
-    /// Returns an error if only one of the enablement properties is present, as this indicates
-    /// an inconsistent state.
     #[allow(unused)]
-    pub(crate) fn in_commit_timestamp_enablement(
-        &self,
-    ) -> DeltaResult<InCommitTimestampEnablement> {
+    pub(crate) fn in_commit_timestamp_enablement(&self) -> InCommitTimestampEnablement {
+        // This uses simple logic because the ICT presence checker (called during
+        // `build_effective_features`) already validated property consistency.
         if !self.is_feature_enabled(&TableFeature::InCommitTimestamp) {
-            return Ok(InCommitTimestampEnablement::NotEnabled);
+            return InCommitTimestampEnablement::NotEnabled;
         }
 
         let enablement_version = self
@@ -390,21 +382,8 @@ impl TableConfiguration {
         let enablement_timestamp = self
             .table_properties()
             .in_commit_timestamp_enablement_timestamp;
-
-        match (enablement_version, enablement_timestamp) {
-            (Some(version), Some(timestamp)) => Ok(InCommitTimestampEnablement::Enabled {
-                enablement: Some((version, timestamp)),
-            }),
-            (Some(_), None) => Err(Error::generic(
-                "In-commit timestamp enabled, but enablement timestamp is missing",
-            )),
-            (None, Some(_)) => Err(Error::generic(
-                "In-commit timestamp enabled, but enablement version is missing",
-            )),
-            // If InCommitTimestamps was enabled at the beginning of the table's history,
-            // it may have an empty enablement version and timestamp
-            (None, None) => Ok(InCommitTimestampEnablement::Enabled { enablement: None }),
-        }
+        let enablement = enablement_version.zip(enablement_timestamp);
+        InCommitTimestampEnablement::Enabled { enablement }
     }
 
     /// Returns `true` if row tracking is suspended for this table.
@@ -704,9 +683,8 @@ mod test {
         assert!(table_config.is_feature_enabled(&TableFeature::InCommitTimestamp));
         // When ICT is enabled from table creation (version 0), it's perfectly normal
         // for enablement properties to be missing
-        let info = table_config.in_commit_timestamp_enablement().unwrap();
         assert_eq!(
-            info,
+            table_config.in_commit_timestamp_enablement(),
             InCommitTimestampEnablement::Enabled { enablement: None }
         );
     }
@@ -746,9 +724,8 @@ mod test {
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
         assert!(table_config.is_feature_enabled(&TableFeature::InCommitTimestamp));
-        let info = table_config.in_commit_timestamp_enablement().unwrap();
         assert_eq!(
-            info,
+            table_config.in_commit_timestamp_enablement(),
             InCommitTimestampEnablement::Enabled {
                 enablement: Some((5, 100))
             }
@@ -784,13 +761,12 @@ mod test {
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
-        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
-        assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
-        assert!(table_config.is_feature_enabled(&TableFeature::InCommitTimestamp));
-        assert!(matches!(
-            table_config.in_commit_timestamp_enablement(),
-            Err(Error::Generic(msg)) if msg.contains("In-commit timestamp enabled, but enablement timestamp is missing")
-        ));
+        let err = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("enablementVersion and enablementTimestamp must both be present"),
+            "Expected pairing error, got: {err}"
+        );
     }
     #[test]
     fn ict_supported_and_not_enabled() {
@@ -807,7 +783,7 @@ mod test {
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
         assert!(!table_config.is_feature_enabled(&TableFeature::InCommitTimestamp));
-        let info = table_config.in_commit_timestamp_enablement().unwrap();
+        let info = table_config.in_commit_timestamp_enablement();
         assert_eq!(info, InCommitTimestampEnablement::NotEnabled);
     }
     #[test]

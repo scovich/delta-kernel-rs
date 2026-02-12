@@ -772,8 +772,7 @@ fn test_deletion_vectors() {
             PropCase::Enabled(&["delta.enableDeletionVectors=true"]),
             PropCase::Disabled(&["delta.enableDeletionVectors=false"]),
         ],
-        // TODO: reject metadata presence when feature not in protocol
-        expected_orphan: OpExpect::Ok,
+        expected_orphan: OpExpect::Err,
         capability: ALL_SUPPORTED,
     });
 }
@@ -815,8 +814,7 @@ fn test_row_tracking() {
                 "delta.rowTracking.materializedRowCommitVersionColumnName=_row-cv",
             ]),
         ],
-        // TODO: reject metadata presence when feature not in protocol
-        expected_orphan: OpExpect::Ok,
+        expected_orphan: OpExpect::Err,
         capability: ALL_SUPPORTED,
     });
 }
@@ -876,8 +874,7 @@ fn test_v2_checkpoint() {
             PropCase::Enabled(&["delta.checkpointPolicy=v2"]),
             PropCase::Enabled(&[]),
         ],
-        // TODO: reject metadata presence when feature not in protocol
-        expected_orphan: OpExpect::Ok,
+        expected_orphan: OpExpect::Err,
         capability: ALL_SUPPORTED,
     });
 }
@@ -991,15 +988,13 @@ fn test_in_commit_timestamp() {
                 "delta.inCommitTimestampEnablementVersion=1",
                 "delta.inCommitTimestampEnablementTimestamp=12345",
             ]),
-            // TODO: should be Error (unpaired aux property), but pairing is not
-            // currently validated at construction time -- only at query time.
-            PropCase::Enabled(&[
+            // Unpaired auxiliary property: rejected at construction.
+            PropCase::Error(&[
                 "delta.enableInCommitTimestamps=true",
                 "delta.inCommitTimestampEnablementVersion=1",
             ]),
         ],
-        // TODO: reject metadata presence when feature not in protocol
-        expected_orphan: OpExpect::Ok,
+        expected_orphan: OpExpect::Err,
         capability: ALL_SUPPORTED,
     });
 }
@@ -1090,8 +1085,7 @@ fn test_type_widening() {
             PropCase::Enabled(&["delta.enableTypeWidening=true"]),
             PropCase::Disabled(&["delta.enableTypeWidening=false"]),
         ],
-        // TODO: reject metadata presence when feature not in protocol
-        expected_orphan: OpExpect::Ok,
+        expected_orphan: OpExpect::Err,
         capability: READS_ONLY,
     });
 }
@@ -1110,8 +1104,7 @@ fn test_type_widening_preview() {
             PropCase::Enabled(&["delta.enableTypeWidening=true"]),
             PropCase::Disabled(&["delta.enableTypeWidening=false"]),
         ],
-        // TODO: reject metadata presence when feature not in protocol
-        expected_orphan: OpExpect::Ok,
+        expected_orphan: OpExpect::Err,
         capability: READS_ONLY,
     });
 }
