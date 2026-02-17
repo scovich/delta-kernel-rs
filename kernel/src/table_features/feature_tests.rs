@@ -78,12 +78,6 @@ struct FeatureFixture {
     /// Legacy protocol versions if this is a legacy feature.
     /// `None` for modern-only features. Controls whether legacy battery tests apply.
     spec_legacy_versions: Option<MinReaderWriterVersion>,
-    /// Whether legacy enablement depends on metadata presence (schema annotations or properties).
-    /// `false`: feature has no presence checker yet, so enablement cannot be tested at legacy version.
-    /// `true`: presence checker exists; legacy version + no presence = supported but NOT enabled.
-    /// Only meaningful when `spec_legacy_versions` is `Some`. Delete once all legacy features
-    /// have presence checkers (at which point all would be `true`).
-    legacy_enablement_by_presence: bool,
     /// Schema with annotations that make the feature "present" (for schema-based features).
     /// The harness combines this with Enabled prop_cases when constructing TCs.
     presence_schema: Option<StructType>,
@@ -351,7 +345,7 @@ fn run_battery(fixture: &FeatureFixture) {
              expected is_feature_supported = true"
         );
         assert!(
-            !fixture.legacy_enablement_by_presence || !tc.is_feature_enabled(&feature),
+            !tc.is_feature_enabled(&feature),
             "{name}: legacy version only ({legacy_reader},{legacy_writer}): \
              expected is_feature_enabled = false (no presence)"
         );
@@ -608,7 +602,6 @@ fn test_append_only() {
         name: "appendOnly",
         spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: Some(MinReaderWriterVersion(1, 2)),
-        legacy_enablement_by_presence: true,
         presence_schema: None,
         required_deps: &[],
         anti_deps: &[],
@@ -633,7 +626,6 @@ fn test_invariants() {
         name: "invariants",
         spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: Some(MinReaderWriterVersion(1, 2)),
-        legacy_enablement_by_presence: true,
         presence_schema: Some(invariants_schema),
         required_deps: &[],
         anti_deps: &[],
@@ -650,7 +642,6 @@ fn test_check_constraints() {
         name: "checkConstraints",
         spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: Some(MinReaderWriterVersion(1, 3)),
-        legacy_enablement_by_presence: true,
         presence_schema: None,
         required_deps: &[],
         anti_deps: &[],
@@ -670,7 +661,6 @@ fn test_change_data_feed() {
         name: "changeDataFeed",
         spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: Some(MinReaderWriterVersion(1, 4)),
-        legacy_enablement_by_presence: true,
         presence_schema: None,
         required_deps: &[],
         anti_deps: &[],
@@ -696,7 +686,6 @@ fn test_generated_columns() {
         name: "generatedColumns",
         spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: Some(MinReaderWriterVersion(1, 4)),
-        legacy_enablement_by_presence: true,
         presence_schema: Some(gen_schema),
         required_deps: &[],
         anti_deps: &[],
@@ -713,7 +702,6 @@ fn test_column_mapping() {
         name: "columnMapping",
         spec_type: FeatureType::ReaderWriter,
         spec_legacy_versions: Some(MinReaderWriterVersion(2, 5)),
-        legacy_enablement_by_presence: true,
         presence_schema: Some(column_mapping_schema()),
         required_deps: &[],
         anti_deps: &[],
@@ -740,7 +728,6 @@ fn test_identity_columns() {
         name: "identityColumns",
         spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: Some(MinReaderWriterVersion(1, 6)),
-        legacy_enablement_by_presence: true,
         presence_schema: Some(identity_schema),
         required_deps: &[],
         anti_deps: &[],
@@ -761,7 +748,6 @@ fn test_deletion_vectors() {
         name: "deletionVectors",
         spec_type: FeatureType::ReaderWriter,
         spec_legacy_versions: None,
-        legacy_enablement_by_presence: false,
         presence_schema: None,
         required_deps: &[],
         anti_deps: &[],
@@ -780,7 +766,6 @@ fn test_row_tracking() {
         name: "rowTracking",
         spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: None,
-        legacy_enablement_by_presence: false,
         presence_schema: None,
         required_deps: &["domainMetadata"],
         anti_deps: &[],
@@ -827,7 +812,6 @@ fn test_timestamp_ntz() {
         name: "timestampNtz",
         spec_type: FeatureType::ReaderWriter,
         spec_legacy_versions: None,
-        legacy_enablement_by_presence: false,
         presence_schema: Some(ntz_schema),
         required_deps: &[],
         anti_deps: &[],
@@ -845,7 +829,6 @@ fn test_domain_metadata() {
         name: "domainMetadata",
         spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: None,
-        legacy_enablement_by_presence: false,
         presence_schema: None,
         required_deps: &[],
         anti_deps: &[],
@@ -862,7 +845,6 @@ fn test_v2_checkpoint() {
         name: "v2Checkpoint",
         spec_type: FeatureType::ReaderWriter,
         spec_legacy_versions: None,
-        legacy_enablement_by_presence: false,
         presence_schema: None,
         required_deps: &[],
         anti_deps: &[],
@@ -882,7 +864,6 @@ fn test_iceberg_compat_v1() {
         name: "icebergCompatV1",
         spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: None,
-        legacy_enablement_by_presence: false,
         presence_schema: Some(column_mapping_schema()),
         // IcebergCompatV1 requires column mapping enabled in name or id mode.
         // Also requires DeletionVectors NOT supported.
@@ -910,7 +891,6 @@ fn test_iceberg_compat_v2() {
         name: "icebergCompatV2",
         spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: None,
-        legacy_enablement_by_presence: false,
         presence_schema: Some(column_mapping_schema()),
         // IcebergCompatV2 requires column mapping enabled in name or id mode.
         // Requires DeletionVectors NOT supported, IcebergCompatV1 NOT enabled.
@@ -938,7 +918,6 @@ fn test_clustered_table() {
         name: "clustering",
         spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: None,
-        legacy_enablement_by_presence: false,
         presence_schema: None,
         required_deps: &["domainMetadata"],
         anti_deps: &[],
@@ -955,7 +934,6 @@ fn test_vacuum_protocol_check() {
         name: "vacuumProtocolCheck",
         spec_type: FeatureType::ReaderWriter,
         spec_legacy_versions: None,
-        legacy_enablement_by_presence: false,
         presence_schema: None,
         required_deps: &[],
         anti_deps: &[],
@@ -972,7 +950,6 @@ fn test_in_commit_timestamp() {
         name: "inCommitTimestamp",
         spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: None,
-        legacy_enablement_by_presence: false,
         presence_schema: None,
         required_deps: &[],
         anti_deps: &[],
@@ -1002,7 +979,6 @@ fn test_variant_type() {
         name: "variantType",
         spec_type: FeatureType::ReaderWriter,
         spec_legacy_versions: None,
-        legacy_enablement_by_presence: false,
         presence_schema: Some(variant_schema()),
         required_deps: &[],
         anti_deps: &[],
@@ -1020,7 +996,6 @@ fn test_variant_type_preview() {
         name: "variantType-preview",
         spec_type: FeatureType::ReaderWriter,
         spec_legacy_versions: None,
-        legacy_enablement_by_presence: false,
         presence_schema: Some(variant_schema()),
         required_deps: &[],
         anti_deps: &[],
@@ -1040,7 +1015,6 @@ fn test_variant_shredding_preview_with_variant_type() {
         name: "variantShredding-preview",
         spec_type: FeatureType::ReaderWriter,
         spec_legacy_versions: None,
-        legacy_enablement_by_presence: false,
         presence_schema: Some(variant_schema()),
         required_deps: &["variantType"],
         anti_deps: &[],
@@ -1057,7 +1031,6 @@ fn test_variant_shredding_preview_with_variant_type_preview() {
         name: "variantShredding-preview",
         spec_type: FeatureType::ReaderWriter,
         spec_legacy_versions: None,
-        legacy_enablement_by_presence: false,
         presence_schema: Some(variant_schema()),
         required_deps: &["variantType-preview"],
         anti_deps: &[],
@@ -1074,7 +1047,6 @@ fn test_type_widening() {
         name: "typeWidening",
         spec_type: FeatureType::ReaderWriter,
         spec_legacy_versions: None,
-        legacy_enablement_by_presence: false,
         presence_schema: Some(type_widened_schema()),
         required_deps: &[],
         anti_deps: &[],
@@ -1093,7 +1065,6 @@ fn test_type_widening_preview() {
         name: "typeWidening-preview",
         spec_type: FeatureType::ReaderWriter,
         spec_legacy_versions: None,
-        legacy_enablement_by_presence: false,
         presence_schema: Some(type_widened_schema()),
         required_deps: &[],
         anti_deps: &[],
@@ -1112,7 +1083,6 @@ fn test_materialize_partition_columns() {
         name: "materializePartitionColumns",
         spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: None,
-        legacy_enablement_by_presence: false,
         presence_schema: None,
         required_deps: &[],
         anti_deps: &[],
@@ -1129,7 +1099,6 @@ fn test_catalog_managed() {
         name: "catalogManaged",
         spec_type: FeatureType::ReaderWriter,
         spec_legacy_versions: None,
-        legacy_enablement_by_presence: false,
         presence_schema: None,
         required_deps: &[],
         anti_deps: &[],
@@ -1151,7 +1120,6 @@ fn test_catalog_owned_preview() {
         name: "catalogOwned-preview",
         spec_type: FeatureType::ReaderWriter,
         spec_legacy_versions: None,
-        legacy_enablement_by_presence: false,
         presence_schema: None,
         required_deps: &[],
         anti_deps: &[],
@@ -1176,7 +1144,6 @@ fn test_allow_column_defaults() {
         name: "allowColumnDefaults",
         spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: None,
-        legacy_enablement_by_presence: false,
         presence_schema: None,
         required_deps: &[],
         anti_deps: &[],
