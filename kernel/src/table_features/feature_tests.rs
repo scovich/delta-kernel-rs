@@ -202,6 +202,7 @@ fn try_create_table_config(
 }
 
 /// Convenience: create TC that must succeed, panicking on failure.
+#[track_caller]
 fn create_table_config(
     feature_names: &[&str],
     raw_props: &[&str],
@@ -457,7 +458,7 @@ fn run_battery(fixture: &FeatureFixture) {
     // regardless of the operation to be performed. When construction doesn't catch it, we verify
     // that operations which exercise the feature are rejected, based on feature type.
     {
-        // G1: Missing required dep -> should be rejected
+        // G1a: Missing required dep -> should be rejected
         for missing_dep in fixture.required_deps.iter() {
             let without_dep: Vec<&str> = all_feature_names
                 .iter()
@@ -470,6 +471,24 @@ fn run_battery(fixture: &FeatureFixture) {
                 fixture.spec_type,
                 try_create_table_config(&without_dep, enabled_props, schema_ref, 3, 7),
             );
+        }
+
+        // G1b: Verify deps are enabled (not merely supported) when feature is enabled.
+        // This catches cases where the kernel only checks Supported instead of Enabled,
+        // and also validates that the fixture's enabled_props correctly enable all deps.
+        if !fixture.required_deps.is_empty() {
+            let tc = create_table_config(&all_feature_names, enabled_props, schema_ref, 3, 7);
+            assert!(
+                tc.is_feature_enabled(&feature),
+                "{name}: expected feature to be enabled with enabled_props"
+            );
+            for dep_name in fixture.required_deps.iter() {
+                assert!(
+                    tc.is_feature_enabled(&dep_name.into_table_feature()),
+                    "{name}: dep '{dep_name}' must be enabled (not merely supported) \
+                     when feature is enabled"
+                );
+            }
         }
 
         // G2: Present anti-dep -> should be rejected

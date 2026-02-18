@@ -332,14 +332,6 @@ impl TableConfiguration {
     fn validate_feature_requirements(&self, feature: &TableFeature) -> DeltaResult<()> {
         for req in feature.feature_requirements() {
             match req {
-                FeatureRequirement::Supported(dep) => {
-                    require!(
-                        self.is_feature_supported(dep),
-                        Error::invalid_protocol(format!(
-                            "Feature '{feature}' requires '{dep}' to be supported"
-                        ))
-                    );
-                }
                 FeatureRequirement::Enabled(dep) => {
                     require!(
                         self.is_feature_enabled(dep),
@@ -353,14 +345,6 @@ impl TableConfiguration {
                         !self.is_feature_supported(dep),
                         Error::invalid_protocol(format!(
                             "Feature '{feature}' requires '{dep}' to not be supported"
-                        ))
-                    );
-                }
-                FeatureRequirement::NotEnabled(dep) => {
-                    require!(
-                        !self.is_feature_enabled(dep),
-                        Error::invalid_protocol(format!(
-                            "Feature '{feature}' requires '{dep}' to not be enabled"
                         ))
                     );
                 }
@@ -1220,7 +1204,7 @@ mod test {
         let table_root = Url::try_from("file:///").unwrap();
         assert_result_error_with_message(
             TableConfiguration::try_new(metadata, protocol, table_root, 0),
-            "Feature 'rowTracking' requires 'domainMetadata' to be supported",
+            "Feature 'rowTracking' requires 'domainMetadata' to be enabled",
         );
     }
 

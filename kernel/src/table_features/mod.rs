@@ -311,17 +311,16 @@ enum KernelSupport {
     Custom(fn(&Protocol, &TableProperties, Operation) -> DeltaResult<()>),
 }
 
-/// Types of requirements for feature dependencies
+/// Types of requirements for feature dependencies.
+///
+/// A dependency must be enabled (not merely supported) to be useful. An anti-dependency must not
+/// even be supported -- disabling it is not enough if its metadata traces may still be present.
 #[derive(Debug)]
 pub(crate) enum FeatureRequirement {
-    /// Feature must be supported (in protocol)
-    Supported(TableFeature),
-    /// Feature must be enabled (supported + property set)
+    /// Feature must be enabled (supported + enablement check passes)
     Enabled(TableFeature),
-    /// Feature must NOT be supported
+    /// Feature must NOT be supported (must not appear in the protocol at all)
     NotSupported(TableFeature),
-    /// Feature must NOT be enabled (may be supported but property must not activate it)
-    NotEnabled(TableFeature),
 }
 
 /// Signature for presence checkers registered in [`FeatureInfo`].
@@ -521,7 +520,7 @@ static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
 static ROW_TRACKING_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
-    feature_requirements: &[FeatureRequirement::Supported(TableFeature::DomainMetadata)],
+    feature_requirements: &[FeatureRequirement::Enabled(TableFeature::DomainMetadata)],
     kernel_support: KernelSupport::Supported,
     presence_check: None,
     metadata_description: "",
@@ -572,8 +571,8 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[
         FeatureRequirement::Enabled(TableFeature::ColumnMapping),
-        FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV1),
-        FeatureRequirement::NotEnabled(TableFeature::DeletionVectors),
+        FeatureRequirement::NotSupported(TableFeature::IcebergCompatV1),
+        FeatureRequirement::NotSupported(TableFeature::DeletionVectors),
     ],
     kernel_support: KernelSupport::NotSupported,
     presence_check: None,
@@ -586,7 +585,7 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
 static CLUSTERED_TABLE_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
-    feature_requirements: &[FeatureRequirement::Supported(TableFeature::DomainMetadata)],
+    feature_requirements: &[FeatureRequirement::Enabled(TableFeature::DomainMetadata)],
     kernel_support: KernelSupport::NotSupported,
     // TODO: Add presence checker when DomainMetadata access allows checking for delta.clustering domain.
     presence_check: None,
