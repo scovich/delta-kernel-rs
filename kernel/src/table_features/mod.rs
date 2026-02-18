@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -262,11 +262,12 @@ pub(crate) fn build_effective_features(
     protocol: &Protocol,
     schema: &Schema,
     properties: &TableProperties,
-) -> DeltaResult<HashSet<TableFeature>> {
+) -> DeltaResult<HashMap<TableFeature, bool>> {
     // Step 1: Seed from protocol writer feature list (if any).
-    let mut features = match protocol.writer_features() {
-        Some(writer_list) => HashSet::from_iter(writer_list.iter().cloned()),
-        None => HashSet::new(),
+    // Presence values are filled in by Step 2.
+    let mut features: HashMap<TableFeature, bool> = match protocol.writer_features() {
+        Some(writer_list) => HashMap::from_iter(writer_list.iter().map(|f| (f.clone(), false))),
+        None => HashMap::new(),
     };
 
     // `Protocol::try_new` rejects reader-writer features that appear only on the reader list, so we
@@ -287,9 +288,9 @@ pub(crate) fn build_effective_features(
 
     // Step 2: Detect features from metadata presence and/or legacy version inference.
     //
-    // Features already in the set (from the writer list) are skipped. For the rest:
-    // - If a presence checker is defined and reports true, validate and add the feature.
-    // - If no presence checker is defined, fall back to legacy version inference.
+    // For features already in the map (from the writer list), record presence. For the rest:
+    // - Feature-list protocol: presence without listing is an error; absence is fine.
+    // - Legacy protocol: version determines support; presence is recorded for enablement.
     //
     // NOTE: TableFeature::Unknown has no presence checker and no legacy version, so is skipped.
     let has_writer_list = protocol.writer_features().is_some();
@@ -297,7 +298,8 @@ pub(crate) fn build_effective_features(
         // Listing a feature in the protocol does not require it to be present, but we still have
         // to invoke the presence checker in case it finds invalid metadata.
         let known_present = feature.check_presence(schema, properties)?.unwrap_or(false);
-        if features.contains(&feature) {
+        if let Some(cached) = features.get_mut(&feature) {
+            *cached = known_present;
             continue;
         }
 
@@ -335,7 +337,7 @@ pub(crate) fn build_effective_features(
             continue;
         }
 
-        features.insert(feature);
+        features.insert(feature, known_present);
     }
 
     // Step 3: Validate groups of related features with overlapping metadata presence (such as
@@ -353,6 +355,10 @@ pub(crate) fn build_effective_features(
 enum EnablementCheck {
     /// Feature is enabled if it's supported (appears in protocol feature lists)
     AlwaysIfSupported,
+    /// Feature is enabled if its [`FeatureInfo::presence_check`] returns true. Useful for features
+    /// whose enablement is determined entirely by schema annotations or metadata existence rather
+    /// than a boolean toggle property (e.g. invariants, generatedColumns, timestampNtz).
+    EnabledIfPresent,
     /// Feature is enabled if supported AND the provided function returns true when checking table properties
     EnabledIf(fn(&TableProperties) -> bool),
 }
@@ -431,13 +437,13 @@ struct FeatureGroup {
 impl FeatureGroup {
     fn validate(
         &self,
-        features: &HashSet<TableFeature>,
+        features: &HashMap<TableFeature, bool>,
         schema: &Schema,
         props: &TableProperties,
     ) -> DeltaResult<()> {
         if (self.presence_check)(schema, props)? {
             require!(
-                self.members.iter().any(|f| features.contains(f)),
+                self.members.iter().any(|f| features.contains_key(f)),
                 Error::invalid_protocol(format!(
                     "Table has {} but none of [{}] are in the protocol",
                     self.metadata_description,
@@ -543,7 +549,7 @@ static INVARIANTS_INFO: FeatureInfo = FeatureInfo {
     kernel_support: KernelSupport::NotSupportedIfPresent,
     presence_check: Some(|s, _p| Ok(crate::schema::InvariantChecker::has_invariants(s))),
     metadata_description: "column invariants",
-    enablement_check: EnablementCheck::AlwaysIfSupported,
+    enablement_check: EnablementCheck::EnabledIfPresent,
 };
 
 static CHECK_CONSTRAINTS_INFO: FeatureInfo = FeatureInfo {
@@ -556,7 +562,7 @@ static CHECK_CONSTRAINTS_INFO: FeatureInfo = FeatureInfo {
         Ok(keys.any(|k| k.starts_with("delta.constraints.")))
     }),
     metadata_description: "check constraint properties",
-    enablement_check: EnablementCheck::AlwaysIfSupported,
+    enablement_check: EnablementCheck::EnabledIfPresent,
 };
 
 static CHANGE_DATA_FEED_INFO: FeatureInfo = FeatureInfo {
@@ -578,7 +584,7 @@ static GENERATED_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     kernel_support: KernelSupport::NotSupportedIfPresent,
     presence_check: Some(|s, _p| Ok(crate::schema::has_generation_expressions(s))),
     metadata_description: "generation expression annotations",
-    enablement_check: EnablementCheck::AlwaysIfSupported,
+    enablement_check: EnablementCheck::EnabledIfPresent,
 };
 
 static IDENTITY_COLUMNS_INFO: FeatureInfo = FeatureInfo {
@@ -588,7 +594,7 @@ static IDENTITY_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     kernel_support: KernelSupport::NotSupportedIfPresent,
     presence_check: Some(|s, _p| Ok(crate::schema::has_identity_columns(s))),
     metadata_description: "identity column annotations",
-    enablement_check: EnablementCheck::AlwaysIfSupported,
+    enablement_check: EnablementCheck::EnabledIfPresent,
 };
 
 static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
@@ -769,7 +775,7 @@ static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
     kernel_support: KernelSupport::Supported,
     presence_check: Some(|s, _p| Ok(schema_uses_timestamp_ntz(s))),
     metadata_description: "TIMESTAMP_NTZ columns",
-    enablement_check: EnablementCheck::AlwaysIfSupported,
+    enablement_check: EnablementCheck::EnabledIfPresent,
 };
 
 static TYPE_WIDENING_INFO: FeatureInfo = FeatureInfo {
@@ -907,12 +913,14 @@ impl TableFeature {
         self.info().feature_type
     }
 
-    /// Returns true if this feature is enabled given the table properties.
-    /// A feature is "enabled" if its enablement check passes (e.g. the toggle property is true).
+    /// Returns true if this feature is enabled given its cached presence and table properties.
+    /// A feature is "enabled" if its enablement check passes (e.g. the toggle property is true,
+    /// or metadata presence was detected at construction for [`EnablementCheck::EnabledIfPresent`]).
     /// This does NOT check whether the feature is supported — the caller must check that separately.
-    pub(crate) fn is_enabled(&self, props: &TableProperties) -> bool {
+    pub(crate) fn is_enabled(&self, present: bool, props: &TableProperties) -> bool {
         match self.info().enablement_check {
             EnablementCheck::AlwaysIfSupported => true,
+            EnablementCheck::EnabledIfPresent => present,
             EnablementCheck::EnabledIf(f) => f(props),
         }
     }
@@ -969,8 +977,8 @@ impl TableFeature {
     pub(crate) fn check_kernel_support(
         &self,
         protocol: &Protocol,
-        schema: &Schema,
         props: &TableProperties,
+        present: bool,
         operation: Operation,
     ) -> DeltaResult<()> {
         // Determine whether this feature is problematic for the requested operation.
@@ -978,12 +986,8 @@ impl TableFeature {
         match &self.info().kernel_support {
             KernelSupport::Supported => return Ok(()),
             KernelSupport::Custom(check) => return check(protocol, props, operation),
-            KernelSupport::NotSupportedIfPresent => {
-                if let Some(false) = self.check_presence(schema, props)? {
-                    return Ok(());
-                }
-            }
-            KernelSupport::NotSupported => {}
+            KernelSupport::NotSupportedIfPresent if !present => return Ok(()),
+            KernelSupport::NotSupported | KernelSupport::NotSupportedIfPresent => {}
         }
 
         // Feature is not supported (or present when it shouldn't be).

@@ -633,7 +633,7 @@ fn test_invariants() {
         name: "invariants",
         spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: Some(MinReaderWriterVersion(1, 2)),
-        legacy_enablement_by_presence: false,
+        legacy_enablement_by_presence: true,
         presence_schema: Some(invariants_schema),
         required_deps: &[],
         anti_deps: &[],
@@ -650,15 +650,14 @@ fn test_check_constraints() {
         name: "checkConstraints",
         spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: Some(MinReaderWriterVersion(1, 3)),
-        // TODO: infer enablement by metadata presence, not just protocol version
-        legacy_enablement_by_presence: false,
+        legacy_enablement_by_presence: true,
         presence_schema: None,
         required_deps: &[],
         anti_deps: &[],
         // No toggle property. Enabled when delta.constraints.* table properties are present.
         prop_cases: &[
             PropCase::Enabled(&["delta.constraints.valueInRange=value > 0"]),
-            PropCase::Enabled(&[]), // TODO: Should be Disabled
+            PropCase::Disabled(&[]),
         ],
         expected_orphan: OpExpect::Err,
         capability: READS_ONLY,
@@ -697,8 +696,7 @@ fn test_generated_columns() {
         name: "generatedColumns",
         spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: Some(MinReaderWriterVersion(1, 4)),
-        // TODO: infer enablement by metadata presence, not just protocol version
-        legacy_enablement_by_presence: false,
+        legacy_enablement_by_presence: true,
         presence_schema: Some(gen_schema),
         required_deps: &[],
         anti_deps: &[],
@@ -742,8 +740,7 @@ fn test_identity_columns() {
         name: "identityColumns",
         spec_type: FeatureType::WriterOnly,
         spec_legacy_versions: Some(MinReaderWriterVersion(1, 6)),
-        // TODO: infer enablement by metadata presence, not just protocol version
-        legacy_enablement_by_presence: false,
+        legacy_enablement_by_presence: true,
         presence_schema: Some(identity_schema),
         required_deps: &[],
         anti_deps: &[],

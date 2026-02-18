@@ -8,7 +8,7 @@
 //! [`TableProperties`].
 //!
 //! [`Schema`]: crate::schema::Schema
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use url::Url;
@@ -73,15 +73,19 @@ pub(crate) struct TableConfiguration {
     protocol: Protocol,
     schema: SchemaRef,
     table_properties: TableProperties,
-    /// Effective feature list derived from protocol lists (if present) and/or legacy
-    /// version inference with presence checks. Downstream code should use this list
-    /// via `is_feature_supported` rather than inspecting protocol lists directly.
+    /// Effective feature map derived from protocol lists (if present) and/or legacy version
+    /// inference with presence checks. Keys are supported features; values indicate whether the
+    /// feature's metadata was detected at construction time (cached for benefit of
+    /// [`EnablementCheck::EnabledIfPresent`] and [`KernelSupport::NotSupportedIfPresent`]).
+    ///
+    /// Downstream code should use `is_feature_supported` / `is_feature_enabled` rather than
+    /// inspecting this map directly.
     ///
     /// NOTE: This is the deduplicated union of reader and writer lists, so reader vs. writer
     /// provenance is lost. We rely on `feature_type()` to reconstruct it: `WriterOnly` and
     /// `ReaderWriter` are static, and unknown reader features are rejected at build
     /// time (see [`TableFeature::feature_type`]).
-    effective_features: HashSet<TableFeature>,
+    effective_features: HashMap<TableFeature, bool>,
     table_root: Url,
     version: Version,
 }
@@ -128,7 +132,7 @@ impl TableConfiguration {
         };
 
         // Now that we have the effective feature set, validate requirements.
-        for feature in &table_config.effective_features {
+        for feature in table_config.effective_features.keys() {
             table_config.validate_feature_requirements(feature)?;
         }
 
@@ -358,11 +362,9 @@ impl TableConfiguration {
     /// features, but readers can skip unknown features — see [`TableFeature::feature_type`].
     #[internal_api]
     pub(crate) fn check_kernel_capabilities(&self, operation: Operation) -> DeltaResult<()> {
-        let protocol = &self.protocol;
-        let schema = self.schema();
         let props = &self.table_properties;
-        for feature in &self.effective_features {
-            feature.check_kernel_support(protocol, schema.as_ref(), props, operation)?;
+        for (feature, &present) in &self.effective_features {
+            feature.check_kernel_support(&self.protocol, props, present, operation)?;
         }
         Ok(())
     }
@@ -427,17 +429,24 @@ impl TableConfiguration {
     /// checks, so this is a simple lookup.
     #[internal_api]
     pub(crate) fn is_feature_supported(&self, feature: &TableFeature) -> bool {
-        self.effective_features.contains(feature)
+        self.effective_features.contains_key(feature)
     }
 
     /// Check if a feature is enabled.
     ///
     /// A feature is enabled if:
     /// 1. It is in the effective feature list (i.e. supported)
-    /// 2. The enablement check passes (e.g. table property is set)
+    /// 2. The enablement check passes (e.g. table property is set, or metadata is present)
     #[internal_api]
     pub(crate) fn is_feature_enabled(&self, feature: &TableFeature) -> bool {
-        self.is_feature_supported(feature) && feature.is_enabled(&self.table_properties)
+        let present = self.is_feature_present(feature);
+        self.is_feature_supported(feature) && feature.is_enabled(present, &self.table_properties)
+    }
+
+    /// Whether metadata for this feature was detected during construction.
+    /// Returns false if the feature is not in the effective set.
+    fn is_feature_present(&self, feature: &TableFeature) -> bool {
+        self.effective_features.get(feature) == Some(&true)
     }
 }
 
