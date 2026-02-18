@@ -88,10 +88,6 @@ struct FeatureFixture {
     /// Property-based test cases. Convention: first `Enabled` variant is the "full presence" case,
     /// used for orphan tests and capability setup.
     prop_cases: &'static [PropCase],
-    /// Expected outcome when presence metadata exists but the feature is NOT in the protocol.
-    /// `OpExpect::Err` for features with active orphan detection.
-    /// `OpExpect::Ok` for features without orphan detection yet.
-    expected_orphan: OpExpect,
     /// Expected kernel capability when the feature is supported+enabled.
     capability: CapabilityExpect,
 }
@@ -310,25 +306,12 @@ fn run_battery(fixture: &FeatureFixture) {
     // D. Orphan test: presence metadata + feature NOT in protocol
     // ============================================================================================
     if fixture.has_metadata_footprint() {
-        // Use Enabled props if available (for property-based presence), otherwise empty
-        // (for schema-only presence like timestampNtz, variantType).
-
-        // Feature NOT in protocol, but its metadata IS present
+        // Feature NOT in protocol, but its metadata IS present -- should be rejected.
         let result = try_create_table_config(&[], enabled_props, schema_ref, 3, 7);
-
-        match fixture.expected_orphan {
-            OpExpect::Err => {
-                assert!(
-                    result.is_err(),
-                    "{name}: orphan: expected TC construction to fail (orphan detection), but it succeeded"
-                );
-            }
-            OpExpect::Ok => {
-                result.unwrap_or_else(|e| {
-                    panic!("{name}: orphan: expected TC construction to succeed (no orphan detection yet), got: {e}")
-                });
-            }
-        }
+        assert!(
+            result.is_err(),
+            "{name}: orphan: expected TC construction to fail (orphan detection), but it succeeded"
+        );
     }
 
     // ============================================================================================
@@ -609,7 +592,6 @@ fn test_append_only() {
             PropCase::Enabled(&["delta.appendOnly=true"]),
             PropCase::Disabled(&["delta.appendOnly=false"]),
         ],
-        expected_orphan: OpExpect::Err,
         capability: ALL_SUPPORTED,
     });
 }
@@ -631,7 +613,6 @@ fn test_invariants() {
         anti_deps: &[],
         // No toggle property. TODO: Enabled when delta.invariants column metadata is present in schema.
         prop_cases: &[],
-        expected_orphan: OpExpect::Err,
         capability: READS_ONLY,
     });
 }
@@ -650,7 +631,6 @@ fn test_check_constraints() {
             PropCase::Enabled(&["delta.constraints.valueInRange=value > 0"]),
             PropCase::Disabled(&[]),
         ],
-        expected_orphan: OpExpect::Err,
         capability: READS_ONLY,
     });
 }
@@ -668,7 +648,6 @@ fn test_change_data_feed() {
             PropCase::Enabled(&["delta.enableChangeDataFeed=true"]),
             PropCase::Disabled(&["delta.enableChangeDataFeed=false"]),
         ],
-        expected_orphan: OpExpect::Err,
         capability: ALL_SUPPORTED,
     });
 }
@@ -691,7 +670,6 @@ fn test_generated_columns() {
         anti_deps: &[],
         // No toggle property. Enabled when delta.generationExpression column metadata is present.
         prop_cases: &[],
-        expected_orphan: OpExpect::Err,
         capability: READS_ONLY,
     });
 }
@@ -711,7 +689,6 @@ fn test_column_mapping() {
             // mode=none is a feature-specific edge case -- see column_mapping module tests.
         ],
         // CM schema annotations without CM in protocol are rejected.
-        expected_orphan: OpExpect::Err,
         // Column mapping: reads supported (scan+cdf), writes not supported
         capability: READS_ONLY,
     });
@@ -733,7 +710,6 @@ fn test_identity_columns() {
         anti_deps: &[],
         // No toggle property. Enabled when delta.identity.* column metadata is present in schema.
         prop_cases: &[],
-        expected_orphan: OpExpect::Err,
         capability: READS_ONLY,
     });
 }
@@ -755,7 +731,6 @@ fn test_deletion_vectors() {
             PropCase::Enabled(&["delta.enableDeletionVectors=true"]),
             PropCase::Disabled(&["delta.enableDeletionVectors=false"]),
         ],
-        expected_orphan: OpExpect::Err,
         capability: ALL_SUPPORTED,
     });
 }
@@ -796,7 +771,6 @@ fn test_row_tracking() {
                 "delta.rowTracking.materializedRowCommitVersionColumnName=_row-cv",
             ]),
         ],
-        expected_orphan: OpExpect::Err,
         capability: ALL_SUPPORTED,
     });
 }
@@ -818,7 +792,6 @@ fn test_timestamp_ntz() {
         // No toggle property. Presence is a TimestampNtz column in the schema.
         prop_cases: &[],
         // TimestampNtz columns without the feature in protocol are rejected.
-        expected_orphan: OpExpect::Err,
         capability: ALL_SUPPORTED,
     });
 }
@@ -834,7 +807,6 @@ fn test_domain_metadata() {
         anti_deps: &[],
         // Protocol-only, no metadata footprint.
         prop_cases: &[],
-        expected_orphan: OpExpect::Ok,
         capability: ALL_SUPPORTED,
     });
 }
@@ -853,7 +825,6 @@ fn test_v2_checkpoint() {
             PropCase::Enabled(&["delta.checkpointPolicy=v2"]),
             PropCase::Enabled(&[]),
         ],
-        expected_orphan: OpExpect::Err,
         capability: ALL_SUPPORTED,
     });
 }
@@ -880,7 +851,6 @@ fn test_iceberg_compat_v1() {
             ]),
         ],
         // CM schema annotations without CM in protocol are rejected.
-        expected_orphan: OpExpect::Err,
         capability: READS_ONLY,
     });
 }
@@ -907,7 +877,6 @@ fn test_iceberg_compat_v2() {
             ]),
         ],
         // CM schema annotations without CM in protocol are rejected.
-        expected_orphan: OpExpect::Err,
         capability: READS_ONLY,
     });
 }
@@ -923,7 +892,6 @@ fn test_clustered_table() {
         anti_deps: &[],
         // Protocol-only, no metadata footprint.
         prop_cases: &[],
-        expected_orphan: OpExpect::Ok,
         capability: READS_ONLY,
     });
 }
@@ -939,7 +907,6 @@ fn test_vacuum_protocol_check() {
         anti_deps: &[],
         // Protocol-only, no metadata footprint.
         prop_cases: &[],
-        expected_orphan: OpExpect::Ok,
         capability: ALL_SUPPORTED,
     });
 }
@@ -968,7 +935,6 @@ fn test_in_commit_timestamp() {
                 "delta.inCommitTimestampEnablementVersion=1",
             ]),
         ],
-        expected_orphan: OpExpect::Err,
         capability: ALL_SUPPORTED,
     });
 }
@@ -985,7 +951,6 @@ fn test_variant_type() {
         // No toggle property. Presence is a Variant column in the schema.
         prop_cases: &[],
         // Variant columns without the feature in protocol are rejected.
-        expected_orphan: OpExpect::Err,
         capability: ALL_SUPPORTED,
     });
 }
@@ -1002,7 +967,6 @@ fn test_variant_type_preview() {
         // No toggle property. Presence is a Variant column in the schema.
         prop_cases: &[],
         // Variant columns without the feature in protocol are rejected.
-        expected_orphan: OpExpect::Err,
         capability: ALL_SUPPORTED,
     });
 }
@@ -1020,7 +984,6 @@ fn test_variant_shredding_preview_with_variant_type() {
         anti_deps: &[],
         // No toggle property. Presence is a Variant column in the schema.
         prop_cases: &[],
-        expected_orphan: OpExpect::Err,
         capability: ALL_SUPPORTED,
     });
 }
@@ -1036,7 +999,6 @@ fn test_variant_shredding_preview_with_variant_type_preview() {
         anti_deps: &[],
         // No toggle property. Presence is a Variant column in the schema.
         prop_cases: &[],
-        expected_orphan: OpExpect::Err,
         capability: ALL_SUPPORTED,
     });
 }
@@ -1054,7 +1016,6 @@ fn test_type_widening() {
             PropCase::Enabled(&["delta.enableTypeWidening=true"]),
             PropCase::Disabled(&["delta.enableTypeWidening=false"]),
         ],
-        expected_orphan: OpExpect::Err,
         capability: READS_ONLY,
     });
 }
@@ -1072,7 +1033,6 @@ fn test_type_widening_preview() {
             PropCase::Enabled(&["delta.enableTypeWidening=true"]),
             PropCase::Disabled(&["delta.enableTypeWidening=false"]),
         ],
-        expected_orphan: OpExpect::Err,
         capability: READS_ONLY,
     });
 }
@@ -1088,7 +1048,6 @@ fn test_materialize_partition_columns() {
         anti_deps: &[],
         // Protocol-only, no metadata footprint.
         prop_cases: &[],
-        expected_orphan: OpExpect::Ok,
         capability: ALL_SUPPORTED,
     });
 }
@@ -1104,7 +1063,6 @@ fn test_catalog_managed() {
         anti_deps: &[],
         // Protocol-only, no metadata footprint.
         prop_cases: &[],
-        expected_orphan: OpExpect::Ok,
         // CDF not supported for catalog-managed tables.
         capability: CapabilityExpect {
             scan: OpExpect::Ok,
@@ -1125,7 +1083,6 @@ fn test_catalog_owned_preview() {
         anti_deps: &[],
         // Protocol-only, no metadata footprint.
         prop_cases: &[],
-        expected_orphan: OpExpect::Ok,
         // CDF not supported for catalog-managed tables (same as catalogManaged).
         capability: CapabilityExpect {
             scan: OpExpect::Ok,
@@ -1149,7 +1106,6 @@ fn test_allow_column_defaults() {
         anti_deps: &[],
         // Unknown to kernel -- no toggle property can be modeled.
         prop_cases: &[],
-        expected_orphan: OpExpect::Ok,
         // Unknown writer feature: reads should succeed (writer-only gate skips), writes fail.
         capability: READS_ONLY,
     });
