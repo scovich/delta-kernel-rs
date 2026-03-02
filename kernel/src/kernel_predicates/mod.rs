@@ -40,6 +40,18 @@ pub type DirectDataSkippingPredicateEvaluator<'a> =
 pub type IndirectDataSkippingPredicateEvaluator<'a> =
     dyn DataSkippingPredicateEvaluator<Output = Pred, ColumnStat = Expr> + 'a;
 
+/// A metadata skipping predicate evaluator that rewrites the input to a predicate over
+/// checkpoint/sidecar parquet footer stats (stats-over-stats). The resulting predicate can be
+/// evaluated against a resolver-backed [`DirectPredicateEvaluator`].
+///
+/// Unlike [`IndirectDataSkippingPredicateEvaluator`], the mapped min/max accessors are expected to
+/// encode "safe to use" checks in the rewritten output expression itself (for example, by guarding
+/// nested stat comparisons with checks over `add.stats_parsed.{minValues,maxValues}.<col>`
+/// nullcounts). This is required because rewriting happens once per query, while safety must be
+/// enforced per file/row-group by later direct evaluators.
+pub type IndirectMetaDataSkippingPredicateEvaluator<'a> =
+    dyn MetaDataSkippingPredicateEvaluator<Output = Pred, ColumnStat = Expr> + 'a;
+
 /// Uses kernel (not engine) logic to evaluate a predicate tree against column names that resolve as
 /// scalars. Useful for testing/debugging but also serves as a reference implementation that
 /// documents the expression semantics that kernel relies on for data skipping.
@@ -581,6 +593,13 @@ impl KernelPredicateEvaluatorDefaults {
 
 /// Resolves columns as scalars, as a building block for [`DefaultKernelPredicateEvaluator`].
 pub(crate) trait ResolveColumnAsScalar {
+    /// Resolves a column as a scalar, with an optional logical type hint.
+    ///
+    /// Implementations that do not need type hints can keep using [`Self::resolve_column`].
+    fn resolve_column_typed(&self, col: &ColumnName, _data_type: Option<&DataType>) -> Option<Scalar> {
+        self.resolve_column(col)
+    }
+
     fn resolve_column(&self, col: &ColumnName) -> Option<Scalar>;
 }
 
@@ -617,6 +636,11 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
     // Convenient thin wrapper
     fn resolve_column(&self, col: &ColumnName) -> Option<Scalar> {
         self.resolver.resolve_column(col)
+    }
+
+    // Convenient thin wrapper
+    fn resolve_column_typed(&self, col: &ColumnName, data_type: Option<&DataType>) -> Option<Scalar> {
+        self.resolver.resolve_column_typed(col, data_type)
     }
 
     pub(crate) fn eval_expr(&self, expr: &Expr) -> Option<Scalar> {
@@ -673,17 +697,17 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
     }
 
     fn eval_pred_lt(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<bool> {
-        let col = self.resolve_column(col)?;
+        let col = self.resolve_column_typed(col, Some(&val.data_type()))?;
         self.eval_pred_binary_scalars(BinaryPredicateOp::LessThan, &col, val, inverted)
     }
 
     fn eval_pred_gt(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<bool> {
-        let col = self.resolve_column(col)?;
+        let col = self.resolve_column_typed(col, Some(&val.data_type()))?;
         self.eval_pred_binary_scalars(BinaryPredicateOp::GreaterThan, &col, val, inverted)
     }
 
     fn eval_pred_eq(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<bool> {
-        let col = self.resolve_column(col)?;
+        let col = self.resolve_column_typed(col, Some(&val.data_type()))?;
         self.eval_pred_binary_scalars(BinaryPredicateOp::Equal, &col, val, inverted)
     }
 
@@ -912,6 +936,172 @@ pub trait DataSkippingPredicateEvaluator {
             let preds = [
                 self.partial_cmp_min_stat(col, val, Ordering::Greater, true),
                 self.partial_cmp_max_stat(col, val, Ordering::Less, true),
+            ];
+            (JunctionPredicateOp::And, preds)
+        };
+        self.finish_eval_pred_junction(op, &mut preds.into_iter(), false)
+    }
+}
+
+/// A predicate evaluator for metadata skipping semantics, i.e. evaluating a data predicate against
+/// parquet footer stats of checkpoint/sidecar metadata columns (`stats` over `stats_parsed`).
+///
+/// This trait intentionally mirrors [`DataSkippingPredicateEvaluator`] but routes min/max access
+/// through metadata-specific accessors. Callers of this trait should interpret:
+/// - `get_metadata_min_stat(col)` as "min of `add.stats_parsed.minValues.<col>`"
+/// - `get_metadata_max_stat(col)` as "max of `add.stats_parsed.maxValues.<col>`"
+///
+/// Safety checks for nested stats (e.g. guarding on nullcount) must be encoded into rewritten
+/// output predicates via [`Self::apply_metadata_min_safety`] and
+/// [`Self::apply_metadata_max_safety`], so that direct evaluators can re-check safety per file.
+/// The provided comparison methods are authoritative and always invoke these safety hooks.
+///
+/// For partition columns, implementations may map both min/max to
+/// `add.partitionValues_parsed.<col>` where appropriate.
+///
+/// This is currently a sketch trait and is not yet wired into production scan paths.
+pub trait MetaDataSkippingPredicateEvaluator {
+    /// The output type produced by this predicate evaluator
+    type Output;
+    /// The type for metadata stats consumed by this predicate evaluator
+    type ColumnStat;
+
+    /// Retrieves the raw metadata min-stat for a column, if it exists.
+    fn get_metadata_min_stat(
+        &self,
+        col: &ColumnName,
+        data_type: &DataType,
+    ) -> Option<Self::ColumnStat>;
+
+    /// Retrieves the raw metadata max-stat for a column, if it exists.
+    fn get_metadata_max_stat(
+        &self,
+        col: &ColumnName,
+        data_type: &DataType,
+    ) -> Option<Self::ColumnStat>;
+
+    /// Retrieves the metadata nullcount stat for a column, if it exists.
+    fn get_metadata_nullcount_stat(&self, col: &ColumnName) -> Option<Self::ColumnStat>;
+
+    /// Retrieves the metadata rowcount stat, if it exists.
+    fn get_metadata_rowcount_stat(&self) -> Option<Self::ColumnStat>;
+
+    /// See [`KernelPredicateEvaluator::eval_pred_scalar`]
+    fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<Self::Output>;
+
+    /// See [`KernelPredicateEvaluator::eval_pred_scalar_is_null`]
+    fn eval_pred_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Self::Output>;
+
+    /// See [`DataSkippingPredicateEvaluator::eval_pred_is_null`]
+    fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Self::Output>;
+
+    /// See [`KernelPredicateEvaluator::eval_pred_binary_scalars`]
+    fn eval_pred_binary_scalars(
+        &self,
+        op: BinaryPredicateOp,
+        left: &Scalar,
+        right: &Scalar,
+        inverted: bool,
+    ) -> Option<Self::Output>;
+
+    /// See [`KernelPredicateEvaluator::eval_pred_opaque`]
+    fn eval_pred_opaque(
+        &self,
+        op: &OpaquePredicateOpRef,
+        exprs: &[Expr],
+        inverted: bool,
+    ) -> Option<Self::Output>;
+
+    /// See [`KernelPredicateEvaluator::finish_eval_pred_junction`]
+    fn finish_eval_pred_junction(
+        &self,
+        op: JunctionPredicateOp,
+        preds: &mut dyn Iterator<Item = Option<Self::Output>>,
+        inverted: bool,
+    ) -> Option<Self::Output>;
+
+    /// Helper method that performs a (possibly inverted) partial comparison between a typed column
+    /// stat and a scalar.
+    fn eval_partial_cmp(
+        &self,
+        ord: Ordering,
+        col: Self::ColumnStat,
+        val: &Scalar,
+        inverted: bool,
+    ) -> Option<Self::Output>;
+
+    /// Performs a partial comparison against a metadata min-stat.
+    fn partial_cmp_metadata_min_stat(
+        &self,
+        col: &ColumnName,
+        val: &Scalar,
+        ord: Ordering,
+        inverted: bool,
+    ) -> Option<Self::Output> {
+        let min = self.get_metadata_min_stat(col, &val.data_type())?;
+        let pred = self.eval_partial_cmp(ord, min, val, inverted)?;
+        self.apply_metadata_min_safety(col, pred)
+    }
+
+    /// Performs a partial comparison against a metadata max-stat.
+    fn partial_cmp_metadata_max_stat(
+        &self,
+        col: &ColumnName,
+        val: &Scalar,
+        ord: Ordering,
+        inverted: bool,
+    ) -> Option<Self::Output> {
+        let max = self.get_metadata_max_stat(col, &val.data_type())?;
+        let pred = self.eval_partial_cmp(ord, max, val, inverted)?;
+        self.apply_metadata_max_safety(col, pred)
+    }
+
+    /// Applies per-column safety checks to a rewritten predicate that uses a metadata min-stat.
+    /// Implementations must encode any necessary per-file/per-row-group safety conditions here.
+    fn apply_metadata_min_safety(
+        &self,
+        col: &ColumnName,
+        pred: Self::Output,
+    ) -> Option<Self::Output>;
+
+    /// Applies per-column safety checks to a rewritten predicate that uses a metadata max-stat.
+    /// Implementations must encode any necessary per-file/per-row-group safety conditions here.
+    fn apply_metadata_max_safety(
+        &self,
+        col: &ColumnName,
+        pred: Self::Output,
+    ) -> Option<Self::Output>;
+
+    /// See [`KernelPredicateEvaluator::eval_pred_lt`]
+    fn eval_pred_lt(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output> {
+        if inverted {
+            self.partial_cmp_metadata_max_stat(col, val, Ordering::Less, true)
+        } else {
+            self.partial_cmp_metadata_min_stat(col, val, Ordering::Less, false)
+        }
+    }
+
+    /// See [`KernelPredicateEvaluator::eval_pred_gt`]
+    fn eval_pred_gt(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output> {
+        if inverted {
+            self.partial_cmp_metadata_min_stat(col, val, Ordering::Greater, true)
+        } else {
+            self.partial_cmp_metadata_max_stat(col, val, Ordering::Greater, false)
+        }
+    }
+
+    /// See [`KernelPredicateEvaluator::eval_pred_eq`]
+    fn eval_pred_eq(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output> {
+        let (op, preds) = if inverted {
+            let preds = [
+                self.partial_cmp_metadata_min_stat(col, val, Ordering::Equal, true),
+                self.partial_cmp_metadata_max_stat(col, val, Ordering::Equal, true),
+            ];
+            (JunctionPredicateOp::Or, preds)
+        } else {
+            let preds = [
+                self.partial_cmp_metadata_min_stat(col, val, Ordering::Greater, true),
+                self.partial_cmp_metadata_max_stat(col, val, Ordering::Less, true),
             ];
             (JunctionPredicateOp::And, preds)
         };
