@@ -28,7 +28,7 @@ use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _}
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, Error, Expression, FileMeta, Predicate, PredicateRef, RowVisitor,
-    StorageHandler, Version,
+    Version,
 };
 
 mod domain_metadata_replay;
@@ -303,21 +303,21 @@ impl LogSegment {
     #[instrument(
         name = "segment.for_snapshot",
         err,
-        skip(storage, time_travel_version),
+        skip(engine, time_travel_version),
         fields(report, operation_id = %operation_id, num_commit_files, num_checkpoint_files, num_compaction_files)
     )]
     #[internal_api]
     pub(crate) fn for_snapshot(
-        storage: &dyn StorageHandler,
+        engine: &dyn Engine,
         log_root: Url,
         log_tail: Vec<ParsedLogPath>,
         time_travel_version: impl Into<Option<Version>>,
         operation_id: MetricId,
     ) -> DeltaResult<Self> {
         let time_travel_version = time_travel_version.into();
-        let checkpoint_hint = LastCheckpointHint::try_read(storage, &log_root)?;
+        let checkpoint_hint = LastCheckpointHint::try_read(engine.storage_handler().as_ref(), &log_root)?;
         let result = Self::for_snapshot_impl(
-            storage,
+            engine,
             log_root,
             log_tail,
             checkpoint_hint,
@@ -346,7 +346,7 @@ impl LogSegment {
 
     // factored out for testing
     pub(crate) fn for_snapshot_impl(
-        storage: &dyn StorageHandler,
+        engine: &dyn Engine,
         log_root: Url,
         log_tail: Vec<ParsedLogPath>,
         checkpoint_hint: Option<LastCheckpointHint>,
@@ -384,17 +384,17 @@ impl LogSegment {
             // Cases 1 and 2
             (Some(cp), end_version) => LogSegmentFiles::list_with_checkpoint_hint(
                 &cp,
-                storage,
+                engine,
                 &log_root,
                 log_tail,
                 end_version,
             )?,
             // Case 3
             (None, Some(end)) => LogSegmentFiles::list_with_backward_checkpoint_scan(
-                storage, &log_root, log_tail, end,
+                engine, &log_root, log_tail, end,
             )?,
             // Case 4
-            (None, None) => LogSegmentFiles::list(storage, &log_root, log_tail, None, None)?,
+            (None, None) => LogSegmentFiles::list(engine, &log_root, log_tail, None, None)?,
         };
 
         LogSegment::try_new(
@@ -412,7 +412,7 @@ impl LogSegment {
     /// default.
     #[internal_api]
     pub(crate) fn for_table_changes(
-        storage: &dyn StorageHandler,
+        engine: &dyn Engine,
         log_root: Url,
         start_version: Version,
         end_version: impl Into<Option<Version>>,
@@ -427,8 +427,12 @@ impl LogSegment {
         }
 
         // TODO: compactions?
-        let listed_files =
-            LogSegmentFiles::list_commits(storage, &log_root, Some(start_version), end_version)?;
+        let listed_files = LogSegmentFiles::list_commits(
+            engine,
+            &log_root,
+            Some(start_version),
+            end_version,
+        )?;
         // - Here check that the start version is correct.
         // - [`LogSegment::try_new`] will verify that the `end_version` is correct if present.
         // - [`LogSegmentFiles::list_commits`] also checks that there are no gaps between commits.
@@ -457,7 +461,7 @@ impl LogSegment {
     // This lists all files starting from `end-limit` if `limit` is defined. For large tables,
     // listing with a `limit` can be a significant speedup over listing _all_ the files in the log.
     pub(crate) fn for_timestamp_conversion(
-        storage: &dyn StorageHandler,
+        engine: &dyn Engine,
         log_root: Url,
         end_version: Version,
         limit: Option<NonZero<usize>>,
@@ -475,7 +479,7 @@ impl LogSegment {
         // this is a list of commits with possible gaps, we want to take the latest contiguous
         // chunk of commits
         let mut listed_commits =
-            LogSegmentFiles::list_commits(storage, &log_root, start_from, Some(end_version))?;
+            LogSegmentFiles::list_commits(engine, &log_root, start_from, Some(end_version))?;
 
         // remove gaps - return latest contiguous chunk of commits
         let commits = listed_commits.ascending_commit_files_mut();

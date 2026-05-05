@@ -24,6 +24,8 @@ use crate::{
     Engine, EngineData, EvaluationHandler, FileDataReadResultIterator, FileMeta, JsonHandler,
     ParquetFooter, ParquetHandler, PredicateRef, Snapshot, StorageHandler,
 };
+#[cfg(feature = "declarative-query-plan")]
+use crate::{QueryPlan, QueryPlanResultIterator};
 
 /// Helper macro to extract a typed column from a RecordBatch or StructArray.
 macro_rules! get_column {
@@ -1464,6 +1466,11 @@ impl Engine for EmptyParquetEngine {
 
     fn storage_handler(&self) -> Arc<dyn StorageHandler> {
         self.0.storage_handler()
+    }
+
+    #[cfg(feature = "declarative-query-plan")]
+    fn execute_query_plan(&self, _query_plan: QueryPlan) -> DeltaResult<QueryPlanResultIterator> {
+        unimplemented!()
     }
 }
 

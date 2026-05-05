@@ -10,7 +10,7 @@ use crate::engine::default::filesystem::ObjectStoreStorageHandler;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path as ObjectPath;
 use crate::object_store::ObjectStoreExt as _;
-use crate::FileMeta;
+use crate::{Engine, EvaluationHandler, FileMeta, JsonHandler, ParquetHandler};
 
 // size markers used to identify commit sources in tests
 const FILESYSTEM_SIZE_MARKER: u64 = 10;
@@ -54,7 +54,7 @@ fn log_path_for_file_type(version: Version, file_type: &LogPathFileType) -> Stri
 
 async fn create_storage(
     log_files: Vec<(Version, LogPathFileType, CommitSource)>,
-) -> (Box<dyn StorageHandler>, Url) {
+) -> (Arc<dyn StorageHandler>, Url) {
     let store = Arc::new(InMemory::new());
     let log_root = Url::parse("memory:///_delta_log/").unwrap();
 
@@ -71,8 +71,44 @@ async fn create_storage(
     }
 
     let executor = Arc::new(TokioBackgroundExecutor::new());
-    let storage = Box::new(ObjectStoreStorageHandler::new(store, executor));
+    let storage = Arc::new(ObjectStoreStorageHandler::new(store, executor));
     (storage, log_root)
+}
+
+/// A minimal test engine that only supports `storage_handler`.
+#[derive(Clone)]
+struct StorageOnlyEngine {
+    storage: Arc<dyn StorageHandler>,
+}
+
+impl Engine for StorageOnlyEngine {
+    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+        unimplemented!()
+    }
+
+    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+        self.storage.clone()
+    }
+
+    fn json_handler(&self) -> Arc<dyn JsonHandler> {
+        unimplemented!()
+    }
+
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+        unimplemented!()
+    }
+
+    #[cfg(feature = "declarative-query-plan")]
+    fn execute_query_plan(
+        &self,
+        _query_plan: crate::QueryPlan,
+    ) -> DeltaResult<crate::QueryPlanResultIterator> {
+        unimplemented!()
+    }
+}
+
+fn test_engine_with_storage(storage: Arc<dyn StorageHandler>) -> Arc<dyn Engine> {
+    Arc::new(StorageOnlyEngine { storage })
 }
 
 // helper to create a ParsedLogPath with specific source marker
@@ -121,16 +157,17 @@ fn assert_source(commit: &ParsedLogPath, expected_source: CommitSource) {
 /// A [`StorageHandler`] wrapper that counts the number of `list_from` calls.
 /// Used to verify that `list_with_backward_checkpoint_scan` issues the expected
 /// number of storage listing requests.
+#[derive(Clone)]
 struct CountingStorageHandler {
-    inner: Box<dyn StorageHandler>,
-    list_from_count: AtomicU32,
+    inner: Arc<dyn StorageHandler>,
+    list_from_count: Arc<AtomicU32>,
 }
 
 impl CountingStorageHandler {
-    fn new(inner: Box<dyn StorageHandler>) -> Self {
+    fn new(inner: Arc<dyn StorageHandler>) -> Self {
         Self {
             inner,
-            list_from_count: AtomicU32::new(0),
+            list_from_count: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -168,12 +205,38 @@ impl StorageHandler for CountingStorageHandler {
     }
 }
 
+impl Engine for CountingStorageHandler {
+    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+        unimplemented!()
+    }
+
+    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+        Arc::new(self.clone())
+    }
+
+    fn json_handler(&self) -> Arc<dyn JsonHandler> {
+        unimplemented!()
+    }
+
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+        unimplemented!()
+    }
+
+    #[cfg(feature = "declarative-query-plan")]
+    fn execute_query_plan(
+        &self,
+        _query_plan: crate::QueryPlan,
+    ) -> DeltaResult<crate::QueryPlanResultIterator> {
+        unimplemented!()
+    }
+}
+
 /// Helper to call `LogSegmentFiles::list()` and destructure the result for assertions.
 /// Returns (ascending_commit_files, ascending_compaction_files, checkpoint_parts,
 ///          latest_crc_file, latest_commit_file, max_published_version).
 #[allow(clippy::type_complexity)]
 fn list_and_destructure(
-    storage: &dyn StorageHandler,
+    engine: &dyn Engine,
     log_root: &Url,
     log_tail: Vec<ParsedLogPath>,
     start_version: Option<Version>,
@@ -186,7 +249,7 @@ fn list_and_destructure(
     Option<ParsedLogPath>,
     Option<Version>,
 ) {
-    let r = LogSegmentFiles::list(storage, log_root, log_tail, start_version, end_version).unwrap();
+    let r = LogSegmentFiles::list(engine, log_root, log_tail, start_version, end_version).unwrap();
     (
         r.ascending_commit_files,
         r.ascending_compaction_files,
@@ -209,7 +272,7 @@ async fn test_empty_log_tail() {
     let (storage, log_root) = create_storage(log_files).await;
 
     let (commits, _, _, _, latest_commit, max_pub) =
-        list_and_destructure(storage.as_ref(), &log_root, vec![], Some(1), Some(2));
+        list_and_destructure(test_engine_with_storage(storage.clone()).as_ref(), &log_root, vec![], Some(1), Some(2));
 
     assert_eq!(commits.len(), 2);
     assert_eq!(commits[0].version, 1);
@@ -237,7 +300,7 @@ async fn test_log_tail_has_latest_commit_files() {
     ];
 
     let (commits, _, _, _, latest_commit, max_pub) =
-        list_and_destructure(storage.as_ref(), &log_root, log_tail, Some(0), Some(5));
+        list_and_destructure(test_engine_with_storage(storage.clone()).as_ref(), &log_root, log_tail, Some(0), Some(5));
 
     assert_eq!(commits.len(), 6);
     // filesystem commits 0-2
@@ -272,7 +335,7 @@ async fn test_request_subset_with_log_tail() {
 
     // list for only versions 1-3
     let (commits, _, _, _, latest_commit, max_pub) =
-        list_and_destructure(storage.as_ref(), &log_root, log_tail, Some(1), Some(3));
+        list_and_destructure(test_engine_with_storage(storage.clone()).as_ref(), &log_root, log_tail, Some(1), Some(3));
 
     assert_eq!(commits.len(), 3);
     assert_eq!(commits[0].version, 1);
@@ -305,7 +368,7 @@ async fn test_log_tail_defines_latest_version() {
     )];
 
     let (commits, _, _, _, latest_commit, max_pub) =
-        list_and_destructure(storage.as_ref(), &log_root, log_tail, Some(0), None);
+        list_and_destructure(test_engine_with_storage(storage.clone()).as_ref(), &log_root, log_tail, Some(0), None);
 
     // expect only 0 from file system and 1 from log tail
     assert_eq!(commits.len(), 2);
@@ -324,6 +387,7 @@ fn test_log_tail_covers_entire_range_empty_filesystem() {
     // When the log_tail covers the entire commit range, we still call list_from
     // (to pick up non-commit files like CRC/checkpoints), but the filesystem may
     // have nothing — e.g. a purely catalog-managed table.
+    #[derive(Clone, Copy)]
     struct EmptyStorageHandler;
     impl StorageHandler for EmptyStorageHandler {
         fn list_from(
@@ -356,10 +420,10 @@ fn test_log_tail_covers_entire_range_empty_filesystem() {
         make_parsed_log_path_with_source(2, LogPathFileType::StagedCommit, CommitSource::Catalog),
     ];
 
-    let storage = EmptyStorageHandler;
+    let storage: Arc<dyn StorageHandler> = Arc::new(EmptyStorageHandler);
     let url = Url::parse("memory:///anything/_delta_log/").unwrap();
     let (commits, _, _, _, latest_commit, max_pub) =
-        list_and_destructure(&storage, &url, log_tail, Some(0), Some(2));
+        list_and_destructure(test_engine_with_storage(storage.clone()).as_ref(), &url, log_tail, Some(0), Some(2));
 
     // Only log_tail commits should appear (filesystem is empty)
     assert_eq!(commits.len(), 3);
@@ -394,7 +458,7 @@ async fn test_log_tail_covers_entire_range_with_crc() {
     ];
 
     let (commits, _, _, latest_crc, latest_commit, max_pub) =
-        list_and_destructure(storage.as_ref(), &log_root, log_tail, Some(0), Some(2));
+        list_and_destructure(test_engine_with_storage(storage.clone()).as_ref(), &log_root, log_tail, Some(0), Some(2));
 
     // 3 commits from log_tail: 0, 1, 2
     assert_eq!(commits.len(), 3);
@@ -428,7 +492,7 @@ async fn test_listing_omits_staged_commits() {
 
     let (storage, log_root) = create_storage(log_files).await;
     let (commits, _, _, _, latest_commit, max_pub) =
-        list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+        list_and_destructure(test_engine_with_storage(storage.clone()).as_ref(), &log_root, vec![], None, None);
 
     // we must only see two regular commits
     assert_eq!(commits.len(), 2);
@@ -451,7 +515,7 @@ async fn test_listing_with_large_end_version() {
     let (storage, log_root) = create_storage(log_files).await;
     // note we let you request end version past the end of log. up to consumer to interpret
     let (commits, _, _, _, latest_commit, max_pub) =
-        list_and_destructure(storage.as_ref(), &log_root, vec![], None, Some(3));
+        list_and_destructure(test_engine_with_storage(storage.clone()).as_ref(), &log_root, vec![], None, Some(3));
 
     // we must only see two regular commits
     assert_eq!(commits.len(), 2);
@@ -494,7 +558,7 @@ async fn test_non_commit_files_at_log_tail_versions_are_preserved() {
     ];
 
     let (commits, _, checkpoint_parts, latest_crc, latest_commit, max_pub) =
-        list_and_destructure(storage.as_ref(), &log_root, log_tail, Some(0), Some(10));
+        list_and_destructure(test_engine_with_storage(storage.clone()).as_ref(), &log_root, log_tail, Some(0), Some(10));
 
     // Checkpoint at version 7 is preserved from filesystem
     assert_eq!(checkpoint_parts.len(), 1);
@@ -740,7 +804,7 @@ async fn backward_scan_with_log_tail_derives_lower_bound_from_checkpoint() {
         .collect();
 
     let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         &log_root,
         log_tail,
         10,
@@ -790,7 +854,7 @@ async fn backward_scan_with_log_tail_starting_before_checkpoint() {
         .collect();
 
     let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         &log_root,
         log_tail,
         8,
@@ -832,7 +896,7 @@ async fn backward_scan_log_tail_defines_latest_version() {
     )];
 
     let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         &log_root,
         log_tail,
         5,
@@ -861,7 +925,7 @@ async fn backward_scan_log_tail_defines_latest_version() {
 /// (version, file_type, is_empty). Non-empty files get placeholder content.
 async fn create_storage_with_empty_files(
     log_files: Vec<(Version, LogPathFileType, bool)>,
-) -> (Box<dyn StorageHandler>, Url) {
+) -> (Arc<dyn StorageHandler>, Url) {
     let store = Arc::new(InMemory::new());
     let log_root = Url::parse("memory:///_delta_log/").unwrap();
 
@@ -879,7 +943,7 @@ async fn create_storage_with_empty_files(
     }
 
     let executor = Arc::new(TokioBackgroundExecutor::new());
-    let storage = Box::new(ObjectStoreStorageHandler::new(store, executor));
+    let storage = Arc::new(ObjectStoreStorageHandler::new(store, executor));
     (storage, log_root)
 }
 
@@ -894,7 +958,7 @@ async fn test_zero_byte_commit_kept_in_listing() {
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result =
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
+        LogSegmentFiles::list(test_engine_with_storage(storage.clone()).as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
     assert_eq!(result.ascending_commit_files.len(), 3);
     assert_eq!(result.ascending_commit_files[0].version, 0);
     assert_eq!(result.ascending_commit_files[1].version, 1);
@@ -923,10 +987,10 @@ async fn test_zero_byte_compaction_skipped_commits_used(#[case] use_backward_sca
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result = if use_backward_scan {
-        LogSegmentFiles::list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, vec![], 4)
+        LogSegmentFiles::list_with_backward_checkpoint_scan(test_engine_with_storage(storage.clone()).as_ref(), &log_root, vec![], 4)
             .unwrap()
     } else {
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(4)).unwrap()
+        LogSegmentFiles::list(test_engine_with_storage(storage.clone()).as_ref(), &log_root, vec![], Some(0), Some(4)).unwrap()
     };
 
     assert!(
@@ -963,10 +1027,10 @@ async fn test_zero_byte_checkpoint_skipped_older_used(#[case] use_backward_scan:
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result = if use_backward_scan {
-        LogSegmentFiles::list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, vec![], 10)
+        LogSegmentFiles::list_with_backward_checkpoint_scan(test_engine_with_storage(storage.clone()).as_ref(), &log_root, vec![], 10)
             .unwrap()
     } else {
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(10)).unwrap()
+        LogSegmentFiles::list(test_engine_with_storage(storage.clone()).as_ref(), &log_root, vec![], Some(0), Some(10)).unwrap()
     };
 
     // Should fall back to checkpoint at v5 (the empty v10 checkpoint is skipped)
@@ -992,7 +1056,7 @@ async fn test_zero_byte_crc_kept() {
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result =
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
+        LogSegmentFiles::list(test_engine_with_storage(storage.clone()).as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
 
     // The 0-byte CRC at v2 is kept (latest_crc_file tracks the highest version)
     let crc = result.latest_crc_file.unwrap();
@@ -1040,7 +1104,7 @@ async fn test_list_commits_zero_byte_commit_kept() {
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result =
-        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, Some(0), Some(2)).unwrap();
+        LogSegmentFiles::list_commits(test_engine_with_storage(storage.clone()).as_ref(), &log_root, Some(0), Some(2)).unwrap();
     assert_eq!(result.ascending_commit_files.len(), 3);
     assert_eq!(result.ascending_commit_files[2].version, 2);
     assert_eq!(result.ascending_commit_files[2].location.size, 0);

@@ -39,9 +39,45 @@ use crate::utils::test_utils::{
     assert_batch_matches, assert_result_error_with_message, string_array_to_engine_data, Action,
 };
 use crate::{
-    DeltaResult, EngineData, Expression, FileMeta, JsonHandler, ParquetHandler, Predicate,
-    PredicateRef, RowVisitor, StorageHandler,
+    DeltaResult, Engine, EngineData, EvaluationHandler, Expression, FileMeta, JsonHandler,
+    ParquetHandler, Predicate, PredicateRef, RowVisitor, StorageHandler,
 };
+
+/// A minimal test engine that only supports `storage_handler`.
+#[derive(Clone)]
+struct StorageOnlyEngine {
+    storage: Arc<dyn StorageHandler>,
+}
+
+impl Engine for StorageOnlyEngine {
+    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+        unimplemented!()
+    }
+
+    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+        self.storage.clone()
+    }
+
+    fn json_handler(&self) -> Arc<dyn JsonHandler> {
+        unimplemented!()
+    }
+
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+        unimplemented!()
+    }
+
+    #[cfg(feature = "declarative-query-plan")]
+    fn execute_query_plan(
+        &self,
+        _query_plan: crate::QueryPlan,
+    ) -> DeltaResult<crate::QueryPlanResultIterator> {
+        unimplemented!()
+    }
+}
+
+fn test_engine_with_storage(storage: Arc<dyn StorageHandler>) -> Arc<dyn Engine> {
+    Arc::new(StorageOnlyEngine { storage })
+}
 
 /// Processes sidecar files for the given checkpoint batch.
 ///
@@ -90,7 +126,7 @@ fn delta_path_for_multipart_checkpoint(version: u64, part_num: u32, num_parts: u
 async fn build_log_with_paths_and_checkpoint(
     paths: &[Path],
     checkpoint_metadata: Option<&LastCheckpointHint>,
-) -> (Box<dyn StorageHandler>, Url) {
+) -> (Arc<dyn StorageHandler>, Url) {
     let store = Arc::new(InMemory::new());
 
     let data = bytes::Bytes::from("kernel-data");
@@ -114,11 +150,12 @@ async fn build_log_with_paths_and_checkpoint(
             .expect("Write _last_checkpoint");
     }
 
-    let storage = ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+    let storage: Arc<dyn StorageHandler> =
+        Arc::new(ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new())));
 
     let table_root = Url::parse("memory:///").expect("valid url");
     let log_root = table_root.join("_delta_log/").unwrap();
-    (Box::new(storage), log_root)
+    (storage, log_root)
 }
 
 // Create an in-memory store and return the store and the URL for the store's _delta_log directory.
@@ -240,7 +277,7 @@ async fn build_snapshot_with_uuid_checkpoint_parquet() {
     .await;
 
     let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         log_root,
         vec![], // log_tail
         None,
@@ -277,7 +314,7 @@ async fn build_snapshot_with_uuid_checkpoint_json() {
     .await;
 
     let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         log_root,
         vec![], // log_tail
         None,
@@ -327,7 +364,7 @@ async fn build_snapshot_with_correct_last_uuid_checkpoint() {
     .await;
 
     let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
@@ -372,7 +409,7 @@ async fn build_snapshot_with_multiple_incomplete_multipart_checkpoints() {
     .await;
 
     let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         log_root,
         vec![], // log_tail
         None,
@@ -419,7 +456,7 @@ async fn build_snapshot_with_out_of_date_last_checkpoint() {
     .await;
 
     let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
@@ -470,7 +507,7 @@ async fn build_snapshot_with_correct_last_multipart_checkpoint() {
     .await;
 
     let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
@@ -521,7 +558,7 @@ async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
     .await;
 
     let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
@@ -566,7 +603,7 @@ async fn build_snapshot_with_bad_checkpoint_hint_fails() {
     .await;
 
     let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
@@ -604,7 +641,7 @@ async fn build_snapshot_with_missing_checkpoint_part_no_hint() {
     .await;
 
     let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         log_root,
         vec![], // log_tail
         None,
@@ -658,7 +695,7 @@ async fn build_snapshot_with_out_of_date_last_checkpoint_and_incomplete_recent_c
     .await;
 
     let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
@@ -698,7 +735,7 @@ async fn build_snapshot_without_checkpoints() {
 
     ///////// Specify no checkpoint or end version /////////
     let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         log_root.clone(),
         vec![], // log_tail
         None,
@@ -718,7 +755,7 @@ async fn build_snapshot_without_checkpoints() {
 
     ///////// Specify  only end version /////////
     let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         log_root,
         vec![], // log_tail
         None,
@@ -768,7 +805,7 @@ async fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
     .await;
 
     let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
@@ -814,7 +851,7 @@ async fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
     .await;
 
     let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
@@ -847,7 +884,7 @@ async fn build_snapshot_time_travel_no_checkpoint_falls_back_to_v0(
     let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
 
     let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], hint, Some(5)).unwrap();
+        LogSegment::for_snapshot_impl(test_engine_with_storage(storage.clone()).as_ref(), log_root, vec![], hint, Some(5)).unwrap();
 
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
@@ -874,7 +911,7 @@ async fn build_snapshot_time_travel_no_hint_checkpoint_at_end_version_included()
     .await;
 
     let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, Some(5)).unwrap();
+        LogSegment::for_snapshot_impl(test_engine_with_storage(storage.clone()).as_ref(), log_root, vec![], None, Some(5)).unwrap();
 
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
@@ -906,7 +943,7 @@ async fn build_table_changes_with_commit_versions() {
     ///////// Specify start version and end version /////////
 
     let log_segment =
-        LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 2, 5).unwrap();
+        LogSegment::for_table_changes(test_engine_with_storage(storage.clone()).as_ref(), log_root.clone(), 2, 5).unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
@@ -920,7 +957,7 @@ async fn build_table_changes_with_commit_versions() {
 
     ///////// Start version and end version are the same /////////
     let log_segment =
-        LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 0, Some(0)).unwrap();
+        LogSegment::for_table_changes(test_engine_with_storage(storage.clone()).as_ref(), log_root.clone(), 0, Some(0)).unwrap();
 
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
@@ -932,7 +969,7 @@ async fn build_table_changes_with_commit_versions() {
     assert_eq!(commit_files[0].version, 0);
 
     ///////// Specify no start or end version /////////
-    let log_segment = LogSegment::for_table_changes(storage.as_ref(), log_root, 0, None).unwrap();
+    let log_segment = LogSegment::for_table_changes(test_engine_with_storage(storage.clone()).as_ref(), log_root, 0, None).unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
@@ -958,7 +995,7 @@ async fn test_non_contiguous_log() {
     .await;
 
     let log_segment_res =
-        LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 0, None);
+        LogSegment::for_table_changes(test_engine_with_storage(storage.clone()).as_ref(), log_root.clone(), 0, None);
     // check the error message up to the timestamp
     let expected_error_pattern = "Generic delta kernel error: Expected contiguous commit files, \
         but found gap: ParsedLogPath { location: FileMeta { location: Url { scheme: \"memory\", \
@@ -967,13 +1004,13 @@ async fn test_non_contiguous_log() {
     assert_result_error_with_message(log_segment_res, expected_error_pattern);
 
     let log_segment_res =
-        LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 1, None);
+        LogSegment::for_table_changes(test_engine_with_storage(storage.clone()).as_ref(), log_root.clone(), 1, None);
     assert_result_error_with_message(
         log_segment_res,
         "Generic delta kernel error: Expected the first commit to have version 1",
     );
 
-    let log_segment_res = LogSegment::for_table_changes(storage.as_ref(), log_root, 0, Some(1));
+    let log_segment_res = LogSegment::for_table_changes(test_engine_with_storage(storage.clone()).as_ref(), log_root, 0, Some(1));
     assert_result_error_with_message(
         log_segment_res,
         "Generic delta kernel error: LogSegment end version 0 not the same as the specified end \
@@ -992,7 +1029,7 @@ async fn table_changes_fails_with_larger_start_version_than_end() {
         None,
     )
     .await;
-    let log_segment_res = LogSegment::for_table_changes(storage.as_ref(), log_root, 1, Some(0));
+    let log_segment_res = LogSegment::for_table_changes(test_engine_with_storage(storage.clone()).as_ref(), log_root, 1, Some(0));
     assert_result_error_with_message(log_segment_res, "Generic delta kernel error: Failed to build LogSegment: start_version cannot be greater than end_version");
 }
 
@@ -1578,7 +1615,7 @@ async fn create_segment_for(segment: LogSegmentConfig<'_>) -> LogSegment {
         })
         .collect();
     LogSegment::for_snapshot_impl(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         log_root.clone(),
         staged_commits_log_tail,
         None,
@@ -1601,7 +1638,7 @@ async fn test_list_log_files_with_version() -> DeltaResult<()> {
     )
     .await;
     let result = LogSegmentFiles::list(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         &log_root,
         vec![], // log_tail
         Some(0),
@@ -2005,12 +2042,19 @@ async fn test_commit_cover_zero_byte_compaction_uses_commits() {
         .await
         .expect("put empty compaction");
 
-    let storage = ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+    let storage: Arc<dyn StorageHandler> =
+        Arc::new(ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new())));
     let table_root = Url::parse("memory:///").expect("valid url");
     let log_root = table_root.join("_delta_log/").unwrap();
 
-    let log_segment =
-        LogSegment::for_snapshot_impl(&storage, log_root.clone(), vec![], None, None).unwrap();
+    let log_segment = LogSegment::for_snapshot_impl(
+        test_engine_with_storage(storage.clone()).as_ref(),
+        log_root.clone(),
+        vec![],
+        None,
+        None,
+    )
+    .unwrap();
 
     assert_eq!(
         log_segment.listed.ascending_compaction_files.len(),
@@ -2357,7 +2401,7 @@ async fn for_timestamp_conversion_gets_commit_range() {
     .await;
 
     let log_segment =
-        LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 7, None).unwrap();
+        LogSegment::for_timestamp_conversion(test_engine_with_storage(storage.clone()).as_ref(), log_root.clone(), 7, None).unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
@@ -2388,7 +2432,7 @@ async fn for_timestamp_conversion_with_old_end_version() {
     .await;
 
     let log_segment =
-        LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 5, None).unwrap();
+        LogSegment::for_timestamp_conversion(test_engine_with_storage(storage.clone()).as_ref(), log_root.clone(), 5, None).unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
@@ -2419,7 +2463,7 @@ async fn for_timestamp_conversion_only_contiguous_ranges() {
     .await;
 
     let log_segment =
-        LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 7, None).unwrap();
+        LogSegment::for_timestamp_conversion(test_engine_with_storage(storage.clone()).as_ref(), log_root.clone(), 7, None).unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
@@ -2450,7 +2494,7 @@ async fn for_timestamp_conversion_with_limit() {
     .await;
 
     let log_segment = LogSegment::for_timestamp_conversion(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         log_root.clone(),
         7,
         Some(NonZero::new(3).unwrap()),
@@ -2486,7 +2530,7 @@ async fn for_timestamp_conversion_with_large_limit() {
     .await;
 
     let log_segment = LogSegment::for_timestamp_conversion(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         log_root.clone(),
         7,
         Some(NonZero::new(20).unwrap()),
@@ -2509,7 +2553,7 @@ async fn for_timestamp_conversion_no_commit_files() {
     )
     .await;
 
-    let res = LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 0, None);
+    let res = LogSegment::for_timestamp_conversion(test_engine_with_storage(storage.clone()).as_ref(), log_root.clone(), 0, None);
     assert_result_error_with_message(res, "Generic delta kernel error: No files in log segment");
 }
 
@@ -2531,7 +2575,7 @@ async fn test_latest_commit_file_field_is_captured() {
     .await;
 
     let log_segment = LogSegment::for_snapshot(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         log_root.clone(),
         vec![],
         None,
@@ -2564,7 +2608,7 @@ async fn test_latest_commit_file_with_checkpoint_filtering() {
     .await;
 
     let log_segment = LogSegment::for_snapshot(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         log_root.clone(),
         vec![],
         None,
@@ -2591,7 +2635,7 @@ async fn test_latest_commit_file_with_no_commits() {
     .await;
 
     let log_segment = LogSegment::for_snapshot(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         log_root.clone(),
         vec![],
         None,
@@ -2621,7 +2665,7 @@ async fn test_latest_commit_file_with_checkpoint_at_same_version() {
     .await;
 
     let log_segment = LogSegment::for_snapshot(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         log_root.clone(),
         vec![],
         None,
@@ -2653,7 +2697,7 @@ async fn test_latest_commit_file_edge_case_commit_before_checkpoint() {
     .await;
 
     let log_segment = LogSegment::for_snapshot(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         log_root.clone(),
         vec![],
         None,
@@ -2757,7 +2801,7 @@ async fn test_checkpoint_schema_propagation_from_hint() {
     .await;
 
     let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
+        test_engine_with_storage(storage.clone()).as_ref(),
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
@@ -4479,9 +4523,7 @@ async fn read_actions_with_null_map_values(
 
     // Build engine and read actions -- same as DeltaActionExtractor::get_actions.
     let engine = DefaultEngineBuilder::new(store).build();
-    let log_segment =
-        LogSegment::for_table_changes(engine.storage_handler().as_ref(), log_root, 0, Some(0))
-            .unwrap();
+    let log_segment = LogSegment::for_table_changes(&engine, log_root, 0, Some(0)).unwrap();
 
     // Use all_actions_schema to cover sidecar and checkpointMetadata (checkpoint-only actions).
     let action_schema = get_all_actions_schema().clone();

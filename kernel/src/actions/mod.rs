@@ -1068,6 +1068,8 @@ mod tests {
     use crate::{
         Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
     };
+    #[cfg(feature = "declarative-query-plan")]
+    use crate::{QueryPlan, QueryPlanResultIterator};
 
     // duplicated
     struct ExprEngine(Arc<dyn EvaluationHandler>);
@@ -1092,6 +1094,14 @@ mod tests {
         }
 
         fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+            unimplemented!()
+        }
+
+        #[cfg(feature = "declarative-query-plan")]
+        fn execute_query_plan(
+            &self,
+            _query_plan: QueryPlan,
+        ) -> DeltaResult<QueryPlanResultIterator> {
             unimplemented!()
         }
     }

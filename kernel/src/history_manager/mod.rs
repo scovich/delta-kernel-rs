@@ -350,7 +350,7 @@ pub(crate) fn timestamp_to_version(
     // the commit sequence. for_timestamp_conversion returns only contiguous commits,
     // which is required for correct timestamp-to-version mapping.
     let log_segment = LogSegment::for_timestamp_conversion(
-        engine.storage_handler().as_ref(),
+        engine,
         snapshot.log_segment().log_root.clone(),
         snapshot.version(),
         None,
@@ -688,7 +688,7 @@ mod tests {
         }
         let snapshot = builder.build(&engine).unwrap();
         let log_segment = LogSegment::for_timestamp_conversion(
-            engine.storage_handler().as_ref(),
+            &engine,
             snapshot.log_segment().log_root.clone(),
             snapshot.version(),
             None,
@@ -802,7 +802,7 @@ mod tests {
 
         // Build a new log segment that only sees v3+ (simulating post-cleanup state)
         let cleaned_log_segment = LogSegment::for_timestamp_conversion(
-            engine.storage_handler().as_ref(),
+            &engine,
             snapshot.log_segment().log_root.clone(),
             snapshot.version(),
             None,

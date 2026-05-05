@@ -678,6 +678,14 @@ impl Engine for FailingEngine {
     fn parquet_handler(&self) -> Arc<dyn delta_kernel::ParquetHandler> {
         unimplemented!()
     }
+
+    #[cfg(feature = "declarative-query-plan")]
+    fn execute_query_plan(
+        &self,
+        _query_plan: delta_kernel::QueryPlan,
+    ) -> DeltaResult<delta_kernel::QueryPlanResultIterator> {
+        unimplemented!()
+    }
 }
 
 #[tokio::test]

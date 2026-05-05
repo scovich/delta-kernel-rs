@@ -209,14 +209,13 @@ impl Snapshot {
         }
 
         let log_root = existing_log_segment.log_root.clone();
-        let storage = engine.storage_handler();
 
         // Start listing just after the previous segment's checkpoint, if any.
         let listing_start = existing_log_segment.checkpoint_version.unwrap_or(0) + 1;
 
         // Check for new commits (and CRC)
         let new_listed_files = LogSegmentFiles::list(
-            storage.as_ref(),
+            engine,
             &log_root,
             log_tail,
             Some(listing_start),

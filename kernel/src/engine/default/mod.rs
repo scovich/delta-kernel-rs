@@ -25,6 +25,8 @@ use crate::transaction::WriteContext;
 use crate::{
     DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
 };
+#[cfg(feature = "declarative-query-plan")]
+use crate::{QueryPlan, QueryPlanResultIterator};
 
 pub mod executor;
 pub mod file_stream;
@@ -316,6 +318,13 @@ impl<E: TaskExecutor> Engine for DefaultEngine<E> {
 
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
         self.parquet.clone()
+    }
+
+    #[cfg(feature = "declarative-query-plan")]
+    fn execute_query_plan(&self, _query_plan: QueryPlan) -> DeltaResult<QueryPlanResultIterator> {
+        Err(crate::Error::unsupported(
+            "declarative query plans are not implemented for DefaultEngine",
+        ))
     }
 }
 

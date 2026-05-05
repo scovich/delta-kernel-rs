@@ -12,6 +12,8 @@ use crate::{
     DeltaResult, Engine, Error, EvaluationHandler, FileDataReadResultIterator, FileMeta,
     JsonHandler, ParquetHandler, PredicateRef, SchemaRef, StorageHandler,
 };
+#[cfg(feature = "declarative-query-plan")]
+use crate::{QueryPlan, QueryPlanResultIterator};
 
 pub(crate) mod json;
 mod parquet;
@@ -54,6 +56,13 @@ impl Engine for SyncEngine {
 
     fn json_handler(&self) -> Arc<dyn JsonHandler> {
         self.json_handler.clone()
+    }
+
+    #[cfg(feature = "declarative-query-plan")]
+    fn execute_query_plan(&self, _query_plan: QueryPlan) -> DeltaResult<QueryPlanResultIterator> {
+        Err(Error::unsupported(
+            "declarative query plans are not implemented for SyncEngine",
+        ))
     }
 }
 

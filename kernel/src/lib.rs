@@ -103,6 +103,8 @@ mod log_path;
 mod log_reader;
 pub mod metrics;
 pub mod partition;
+#[cfg(feature = "declarative-query-plan")]
+pub mod query_plan;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -181,6 +183,8 @@ pub use error::{DeltaResult, Error};
 use expressions::{literal_expression_transform, Scalar};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
+#[cfg(feature = "declarative-query-plan")]
+pub use query_plan::QueryPlan;
 use schema::{StructField, StructType};
 pub use snapshot::{Snapshot, SnapshotRef};
 
@@ -205,6 +209,11 @@ pub type FileDataReadResult = (FileMeta, Box<dyn EngineData>);
 
 /// An iterator of data read from specified files
 pub type FileDataReadResultIterator =
+    Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>;
+
+/// An iterator over query-plan execution results.
+#[cfg(feature = "declarative-query-plan")]
+pub type QueryPlanResultIterator =
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>;
 
 /// The metadata that describes an object.
@@ -925,6 +934,10 @@ pub trait Engine: AsAny {
 
     /// Get the connector provided [`ParquetHandler`].
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler>;
+
+    /// Execute a declarative query plan and return an iterator over result batches.
+    #[cfg(feature = "declarative-query-plan")]
+    fn execute_query_plan(&self, query_plan: QueryPlan) -> DeltaResult<QueryPlanResultIterator>;
 }
 
 // we have an 'internal' feature flag: default-engine-base, which is actually just the shared

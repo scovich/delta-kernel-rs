@@ -144,7 +144,7 @@ impl TableChanges {
     ) -> DeltaResult<Self> {
         let log_root = table_root.join("_delta_log/")?;
         let log_segment = LogSegment::for_table_changes(
-            engine.storage_handler().as_ref(),
+            engine,
             log_root,
             start_version,
             end_version,

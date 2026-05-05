@@ -17,6 +17,8 @@
 //! [`LogSegment`]: crate::log_segment::LogSegment
 
 use std::collections::HashMap;
+#[cfg(feature = "declarative-query-plan")]
+use std::sync::LazyLock;
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
@@ -26,7 +28,15 @@ use url::Url;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
 use crate::path::{LogPathFileType, ParsedLogPath};
-use crate::{DeltaResult, Error, StorageHandler, Version};
+#[cfg(feature = "declarative-query-plan")]
+use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
+use crate::{DeltaResult, Engine, Error, StorageHandler, Version};
+#[cfg(feature = "declarative-query-plan")]
+use crate::FileMeta;
+#[cfg(feature = "declarative-query-plan")]
+use crate::engine_data::TypedGetData as _;
+#[cfg(feature = "declarative-query-plan")]
+use crate::{GetData, QueryPlan, RowVisitor};
 
 #[cfg(test)]
 mod tests;
@@ -64,6 +74,7 @@ pub(crate) struct LogSegmentFiles {
 /// This is a thin wrapper around [`StorageHandler::list_from`] that provides the standard
 /// Delta log file discovery pipeline. Callers are responsible for handling the `log_tail`
 /// (catalog-provided commits) and tracking `max_published_version`.
+#[cfg_attr(feature = "declarative-query-plan", allow(dead_code))]
 fn list_from_storage(
     storage: &dyn StorageHandler,
     log_root: &Url,
@@ -87,6 +98,85 @@ fn list_from_storage(
             Err(_) => true,
         });
     Ok(files)
+}
+
+#[cfg(feature = "declarative-query-plan")]
+#[derive(Default)]
+struct ListedFileMetaVisitor {
+    files: Vec<FileMeta>,
+}
+
+#[cfg(feature = "declarative-query-plan")]
+impl RowVisitor for ListedFileMetaVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            (
+                vec![
+                    column_name!("location"),
+                    column_name!("last_modified"),
+                    column_name!("size"),
+                ],
+                vec![DataType::STRING, DataType::LONG, DataType::LONG],
+            )
+                .into()
+        });
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        for i in 0..row_count {
+            let location: String = getters[0].get(i, "location")?;
+            let last_modified: i64 = getters[1].get(i, "last_modified")?;
+            let size_i64: i64 = getters[2].get(i, "size")?;
+            let size = size_i64
+                .try_into()
+                .map_err(|_| Error::generic(format!("Invalid negative file size: {size_i64}")))?;
+            let location = Url::parse(&location)
+                .map_err(|e| Error::generic(format!("Invalid file URL '{location}': {e}")))?;
+            self.files.push(FileMeta {
+                location,
+                last_modified,
+                size,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "declarative-query-plan")]
+fn list_from_engine(
+    engine: &dyn Engine,
+    log_root: &Url,
+    start_version: Version,
+    end_version: Version,
+) -> DeltaResult<impl Iterator<Item = DeltaResult<ParsedLogPath>>> {
+    let start_from = log_root.join(&format!("{start_version:020}"))?;
+    let data_iter = engine.execute_query_plan(QueryPlan::ListLogFiles { start_from })?;
+
+    let mut parsed_paths = Vec::new();
+    for data in data_iter {
+        let data = data?;
+        let mut visitor = ListedFileMetaVisitor::default();
+        visitor.visit_rows_of(data.as_ref())?;
+
+        // TODO: can we move some of the filtering into the row visitor to avoid unnecessary 
+        // FileMeta creation?
+        for file_meta in visitor.files {
+            let Some(parsed) = ParsedLogPath::try_from(file_meta)? else {
+                continue;
+            };
+            if !parsed.should_list() {
+                continue;
+            }
+            if parsed.version > end_version {
+                return Ok(parsed_paths.into_iter().map(Ok));
+            }
+            parsed_paths.push(parsed);
+        }
+    }
+
+    // TODO: Make this pipelined instead of collecting all the paths into a vector first
+    Ok(parsed_paths.into_iter().map(Ok))
 }
 
 /// Groups all checkpoint parts according to the checkpoint they belong to.
@@ -430,15 +520,20 @@ impl LogSegmentFiles {
     /// List all commits between the provided `start_version` (inclusive) and `end_version`
     /// (inclusive). All other types are ignored.
     pub(crate) fn list_commits(
-        storage: &dyn StorageHandler,
+        engine: &dyn Engine,
         log_root: &Url,
         start_version: Option<Version>,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
+        #[cfg(not(feature = "declarative-query-plan"))]
+        let storage = engine.storage_handler();
         // TODO: plumb through a log_tail provided by our caller
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);
-        let fs_iter = list_from_storage(storage, log_root, start, end)?;
+        #[cfg(feature = "declarative-query-plan")]
+        let fs_iter = list_from_engine(engine, log_root, start, end)?;
+        #[cfg(not(feature = "declarative-query-plan"))]
+        let fs_iter = list_from_storage(storage.as_ref(), log_root, start, end)?;
 
         let mut listed_commits = Vec::new();
         let mut max_published_version: Option<Version> = None;
@@ -476,15 +571,20 @@ impl LogSegmentFiles {
     //   version)
     #[instrument(name = "log.list", skip_all, fields(start = ?start_version, end = ?end_version), err)]
     pub(crate) fn list(
-        storage: &dyn StorageHandler,
+        engine: &dyn Engine,
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         start_version: Option<Version>,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
+        #[cfg(not(feature = "declarative-query-plan"))]
+        let storage = engine.storage_handler();
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);
-        let fs_iter = list_from_storage(storage, log_root, start, end)?;
+        #[cfg(feature = "declarative-query-plan")]
+        let fs_iter = list_from_engine(engine, log_root, start, end)?;
+        #[cfg(not(feature = "declarative-query-plan"))]
+        let fs_iter = list_from_storage(storage.as_ref(), log_root, start, end)?;
         Self::build_log_segment_files(fs_iter, log_tail, start, end_version)
     }
 
@@ -493,13 +593,13 @@ impl LogSegmentFiles {
     /// `end_version`.
     pub(crate) fn list_with_checkpoint_hint(
         checkpoint_metadata: &LastCheckpointHint,
-        storage: &dyn StorageHandler,
+        engine: &dyn Engine,
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
         let listed_files = Self::list(
-            storage,
+            engine,
             log_root,
             log_tail,
             Some(checkpoint_metadata.version),
@@ -549,11 +649,13 @@ impl LogSegmentFiles {
     /// rooted at the checkpoint at v8900 with all commits from v8901 to v12500.
     #[instrument(name = "log.list_with_backward_checkpoint_scan", skip_all, fields(end = end_version), err)]
     pub(crate) fn list_with_backward_checkpoint_scan(
-        storage: &dyn StorageHandler,
+        engine: &dyn Engine,
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         end_version: Version,
     ) -> DeltaResult<Self> {
+        #[cfg(not(feature = "declarative-query-plan"))]
+        let storage = engine.storage_handler();
         // Scan backward in 1000-version windows, collecting ALL file types, until a complete
         // checkpoint is found or the log is exhausted.
         let mut windows: Vec<Vec<ParsedLogPath>> = Vec::new();
@@ -564,8 +666,13 @@ impl LogSegmentFiles {
         let mut upper = end_version + 1;
         while upper > 0 {
             let lower = upper.saturating_sub(BACKWARD_SCAN_WINDOW_SIZE);
+            #[cfg(feature = "declarative-query-plan")]
+            let window_files: Vec<_> = list_from_engine(engine, log_root, lower, upper - 1)?
+                .try_collect()?;
+            #[cfg(not(feature = "declarative-query-plan"))]
             let window_files: Vec<_> =
-                list_from_storage(storage, log_root, lower, upper - 1)?.try_collect()?;
+                list_from_storage(storage.as_ref(), log_root, lower, upper - 1)?
+                .try_collect()?;
 
             found_checkpoint_version = find_complete_checkpoint_version(&window_files);
             windows.push(window_files);
