@@ -143,12 +143,8 @@ impl TableChanges {
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
         let log_root = table_root.join("_delta_log/")?;
-        let log_segment = LogSegment::for_table_changes(
-            engine,
-            log_root,
-            start_version,
-            end_version,
-        )?;
+        let log_segment =
+            LogSegment::for_table_changes(engine, log_root, start_version, end_version)?;
 
         let start_snapshot = Snapshot::builder_for(table_root.as_url().clone())
             .at_version(start_version)

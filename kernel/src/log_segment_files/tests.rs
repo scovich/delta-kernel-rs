@@ -271,8 +271,13 @@ async fn test_empty_log_tail() {
     ];
     let (storage, log_root) = create_storage(log_files).await;
 
-    let (commits, _, _, _, latest_commit, max_pub) =
-        list_and_destructure(test_engine_with_storage(storage.clone()).as_ref(), &log_root, vec![], Some(1), Some(2));
+    let (commits, _, _, _, latest_commit, max_pub) = list_and_destructure(
+        test_engine_with_storage(storage.clone()).as_ref(),
+        &log_root,
+        vec![],
+        Some(1),
+        Some(2),
+    );
 
     assert_eq!(commits.len(), 2);
     assert_eq!(commits[0].version, 1);
@@ -299,8 +304,13 @@ async fn test_log_tail_has_latest_commit_files() {
         make_parsed_log_path_with_source(5, LogPathFileType::Commit, CommitSource::Catalog),
     ];
 
-    let (commits, _, _, _, latest_commit, max_pub) =
-        list_and_destructure(test_engine_with_storage(storage.clone()).as_ref(), &log_root, log_tail, Some(0), Some(5));
+    let (commits, _, _, _, latest_commit, max_pub) = list_and_destructure(
+        test_engine_with_storage(storage.clone()).as_ref(),
+        &log_root,
+        log_tail,
+        Some(0),
+        Some(5),
+    );
 
     assert_eq!(commits.len(), 6);
     // filesystem commits 0-2
@@ -334,8 +344,13 @@ async fn test_request_subset_with_log_tail() {
     ];
 
     // list for only versions 1-3
-    let (commits, _, _, _, latest_commit, max_pub) =
-        list_and_destructure(test_engine_with_storage(storage.clone()).as_ref(), &log_root, log_tail, Some(1), Some(3));
+    let (commits, _, _, _, latest_commit, max_pub) = list_and_destructure(
+        test_engine_with_storage(storage.clone()).as_ref(),
+        &log_root,
+        log_tail,
+        Some(1),
+        Some(3),
+    );
 
     assert_eq!(commits.len(), 3);
     assert_eq!(commits[0].version, 1);
@@ -367,8 +382,13 @@ async fn test_log_tail_defines_latest_version() {
         CommitSource::Catalog,
     )];
 
-    let (commits, _, _, _, latest_commit, max_pub) =
-        list_and_destructure(test_engine_with_storage(storage.clone()).as_ref(), &log_root, log_tail, Some(0), None);
+    let (commits, _, _, _, latest_commit, max_pub) = list_and_destructure(
+        test_engine_with_storage(storage.clone()).as_ref(),
+        &log_root,
+        log_tail,
+        Some(0),
+        None,
+    );
 
     // expect only 0 from file system and 1 from log tail
     assert_eq!(commits.len(), 2);
@@ -422,8 +442,13 @@ fn test_log_tail_covers_entire_range_empty_filesystem() {
 
     let storage: Arc<dyn StorageHandler> = Arc::new(EmptyStorageHandler);
     let url = Url::parse("memory:///anything/_delta_log/").unwrap();
-    let (commits, _, _, _, latest_commit, max_pub) =
-        list_and_destructure(test_engine_with_storage(storage.clone()).as_ref(), &url, log_tail, Some(0), Some(2));
+    let (commits, _, _, _, latest_commit, max_pub) = list_and_destructure(
+        test_engine_with_storage(storage.clone()).as_ref(),
+        &url,
+        log_tail,
+        Some(0),
+        Some(2),
+    );
 
     // Only log_tail commits should appear (filesystem is empty)
     assert_eq!(commits.len(), 3);
@@ -457,8 +482,13 @@ async fn test_log_tail_covers_entire_range_with_crc() {
         make_parsed_log_path_with_source(2, LogPathFileType::StagedCommit, CommitSource::Catalog),
     ];
 
-    let (commits, _, _, latest_crc, latest_commit, max_pub) =
-        list_and_destructure(test_engine_with_storage(storage.clone()).as_ref(), &log_root, log_tail, Some(0), Some(2));
+    let (commits, _, _, latest_crc, latest_commit, max_pub) = list_and_destructure(
+        test_engine_with_storage(storage.clone()).as_ref(),
+        &log_root,
+        log_tail,
+        Some(0),
+        Some(2),
+    );
 
     // 3 commits from log_tail: 0, 1, 2
     assert_eq!(commits.len(), 3);
@@ -491,8 +521,13 @@ async fn test_listing_omits_staged_commits() {
     ];
 
     let (storage, log_root) = create_storage(log_files).await;
-    let (commits, _, _, _, latest_commit, max_pub) =
-        list_and_destructure(test_engine_with_storage(storage.clone()).as_ref(), &log_root, vec![], None, None);
+    let (commits, _, _, _, latest_commit, max_pub) = list_and_destructure(
+        test_engine_with_storage(storage.clone()).as_ref(),
+        &log_root,
+        vec![],
+        None,
+        None,
+    );
 
     // we must only see two regular commits
     assert_eq!(commits.len(), 2);
@@ -514,8 +549,13 @@ async fn test_listing_with_large_end_version() {
 
     let (storage, log_root) = create_storage(log_files).await;
     // note we let you request end version past the end of log. up to consumer to interpret
-    let (commits, _, _, _, latest_commit, max_pub) =
-        list_and_destructure(test_engine_with_storage(storage.clone()).as_ref(), &log_root, vec![], None, Some(3));
+    let (commits, _, _, _, latest_commit, max_pub) = list_and_destructure(
+        test_engine_with_storage(storage.clone()).as_ref(),
+        &log_root,
+        vec![],
+        None,
+        Some(3),
+    );
 
     // we must only see two regular commits
     assert_eq!(commits.len(), 2);
@@ -557,8 +597,13 @@ async fn test_non_commit_files_at_log_tail_versions_are_preserved() {
         make_parsed_log_path_with_source(10, LogPathFileType::Commit, CommitSource::Catalog),
     ];
 
-    let (commits, _, checkpoint_parts, latest_crc, latest_commit, max_pub) =
-        list_and_destructure(test_engine_with_storage(storage.clone()).as_ref(), &log_root, log_tail, Some(0), Some(10));
+    let (commits, _, checkpoint_parts, latest_crc, latest_commit, max_pub) = list_and_destructure(
+        test_engine_with_storage(storage.clone()).as_ref(),
+        &log_root,
+        log_tail,
+        Some(0),
+        Some(10),
+    );
 
     // Checkpoint at version 7 is preserved from filesystem
     assert_eq!(checkpoint_parts.len(), 1);
@@ -957,8 +1002,14 @@ async fn test_zero_byte_commit_kept_in_listing() {
     ];
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
-    let result =
-        LogSegmentFiles::list(test_engine_with_storage(storage.clone()).as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
+    let result = LogSegmentFiles::list(
+        test_engine_with_storage(storage.clone()).as_ref(),
+        &log_root,
+        vec![],
+        Some(0),
+        Some(2),
+    )
+    .unwrap();
     assert_eq!(result.ascending_commit_files.len(), 3);
     assert_eq!(result.ascending_commit_files[0].version, 0);
     assert_eq!(result.ascending_commit_files[1].version, 1);
@@ -987,10 +1038,22 @@ async fn test_zero_byte_compaction_skipped_commits_used(#[case] use_backward_sca
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result = if use_backward_scan {
-        LogSegmentFiles::list_with_backward_checkpoint_scan(test_engine_with_storage(storage.clone()).as_ref(), &log_root, vec![], 4)
-            .unwrap()
+        LogSegmentFiles::list_with_backward_checkpoint_scan(
+            test_engine_with_storage(storage.clone()).as_ref(),
+            &log_root,
+            vec![],
+            4,
+        )
+        .unwrap()
     } else {
-        LogSegmentFiles::list(test_engine_with_storage(storage.clone()).as_ref(), &log_root, vec![], Some(0), Some(4)).unwrap()
+        LogSegmentFiles::list(
+            test_engine_with_storage(storage.clone()).as_ref(),
+            &log_root,
+            vec![],
+            Some(0),
+            Some(4),
+        )
+        .unwrap()
     };
 
     assert!(
@@ -1027,10 +1090,22 @@ async fn test_zero_byte_checkpoint_skipped_older_used(#[case] use_backward_scan:
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result = if use_backward_scan {
-        LogSegmentFiles::list_with_backward_checkpoint_scan(test_engine_with_storage(storage.clone()).as_ref(), &log_root, vec![], 10)
-            .unwrap()
+        LogSegmentFiles::list_with_backward_checkpoint_scan(
+            test_engine_with_storage(storage.clone()).as_ref(),
+            &log_root,
+            vec![],
+            10,
+        )
+        .unwrap()
     } else {
-        LogSegmentFiles::list(test_engine_with_storage(storage.clone()).as_ref(), &log_root, vec![], Some(0), Some(10)).unwrap()
+        LogSegmentFiles::list(
+            test_engine_with_storage(storage.clone()).as_ref(),
+            &log_root,
+            vec![],
+            Some(0),
+            Some(10),
+        )
+        .unwrap()
     };
 
     // Should fall back to checkpoint at v5 (the empty v10 checkpoint is skipped)
@@ -1055,8 +1130,14 @@ async fn test_zero_byte_crc_kept() {
     ];
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
-    let result =
-        LogSegmentFiles::list(test_engine_with_storage(storage.clone()).as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
+    let result = LogSegmentFiles::list(
+        test_engine_with_storage(storage.clone()).as_ref(),
+        &log_root,
+        vec![],
+        Some(0),
+        Some(2),
+    )
+    .unwrap();
 
     // The 0-byte CRC at v2 is kept (latest_crc_file tracks the highest version)
     let crc = result.latest_crc_file.unwrap();
@@ -1103,8 +1184,13 @@ async fn test_list_commits_zero_byte_commit_kept() {
     ];
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
-    let result =
-        LogSegmentFiles::list_commits(test_engine_with_storage(storage.clone()).as_ref(), &log_root, Some(0), Some(2)).unwrap();
+    let result = LogSegmentFiles::list_commits(
+        test_engine_with_storage(storage.clone()).as_ref(),
+        &log_root,
+        Some(0),
+        Some(2),
+    )
+    .unwrap();
     assert_eq!(result.ascending_commit_files.len(), 3);
     assert_eq!(result.ascending_commit_files[2].version, 2);
     assert_eq!(result.ascending_commit_files[2].location.size, 0);

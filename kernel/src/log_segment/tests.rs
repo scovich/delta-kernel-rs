@@ -150,8 +150,10 @@ async fn build_log_with_paths_and_checkpoint(
             .expect("Write _last_checkpoint");
     }
 
-    let storage: Arc<dyn StorageHandler> =
-        Arc::new(ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new())));
+    let storage: Arc<dyn StorageHandler> = Arc::new(ObjectStoreStorageHandler::new(
+        store,
+        Arc::new(TokioBackgroundExecutor::new()),
+    ));
 
     let table_root = Url::parse("memory:///").expect("valid url");
     let log_root = table_root.join("_delta_log/").unwrap();
@@ -883,8 +885,14 @@ async fn build_snapshot_time_travel_no_checkpoint_falls_back_to_v0(
     let paths: Vec<Path> = (0..=5).map(|v| delta_path_for_version(v, "json")).collect();
     let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
 
-    let log_segment =
-        LogSegment::for_snapshot_impl(test_engine_with_storage(storage.clone()).as_ref(), log_root, vec![], hint, Some(5)).unwrap();
+    let log_segment = LogSegment::for_snapshot_impl(
+        test_engine_with_storage(storage.clone()).as_ref(),
+        log_root,
+        vec![],
+        hint,
+        Some(5),
+    )
+    .unwrap();
 
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
@@ -910,8 +918,14 @@ async fn build_snapshot_time_travel_no_hint_checkpoint_at_end_version_included()
     )
     .await;
 
-    let log_segment =
-        LogSegment::for_snapshot_impl(test_engine_with_storage(storage.clone()).as_ref(), log_root, vec![], None, Some(5)).unwrap();
+    let log_segment = LogSegment::for_snapshot_impl(
+        test_engine_with_storage(storage.clone()).as_ref(),
+        log_root,
+        vec![],
+        None,
+        Some(5),
+    )
+    .unwrap();
 
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
@@ -942,8 +956,13 @@ async fn build_table_changes_with_commit_versions() {
 
     ///////// Specify start version and end version /////////
 
-    let log_segment =
-        LogSegment::for_table_changes(test_engine_with_storage(storage.clone()).as_ref(), log_root.clone(), 2, 5).unwrap();
+    let log_segment = LogSegment::for_table_changes(
+        test_engine_with_storage(storage.clone()).as_ref(),
+        log_root.clone(),
+        2,
+        5,
+    )
+    .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
@@ -956,8 +975,13 @@ async fn build_table_changes_with_commit_versions() {
     assert_eq!(versions, expected_versions);
 
     ///////// Start version and end version are the same /////////
-    let log_segment =
-        LogSegment::for_table_changes(test_engine_with_storage(storage.clone()).as_ref(), log_root.clone(), 0, Some(0)).unwrap();
+    let log_segment = LogSegment::for_table_changes(
+        test_engine_with_storage(storage.clone()).as_ref(),
+        log_root.clone(),
+        0,
+        Some(0),
+    )
+    .unwrap();
 
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
@@ -969,7 +993,13 @@ async fn build_table_changes_with_commit_versions() {
     assert_eq!(commit_files[0].version, 0);
 
     ///////// Specify no start or end version /////////
-    let log_segment = LogSegment::for_table_changes(test_engine_with_storage(storage.clone()).as_ref(), log_root, 0, None).unwrap();
+    let log_segment = LogSegment::for_table_changes(
+        test_engine_with_storage(storage.clone()).as_ref(),
+        log_root,
+        0,
+        None,
+    )
+    .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
@@ -994,8 +1024,12 @@ async fn test_non_contiguous_log() {
     )
     .await;
 
-    let log_segment_res =
-        LogSegment::for_table_changes(test_engine_with_storage(storage.clone()).as_ref(), log_root.clone(), 0, None);
+    let log_segment_res = LogSegment::for_table_changes(
+        test_engine_with_storage(storage.clone()).as_ref(),
+        log_root.clone(),
+        0,
+        None,
+    );
     // check the error message up to the timestamp
     let expected_error_pattern = "Generic delta kernel error: Expected contiguous commit files, \
         but found gap: ParsedLogPath { location: FileMeta { location: Url { scheme: \"memory\", \
@@ -1003,14 +1037,23 @@ async fn test_non_contiguous_log() {
         \"/_delta_log/00000000000000000000.json\", query: None, fragment: None }, last_modified:";
     assert_result_error_with_message(log_segment_res, expected_error_pattern);
 
-    let log_segment_res =
-        LogSegment::for_table_changes(test_engine_with_storage(storage.clone()).as_ref(), log_root.clone(), 1, None);
+    let log_segment_res = LogSegment::for_table_changes(
+        test_engine_with_storage(storage.clone()).as_ref(),
+        log_root.clone(),
+        1,
+        None,
+    );
     assert_result_error_with_message(
         log_segment_res,
         "Generic delta kernel error: Expected the first commit to have version 1",
     );
 
-    let log_segment_res = LogSegment::for_table_changes(test_engine_with_storage(storage.clone()).as_ref(), log_root, 0, Some(1));
+    let log_segment_res = LogSegment::for_table_changes(
+        test_engine_with_storage(storage.clone()).as_ref(),
+        log_root,
+        0,
+        Some(1),
+    );
     assert_result_error_with_message(
         log_segment_res,
         "Generic delta kernel error: LogSegment end version 0 not the same as the specified end \
@@ -1029,7 +1072,12 @@ async fn table_changes_fails_with_larger_start_version_than_end() {
         None,
     )
     .await;
-    let log_segment_res = LogSegment::for_table_changes(test_engine_with_storage(storage.clone()).as_ref(), log_root, 1, Some(0));
+    let log_segment_res = LogSegment::for_table_changes(
+        test_engine_with_storage(storage.clone()).as_ref(),
+        log_root,
+        1,
+        Some(0),
+    );
     assert_result_error_with_message(log_segment_res, "Generic delta kernel error: Failed to build LogSegment: start_version cannot be greater than end_version");
 }
 
@@ -2042,8 +2090,10 @@ async fn test_commit_cover_zero_byte_compaction_uses_commits() {
         .await
         .expect("put empty compaction");
 
-    let storage: Arc<dyn StorageHandler> =
-        Arc::new(ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new())));
+    let storage: Arc<dyn StorageHandler> = Arc::new(ObjectStoreStorageHandler::new(
+        store,
+        Arc::new(TokioBackgroundExecutor::new()),
+    ));
     let table_root = Url::parse("memory:///").expect("valid url");
     let log_root = table_root.join("_delta_log/").unwrap();
 
@@ -2400,8 +2450,13 @@ async fn for_timestamp_conversion_gets_commit_range() {
     )
     .await;
 
-    let log_segment =
-        LogSegment::for_timestamp_conversion(test_engine_with_storage(storage.clone()).as_ref(), log_root.clone(), 7, None).unwrap();
+    let log_segment = LogSegment::for_timestamp_conversion(
+        test_engine_with_storage(storage.clone()).as_ref(),
+        log_root.clone(),
+        7,
+        None,
+    )
+    .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
@@ -2431,8 +2486,13 @@ async fn for_timestamp_conversion_with_old_end_version() {
     )
     .await;
 
-    let log_segment =
-        LogSegment::for_timestamp_conversion(test_engine_with_storage(storage.clone()).as_ref(), log_root.clone(), 5, None).unwrap();
+    let log_segment = LogSegment::for_timestamp_conversion(
+        test_engine_with_storage(storage.clone()).as_ref(),
+        log_root.clone(),
+        5,
+        None,
+    )
+    .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
@@ -2462,8 +2522,13 @@ async fn for_timestamp_conversion_only_contiguous_ranges() {
     )
     .await;
 
-    let log_segment =
-        LogSegment::for_timestamp_conversion(test_engine_with_storage(storage.clone()).as_ref(), log_root.clone(), 7, None).unwrap();
+    let log_segment = LogSegment::for_timestamp_conversion(
+        test_engine_with_storage(storage.clone()).as_ref(),
+        log_root.clone(),
+        7,
+        None,
+    )
+    .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
@@ -2553,7 +2618,12 @@ async fn for_timestamp_conversion_no_commit_files() {
     )
     .await;
 
-    let res = LogSegment::for_timestamp_conversion(test_engine_with_storage(storage.clone()).as_ref(), log_root.clone(), 0, None);
+    let res = LogSegment::for_timestamp_conversion(
+        test_engine_with_storage(storage.clone()).as_ref(),
+        log_root.clone(),
+        0,
+        None,
+    );
     assert_result_error_with_message(res, "Generic delta kernel error: No files in log segment");
 }
 

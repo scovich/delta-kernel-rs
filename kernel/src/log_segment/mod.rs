@@ -27,8 +27,7 @@ use crate::schema::compare::SchemaComparison;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, Error, Expression, FileMeta, Predicate, PredicateRef, RowVisitor,
-    Version,
+    DeltaResult, Engine, Error, Expression, FileMeta, Predicate, PredicateRef, RowVisitor, Version,
 };
 
 mod domain_metadata_replay;
@@ -315,7 +314,8 @@ impl LogSegment {
         operation_id: MetricId,
     ) -> DeltaResult<Self> {
         let time_travel_version = time_travel_version.into();
-        let checkpoint_hint = LastCheckpointHint::try_read(engine.storage_handler().as_ref(), &log_root)?;
+        let checkpoint_hint =
+            LastCheckpointHint::try_read(engine.storage_handler().as_ref(), &log_root)?;
         let result = Self::for_snapshot_impl(
             engine,
             log_root,
@@ -427,12 +427,8 @@ impl LogSegment {
         }
 
         // TODO: compactions?
-        let listed_files = LogSegmentFiles::list_commits(
-            engine,
-            &log_root,
-            Some(start_version),
-            end_version,
-        )?;
+        let listed_files =
+            LogSegmentFiles::list_commits(engine, &log_root, Some(start_version), end_version)?;
         // - Here check that the start version is correct.
         // - [`LogSegment::try_new`] will verify that the `end_version` is correct if present.
         // - [`LogSegmentFiles::list_commits`] also checks that there are no gaps between commits.

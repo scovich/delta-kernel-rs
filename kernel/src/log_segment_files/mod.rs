@@ -25,16 +25,16 @@ use itertools::Itertools;
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 
+#[cfg(feature = "declarative-query-plan")]
+use crate::engine_data::TypedGetData as _;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
 use crate::path::{LogPathFileType, ParsedLogPath};
 #[cfg(feature = "declarative-query-plan")]
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
-use crate::{DeltaResult, Engine, Error, StorageHandler, Version};
 #[cfg(feature = "declarative-query-plan")]
 use crate::FileMeta;
-#[cfg(feature = "declarative-query-plan")]
-use crate::engine_data::TypedGetData as _;
+use crate::{DeltaResult, Engine, Error, StorageHandler, Version};
 #[cfg(feature = "declarative-query-plan")]
 use crate::{GetData, QueryPlan, RowVisitor};
 
@@ -151,32 +151,24 @@ fn list_from_engine(
     end_version: Version,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ParsedLogPath>>> {
     let start_from = log_root.join(&format!("{start_version:020}"))?;
-    let data_iter = engine.execute_query_plan(QueryPlan::ListLogFiles { start_from })?;
+    Ok(engine
+        .execute_query_plan(QueryPlan::ListLogFiles { start_from })? // iter-result
+        .map(move |data_res| -> DeltaResult<_> {
+            let data = data_res?;
+            let mut visitor = ListedFileMetaVisitor::default();
+            visitor.visit_rows_of(data.as_ref())?;
 
-    let mut parsed_paths = Vec::new();
-    for data in data_iter {
-        let data = data?;
-        let mut visitor = ListedFileMetaVisitor::default();
-        visitor.visit_rows_of(data.as_ref())?;
-
-        // TODO: can we move some of the filtering into the row visitor to avoid unnecessary 
-        // FileMeta creation?
-        for file_meta in visitor.files {
-            let Some(parsed) = ParsedLogPath::try_from(file_meta)? else {
-                continue;
-            };
-            if !parsed.should_list() {
-                continue;
-            }
-            if parsed.version > end_version {
-                return Ok(parsed_paths.into_iter().map(Ok));
-            }
-            parsed_paths.push(parsed);
-        }
-    }
-
-    // TODO: Make this pipelined instead of collecting all the paths into a vector first
-    Ok(parsed_paths.into_iter().map(Ok))
+            // TODO: can we move some of the filtering into the row visitor to avoid
+            // unnecessary FileMeta creation?
+            Ok(visitor
+                .files
+                .into_iter()
+                .map(ParsedLogPath::try_from)
+                .filter_map_ok(|opt| opt.filter(|parsed| parsed.should_list())))
+        }) // iter-result-iter-result
+        .flatten_ok() // iter-result-result
+        .map(|path_res| path_res?) // iter-result
+        .take_while(move |path_res| !matches!(path_res, Ok(path) if path.version > end_version)))
 }
 
 /// Groups all checkpoint parts according to the checkpoint they belong to.
@@ -667,12 +659,11 @@ impl LogSegmentFiles {
         while upper > 0 {
             let lower = upper.saturating_sub(BACKWARD_SCAN_WINDOW_SIZE);
             #[cfg(feature = "declarative-query-plan")]
-            let window_files: Vec<_> = list_from_engine(engine, log_root, lower, upper - 1)?
-                .try_collect()?;
+            let window_files: Vec<_> =
+                list_from_engine(engine, log_root, lower, upper - 1)?.try_collect()?;
             #[cfg(not(feature = "declarative-query-plan"))]
             let window_files: Vec<_> =
-                list_from_storage(storage.as_ref(), log_root, lower, upper - 1)?
-                .try_collect()?;
+                list_from_storage(storage.as_ref(), log_root, lower, upper - 1)?.try_collect()?;
 
             found_checkpoint_version = find_complete_checkpoint_version(&window_files);
             windows.push(window_files);
