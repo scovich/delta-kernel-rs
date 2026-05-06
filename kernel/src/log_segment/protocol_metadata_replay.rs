@@ -3,6 +3,8 @@
 //! This module contains the methods that perform a lightweight log replay to extract the latest
 //! Protocol and Metadata actions from a [`LogSegment`].
 
+#[cfg(feature = "declarative-query-plan")]
+use itertools::Itertools;
 use tracing::{info, instrument, warn};
 
 use super::LogSegment;
@@ -10,6 +12,12 @@ use crate::actions::{get_commit_schema, Metadata, Protocol, METADATA_NAME, PROTO
 use crate::crc::{CrcLoadResult, LazyCrc};
 use crate::log_replay::ActionsBatch;
 use crate::metrics::MetricId;
+#[cfg(feature = "declarative-query-plan")]
+use crate::path::ParsedLogPath;
+#[cfg(feature = "declarative-query-plan")]
+use crate::QueryPlan;
+#[cfg(feature = "declarative-query-plan")]
+use crate::Scalar;
 use crate::{DeltaResult, Engine, Error};
 
 impl LogSegment {
@@ -140,9 +148,49 @@ impl LogSegment {
     fn read_pm_batches(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
         let schema = get_commit_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?;
-        self.read_actions(engine, schema)
+
+        // Declarative P&M replay currently supports incremental JSON-only segments.
+        // Segments with checkpoints continue to use the legacy replay path.
+        #[cfg(feature = "declarative-query-plan")]
+        if self.checkpoint_version.is_none() {
+            let files = self
+                .find_commit_cover()
+                .into_iter()
+                .map(|file| {
+                    let parsed = ParsedLogPath::try_from(file.clone())?.ok_or_else(|| {
+                        Error::invalid_log_path(format!(
+                            "Expected a valid log path when building ScanJson plan: {}",
+                            file.location
+                        ))
+                    })?;
+                    let version = i64::try_from(parsed.version).map_err(|_| {
+                        Error::generic(format!(
+                            "Delta log version {} exceeds i64::MAX",
+                            parsed.version
+                        ))
+                    })?;
+                    Ok((file, vec![Scalar::Long(version)]))
+                })
+                .collect::<DeltaResult<Vec<_>>>()?;
+            let plan = QueryPlan::LatestNonNullByVersion {
+                input: Box::new(QueryPlan::ScanJson {
+                    files,
+                    metadata_columns: vec!["version".to_string()],
+                    physical_schema: schema.clone(),
+                }),
+                version_column: "version".to_string(),
+                value_columns: vec![PROTOCOL_NAME.to_string(), METADATA_NAME.to_string()],
+            };
+            return Ok(Box::new(
+                engine
+                    .execute_query_plan(plan)?
+                    .map_ok(|batch| ActionsBatch::new(batch, true)),
+            ));
+        }
+
+        Ok(Box::new(self.read_actions(engine, schema)?))
     }
 }
 
