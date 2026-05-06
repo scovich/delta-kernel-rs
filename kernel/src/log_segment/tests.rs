@@ -1898,7 +1898,7 @@ async fn test_commit_cover(
     });
     assert_eq!(cover.len(), expected_locations.len());
     for (location, expected_location) in cover.iter().zip(expected_locations) {
-        assert_eq!(location.location, expected_location);
+        assert_eq!(location.location.location, expected_location);
     }
 }
 
@@ -2119,7 +2119,7 @@ async fn test_commit_cover_zero_byte_compaction_uses_commits() {
         let expected_url = log_root
             .join(&format!("{expected_version:020}.json"))
             .unwrap();
-        assert_eq!(file.location, expected_url);
+        assert_eq!(file.location.location, expected_url);
     }
 }
 

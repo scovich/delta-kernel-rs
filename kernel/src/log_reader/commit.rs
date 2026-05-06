@@ -25,9 +25,10 @@ impl CommitReader {
         schema: SchemaRef,
     ) -> DeltaResult<Self> {
         let commit_files = log_segment.find_commit_cover();
+        let commit_file_meta: Vec<_> = commit_files.into_iter().map(|path| path.location).collect();
         let actions = engine
             .json_handler()
-            .read_json_files(&commit_files, schema, None)?
+            .read_json_files(&commit_file_meta, schema, None)?
             .map_ok(|batch| ActionsBatch::new(batch, true));
 
         Ok(Self {

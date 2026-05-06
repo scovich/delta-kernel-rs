@@ -152,7 +152,7 @@ fn list_from_engine(
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ParsedLogPath>>> {
     let start_from = log_root.join(&format!("{start_version:020}"))?;
     Ok(engine
-        .execute_query_plan(QueryPlan::ListLogFiles { start_from })? // iter-result
+        .execute_query_plan(QueryPlan::ListFiles { start_from })? // iter-result
         .map(move |data_res| -> DeltaResult<_> {
             let data = data_res?;
             let mut visitor = ListedFileMetaVisitor::default();

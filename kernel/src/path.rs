@@ -133,13 +133,10 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
         #[allow(clippy::unwrap_used)]
         let version = split.next().unwrap();
 
-        // Every valid log path starts with a numeric version part. If version parsing fails, it
-        // must not be a log path and we simply return None. However, it is an error if version
-        // parsing succeeds for a wrong-length numeric string.
-        let version = match version.parse().ok() {
-            Some(v) if version.len() == VERSION_LEN => v,
-            Some(_) => return Ok(None), // has a version but it's not 20 chars
-            None => return Ok(None),
+        // Every valid log path starts with a fixed-width numeric version part. If parsing fails
+        // or width is wrong, this is not a valid log path.
+        let Some(version) = parse_path_part::<Version>(version, VERSION_LEN) else {
+            return Ok(None);
         };
 
         // Every valid log path has a file extension as its last part. Return None if it's missing.

@@ -17,12 +17,9 @@ pub enum QueryPlan {
     /// - `location`: STRING (non-null) - Fully-qualified URL string for the file.
     /// - `last_modified`: LONG (non-null) - Milliseconds since Unix epoch.
     /// - `size`: LONG (non-null) - File size in bytes.
-    ListLogFiles { start_from: Url },
+    ListFiles { start_from: Url },
 
     /// Scan JSON files and return rows projected to `physical_schema`.
-    ///
-    /// The engine must preserve file order (as provided in `files`) and row order within each
-    /// file.
     ///
     /// `metadata_columns` defines additional top-level output columns. For each file, the matching
     /// `metadata_values` are constant across all rows produced from that file.
@@ -32,17 +29,76 @@ pub enum QueryPlan {
         physical_schema: SchemaRef,
     },
 
-    /// Aggregate input rows to produce the latest non-null values for the requested columns by
-    /// `version`.
+    /// Scan Parquet files and return rows projected to `physical_schema`.
     ///
-    /// Semantics are equivalent to, for each `c` in `value_columns`:
+    /// `metadata_columns` defines additional top-level output columns. For each file, the matching
+    /// `metadata_values` are constant across all rows produced from that file.
+    ScanParquet {
+        files: Vec<(FileMeta, Vec<Scalar>)>,
+        metadata_columns: Vec<String>,
+        physical_schema: SchemaRef,
+    },
+
+    /// Concatenate inputs without deduplication.
+    ///
+    /// All inputs must have identical output schemas. This node does not impose any row-ordering
+    /// guarantees.
+    UnionAll { inputs: Vec<QueryPlan> },
+
+    /// Global aggregate over all input rows.
+    ///
+    /// For each `c` in `value_columns`, output:
     /// `max_by(c, version_column) FILTER (WHERE c IS NOT NULL)`.
     ///
-    /// Output is a single row containing the columns in `value_columns` order, with the same types
-    /// as input.
+    /// The output always has exactly one row with columns in `value_columns` order. If no row
+    /// satisfies `c IS NOT NULL` (including empty input), that output value is `NULL`.
     LatestNonNullByVersion {
         input: Box<QueryPlan>,
         version_column: String,
         value_columns: Vec<String>,
     },
+}
+
+impl QueryPlan {
+    /// Builds Some [`QueryPlan::ScanJson`] from non-empty `files`, or None.
+    pub fn scan_json(
+        files: Vec<(FileMeta, Vec<Scalar>)>,
+        metadata_columns: Vec<String>,
+        physical_schema: SchemaRef,
+    ) -> Option<QueryPlan> {
+        (!files.is_empty()).then_some(QueryPlan::ScanJson {
+            files,
+            metadata_columns,
+            physical_schema,
+        })
+    }
+
+    /// Builds Some [`QueryPlan::ScanParquet`] from non-empty `files`, or None.
+    pub fn scan_parquet(
+        files: Vec<(FileMeta, Vec<Scalar>)>,
+        metadata_columns: Vec<String>,
+        physical_schema: SchemaRef,
+    ) -> Option<QueryPlan> {
+        (!files.is_empty()).then_some(QueryPlan::ScanParquet {
+            files,
+            metadata_columns,
+            physical_schema,
+        })
+    }
+
+    /// Build a union-all node from `inputs`.
+    ///
+    /// Returns:
+    /// - Some [`QueryPlan::UnionAll`] when there are two or more inputs
+    /// - Some unmodified input, when there is exactly one input
+    /// - `None` otherwise
+    pub fn union_all(inputs: impl IntoIterator<Item = QueryPlan>) -> Option<QueryPlan> {
+        let mut inputs: Vec<QueryPlan> = inputs.into_iter().collect();
+        if inputs.len() > 1 {
+            Some(QueryPlan::UnionAll { inputs })
+        } else {
+            // Either Some(single_input) or None
+            inputs.pop()
+        }
+    }
 }

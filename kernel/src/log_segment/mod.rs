@@ -734,7 +734,7 @@ impl LogSegment {
     /// returns files is DESCENDING ORDER, as that's what `replay` expects. This function assumes
     /// that all files in `self.ascending_commit_files` and `self.ascending_compaction_files` are in
     /// range for this log segment. This invariant is maintained by our listing code.
-    pub(crate) fn find_commit_cover(&self) -> Vec<FileMeta> {
+    pub(crate) fn find_commit_cover(&self) -> Vec<ParsedLogPath> {
         // Create an iterator sorted in ascending order by (initial version, end version), e.g.
         // [00.json, 00.09.compacted.json, 00.99.compacted.json, 01.json, 02.json, ..., 10.json,
         //  10.19.compacted.json, 11.json, ...]
@@ -766,7 +766,7 @@ impl LogSegment {
             }
             debug!("Provisionally selecting {next:?}");
             last_pushed = Some(next);
-            selected_files.push(next.location.clone());
+            selected_files.push(next.clone());
         }
         selected_files.reverse();
         selected_files
