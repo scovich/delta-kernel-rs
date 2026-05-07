@@ -155,12 +155,7 @@ impl LogSegment {
                 .find_commit_cover()
                 .into_iter()
                 .map(|file| {
-                    let version = i64::try_from(file.version).map_err(|_| {
-                        Error::generic(format!(
-                            "Delta log version {} exceeds i64::MAX",
-                            file.version
-                        ))
-                    })?;
+                    let version = file.version_as_i64()?;
                     Ok((file.location, vec![Scalar::Long(version)]))
                 })
                 .collect::<DeltaResult<_>>()?;
@@ -170,12 +165,7 @@ impl LogSegment {
                 .checkpoint_parts
                 .iter()
                 .map(|checkpoint| {
-                    let version = i64::try_from(checkpoint.version).map_err(|_| {
-                        Error::generic(format!(
-                            "Delta log version {} exceeds i64::MAX",
-                            checkpoint.version
-                        ))
-                    })?;
+                    let version = checkpoint.version_as_i64()?;
                     Ok((checkpoint.location.clone(), vec![Scalar::Long(version)]))
                 })
                 .collect::<DeltaResult<_>>()?;

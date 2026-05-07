@@ -198,6 +198,18 @@ pub mod engine;
 /// Delta table version is 8 byte unsigned int
 pub type Version = u64;
 
+/// Converts a [`Version`] to `i64`, returning an error if the version exceeds `i64::MAX`.
+///
+/// In practice, Delta log versions are 63-bit unsigned values (0..=i64::MAX), because many systems
+/// (notably Java and SQL) lack an unsigned 64-bit type. The limitation is also unlikely to matter
+/// in practice, tho, because it would take nearly 30 _billion_ years, committing ten times per
+/// second, to exhaust even a 63-bit version space.
+pub fn version_as_i64(version: Version) -> DeltaResult<i64> {
+    version
+        .try_into()
+        .map_err(|_| Error::generic(format!("Delta log Version {version} exceeds i64::MAX")))
+}
+
 pub type FileSize = u64;
 pub type FileIndex = u64;
 

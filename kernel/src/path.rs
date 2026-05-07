@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::engine_data::RowVisitor;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, FileMeta, Version};
+use crate::{version_as_i64, DeltaResult, Engine, Error, FileMeta, Version};
 
 /// How many characters a version tag has
 const VERSION_LEN: usize = 20;
@@ -248,6 +248,12 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
             | LogPathFileType::Unknown => true,
             LogPathFileType::StagedCommit => false,
         }
+    }
+
+    /// Convenience: Applies [`version_as_i64`] to `self.version`.
+    #[internal_api]
+    pub(crate) fn version_as_i64(&self) -> DeltaResult<i64> {
+        version_as_i64(self.version)
     }
 
     #[internal_api]
