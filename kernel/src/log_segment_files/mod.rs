@@ -31,12 +31,14 @@ use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
 use crate::path::{LogPathFileType, ParsedLogPath};
 #[cfg(feature = "declarative-query-plan")]
+use crate::query_plan::QueryPlanBuilder;
+#[cfg(feature = "declarative-query-plan")]
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 #[cfg(feature = "declarative-query-plan")]
 use crate::FileMeta;
 use crate::{DeltaResult, Engine, Error, StorageHandler, Version};
 #[cfg(feature = "declarative-query-plan")]
-use crate::{GetData, QueryPlan, RowVisitor};
+use crate::{GetData, RowVisitor};
 
 #[cfg(test)]
 mod tests;
@@ -151,8 +153,11 @@ fn list_from_engine(
     end_version: Version,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ParsedLogPath>>> {
     let start_from = log_root.join(&format!("{start_version:020}"))?;
+    let mut plan_builder = QueryPlanBuilder::new();
+    plan_builder.list_files(start_from)?;
+    let plan = plan_builder.finish()?;
     Ok(engine
-        .execute_query_plan(QueryPlan::ListFiles { start_from })? // iter-result
+        .execute_query_plan(plan)? // iter-result
         .map(move |data_res| -> DeltaResult<_> {
             let data = data_res?;
             let mut visitor = ListedFileMetaVisitor::default();

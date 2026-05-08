@@ -13,7 +13,7 @@ use crate::crc::{CrcLoadResult, LazyCrc};
 use crate::log_replay::ActionsBatch;
 use crate::metrics::MetricId;
 #[cfg(feature = "declarative-query-plan")]
-use crate::QueryPlan;
+use crate::query_plan::QueryPlanBuilder;
 #[cfg(feature = "declarative-query-plan")]
 use crate::Scalar;
 use crate::{DeltaResult, Engine, Error};
@@ -151,6 +151,7 @@ impl LogSegment {
 
         #[cfg(feature = "declarative-query-plan")]
         {
+            let mut plan_builder = QueryPlanBuilder::new();
             let commit_files = self
                 .find_commit_cover()
                 .into_iter()
@@ -170,26 +171,26 @@ impl LogSegment {
                 })
                 .collect::<DeltaResult<_>>()?;
 
-            let checkpoint_source = QueryPlan::scan_parquet(
+            let checkpoint_source = plan_builder.scan_parquet(
                 checkpoint_files,
                 vec!["version".to_string()],
                 schema.clone(),
-            );
-            let commit_source =
-                QueryPlan::scan_json(commit_files, vec!["version".to_string()], schema.clone());
-            let source =
-                QueryPlan::union_all([checkpoint_source, commit_source].into_iter().flatten())
-                    .ok_or_else(|| {
-                        Error::internal_error(
-                            "LogSegment must contain checkpoint or commit files for P&M replay",
-                        )
-                    })?;
+            )?;
+            let commit_source = plan_builder.scan_json(
+                commit_files,
+                vec!["version".to_string()],
+                schema.clone(),
+            )?;
+            let source = plan_builder
+                .union_all([checkpoint_source, commit_source].into_iter().flatten())?
+                .ok_or_else(|| Error::internal_error("LogSegment contains no files"))?;
 
-            let plan = QueryPlan::LatestNonNullByVersion {
-                input: Box::new(source),
-                version_column: "version".to_string(),
-                value_columns: vec![PROTOCOL_NAME.to_string(), METADATA_NAME.to_string()],
-            };
+            plan_builder.latest_non_null_by_version(
+                source,
+                "version",
+                [PROTOCOL_NAME, METADATA_NAME],
+            )?;
+            let plan = plan_builder.finish()?;
 
             return Ok(Box::new(
                 engine
