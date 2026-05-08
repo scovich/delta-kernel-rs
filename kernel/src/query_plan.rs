@@ -1,6 +1,7 @@
 use url::Url;
 
-use crate::{DeltaResult, Error, FileMeta, Scalar, SchemaRef};
+use crate::expressions::ColumnName;
+use crate::{DeltaResult, Error, ExpressionRef, FileMeta, PredicateRef, Scalar, SchemaRef};
 
 /// A relation reference within a [`QueryPlan`].
 ///
@@ -47,24 +48,64 @@ pub enum PlanOp {
         physical_schema: SchemaRef,
     },
 
+    /// Project input rows into a new relation.
+    ///
+    /// `expression` is evaluated against each input row and must produce one struct value.
+    /// `output_schema` defines the names and types of that struct's top-level and nested fields.
+    Project {
+        expression: ExpressionRef,
+        output_schema: SchemaRef,
+    },
+
+    /// Filter input rows by `predicate`, dropping all rows where it does not evaluate to TRUE.
+    Filter { predicate: PredicateRef },
+
     /// Concatenate inputs without deduplication.
     ///
     /// All inputs must have identical output schemas. This node does not impose any row-ordering
     /// guarantees.
     UnionAll,
 
-    /// Global aggregate over all input rows.
+    /// Aggregate over input rows, optionally grouped by `group_by_columns`.
     ///
-    /// For each `c` in `value_columns`, its output is equivalent to the SQL expression:
+    /// Semantics are equivalent to the following SQL query:
     /// ```sql
-    /// max_by(c, version_column) FILTER (WHERE c IS NOT NULL)
+    /// SELECT
+    ///   group_column_1,
+    ///     ...
+    ///   group_column_k,
+    ///   max_by(value_column_1, version_column) FILTER (WHERE value_column_1 IS NOT NULL),
+    ///     ...
+    ///   max_by(value_column_N, version_column) FILTER (WHERE value_column_N IS NOT NULL)
+    /// FROM input
+    /// GROUP BY
+    ///   group_column_1,
+    ///     ...
+    ///   group_column_k
     /// ```
     ///
-    /// The output always has exactly one row with columns in `value_columns` order. If no row
-    /// satisfies `c IS NOT NULL` (including empty input), that output value is `NULL`.
+    /// If `group_by_columns` is empty, the output has exactly one row. If no row satisfies
+    /// a value column's `IS NOT NULL` filter (including empty input), that output value is `NULL`.
+    ///
+    /// If `group_by_columns` is non-empty, output rows are grouped by those columns. If the input
+    /// is empty, the output is also empty.
+    ///
+    /// The output consists of `group_by_columns` followed by `value_columns`, in listed order.
+    ///
+    /// Output column names are defined by `output_schema` and must follow that same order.
     MaxByVersion {
+        group_by_columns: Vec<String>,
         version_column: String,
         value_columns: Vec<String>,
+        output_schema: SchemaRef,
+    },
+
+    /// Left equi-anti-join between two input relations, comparing `key_pairs` for equality.
+    ///
+    /// Rows from the left/probe input side are filtered out if they match any row from the
+    /// right/build side, while the remaining rows pass through unchanged with the same schema.
+    EquiAntiJoin {
+        key_pairs: Vec<(ColumnName, ColumnName)>,
     },
 }
 
@@ -75,8 +116,11 @@ impl PlanOp {
             PlanOp::ListFiles { .. } => "ListFiles",
             PlanOp::ScanJson { .. } => "ScanJson",
             PlanOp::ScanParquet { .. } => "ScanParquet",
+            PlanOp::Project { .. } => "Project",
+            PlanOp::Filter { .. } => "Filter",
             PlanOp::UnionAll => "UnionAll",
             PlanOp::MaxByVersion { .. } => "MaxByVersion",
+            PlanOp::EquiAntiJoin { .. } => "EquiAntiJoin",
         }
     }
 }
@@ -137,8 +181,11 @@ impl PlanOp {
             PlanOp::ListFiles { .. } => InputArity::Zero,
             PlanOp::ScanJson { .. } => InputArity::Zero,
             PlanOp::ScanParquet { .. } => InputArity::Zero,
+            PlanOp::Project { .. } => InputArity::One,
+            PlanOp::Filter { .. } => InputArity::One,
             PlanOp::UnionAll => InputArity::Variadic,
             PlanOp::MaxByVersion { .. } => InputArity::One,
+            PlanOp::EquiAntiJoin { .. } => InputArity::Two,
         }
     }
 }
@@ -204,6 +251,27 @@ impl QueryPlanBuilder {
         )?))
     }
 
+    /// Appends a [`PlanOp::Project`] over `input`.
+    pub fn project(
+        &mut self,
+        input: RefId,
+        expression: ExpressionRef,
+        output_schema: SchemaRef,
+    ) -> DeltaResult<RefId> {
+        self.append(
+            PlanOp::Project {
+                expression,
+                output_schema,
+            },
+            [input],
+        )
+    }
+
+    /// Appends a [`PlanOp::Filter`] over `input`.
+    pub fn filter(&mut self, input: RefId, predicate: PredicateRef) -> DeltaResult<RefId> {
+        self.append(PlanOp::Filter { predicate }, [input])
+    }
+
     /// Appends a [`PlanOp::UnionAll`] over `inputs`, with normalization.
     ///
     /// Returns:
@@ -227,13 +295,52 @@ impl QueryPlanBuilder {
         input: RefId,
         version_column: impl Into<String>,
         value_columns: impl IntoIterator<Item = impl Into<String>>,
+        output_schema: SchemaRef,
+    ) -> DeltaResult<RefId> {
+        self.max_by_version_grouped(
+            input,
+            std::iter::empty::<String>(),
+            version_column,
+            value_columns,
+            output_schema,
+        )
+    }
+
+    /// Appends a grouped [`PlanOp::MaxByVersion`] over `input` and `group_by_columns`.
+    pub fn max_by_version_grouped(
+        &mut self,
+        input: RefId,
+        group_by_columns: impl IntoIterator<Item = impl Into<String>>,
+        version_column: impl Into<String>,
+        value_columns: impl IntoIterator<Item = impl Into<String>>,
+        output_schema: SchemaRef,
     ) -> DeltaResult<RefId> {
         self.append(
             PlanOp::MaxByVersion {
+                group_by_columns: group_by_columns.into_iter().map(Into::into).collect(),
                 version_column: version_column.into(),
                 value_columns: value_columns.into_iter().map(Into::into).collect(),
+                output_schema,
             },
             [input],
+        )
+    }
+
+    /// Appends a [`PlanOp::EquiAntiJoin`] with left/probe `left` and right/build `right`.
+    pub fn equi_anti_join(
+        &mut self,
+        left: RefId,
+        right: RefId,
+        key_pairs: impl IntoIterator<Item = (impl Into<ColumnName>, impl Into<ColumnName>)>,
+    ) -> DeltaResult<RefId> {
+        self.append(
+            PlanOp::EquiAntiJoin {
+                key_pairs: key_pairs
+                    .into_iter()
+                    .map(|(left_key, right_key)| (left_key.into(), right_key.into()))
+                    .collect(),
+            },
+            [left, right],
         )
     }
 

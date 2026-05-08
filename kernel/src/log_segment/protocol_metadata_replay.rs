@@ -15,7 +15,6 @@ use crate::metrics::MetricId;
 #[cfg(feature = "declarative-query-plan")]
 use crate::query_plan::QueryPlanBuilder;
 #[cfg(feature = "declarative-query-plan")]
-use crate::Scalar;
 use crate::{DeltaResult, Engine, Error};
 
 impl LogSegment {
@@ -152,32 +151,14 @@ impl LogSegment {
         #[cfg(feature = "declarative-query-plan")]
         {
             let mut plan_builder = QueryPlanBuilder::new();
-            let commit_files = self
-                .find_commit_cover()
-                .into_iter()
-                .map(|file| {
-                    let version = file.version_as_i64()?;
-                    Ok((file.location, vec![Scalar::Long(version)]))
-                })
-                .collect::<DeltaResult<_>>()?;
-
-            let checkpoint_files = self
-                .listed
-                .checkpoint_parts
-                .iter()
-                .map(|checkpoint| {
-                    let version = checkpoint.version_as_i64()?;
-                    Ok((checkpoint.location.clone(), vec![Scalar::Long(version)]))
-                })
-                .collect::<DeltaResult<_>>()?;
 
             let checkpoint_source = plan_builder.scan_parquet(
-                checkpoint_files,
+                self.checkpoint_parts_with_version_metadata()?,
                 vec!["version".to_string()],
                 schema.clone(),
             )?;
             let commit_source = plan_builder.scan_json(
-                commit_files,
+                self.commit_cover_with_version_metadata()?,
                 vec!["version".to_string()],
                 schema.clone(),
             )?;
@@ -189,6 +170,7 @@ impl LogSegment {
                 source,
                 "version",
                 [PROTOCOL_NAME, METADATA_NAME],
+                schema.clone(),
             )?;
             let plan = plan_builder.finish()?;
 

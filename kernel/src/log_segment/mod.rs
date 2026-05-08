@@ -772,6 +772,37 @@ impl LogSegment {
         selected_files
     }
 
+    #[cfg(feature = "declarative-query-plan")]
+    fn log_paths_with_version_metadata<'a>(
+        paths: impl IntoIterator<Item = &'a ParsedLogPath>,
+    ) -> DeltaResult<Vec<(FileMeta, Vec<crate::Scalar>)>> {
+        paths
+            .into_iter()
+            .map(|path| {
+                let version = path.version_as_i64()?;
+                Ok((path.location.clone(), vec![crate::Scalar::Long(version)]))
+            })
+            .collect()
+    }
+
+    /// Returns commit-cover files annotated with a file-constant `version` metadata column.
+    #[cfg(feature = "declarative-query-plan")]
+    pub(crate) fn commit_cover_with_version_metadata(
+        &self,
+    ) -> DeltaResult<Vec<(FileMeta, Vec<crate::Scalar>)>> {
+        // TODO: Refactor find_commit_cover() to return borrowed ParsedLogPath values so this
+        // helper avoids the extra clone of ParsedLogPath before cloning just FileMeta::location.
+        Self::log_paths_with_version_metadata(&self.find_commit_cover())
+    }
+
+    /// Returns checkpoint-part files annotated with a file-constant `version` metadata column.
+    #[cfg(feature = "declarative-query-plan")]
+    pub(crate) fn checkpoint_parts_with_version_metadata(
+        &self,
+    ) -> DeltaResult<Vec<(FileMeta, Vec<crate::Scalar>)>> {
+        Self::log_paths_with_version_metadata(&self.listed.checkpoint_parts)
+    }
+
     /// Determines the file actions schema and extracts sidecar file references for checkpoints.
     ///
     /// This function analyzes the checkpoint to determine:
