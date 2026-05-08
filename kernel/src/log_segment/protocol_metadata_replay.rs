@@ -185,7 +185,7 @@ impl LogSegment {
                 .union_all([checkpoint_source, commit_source].into_iter().flatten())?
                 .ok_or_else(|| Error::internal_error("LogSegment contains no files"))?;
 
-            plan_builder.latest_non_null_by_version(
+            plan_builder.max_by_version(
                 source,
                 "version",
                 [PROTOCOL_NAME, METADATA_NAME],

@@ -55,12 +55,14 @@ pub enum PlanOp {
 
     /// Global aggregate over all input rows.
     ///
-    /// For each `c` in `value_columns`, output:
-    /// `max_by(c, version_column) FILTER (WHERE c IS NOT NULL)`.
+    /// For each `c` in `value_columns`, its output is equivalent to the SQL expression:
+    /// ```sql
+    /// max_by(c, version_column) FILTER (WHERE c IS NOT NULL)
+    /// ```
     ///
     /// The output always has exactly one row with columns in `value_columns` order. If no row
     /// satisfies `c IS NOT NULL` (including empty input), that output value is `NULL`.
-    LatestNonNullByVersion {
+    MaxByVersion {
         version_column: String,
         value_columns: Vec<String>,
     },
@@ -74,7 +76,7 @@ impl PlanOp {
             PlanOp::ScanJson { .. } => "ScanJson",
             PlanOp::ScanParquet { .. } => "ScanParquet",
             PlanOp::UnionAll => "UnionAll",
-            PlanOp::LatestNonNullByVersion { .. } => "LatestNonNullByVersion",
+            PlanOp::MaxByVersion { .. } => "MaxByVersion",
         }
     }
 }
@@ -136,7 +138,7 @@ impl PlanOp {
             PlanOp::ScanJson { .. } => InputArity::Zero,
             PlanOp::ScanParquet { .. } => InputArity::Zero,
             PlanOp::UnionAll => InputArity::Variadic,
-            PlanOp::LatestNonNullByVersion { .. } => InputArity::One,
+            PlanOp::MaxByVersion { .. } => InputArity::One,
         }
     }
 }
@@ -219,15 +221,15 @@ impl QueryPlanBuilder {
         }
     }
 
-    /// Appends a [`PlanOp::LatestNonNullByVersion`] over `input`.
-    pub fn latest_non_null_by_version(
+    /// Appends a [`PlanOp::MaxByVersion`] over `input`.
+    pub fn max_by_version(
         &mut self,
         input: RefId,
         version_column: impl Into<String>,
         value_columns: impl IntoIterator<Item = impl Into<String>>,
     ) -> DeltaResult<RefId> {
         self.append(
-            PlanOp::LatestNonNullByVersion {
+            PlanOp::MaxByVersion {
                 version_column: version_column.into(),
                 value_columns: value_columns.into_iter().map(Into::into).collect(),
             },
