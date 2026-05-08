@@ -17,6 +17,8 @@ use crate::expressions::{
 };
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
+#[cfg(feature = "declarative-query-plan")]
+use crate::query_plan::QueryPlanBuilder;
 use crate::scan::data_skipping::as_checkpoint_skipping_predicate;
 use crate::scan::state::ScanFile;
 use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
@@ -633,6 +635,174 @@ fn test_scan_with_checkpoint() -> DeltaResult<()> {
     assert_eq!(
         files,
         vec!["part-00000-70b1dcdf-0236-4f63-a072-124cdbafd8a0-c000.snappy.parquet"]
+    );
+    Ok(())
+}
+
+#[cfg(feature = "declarative-query-plan")]
+fn fake_log_file(path_suffix: &str) -> FileMeta {
+    FileMeta {
+        location: url::Url::parse(&format!("file:///tmp/{path_suffix}")).unwrap(),
+        last_modified: 0,
+        size: 1,
+    }
+}
+
+#[cfg(feature = "declarative-query-plan")]
+fn debug_replay_plan_shape(has_commits: bool, has_checkpoint: bool) -> DeltaResult<String> {
+    let add_field = COMMIT_READ_SCHEMA
+        .field(ADD_NAME)
+        .cloned()
+        .ok_or_else(|| Error::internal_error("Missing add field in COMMIT_READ_SCHEMA"))?;
+    let remove_field = COMMIT_READ_SCHEMA
+        .field(REMOVE_NAME)
+        .cloned()
+        .ok_or_else(|| Error::internal_error("Missing remove field in COMMIT_READ_SCHEMA"))?;
+    let commit_actions_with_key_schema = Arc::new(StructType::new_unchecked([
+        StructField::not_null("version", DataType::LONG),
+        add_field.clone(),
+        remove_field.clone(),
+        StructField::nullable("replay_key_path", DataType::STRING),
+    ]));
+    let commit_deduped_actions_schema = Arc::new(StructType::new_unchecked([
+        StructField::nullable("replay_key_path", DataType::STRING),
+        add_field,
+        remove_field,
+    ]));
+
+    let mut plan_builder = QueryPlanBuilder::new();
+    let commit_deduped_actions = plan_builder
+        .scan_json(
+            has_commits
+                .then_some(vec![(
+                    fake_log_file("00000000000000000003.json"),
+                    vec![Scalar::Long(3)],
+                )])
+                .unwrap_or_default(),
+            vec!["version".to_string()],
+            COMMIT_READ_SCHEMA.clone(),
+        )?
+        .map(|commits| {
+            let commit_actions_with_key = plan_builder.project(
+                commits,
+                Arc::new(Expression::struct_from([
+                    column_expr_ref!("version"),
+                    column_expr_ref!("add"),
+                    column_expr_ref!("remove"),
+                    Arc::new(Expression::coalesce([
+                        column_expr!("add.path"),
+                        column_expr!("remove.path"),
+                    ])),
+                ])),
+                commit_actions_with_key_schema,
+            )?;
+            plan_builder.max_by_version_grouped(
+                commit_actions_with_key,
+                ["replay_key_path"],
+                "version",
+                ["add", "remove"],
+                commit_deduped_actions_schema.clone(),
+            )
+        })
+        .transpose()?;
+
+    let checkpoint_adds = plan_builder
+        .scan_parquet(
+            has_checkpoint
+                .then_some(vec![(
+                    fake_log_file("00000000000000000002.checkpoint.parquet"),
+                    vec![Scalar::Long(2)],
+                )])
+                .unwrap_or_default(),
+            vec!["version".to_string()],
+            CHECKPOINT_READ_SCHEMA.clone(),
+        )?
+        .map(|checkpoint| {
+            plan_builder.filter(
+                checkpoint,
+                Arc::new(Predicate::is_not_null(column_expr!("add"))),
+            )
+        })
+        .transpose()?;
+
+    if let Some(commit_deduped_actions) = commit_deduped_actions {
+        let commit_deduped_adds = plan_builder.filter(
+            commit_deduped_actions,
+            Arc::new(Predicate::is_not_null(column_expr!("add"))),
+        )?;
+        if let Some(checkpoint_adds) = checkpoint_adds {
+            let checkpoint_adds_deduplicated = plan_builder.equi_anti_join(
+                checkpoint_adds,
+                commit_deduped_actions,
+                [(column_name!("add.path"), column_name!("replay_key_path"))],
+            )?;
+            plan_builder.union_all([commit_deduped_adds, checkpoint_adds_deduplicated])?;
+        }
+    }
+
+    let plan = plan_builder.finish()?;
+    Ok(format!("{plan:?}"))
+}
+
+#[cfg(feature = "declarative-query-plan")]
+#[test]
+fn debug_scan_replay_plan_commit_only_shape() -> DeltaResult<()> {
+    let debug_text = debug_replay_plan_shape(true, false)?;
+    println!("commit-only plan:\n{debug_text}");
+
+    assert!(
+        debug_text.contains("ScanJson"),
+        "expected commit-only plan to include ScanJson: {debug_text}"
+    );
+    assert!(
+        !debug_text.contains("ScanParquet"),
+        "did not expect commit-only plan to include ScanParquet: {debug_text}"
+    );
+    assert!(
+        !debug_text.contains("EquiAntiJoin"),
+        "did not expect commit-only plan to include EquiAntiJoin: {debug_text}"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "declarative-query-plan")]
+#[test]
+fn debug_scan_replay_plan_checkpoint_only_shape() -> DeltaResult<()> {
+    let debug_text = debug_replay_plan_shape(false, true)?;
+    println!("checkpoint-only plan:\n{debug_text}");
+
+    assert!(
+        debug_text.contains("ScanParquet"),
+        "expected checkpoint-only plan to include ScanParquet: {debug_text}"
+    );
+    assert!(
+        !debug_text.contains("ScanJson"),
+        "did not expect checkpoint-only plan to include ScanJson: {debug_text}"
+    );
+    assert!(
+        !debug_text.contains("EquiAntiJoin"),
+        "did not expect checkpoint-only plan to include EquiAntiJoin: {debug_text}"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "declarative-query-plan")]
+#[test]
+fn debug_scan_replay_plan_checkpoint_and_commit_shape() -> DeltaResult<()> {
+    let debug_text = debug_replay_plan_shape(true, true)?;
+    println!("checkpoint+commit plan:\n{debug_text}");
+
+    assert!(
+        debug_text.contains("ScanJson"),
+        "expected mixed plan to include ScanJson: {debug_text}"
+    );
+    assert!(
+        debug_text.contains("ScanParquet"),
+        "expected mixed plan to include ScanParquet: {debug_text}"
+    );
+    assert!(
+        debug_text.contains("EquiAntiJoin"),
+        "expected mixed plan to include EquiAntiJoin: {debug_text}"
     );
     Ok(())
 }

@@ -1,3 +1,6 @@
+use std::collections::{HashMap, HashSet};
+use std::fmt::{Debug, Formatter};
+
 use url::Url;
 
 use crate::expressions::ColumnName;
@@ -154,7 +157,7 @@ impl PlanNode {
 ///
 /// A plan is a non-empty sequence of [`PlanNode`] entries, whose output is the output
 /// of its last operation.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct QueryPlan {
     nodes: Vec<PlanNode>,
 }
@@ -163,6 +166,180 @@ impl QueryPlan {
     /// Returns the nodes in execution order.
     pub fn nodes(&self) -> &[PlanNode] {
         &self.nodes
+    }
+}
+
+impl Debug for QueryPlan {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let Some(result_ref) = self.nodes.last().map(PlanNode::output) else {
+            return write!(f, "QueryPlan(<empty>)");
+        };
+        let context = QueryPlanDebugContext::new(&self.nodes, result_ref);
+
+        if context.shared_refs_in_order.is_empty() {
+            let rendered = context.render_ref(result_ref, None);
+            return write!(f, "{rendered}");
+        }
+
+        writeln!(f, "WITH")?;
+        for ref_id in &context.shared_refs_in_order {
+            let rhs_lines = context.render_ref_lines(*ref_id, Some(*ref_id));
+            let head = format!("  r{} = ", ref_id.0);
+            writeln!(
+                f,
+                "{head}{}",
+                rhs_lines.first().unwrap_or(&"<empty>".to_string())
+            )?;
+            let continuation = " ".repeat(head.len());
+            for line in rhs_lines.iter().skip(1) {
+                writeln!(f, "{continuation}{line}")?;
+            }
+        }
+        let result_lines = context.render_ref_lines(result_ref, None);
+        let head = "result = ";
+        writeln!(
+            f,
+            "{head}{}",
+            result_lines.first().unwrap_or(&"<empty>".to_string())
+        )?;
+        let continuation = " ".repeat(head.len());
+        for line in result_lines.iter().skip(1) {
+            writeln!(f, "{continuation}{line}")?;
+        }
+        Ok(())
+    }
+}
+
+struct QueryPlanDebugContext<'a> {
+    nodes_by_ref: HashMap<u32, &'a PlanNode>,
+    shared_refs: HashSet<u32>,
+    shared_refs_in_order: Vec<RefId>,
+}
+
+impl<'a> QueryPlanDebugContext<'a> {
+    fn new(nodes: &'a [PlanNode], result_ref: RefId) -> Self {
+        let nodes_by_ref: HashMap<u32, &PlanNode> =
+            nodes.iter().map(|node| (node.output().0, node)).collect();
+
+        let mut reachable = HashSet::new();
+        let mut stack = vec![result_ref];
+        while let Some(current) = stack.pop() {
+            if !reachable.insert(current.0) {
+                continue;
+            }
+            if let Some(node) = nodes_by_ref.get(&current.0) {
+                stack.extend(node.inputs().iter().copied());
+            }
+        }
+
+        let mut consumer_count: HashMap<u32, usize> = HashMap::new();
+        for node in nodes {
+            for input in node.inputs() {
+                if reachable.contains(&input.0) {
+                    *consumer_count.entry(input.0).or_default() += 1;
+                }
+            }
+        }
+
+        let shared_refs: HashSet<u32> = consumer_count
+            .into_iter()
+            .filter_map(|(ref_id, count)| (count > 1).then_some(ref_id))
+            .collect();
+        let shared_refs_in_order = nodes
+            .iter()
+            .filter_map(|node| {
+                let ref_id = node.output();
+                shared_refs.contains(&ref_id.0).then_some(ref_id)
+            })
+            .collect();
+
+        Self {
+            nodes_by_ref,
+            shared_refs,
+            shared_refs_in_order,
+        }
+    }
+
+    fn render_ref(&self, ref_id: RefId, defining_shared_ref: Option<RefId>) -> String {
+        self.render_ref_lines(ref_id, defining_shared_ref)
+            .join("\n")
+    }
+
+    fn render_ref_lines(&self, ref_id: RefId, defining_shared_ref: Option<RefId>) -> Vec<String> {
+        if self.shared_refs.contains(&ref_id.0) && defining_shared_ref != Some(ref_id) {
+            return vec![format!("r{}", ref_id.0)];
+        }
+
+        let Some(node) = self.nodes_by_ref.get(&ref_id.0) else {
+            return vec![format!("<missing:{}>", ref_id.0)];
+        };
+        let op_desc = Self::op_desc(node.op());
+        let inputs = node.inputs();
+
+        match inputs {
+            [] => vec![op_desc],
+            [input] => {
+                let mut lines = self.render_ref_lines(*input, defining_shared_ref);
+                lines.push(format!("|> {op_desc}"));
+                lines
+            }
+            _ => {
+                let mut lines = vec![op_desc];
+                let last_idx = inputs.len() - 1;
+                for (idx, input) in inputs.iter().enumerate() {
+                    let child_lines = self.render_ref_lines(*input, defining_shared_ref);
+                    let is_last = idx == last_idx;
+                    let branch = if is_last { "└─ " } else { "├─ " };
+                    let pad = if is_last { "   " } else { "│  " };
+                    if let Some((first, rest)) = child_lines.split_first() {
+                        lines.push(format!("{branch}{first}"));
+                        lines.extend(rest.iter().map(|line| format!("{pad}{line}")));
+                    }
+                }
+                lines
+            }
+        }
+    }
+
+    fn op_desc(op: &PlanOp) -> String {
+        match op {
+            PlanOp::ListFiles { start_from } => format!("ListFiles(start_from={start_from})"),
+            PlanOp::ScanJson {
+                files,
+                metadata_columns,
+                ..
+            } => format!(
+                "ScanJson(files={}, metadata_columns={metadata_columns:?})",
+                files.len()
+            ),
+            PlanOp::ScanParquet {
+                files,
+                metadata_columns,
+                ..
+            } => format!(
+                "ScanParquet(files={}, metadata_columns={metadata_columns:?})",
+                files.len()
+            ),
+            PlanOp::Project { .. } => "Project".to_string(),
+            PlanOp::Filter { .. } => "Filter".to_string(),
+            PlanOp::UnionAll => "UnionAll".to_string(),
+            PlanOp::MaxByVersion {
+                group_by_columns,
+                version_column,
+                value_columns,
+                ..
+            } => format!(
+                "MaxByVersion(group_by={group_by_columns:?}, version={version_column}, values={value_columns:?})"
+            ),
+            PlanOp::EquiAntiJoin { key_pairs } => {
+                let key_desc = key_pairs
+                    .iter()
+                    .map(|(left, right)| format!("{left}={right}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("EquiAntiJoin(keys=[{key_desc}])")
+            }
+        }
     }
 }
 
