@@ -853,8 +853,8 @@ impl Scan {
     #[cfg(feature = "declarative-query-plan")]
     #[allow(dead_code)]
     fn build_scan_replay_dedup_pruning_query_plan(&self) -> DeltaResult<QueryPlan> {
-        let mut plan_builder = QueryPlanBuilder::new();
-        let log_segment = self.snapshot.log_segment();
+        // Set up the various schemas we'll need
+        // TODO: Make these static, as applicable (after we sort out pruning and struct stats)
         let add_field = COMMIT_READ_SCHEMA
             .field(ADD_NAME)
             .cloned()
@@ -874,20 +874,18 @@ impl Scan {
             add_field,
             remove_field,
         ]));
-        let commits = plan_builder.scan_json(
-            log_segment.commit_cover_with_version_metadata()?,
-            vec!["version".to_string()],
-            COMMIT_READ_SCHEMA.clone(),
-        )?;
-        let checkpoint = plan_builder.scan_parquet(
-            log_segment.checkpoint_parts_with_version_metadata()?,
-            vec!["version".to_string()],
-            CHECKPOINT_READ_SCHEMA.clone(),
-        )?;
+
+        let mut plan_builder = QueryPlanBuilder::new();
+        let log_segment = self.snapshot.log_segment();
 
         // The set of commit file actions (both add and remove) that survive log replay.
         // Used twice: Once as part of final output, and also to dedup checkpoint add actions.
-        let commit_deduped_actions = commits
+        let commit_deduped_actions = plan_builder
+            .scan_json(
+                log_segment.commit_cover_with_version_metadata()?,
+                vec!["version".to_string()],
+                COMMIT_READ_SCHEMA.clone(),
+            )?
             .map(|commits| {
                 let commit_actions_with_key = plan_builder.project(
                     commits,
@@ -912,18 +910,14 @@ impl Scan {
             })
             .transpose()?;
 
-        // The adds from the commit log replay are part of the final output (see UnionAll below).
-        let commit_deduped_adds = commit_deduped_actions
-            .map(|commit_deduped_actions| {
-                plan_builder.filter(
-                    commit_deduped_actions,
-                    Arc::new(Predicate::is_not_null(column_expr!("add"))),
-                )
-            })
-            .transpose()?;
-
         // The set of add actions from the checkpoint.
-        let checkpoint_adds = checkpoint
+        // NOTE: If we have no commits, this becomes the final result in the plan.
+        let checkpoint_adds = plan_builder
+            .scan_parquet(
+                log_segment.checkpoint_parts_with_version_metadata()?,
+                vec!["version".to_string()],
+                CHECKPOINT_READ_SCHEMA.clone(),
+            )?
             .map(|checkpoint| {
                 plan_builder.filter(
                     checkpoint,
@@ -932,29 +926,28 @@ impl Scan {
             })
             .transpose()?;
 
-        // Deduplicate checkpoint adds against deduped commit actions (if any).
-        let checkpoint_adds_deduplicated = match (checkpoint_adds, commit_deduped_actions) {
-            (Some(checkpoint_adds), Some(commit_deduped_actions)) => {
-                Some(plan_builder.equi_anti_join(
+        if let Some(commit_deduped_actions) = commit_deduped_actions {
+            // We need to include deduped adds from the commit log as part of the final output.
+            // NOTE: If we have no checkpoint, this becomes the final result in the plan.
+            let commit_deduped_adds = plan_builder.filter(
+                commit_deduped_actions,
+                Arc::new(Predicate::is_not_null(column_expr!("add"))),
+            )?;
+
+            // If we have a checkpoint, dedup it against the deduped commit actions and union
+            // those with the deduped commit adds to produce the final result.
+            if let Some(checkpoint_adds) = checkpoint_adds {
+                let checkpoint_adds_deduplicated = plan_builder.equi_anti_join(
                     checkpoint_adds,
                     commit_deduped_actions,
                     [(column_name!("add.path"), column_name!("replay_key_path"))],
-                )?)
-            }
-            (Some(checkpoint_adds), None) => Some(checkpoint_adds),
-            (None, _) => None,
-        };
+                )?;
+                plan_builder.union_all([commit_deduped_adds, checkpoint_adds_deduplicated])?;
+            } // else commit_deduped_adds is the final result
+        } // else checkpoint_adds is the final result
 
-        // The final output is the set of deduplicated commit actions, and the checkpoint actions
-        // that do not conflict with them.
-        let _output = plan_builder
-            .union_all(
-                [commit_deduped_adds, checkpoint_adds_deduplicated]
-                    .into_iter()
-                    .flatten(),
-            )?
-            .ok_or_else(|| Error::internal_error("Log segment contains no files"))?;
-
+        // NOTE: Log segments are never empty, but if it ever happened the builder would fail when
+        // attempting to finish the resulting empty plan.
         plan_builder.finish()
     }
 
