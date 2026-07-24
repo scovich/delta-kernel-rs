@@ -836,6 +836,27 @@ mod tests {
     }
 
     #[test]
+    fn metadata_plan_static_skip_all_is_none() -> DeltaResult<()> {
+        let state = state(
+            data_schema(),
+            vec![],
+            Some(Predicate::literal(false)),
+            StatsOptions::default(),
+            PartitionValuesOptions::default(),
+        );
+        assert_eq!(state.physical_predicate, PhysicalPredicate::StaticSkipAll);
+        assert!(build_metadata_scan_plan(
+            &state,
+            vec![scan_file("file:///1.json", 1)],
+            checkpoint_part(FileType::Parquet),
+            &shape(CheckpointType::Leaf, None),
+            log_root(),
+        )?
+        .is_none());
+        Ok(())
+    }
+
+    #[test]
     fn metadata_plan_executes_commit_dedup_with_sync_executor() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         futures::executor::block_on(async {

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use ::test_utils::table_builder::{LogState, TestTableBuilder};
+use ::test_utils::table_builder::{DataLayoutConfig, FeatureSet, LogState, TestTableBuilder};
 use rstest::rstest;
 
 use super::*;
@@ -255,5 +255,83 @@ fn declarative_metadata_reconciles_checkpoint_with_later_commits() -> DeltaResul
     let actual = declarative_metadata_paths(&scan, &engine)?;
 
     assert_eq!(actual, expected);
+    Ok(())
+}
+
+#[rstest]
+fn declarative_metadata_prunes_across_v1_log_states(
+    #[values(
+        LogState::with_latest_version(4),
+        LogState::with_latest_version(4).with_checkpoint_at([4]),
+        LogState::with_latest_version(4).with_checkpoint_at([2])
+    )]
+    log_state: LogState,
+    #[values(
+        (column_expr!("value").gt(Expr::literal(2500i32)), 2),
+        (
+            column_expr!("part_string").eq(Expr::literal("part_2000")),
+            1
+        )
+    )]
+    pruning: (Pred, usize),
+) -> DeltaResult<()> {
+    assert_declarative_metadata_matches_imperative(
+        log_state,
+        FeatureSet::new(),
+        pruning.0,
+        pruning.1,
+    )
+}
+
+#[rstest]
+fn declarative_metadata_partition_prunes_v2_checkpoints(
+    #[values(2, 4)] checkpoint_version: u64,
+) -> DeltaResult<()> {
+    let log_state = LogState::with_latest_version(4)
+        .with_checkpoint_at([checkpoint_version])
+        .with_sidecars_if_enabled(None);
+    assert_declarative_metadata_matches_imperative(
+        log_state,
+        FeatureSet::new().v2_checkpoint(),
+        column_expr!("part_string").eq(Expr::literal("part_2000")),
+        1,
+    )
+}
+
+fn assert_declarative_metadata_matches_imperative(
+    log_state: LogState,
+    features: FeatureSet,
+    predicate: Pred,
+    expected_count: usize,
+) -> DeltaResult<()> {
+    let table = TestTableBuilder::new()
+        .with_log_state(log_state)
+        .with_features(features)
+        .with_data_layout(DataLayoutConfig::PartitionedAllTypes)
+        .build()
+        .expect("build partitioned table");
+    let engine = SyncEngine::new_with_store(table.store().clone());
+    let snapshot = Snapshot::builder_for(table.table_root()).build(&engine)?;
+    let predicate = Arc::new(predicate);
+
+    let expected = imperative_metadata_paths(
+        snapshot
+            .clone()
+            .scan_builder()
+            .with_predicate(predicate.clone())
+            .with_partition_values(PartitionValuesOptions::with_struct())
+            .build()?,
+        &engine,
+    )?;
+    assert_eq!(expected.len(), expected_count, "{}", table.description());
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(predicate)
+        .with_stats(StatsOptions::all())
+        .with_partition_values(PartitionValuesOptions::with_struct())
+        .build()?;
+    let actual = declarative_metadata_paths(&scan, &engine)?;
+
+    assert_eq!(actual, expected, "{}", table.description());
     Ok(())
 }
