@@ -4,31 +4,76 @@ use ::test_utils::table_builder::{DataLayoutConfig, FeatureSet, LogState, TestTa
 use rstest::rstest;
 
 use super::*;
-use crate::arrow::array::{Array, StringArray, StructArray};
+use crate::arrow::array::{Array, ArrayRef, BooleanArray, StructArray};
+use crate::arrow::compute::filter_record_batch;
+use crate::arrow::datatypes::DataType as ArrowDataType;
 use crate::arrow::record_batch::RecordBatch;
 use crate::arrow::util::pretty::pretty_format_batches;
 use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
 use crate::plans::Operation as PlanOperation;
-use crate::scan::state::ScanFile;
 use crate::scan::{PartitionValuesOptions, Scan, StatsOptions};
 use crate::{DeltaResult, Engine, Snapshot};
 
-fn imperative_metadata_paths(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<String>> {
-    fn collect_path(paths: &mut Vec<String>, scan_file: ScanFile) {
-        paths.push(scan_file.path.to_string());
+fn comparable_metadata_batch(
+    field: impl Fn(&str) -> ArrayRef,
+    stats: ArrayRef,
+    partitions: Option<ArrayRef>,
+) -> DeltaResult<RecordBatch> {
+    let mut columns = vec![
+        ("path", field("path")),
+        ("size", field("size")),
+        ("modificationTime", field("modificationTime")),
+        ("stats", stats),
+        ("deletionVector", field("deletionVector")),
+        ("baseRowId", field("baseRowId")),
+        ("defaultRowCommitVersion", field("defaultRowCommitVersion")),
+        ("tags", field("tags")),
+        ("clusteringProvider", field("clusteringProvider")),
+    ];
+    if let Some(partitions) = partitions {
+        columns.push(("partitionValues", partitions));
     }
-
-    let mut paths = vec![];
-    for scan_metadata in scan.scan_metadata(engine)? {
-        paths = scan_metadata?.visit_scan_files(paths, collect_path)?;
-    }
-    paths.sort();
-    Ok(paths)
+    Ok(RecordBatch::try_from_iter(columns)?)
 }
 
-fn declarative_metadata_paths(scan: &Scan, engine: &dyn Engine) -> DeltaResult<Vec<String>> {
+fn imperative_metadata(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<RecordBatch>> {
+    let mut batches = vec![];
+    for metadata in scan.scan_metadata(engine)? {
+        let (data, selection) = metadata?.scan_files.into_parts();
+        let batch = filter_record_batch(
+            &data.try_into_record_batch()?,
+            &BooleanArray::from(selection),
+        )?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let constants = batch
+            .column_by_name("fileConstantValues")
+            .expect("file constants")
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("file constants struct");
+        batches.push(comparable_metadata_batch(
+            |name| {
+                batch
+                    .column_by_name(name)
+                    .or_else(|| constants.column_by_name(name))
+                    .unwrap_or_else(|| panic!("metadata field {name}"))
+                    .clone()
+            },
+            batch
+                .column_by_name("stats_parsed")
+                .expect("parsed stats")
+                .clone(),
+            batch.column_by_name("partitionValues_parsed").cloned(),
+        )?);
+    }
+    Ok(batches)
+}
+
+fn declarative_metadata(scan: &Scan, engine: &dyn Engine) -> DeltaResult<Vec<RecordBatch>> {
     let Some(plan) = scan.declarative_metadata_scan_plan(engine)? else {
         return Ok(vec![]);
     };
@@ -37,25 +82,61 @@ fn declarative_metadata_paths(scan: &Scan, engine: &dyn Engine) -> DeltaResult<V
         .execute_op(PlanOperation::QueryPlan(plan))?
         .into_data()?;
 
-    let mut paths = vec![];
+    let mut projected = vec![];
     for batch in batches {
         let batch = batch?.try_into_record_batch()?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
         let add = batch
             .column_by_name(ADD_NAME)
             .expect("add column")
             .as_any()
             .downcast_ref::<StructArray>()
             .expect("add struct");
-        let path_col = add
-            .column_by_name("path")
-            .expect("add.path")
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("path string");
-        paths.extend((0..path_col.len()).map(|i| path_col.value(i).to_string()));
+        let partitions = add
+            .column_by_name(PARTITION_VALUES)
+            .filter(|column| matches!(column.data_type(), ArrowDataType::Struct(_)))
+            .cloned();
+        projected.push(comparable_metadata_batch(
+            |name| {
+                add.column_by_name(name)
+                    .unwrap_or_else(|| panic!("add.{name}"))
+                    .clone()
+            },
+            add.column_by_name(STATS).expect("add.stats").clone(),
+            partitions,
+        )?);
     }
-    paths.sort();
-    Ok(paths)
+    Ok(projected)
+}
+
+fn metadata_row_count(batches: &[RecordBatch]) -> usize {
+    batches.iter().map(RecordBatch::num_rows).sum()
+}
+
+fn sorted_pretty_lines(batches: &[RecordBatch]) -> DeltaResult<Vec<String>> {
+    let formatted = pretty_format_batches(batches)?.to_string();
+    let mut lines: Vec<_> = formatted.lines().map(str::to_string).collect();
+    let len = lines.len();
+    if len > 3 {
+        lines[2..len - 1].sort_unstable();
+    }
+    Ok(lines)
+}
+
+fn assert_metadata_eq(
+    actual: &[RecordBatch],
+    expected: &[RecordBatch],
+    context: &str,
+) -> DeltaResult<()> {
+    if let (Some(actual), Some(expected)) = (actual.first(), expected.first()) {
+        assert_eq!(actual.schema(), expected.schema(), "{context}");
+    }
+    let actual = sorted_pretty_lines(actual)?;
+    let expected = sorted_pretty_lines(expected)?;
+    assert_eq!(actual, expected, "{context}");
+    Ok(())
 }
 
 #[rstest]
@@ -80,12 +161,16 @@ fn declarative_metadata_matches_imperative_scan(
     let (engine, snapshot, _tempdir) = crate::utils::test_utils::load_test_table(table)?;
     let predicate = predicate.map(Arc::new);
 
-    let imperative_builder = snapshot.clone().scan_builder();
+    let imperative_builder = snapshot
+        .clone()
+        .scan_builder()
+        .with_stats(StatsOptions::all())
+        .with_partition_values(PartitionValuesOptions::with_struct());
     let imperative_builder = match &predicate {
         Some(predicate) => imperative_builder.with_predicate(predicate.clone()),
         None => imperative_builder,
     };
-    let expected = imperative_metadata_paths(imperative_builder.build()?, engine.as_ref())?;
+    let expected = imperative_metadata(imperative_builder.build()?, engine.as_ref())?;
 
     let declarative_builder = snapshot
         .scan_builder()
@@ -96,10 +181,9 @@ fn declarative_metadata_matches_imperative_scan(
         None => declarative_builder,
     };
     let scan = declarative_builder.build()?;
-    let actual = declarative_metadata_paths(&scan, engine.as_ref())?;
+    let actual = declarative_metadata(&scan, engine.as_ref())?;
 
-    assert_eq!(actual, expected, "table {table}");
-    Ok(())
+    assert_metadata_eq(&actual, &expected, &format!("table {table}"))
 }
 
 #[rstest]
@@ -118,25 +202,27 @@ fn declarative_metadata_data_skipping(
 ) -> DeltaResult<()> {
     let (engine, snapshot, _tempdir) = crate::utils::test_utils::load_test_table(table)?;
     let predicate = Arc::new(predicate);
-    let expected = imperative_metadata_paths(
+    let expected = imperative_metadata(
         snapshot
             .clone()
             .scan_builder()
             .with_predicate(predicate.clone())
+            .with_stats(StatsOptions::all())
+            .with_partition_values(PartitionValuesOptions::with_struct())
             .build()?,
         engine.as_ref(),
     )?;
-    assert_eq!(expected.len(), expected_count);
+    assert_eq!(metadata_row_count(&expected), expected_count);
 
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
         .with_stats(StatsOptions::all())
+        .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
-    let actual = declarative_metadata_paths(&scan, engine.as_ref())?;
+    let actual = declarative_metadata(&scan, engine.as_ref())?;
 
-    assert_eq!(actual, expected, "table {table}");
-    Ok(())
+    assert_metadata_eq(&actual, &expected, &format!("table {table}"))
 }
 
 #[rstest]
@@ -150,26 +236,27 @@ fn declarative_metadata_reconstructs_partition_values_for_pruning(
     let (engine, snapshot, _tempdir) =
         crate::utils::test_utils::load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
     let predicate = Arc::new(predicate);
-    let expected = imperative_metadata_paths(
+    let expected = imperative_metadata(
         snapshot
             .clone()
             .scan_builder()
             .with_predicate(predicate.clone())
+            .with_stats(StatsOptions::all())
             .with_partition_values(PartitionValuesOptions::with_struct())
             .build()?,
         engine.as_ref(),
     )?;
-    assert_eq!(expected.len(), expected_count);
+    assert_eq!(metadata_row_count(&expected), expected_count);
 
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
+        .with_stats(StatsOptions::all())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
-    let actual = declarative_metadata_paths(&scan, engine.as_ref())?;
+    let actual = declarative_metadata(&scan, engine.as_ref())?;
 
-    assert_eq!(actual, expected);
-    Ok(())
+    assert_metadata_eq(&actual, &expected, "partition pruning")
 }
 
 #[test]
@@ -248,14 +335,25 @@ fn declarative_metadata_reconciles_checkpoint_with_later_commits() -> DeltaResul
     let engine = SyncEngine::new_with_store(table.store().clone());
     let snapshot = Snapshot::builder_for(table.table_root()).build(&engine)?;
 
-    let expected = imperative_metadata_paths(snapshot.clone().scan_builder().build()?, &engine)?;
-    assert_eq!(expected.len(), 4);
+    let expected = imperative_metadata(
+        snapshot
+            .clone()
+            .scan_builder()
+            .with_stats(StatsOptions::all())
+            .with_partition_values(PartitionValuesOptions::with_struct())
+            .build()?,
+        &engine,
+    )?;
+    assert_eq!(metadata_row_count(&expected), 4);
 
-    let scan = snapshot.scan_builder().build()?;
-    let actual = declarative_metadata_paths(&scan, &engine)?;
+    let scan = snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::all())
+        .with_partition_values(PartitionValuesOptions::with_struct())
+        .build()?;
+    let actual = declarative_metadata(&scan, &engine)?;
 
-    assert_eq!(actual, expected);
-    Ok(())
+    assert_metadata_eq(&actual, &expected, "checkpoint with later commits")
 }
 
 #[rstest]
@@ -314,24 +412,29 @@ fn assert_declarative_metadata_matches_imperative(
     let snapshot = Snapshot::builder_for(table.table_root()).build(&engine)?;
     let predicate = Arc::new(predicate);
 
-    let expected = imperative_metadata_paths(
+    let expected = imperative_metadata(
         snapshot
             .clone()
             .scan_builder()
             .with_predicate(predicate.clone())
+            .with_stats(StatsOptions::all())
             .with_partition_values(PartitionValuesOptions::with_struct())
             .build()?,
         &engine,
     )?;
-    assert_eq!(expected.len(), expected_count, "{}", table.description());
+    assert_eq!(
+        metadata_row_count(&expected),
+        expected_count,
+        "{}",
+        table.description()
+    );
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
         .with_stats(StatsOptions::all())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
-    let actual = declarative_metadata_paths(&scan, &engine)?;
+    let actual = declarative_metadata(&scan, &engine)?;
 
-    assert_eq!(actual, expected, "{}", table.description());
-    Ok(())
+    assert_metadata_eq(&actual, &expected, table.description())
 }

@@ -429,16 +429,16 @@ fn eval_grouped_max_non_null_by(
         let keys = keys.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
             Error::unsupported("SyncPlanExecutor max_non_null_by with non-LONG key")
         })?;
-        let group_keys = batch_to_rows(batch, &aggregate.group_by)?;
-        for (row, group) in group_keys.iter().enumerate().take(batch.num_rows()) {
-            if values.is_null(row) || keys.is_null(row) {
+        let group_key_rows = batch_to_rows(batch, &aggregate.group_by)?;
+        for (row_idx, group_keys) in group_key_rows.iter().enumerate().take(batch.num_rows()) {
+            if values.is_null(row_idx) || keys.is_null(row_idx) {
                 continue;
             }
-            let candidate = keys.value(row);
-            if matches!(best.get(group), Some((_, best_key)) if candidate <= *best_key) {
+            let candidate = keys.value(row_idx);
+            if matches!(best.get(group_keys), Some((_, best_key)) if candidate <= *best_key) {
                 continue;
             }
-            best.insert(group.clone(), ((batch_idx, row), candidate));
+            best.insert(group_keys.clone(), ((batch_idx, row_idx), candidate));
         }
     }
 
