@@ -216,7 +216,7 @@ fn reparsed_add_field(
 
 /// Build the normalized commit JSON arm.
 ///
-/// SQL equivalent:
+/// ## SQL equivalent:
 ///
 /// SELECT STRUCT(
 ///          add.* EXCEPT (stats, partitionValues),
@@ -299,6 +299,21 @@ fn sidecar_actions(
 }
 
 /// Build normalized checkpoint adds. Returns an absent relation when no checkpoint exists.
+///
+/// ## SQL equivalent:
+//
+/// SELECT STRUCT(
+///          add.* EXCEPT (
+///            stats, stats_parsed, partitionValues, partitionValues_parsed
+///          ),
+///          COALESCE(
+///            add.stats_parsed, FROM_JSON(add.stats, stats_schema)
+///          ) AS stats,
+///          MAP_TO_STRUCT(add.partitionValues, partition_schema) AS partitionValues
+///        ) AS add,
+///        version, add.path IS NOT NULL AS is_add, file_key(add) AS key
+/// FROM checkpoint_actions
+/// WHERE add.path IS NOT NULL
 fn checkpoint_arm(
     checkpoint: Option<(FileType, Vec<ScanFile>)>,
     shape: &CheckpointShape,
@@ -328,20 +343,6 @@ fn checkpoint_arm(
         }
     }?;
 
-    // SQL equivalent:
-    //
-    // SELECT STRUCT(
-    //          add.* EXCEPT (
-    //            stats, stats_parsed, partitionValues, partitionValues_parsed
-    //          ),
-    //          COALESCE(
-    //            add.stats_parsed, FROM_JSON(add.stats, stats_schema)
-    //          ) AS stats,
-    //          MAP_TO_STRUCT(add.partitionValues, partition_schema) AS partitionValues
-    //        ) AS add,
-    //        version, add.path IS NOT NULL AS is_add, file_key(add) AS key
-    // FROM checkpoint_actions
-    // WHERE add.path IS NOT NULL
     actions
         .filter(col!("add.path").is_not_null())?
         .project_patch(|patch| {
