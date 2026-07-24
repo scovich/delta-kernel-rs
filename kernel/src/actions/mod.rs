@@ -12,8 +12,8 @@ use visitors::{MetadataVisitor, ProtocolVisitor};
 use self::deletion_vector::DeletionVectorDescriptor;
 use crate::expressions::{MapData, Scalar, StructData};
 use crate::schema::{
-    lazy_schema_ref, schema_ref, DataType, MapType, SchemaRef, StructField, StructType,
-    ToSchema as _,
+    is_unsupported_delta_type_error, lazy_schema_ref, schema_ref, DataType, MapType, SchemaRef,
+    StructField, StructType, ToSchema as _,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::schema::{schema, ArrayType};
@@ -433,8 +433,9 @@ impl Metadata {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Schema`] when the schema exceeds the supported decoding depth, or
-    /// [`Error::MalformedJson`] for other JSON decoding failures.
+    /// Returns [`Error::Schema`] when the schema exceeds the supported decoding depth or
+    /// declares a type the kernel doesn't support, or [`Error::MalformedJson`] for other
+    /// JSON decoding failures.
     #[internal_api]
     pub(crate) fn parse_schema(&self) -> DeltaResult<StructType> {
         // TODO(#1896): Increase the supported nesting depth or use non-recursive schema decoding.
@@ -451,6 +452,8 @@ impl Metadata {
                      serde_json's recursion limit: {error}"
                 ))
                 .with_backtrace()
+            } else if is_unsupported_delta_type_error(&error) {
+                Error::schema(error.to_string()).with_backtrace()
             } else {
                 error.into()
             }
@@ -1516,20 +1519,65 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parse_schema_malformed_json_returns_malformed_json() {
-        let malformed_metadata = Metadata {
-            schema_string: "{".to_string(),
+    #[rstest]
+    // Syntax error -> MalformedJson.
+    #[case::malformed_syntax("{", "MalformedJson")]
+    // Data error lacking the unsupported-type prefix (invalid decimal) -> MalformedJson, NOT
+    // Schema: the reclassification must not fire for every is_data error.
+    #[case::malformed_bad_decimal(
+        r#"{"type":"struct","fields":[{"name":"t","type":"decimal(nope)","nullable":true,"metadata":{}}]}"#,
+        "MalformedJson"
+    )]
+    // Regression guard: a well-formed schema whose wrong-typed field value echoes the prefix must
+    // stay MalformedJson. `nullable` is a bool, so a string value is an is_data error whose message
+    // *contains* the prefix; matching by `starts_with` keeps it out of the Schema arm.
+    #[case::malformed_value_echoes_prefix(
+        r#"{"type":"struct","fields":[{"name":"t","type":"string","nullable":"Unsupported Delta table type","metadata":{}}]}"#,
+        "MalformedJson"
+    )]
+    // Unsupported primitive types -> Schema.
+    #[case::unsupported_time(
+        r#"{"type":"struct","fields":[{"name":"t","type":"time(6)","nullable":true,"metadata":{}}]}"#,
+        "Schema"
+    )]
+    #[case::unsupported_interval(
+        r#"{"type":"struct","fields":[{"name":"t","type":"interval week","nullable":true,"metadata":{}}]}"#,
+        "Schema"
+    )]
+    // Unsupported primitive nested inside a struct field -> Schema (reclassification is
+    // position-agnostic, not limited to top-level columns).
+    #[case::unsupported_nested(
+        r#"{"type":"struct","fields":[{"name":"t","type":{"type":"struct","fields":[{"name":"inner","type":"time(6)","nullable":true,"metadata":{}}]},"nullable":true,"metadata":{}}]}"#,
+        "Schema"
+    )]
+    // Unknown complex type -> Schema.
+    #[case::unsupported_complex(
+        r#"{"type":"struct","fields":[{"name":"t","type":{"type":"matrix"},"nullable":true,"metadata":{}}]}"#,
+        "Schema"
+    )]
+    fn parse_schema_error_classification(
+        #[case] schema_string: &str,
+        #[case] expected_error: &str,
+    ) {
+        let metadata = Metadata {
+            schema_string: schema_string.to_string(),
             ..Default::default()
         };
-        let malformed_error = malformed_metadata.parse_schema().unwrap_err();
         // Error conversion captures a backtrace only when enabled, so normalize both forms before
         // checking the underlying error.
-        let malformed_error = match malformed_error {
+        let error = match metadata.parse_schema().unwrap_err() {
             Error::Backtraced { source, .. } => *source,
             error => error,
         };
-        assert!(matches!(malformed_error, Error::MalformedJson(_)));
+        match expected_error {
+            "MalformedJson" => {
+                assert!(matches!(error, Error::MalformedJson(_)), "got: {error:?}")
+            }
+            "Schema" => {
+                assert!(matches!(error, Error::Schema(_)), "got: {error:?}")
+            }
+            other => panic!("unknown expected_error discriminant: {other}"),
+        }
     }
 
     fn nested_schema(depth: usize) -> StructType {
