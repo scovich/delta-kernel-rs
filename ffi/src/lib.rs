@@ -78,6 +78,7 @@ mod ffi_test_utils;
 #[cfg(feature = "test-ffi")]
 pub mod test_ffi;
 pub mod transaction;
+use transaction::MutableCommitter;
 
 pub(crate) type NullableCvoid = Option<NonNull<c_void>>;
 
@@ -1236,6 +1237,36 @@ pub unsafe extern "C" fn checkpoint_snapshot(
     snapshot_ref
         .checkpoint(engine_ref.engine().as_ref(), kernel_spec.as_ref())
         .map(|(result, updated)| FfiCheckpointWriteResult::from_kernel(result, updated))
+        .into_extern_result(&engine_ref)
+}
+
+/// Publish unpublished catalog commits on a catalog-managed snapshot.
+///
+/// No-op (still returns a caller-owned snapshot handle at the same version) when there is
+/// nothing to publish. Errors when unpublished commits exist but the table is not
+/// catalog-managed or the committer is not a catalog committer.
+///
+/// Caller owns the returned handle ([`free_snapshot`]). The input snapshot is borrowed; the
+/// committer is consumed (do not free). The returned snapshot carries the published watermark
+/// used by subsequent catalog commits -- use it for the next `transaction_with_committer` /
+/// checkpoint.
+///
+/// # Safety
+///
+/// Caller must pass valid snapshot, committer, and engine handles. The committer handle is
+/// consumed and must not be used or freed afterward.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_publish_with_committer(
+    snapshot: Handle<SharedSnapshot>,
+    committer: Handle<MutableCommitter>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<SharedSnapshot>> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let snapshot_ref: SnapshotRef = unsafe { snapshot.clone_as_arc() };
+    let committer = unsafe { committer.into_inner() };
+    snapshot_ref
+        .publish(engine_ref.engine().as_ref(), committer.as_ref())
+        .map(|updated| updated.into())
         .into_extern_result(&engine_ref)
 }
 
