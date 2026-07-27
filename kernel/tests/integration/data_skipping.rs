@@ -943,6 +943,69 @@ async fn partition_pruning_honors_rfc3339_offset_partition_values(
     Ok(())
 }
 
+#[cfg(feature = "interval-type-in-dev")]
+#[rstest]
+#[case::year_month(
+    DataType::INTERVAL_YEAR_MONTH,
+    Scalar::IntervalYearMonth(12),
+    Scalar::IntervalYearMonth(12),
+    Scalar::IntervalYearMonth(24)
+)]
+#[case::day_time(
+    DataType::INTERVAL_DAY_TIME,
+    Scalar::IntervalDayTime(3_600_000_000),
+    Scalar::IntervalDayTime(3_600_000_000),
+    Scalar::IntervalDayTime(7_200_000_000)
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interval_partition_values_do_not_prune_files(
+    #[case] interval: DataType,
+    #[case] predicate_value: Scalar,
+    #[case] first_value: Scalar,
+    #[case] second_value: Scalar,
+    #[values(false, true)] use_parallel: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("period", interval),
+        StructField::nullable("v", DataType::LONG),
+    ])?);
+    let mut snapshot = create_table(&table_path, schema, "Test/1.0")
+        .with_data_layout(DataLayout::partitioned(["period"]))
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let data_schema = StructType::try_new([StructField::nullable("v", DataType::LONG)])?;
+    let batch = RecordBatch::try_new(
+        Arc::new((&data_schema).try_into_arrow()?),
+        vec![Arc::new(Int64Array::from(vec![1]))],
+    )?;
+    snapshot = write_batch_to_table(
+        &snapshot,
+        engine.as_ref(),
+        batch.clone(),
+        HashMap::from([("period".to_string(), first_value)]),
+    )
+    .await?;
+    let _snapshot = write_batch_to_table(
+        &snapshot,
+        engine.as_ref(),
+        batch,
+        HashMap::from([("period".to_string(), second_value)]),
+    )
+    .await?;
+
+    let predicate = Arc::new(Pred::eq(
+        column_expr!("period"),
+        Expr::literal(predicate_value),
+    ));
+    assert_eq!(
+        surviving_files(&table_path, engine, predicate, use_parallel)?,
+        2
+    );
+    Ok(())
+}
+
 // === All-null file pruning across log-replay sources ===
 //
 // A file whose queried column is entirely NULL can never satisfy a null-intolerant comparison
