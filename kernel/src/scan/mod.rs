@@ -965,8 +965,15 @@ impl Scan {
     }
 
     #[cfg(feature = "declarative-plans")]
-    #[allow(dead_code)]
-    fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
+    /// Builds a declarative plan that produces the scan's live `add` actions.
+    ///
+    /// `engine` supplies the plan executor used to inspect checkpoint shape. Returns `None` when
+    /// no Delta metadata matches this scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if log discovery, checkpoint inspection, or plan construction fails.
+    pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
         let log_segment = self.snapshot.log_segment();
         let commit_files = log_segment.commit_cover_version_tagged_scan_files()?;
         let checkpoint = log_segment.checkpoint_version_tagged_scan_files()?;

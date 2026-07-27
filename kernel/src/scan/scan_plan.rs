@@ -82,12 +82,20 @@ pub(crate) fn build_metadata_scan_plan(
             // NOTE: It is important that add actions are filtered by the partition predicate
             // because partition filtering may not be applied on data rows. On the other
             // hand, failing to skip based on data columns is safe because the data
-            // predicate will also be evaluated on data rows.
+            // predicate will also be evaluated on data rows. Thus it is crucial that we partition
+            // prune adds here.
+            //
+            // NOTE: It is not safe to prune remove actions using the partition filter. This is
+            // because a NULL result for `remove.partitionValues.partCol` may be due to
+            // `remove.partitionValues` being NULL, or it may be from `partCol` being
+            // NULL. Thus, we simply do not prune removes.
             p.filter(Predicate::or(col!("add").is_null(), prune.clone()))
         },
     )?;
 
     let deduped_commit = commit_actions
+        // Wrap `add` so removes, whose inner `add` is null, survive `MaxNonNullBy`. Unwrap it
+        // after aggregation.
         .project_patch(|patch| {
             patch.replace(
                 ADD_NAME,
@@ -98,6 +106,7 @@ pub(crate) fn build_metadata_scan_plan(
         .aggregate_by([ColumnName::new([FILE_ACTION_KEY])], |a| {
             a.max_non_null_by(ColumnName::new([ADD_NAME]), ColumnName::new([VERSION]))
         })?
+        // We unwrap `add.add` to the top level now that MaxNonNullBy is complete.
         .project_patch(|patch| patch.replace(ADD_NAME, add_field.clone(), col!("add.add")))?;
 
     let checkpoint_adds =
