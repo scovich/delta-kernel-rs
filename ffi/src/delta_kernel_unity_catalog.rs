@@ -223,9 +223,11 @@ fn get_uc_committer_impl(
     Ok(committer.into())
 }
 
-/// Free a committer obtained via get_uc_committer. Warning! Normally the value returned here will
-/// be consumed when creating a transaction via [`crate::transaction::transaction_with_committer`]
-/// and will NOT need to be freed.
+/// Free a committer obtained via [`get_uc_committer`] that was not passed to a consuming API.
+///
+/// APIs that take ownership of the committer; `transaction_with_committer`,
+/// `create_table_builder_build_with_committer`, and `snapshot_publish_with_committer`
+/// consume the handle (do not free; it will not need to be freed afterward).
 ///
 /// # Safety
 ///

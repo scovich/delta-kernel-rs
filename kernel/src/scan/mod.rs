@@ -16,6 +16,7 @@ use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
 use crate::actions::{Add, ADD_FIELD, ADD_NAME, REMOVE_FIELD};
+use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
 use crate::engine_data::FilteredEngineData;
@@ -70,9 +71,9 @@ pub(crate) static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref!
     (&ADD_FIELD),
 };
 
-/// Checkpoint schema WITHOUT stats for column projection pushdown.
-/// When skip_stats is enabled, we use this schema to avoid reading the stats column from parquet.
-pub(crate) static CHECKPOINT_READ_SCHEMA_NO_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
+/// Initial checkpoint projection without JSON `add.stats`.
+/// Discovery restores JSON stats when structured stats cannot satisfy the scan.
+pub(crate) static CHECKPOINT_READ_SCHEMA_NO_JSON_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
     let add_schema = Add::to_schema();
     let fields_no_stats: Vec<_> = add_schema
         .fields()
@@ -91,15 +92,16 @@ pub use crate::parallel::parallel_scan_metadata::{
     AfterSequentialScanMetadata, ParallelScanMetadata, ParallelState, SequentialScanMetadata,
 };
 
-/// Engine-facing stats options. Pass to [`ScanBuilder::with_stats`] to declare
-/// what stats data the engine wants in scan metadata output. Two orthogonal axes:
-/// JSON stats (`add.stats`) and struct stats (`add.stats_parsed`).
+/// Configures structured-stats output and JSON synthesis in scan metadata.
+/// Existing JSON passes through for commits and checkpoints without compatible structured stats
+/// unless stats are disabled.
 ///
 /// Most consumers should pick one of the named constructors:
 /// - [`Self::json_only`] (default) -- JSON stats only.
-/// - [`Self::all_struct`] -- all struct stats, no JSON. Cheap path when the engine consumes
-///   `stats_parsed` directly; avoids the per-batch `ToJson` cost.
-/// - [`Self::struct_columns`] -- struct stats projected to a subset of columns, no JSON.
+/// - [`Self::all_struct`] -- all struct stats without JSON synthesis. Compatible checkpoints omit
+///   JSON stats; commits and checkpoints without compatible structured stats pass existing JSON
+///   through.
+/// - [`Self::struct_columns`] -- selected struct stats with the same JSON behavior.
 /// - [`Self::all`] -- both representations.
 /// - [`Self::none`] -- neither, AND disables internal data skipping. Unlike the other four
 ///   constructors, this is the only one that stops kernel from reading stats from parquet at all.
@@ -148,9 +150,9 @@ impl StatsOptions {
         Self::default()
     }
 
-    /// All struct stats, no JSON. Cheap path for engines that consume
-    /// `stats_parsed` directly: avoids the per-batch `ToJson` cost on
-    /// parsed-stats checkpoints.
+    /// All struct stats without JSON synthesis. Compatible checkpoints omit JSON stats and avoid
+    /// per-batch `ToJson`; commits and checkpoints without compatible structured stats pass
+    /// existing JSON through.
     pub fn all_struct() -> Self {
         Self {
             synthesize_json: false,
@@ -158,7 +160,7 @@ impl StatsOptions {
         }
     }
 
-    /// Struct stats projected to the specified columns, no JSON. Like
+    /// Struct stats projected to the specified columns without JSON synthesis. Like
     /// [`Self::all_struct`] but narrowed to a subset of indexed columns.
     pub fn struct_columns(cols: Vec<ColumnName>) -> Self {
         Self {
@@ -228,6 +230,7 @@ pub struct ScanBuilder {
     correlation_id: Option<Arc<str>>,
     without_row_transforms: bool,
     partition_values: PartitionValuesOptions,
+    cancellation_token: Option<CancellationTokenRef>,
 }
 
 impl std::fmt::Debug for ScanBuilder {
@@ -254,6 +257,7 @@ impl ScanBuilder {
             correlation_id: None,
             without_row_transforms: false,
             partition_values: PartitionValuesOptions::default(),
+            cancellation_token: None,
         }
     }
 
@@ -301,8 +305,8 @@ impl ScanBuilder {
     /// Configure stats output for the scan. See [`StatsOptions`].
     ///
     /// Defaults to [`StatsOptions::default`] (JSON only). Engines that consume
-    /// `stats_parsed` directly should pass [`StatsOptions::all_struct`] to skip the
-    /// per-batch `ToJson` synthesis on parsed-stats checkpoints.
+    /// `stats_parsed` directly should pass [`StatsOptions::all_struct`] so compatible
+    /// checkpoints omit JSON stats and skip `ToJson` synthesis.
     pub fn with_stats(mut self, stats: StatsOptions) -> Self {
         self.stats = stats;
         self
@@ -345,6 +349,27 @@ impl ScanBuilder {
     /// [`PartitionValuesOptions::with_struct`] to also emit the typed struct column.
     pub fn with_partition_values(mut self, partition_values: PartitionValuesOptions) -> Self {
         self.partition_values = partition_values;
+        self
+    }
+
+    /// Provide a [`CancellationToken`] so a cancelled request can stop an in-flight
+    /// [`scan_metadata`](Scan::scan_metadata) log replay instead of running to completion.
+    ///
+    /// Cancellation is cooperative: kernel polls the token at each action-batch boundary, and a
+    /// cancellation-aware [`Engine`] additionally races its checkpoint/commit reads against it.
+    /// On cancellation the scan surfaces [`Error::Cancelled`] -- either returned directly from
+    /// [`scan_metadata`](Scan::scan_metadata) when the token is already cancelled before replay
+    /// begins, or as the terminal item of its iterator -- never as a silent early `None`, so a
+    /// cancelled listing cannot be mistaken for a complete one. With no token the scan is not
+    /// cancellable.
+    ///
+    /// [`CancellationToken`]: crate::CancellationToken
+    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    pub fn with_cancellation_token(
+        mut self,
+        token: impl Into<Option<CancellationTokenRef>>,
+    ) -> Self {
+        self.cancellation_token = token.into();
         self
     }
 
@@ -398,6 +423,7 @@ impl ScanBuilder {
             stats: self.stats,
             correlation_id: self.correlation_id,
             partition_values: self.partition_values,
+            cancellation_token: self.cancellation_token,
         })
     }
 }
@@ -542,9 +568,9 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
     }
 }
 
-/// Prefixes all column references in a predicate with a fixed path.
-/// Transforms data-skipping predicates (e.g., `minValues.x > 100`) into
-/// checkpoint/sidecar-compatible predicates (e.g., `add.stats_parsed.minValues.x > 100`).
+/// Prefixes all column references in a predicate with a fixed path. The checkpoint path prefixes
+/// stat expressions that already carry their `stats_parsed.*` root (e.g. `stats_parsed.minValues.x
+/// > 100`) with `add`, yielding `add.stats_parsed.minValues.x > 100`.
 struct PrefixColumns {
     prefix: ColumnName,
 }
@@ -659,6 +685,9 @@ pub struct Scan {
     stats: StatsOptions,
     correlation_id: Option<Arc<str>>,
     partition_values: PartitionValuesOptions,
+    /// Optional cooperative cancellation token supplied via
+    /// [`ScanBuilder::with_cancellation_token`]. `None` means the scan is not cancellable.
+    cancellation_token: Option<CancellationTokenRef>,
 }
 
 impl std::fmt::Debug for Scan {
@@ -676,6 +705,34 @@ impl Scan {
     /// Whether stats reading is entirely skipped, disabling internal data skipping.
     fn skip_stats(&self) -> bool {
         !self.stats.synthesize_json && matches!(self.stats.struct_stats, StructStats::None)
+    }
+
+    fn checkpoint_read_options(&self) -> (SchemaRef, Option<PredicateRef>, Option<&StructType>) {
+        let skip_stats = self.skip_stats();
+        // `physical_stats_schema` is the typed shape this scan can consume, not evidence that the
+        // checkpoint contains `stats_parsed`. Checkpoint discovery validates availability and
+        // restores `add.stats` before opening the reader when the structured field is incompatible.
+        let can_replace_json_with_structured_stats =
+            !self.stats.synthesize_json && self.state_info.physical_stats_schema.is_some();
+        let checkpoint_schema = if skip_stats || can_replace_json_with_structured_stats {
+            CHECKPOINT_READ_SCHEMA_NO_JSON_STATS.clone()
+        } else {
+            CHECKPOINT_READ_SCHEMA.clone()
+        };
+
+        let meta_predicate = if skip_stats {
+            None
+        } else {
+            self.build_actions_meta_predicate()
+        };
+        // Discovery uses this schema to augment the checkpoint projection, so `none()` must
+        // suppress it as well as the initial JSON stats field.
+        let physical_stats_schema = if skip_stats {
+            None
+        } else {
+            self.state_info.physical_stats_schema.as_deref()
+        };
+        (checkpoint_schema, meta_predicate, physical_stats_schema)
     }
 
     /// Build the read-options bundle passed to [`ScanLogReplayProcessor`].
@@ -888,23 +945,18 @@ impl Scan {
 
         // For incremental reads, new_log_segment has no checkpoint but we use the
         // checkpoint schema returned by the function for consistency.
-        let (checkpoint_schema, meta_predicate) = if self.skip_stats() {
-            (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), None)
-        } else {
-            (
-                CHECKPOINT_READ_SCHEMA.clone(),
-                self.build_actions_meta_predicate(),
-            )
-        };
+        let (checkpoint_schema, meta_predicate, physical_stats_schema) =
+            self.checkpoint_read_options();
         let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
             engine,
             COMMIT_READ_SCHEMA.clone(),
             checkpoint_schema,
             meta_predicate,
-            self.state_info
-                .physical_stats_schema
-                .as_ref()
-                .map(|s| s.as_ref()),
+            physical_stats_schema,
+            None,
+            // The incremental path relies on the batch-boundary poll in `scan_metadata_inner`
+            // for cancellation; it does not thread the token into the engine reads here, so a
+            // read already in flight is not interrupted mid-I/O.
             None,
         )?;
         let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
@@ -938,9 +990,15 @@ impl Scan {
                 (None, Arc::new(ScanMetrics::default()))
             }
             _ => {
+                // Wrap the input iterator (not the shared `process_actions_iter`) so token
+                // polling stays scoped to scans.
+                let actions = CancellableIterator::new(
+                    actions_with_checkpoint_info.actions,
+                    self.cancellation_token.clone(),
+                );
                 let (it, m) = scan_action_iter(
                     engine,
-                    actions_with_checkpoint_info.actions,
+                    actions,
                     self.state_info.clone(),
                     actions_with_checkpoint_info.checkpoint_info,
                     self.stats_options(),
@@ -1001,14 +1059,10 @@ impl Scan {
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
-        let (checkpoint_schema, meta_predicate) = if self.skip_stats() {
-            (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), None)
-        } else {
-            (
-                CHECKPOINT_READ_SCHEMA.clone(),
-                self.build_actions_meta_predicate(),
-            )
-        };
+        let (checkpoint_schema, meta_predicate, physical_stats_schema) =
+            self.checkpoint_read_options();
+        // Checkpoints already represent reconciled state, so scans project only Add actions. This
+        // derives `add.path IS NOT NULL` and allows readers to skip non-Add row groups.
         self.snapshot
             .log_segment()
             .read_actions_with_projected_checkpoint_actions(
@@ -1016,52 +1070,65 @@ impl Scan {
                 COMMIT_READ_SCHEMA.clone(),
                 checkpoint_schema,
                 meta_predicate,
-                self.state_info
-                    .physical_stats_schema
-                    .as_ref()
-                    .map(|s| s.as_ref()),
+                physical_stats_schema,
                 self.state_info
                     .physical_partition_schema
                     .as_ref()
                     .map(|s| s.as_ref()),
+                self.cancellation_token.as_ref(),
             )
     }
 
     /// Builds a predicate for row group skipping in checkpoint and sidecar parquet files.
     ///
-    /// The scan predicate is first transformed into a data-skipping form with IS NULL guards
-    /// (e.g., `x > 100` becomes `OR(maxValues.x IS NULL, maxValues.x > 100)`), then column
-    /// references are prefixed with `add.stats_parsed` to match the physical column layout
-    /// of checkpoint/sidecar files. The parquet reader's row group filter can then use
-    /// parquet-level statistics on these nested columns to skip entire row groups that cannot
-    /// contain matching files.
+    /// The scan predicate is rewritten into a data-skipping form scoped under the `add` action:
+    /// data-column references become `add.stats_parsed.{minValues,maxValues,nullCount}.<col>` and
+    /// partition references become `add.partitionValues_parsed.<col>`, so the parquet reader's row
+    /// group filter can use footer statistics to skip row groups that cannot contain matching
+    /// files. See [`as_checkpoint_skipping_predicate`] for the rewrite and its data-stat IS NULL
+    /// guards.
     ///
-    /// The IS NULL guards are necessary because parquet footer min/max statistics ignore null
-    /// values. Without them, row groups containing files with missing stats (null stat columns)
-    /// could be incorrectly pruned, since the footer min/max wouldn't reflect those files.
-    ///
-    /// Returns `None` if the scan has no predicate, no stats schema, or if the predicate is a
-    /// bare unsupported expression (e.g. column-column comparison). Junctions with unsupported
-    /// arms replace them with TRUE to conservatively prevent pruning.
+    /// Returns `None` if the scan has no predicate, if neither a data-column stats schema nor a
+    /// partition schema is available, or if the predicate is a bare unsupported expression (e.g.
+    /// column-column comparison). Junctions represent unsupported arms with a NULL literal,
+    /// preserving three-valued logic while allowing independently decisive supported arms to
+    /// prune.
     fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
         let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
             return None;
         };
-        self.state_info.physical_stats_schema.as_ref()?;
+        // Skipping needs either data-column stats or partition values to rewrite against; a
+        // partition-only predicate has no `stats_parsed` schema, a data-only predicate on an
+        // unpartitioned table has no partition schema.
+        if self.state_info.physical_stats_schema.is_none()
+            && self.state_info.physical_partition_schema.is_none()
+        {
+            return None;
+        }
 
-        let partition_columns = self
-            .snapshot
-            .table_configuration()
-            .metadata()
-            .partition_columns();
+        // `partitionValues_parsed` is keyed by PHYSICAL partition name, and (under column mapping)
+        // the predicate also references physical columns, so partition detection reads the physical
+        // partition schema rather than the logical names in table metadata.
+        let mut partition_columns = HashSet::new();
+        let mut floating_partition_columns = HashSet::new();
+        if let Some(schema) = self.state_info.physical_partition_schema.as_ref() {
+            for field in schema.fields() {
+                let column = ColumnName::new([field.name()]);
+                if field.data_type() == &DataType::FLOAT || field.data_type() == &DataType::DOUBLE {
+                    floating_partition_columns.insert(column.clone());
+                }
+                partition_columns.insert(column);
+            }
+        }
         let skipping_pred = as_checkpoint_skipping_predicate(
             predicate,
-            partition_columns,
+            &partition_columns,
+            &floating_partition_columns,
             &self.state_info.physical_stats_columns,
         )?;
 
         let mut prefixer = PrefixColumns {
-            prefix: ColumnName::new(["add", "stats_parsed"]),
+            prefix: ColumnName::new(["add"]),
         };
         let prefixed = prefixer.transform_pred(&skipping_pred);
         Some(Arc::new(prefixed.into_owned()))
@@ -1072,6 +1139,10 @@ impl Scan {
     /// This method returns a [`SequentialScanMetadata`] iterator that processes commits and
     /// checkpoint manifests sequentially. After exhausting this iterator, call `finish()`
     /// to determine if a distributed phase is needed.
+    ///
+    /// Cancellation is not supported on this path: it errors if a token was set via
+    /// [`ScanBuilder::with_cancellation_token`], rather than silently running to completion.
+    /// Only [`scan_metadata`](Self::scan_metadata) honors the token today.
     ///
     /// # Example
     ///
@@ -1127,11 +1198,19 @@ impl Scan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<SequentialScanMetadata> {
+        // Fail fast rather than silently ignore a caller-supplied token: the parallel path does
+        // not thread cancellation, so honoring a set token would require dropping it on the floor.
+        if self.cancellation_token.is_some() {
+            return Err(Error::unsupported(
+                "cancellation is not supported by parallel_scan_metadata; \
+                 use scan_metadata for a cancellable scan",
+            ));
+        }
         // For the sequential/parallel phase approach, we use a conservative checkpoint_info
         // since SequentialPhase reads checkpoints via CheckpointManifestReader which doesn't
         // currently support stats_parsed optimization.
         let checkpoint_read_schema = if self.skip_stats() {
-            CHECKPOINT_READ_SCHEMA_NO_STATS.clone()
+            CHECKPOINT_READ_SCHEMA_NO_JSON_STATS.clone()
         } else {
             CHECKPOINT_READ_SCHEMA.clone()
         };

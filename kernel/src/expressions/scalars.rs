@@ -788,6 +788,11 @@ impl PrimitiveType {
             IntervalYearMonth | IntervalDayTime => Err(Error::unsupported(
                 "Interval types are not supported as scalar or partition values",
             )),
+            // Kernel does not support parsing text into Geometry/Geography types yet.
+            #[cfg(feature = "geo-type-in-dev")]
+            Geometry(_) | Geography(_) => Err(Error::Unsupported(format!(
+                "parse_scalar is not supported for {self:?}"
+            ))),
         }
     }
 
@@ -832,15 +837,15 @@ impl PrimitiveType {
     }
 
     fn parse_decimal(raw: &str, dtype: DecimalType) -> Result<Scalar, Error> {
+        let parse_error = || PrimitiveType::from(dtype).parse_error(raw);
         let (base, exp): (&str, i128) = match raw.find(['e', 'E']) {
             None => (raw, 0), // no 'e' or 'E', so there's no exponent
             Some(pos) => {
                 let (base, exp) = raw.split_at(pos);
                 // exp now has '[e/E][exponent]', strip the 'e/E' and parse it
-                (base, exp[1..].parse()?)
+                (base, exp[1..].parse().map_err(|_| parse_error())?)
             }
         };
-        let parse_error = || PrimitiveType::from(dtype).parse_error(raw);
         require!(!base.is_empty(), parse_error());
 
         // now split on any '.' and parse
@@ -865,10 +870,14 @@ impl PrimitiveType {
         let scale: u8 = scale.try_into().map_err(|_| parse_error())?;
         require!(scale == dtype.scale(), parse_error());
         let int: i128 = match frac_part {
-            None => int_part.parse()?,
-            Some(frac_part) => format!("{int_part}{frac_part}").parse()?,
+            None => int_part.parse().map_err(|_| parse_error())?,
+            Some(frac_part) => format!("{int_part}{frac_part}")
+                .parse()
+                .map_err(|_| parse_error())?,
         };
-        Ok(Scalar::Decimal(DecimalData::try_new(int, dtype)?))
+        DecimalData::try_new(int, dtype)
+            .map(Scalar::Decimal)
+            .map_err(|_| parse_error())
     }
 }
 
@@ -893,6 +902,26 @@ mod tests {
         PrimitiveType::Void.parse_scalar("anything").unwrap_err();
     }
 
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest::rstest]
+    #[case(PrimitiveType::Geometry(Box::new(
+        crate::schema::GeometryType::try_new("EPSG:4326").unwrap()
+    )))]
+    #[case(PrimitiveType::Geography(Box::new(
+        crate::schema::GeographyType::try_new(
+            "EPSG:4326",
+            crate::schema::EdgeInterpolationAlgorithm::Spherical,
+        )
+        .unwrap()
+    )))]
+    fn test_geo_parse_scalar_unsupported(#[case] ptype: PrimitiveType) {
+        let err = ptype.parse_scalar("anything").unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "expected Unsupported, got: {err:?}"
+        );
+    }
+
     #[test]
     fn test_bad_decimal() {
         let dtype = DecimalType::try_new(3, 0).unwrap();
@@ -900,6 +929,7 @@ mod tests {
         PrimitiveType::parse_decimal("0.12345", dtype).expect_err("should have failed");
         PrimitiveType::parse_decimal("12345", dtype).expect_err("should have failed");
     }
+
     #[test]
     fn test_decimal_display() {
         let s = Scalar::decimal(123456789, 9, 2).unwrap();
@@ -1013,8 +1043,10 @@ mod tests {
 
     fn expect_fail_parse(raw: &str, prec: u8, scale: u8) {
         let s = PrimitiveType::decimal(prec, scale).unwrap();
-        let res = s.parse_scalar(raw);
-        assert!(res.is_err(), "Fail on {raw}");
+        match s.parse_scalar(raw) {
+            Err(Error::ParseError(..)) => {}
+            other => panic!("expected ParseError for {raw:?}, got {other:?}"),
+        }
     }
 
     #[test]

@@ -12,11 +12,10 @@ pub(crate) use column_mapping::{
     validate_column_mapping_id, StaleAnnotationPolicy,
 };
 use delta_kernel_derive::internal_api;
+#[cfg(feature = "geo-type-in-dev")]
+pub(crate) use geospatial::validate_geospatial_feature_support;
 pub(crate) use iceberg_compat::v3::{iceberg_compat_v3_column_defaults_validation, V3_VALIDATOR};
 pub(crate) use iceberg_compat::validate_iceberg_compat_if_needed;
-pub(crate) use interval_type::{
-    schema_contains_interval_type, validate_interval_type_feature_support_on_write,
-};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumIter, EnumString};
@@ -33,8 +32,9 @@ use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 mod column_mapping;
+#[cfg(feature = "geo-type-in-dev")]
+mod geospatial;
 mod iceberg_compat;
-mod interval_type;
 mod timestamp_ntz;
 
 /// Minimum reader/writer protocol version that the kernel can handle.
@@ -144,18 +144,14 @@ pub(crate) enum TableFeature {
     ColumnMapping,
     /// Deletion vectors for merge, update, delete
     DeletionVectors,
-    /// ANSI interval types, in preview pending RFC ratification (`intervalType-preview`).
+    /// Timestamps without timezone support. The canonical protocol feature name is `timestampNtz`.
     ///
-    /// TODO(#2840): intervalType support is gated by the `interval-type-in-dev` cargo feature.
-    /// Connectors may enable this protocol feature explicitly. It is not auto-enabled from schema
-    /// contents so tables created for legacy interoperability remain readable by connectors that
-    /// predate the feature.
-    #[strum(serialize = "intervalType-preview")]
-    #[serde(rename = "intervalType-preview")]
-    IntervalTypePreview,
-    /// timestamps without timezone support
-    #[strum(serialize = "timestampNtz")]
-    #[serde(rename = "timestampNtz")]
+    /// `timestampWithoutTimezone` is not a Delta protocol feature name, but some existing tables
+    /// carry it in their reader/writer feature arrays. Kernel accepts it on read for compatibility
+    /// with those tables and always writes the canonical `timestampNtz`. See
+    /// <https://github.com/delta-io/delta-kernel-rs/issues/2557>.
+    #[strum(to_string = "timestampNtz", serialize = "timestampWithoutTimezone")]
+    #[serde(rename = "timestampNtz", alias = "timestampWithoutTimezone")]
     TimestampWithoutTimezone,
     // Allow columns to change type
     TypeWidening,
@@ -182,6 +178,10 @@ pub(crate) enum TableFeature {
     #[strum(serialize = "adaptiveMetadata-preview")]
     #[serde(rename = "adaptiveMetadata-preview")]
     AdaptiveMetadataPreview,
+    /// Geospatial type support (geometry and geography columns)
+    #[strum(serialize = "geospatial")]
+    #[serde(rename = "geospatial")]
+    GeospatialType,
 
     #[serde(untagged)]
     #[strum(default)]
@@ -562,17 +562,6 @@ static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-static INTERVAL_TYPE_PREVIEW_INFO: FeatureInfo = FeatureInfo {
-    feature_type: FeatureType::ReaderWriter,
-    min_legacy_version: None,
-    feature_requirements: &[],
-    #[cfg(feature = "interval-type-in-dev")]
-    kernel_support: KernelSupport::Supported,
-    #[cfg(not(feature = "interval-type-in-dev"))]
-    kernel_support: KernelSupport::NotSupported,
-    enablement_check: EnablementCheck::AlwaysIfSupported,
-};
-
 /// TODO: When type widening is supported on writes, restrict the allowed
 /// widenings on IcebergCompatV3 tables to the subset permitted by the Iceberg v3
 /// schema-evolution rules. Ref: <https://iceberg.apache.org/spec/#schema-evolution>
@@ -682,6 +671,23 @@ static ADAPTIVE_METADATA_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+// TODO(#2949): drop the `geo-type-in-dev` gate once full geospatial support ships.
+static GEOSPATIAL_TYPE_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
+    feature_requirements: &[],
+    #[cfg(feature = "geo-type-in-dev")]
+    kernel_support: KernelSupport::Custom(|_, _, op| match op {
+        Operation::Scan | Operation::Cdf => Ok(()),
+        Operation::Write => Err(Error::unsupported(
+            "Feature 'geospatial' is not supported for writes",
+        )),
+    }),
+    #[cfg(not(feature = "geo-type-in-dev"))]
+    kernel_support: KernelSupport::NotSupported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
 /// By definition, kernel cannot know how to handle unknown features and must assume they're always
 /// enabled if supported in protocol. However, the read path ignores all writer-only features,
 /// including unknown ones. Unknown features are never inferred from legacy protocol versions.
@@ -705,7 +711,6 @@ impl TableFeature {
             | TableFeature::CatalogOwnedPreview
             | TableFeature::ColumnMapping
             | TableFeature::DeletionVectors
-            | TableFeature::IntervalTypePreview
             | TableFeature::TimestampWithoutTimezone
             | TableFeature::TypeWidening
             | TableFeature::TypeWideningPreview
@@ -715,7 +720,8 @@ impl TableFeature {
             | TableFeature::VariantTypePreview
             | TableFeature::VariantShredding
             | TableFeature::VariantShreddingPreview
-            | TableFeature::AdaptiveMetadataPreview => FeatureType::ReaderWriter,
+            | TableFeature::AdaptiveMetadataPreview
+            | TableFeature::GeospatialType => FeatureType::ReaderWriter,
             TableFeature::AppendOnly
             | TableFeature::DomainMetadata
             | TableFeature::Invariants
@@ -773,7 +779,6 @@ impl TableFeature {
             TableFeature::CatalogOwnedPreview => &CATALOG_OWNED_PREVIEW_INFO,
             TableFeature::ColumnMapping => &COLUMN_MAPPING_INFO,
             TableFeature::DeletionVectors => &DELETION_VECTORS_INFO,
-            TableFeature::IntervalTypePreview => &INTERVAL_TYPE_PREVIEW_INFO,
             TableFeature::TimestampWithoutTimezone => &TIMESTAMP_WITHOUT_TIMEZONE_INFO,
             TableFeature::TypeWidening => &TYPE_WIDENING_INFO,
             TableFeature::TypeWideningPreview => &TYPE_WIDENING_PREVIEW_INFO,
@@ -784,6 +789,7 @@ impl TableFeature {
             TableFeature::VariantShredding => &VARIANT_SHREDDING_INFO,
             TableFeature::VariantShreddingPreview => &VARIANT_SHREDDING_PREVIEW_INFO,
             TableFeature::AdaptiveMetadataPreview => &ADAPTIVE_METADATA_PREVIEW_INFO,
+            TableFeature::GeospatialType => &GEOSPATIAL_TYPE_INFO,
 
             // Unknown features: not supported by kernel, no legacy version inference.
             TableFeature::Unknown(_) => &UNKNOWN_FEATURE_INFO,
@@ -1063,26 +1069,38 @@ mod tests {
         }
     }
 
-    /// A table that declares `intervalType-preview` in its reader features is readable exactly when
-    /// kernel support is compiled in (the `interval-type-in-dev` gate); otherwise the read is
-    /// refused.
     #[test]
-    fn test_read_protocol_with_interval_type_feature() {
-        let protocol = Protocol::try_new_modern(
-            [TableFeature::IntervalTypePreview],
-            [TableFeature::IntervalTypePreview],
-        )
-        .unwrap();
-        let result = ensure_table_can_be_read(&protocol);
-        if cfg!(feature = "interval-type-in-dev") {
-            result
-                .expect("intervalType-preview table must be readable when the feature is enabled");
-        } else {
-            assert!(
-                matches!(result, Err(Error::Unsupported(_))),
-                "intervalType-preview read must be Unsupported when the feature is off, got: {result:?}"
-            );
-        }
+    fn test_timestamp_ntz_legacy_alias() {
+        assert_eq!(
+            TableFeature::from("timestampNtz"),
+            TableFeature::TimestampWithoutTimezone
+        );
+        assert_eq!(
+            TableFeature::from("timestampWithoutTimezone"),
+            TableFeature::TimestampWithoutTimezone
+        );
+
+        assert_eq!(
+            serde_json::from_str::<TableFeature>("\"timestampNtz\"").unwrap(),
+            TableFeature::TimestampWithoutTimezone
+        );
+        assert_eq!(
+            serde_json::from_str::<TableFeature>("\"timestampWithoutTimezone\"").unwrap(),
+            TableFeature::TimestampWithoutTimezone
+        );
+
+        assert_eq!(
+            TableFeature::TimestampWithoutTimezone.to_string(),
+            "timestampNtz"
+        );
+        assert_eq!(
+            TableFeature::TimestampWithoutTimezone.as_ref(),
+            "timestampNtz"
+        );
+        assert_eq!(
+            serde_json::to_string(&TableFeature::TimestampWithoutTimezone).unwrap(),
+            "\"timestampNtz\""
+        );
     }
 
     #[test]
@@ -1109,7 +1127,6 @@ mod tests {
                 TableFeature::CatalogOwnedPreview => "catalogOwned-preview",
                 TableFeature::ColumnMapping => "columnMapping",
                 TableFeature::DeletionVectors => "deletionVectors",
-                TableFeature::IntervalTypePreview => "intervalType-preview",
                 TableFeature::TimestampWithoutTimezone => "timestampNtz",
                 TableFeature::TypeWidening => "typeWidening",
                 TableFeature::TypeWideningPreview => "typeWidening-preview",
@@ -1121,6 +1138,7 @@ mod tests {
                 TableFeature::VariantShreddingPreview => "variantShredding-preview",
                 TableFeature::AdaptiveMetadataPreview => "adaptiveMetadata-preview",
                 TableFeature::AllowColumnDefaults => "allowColumnDefaults",
+                TableFeature::GeospatialType => "geospatial",
                 TableFeature::Unknown(_) => continue, // tested in test_unknown_features
             };
 

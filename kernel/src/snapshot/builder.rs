@@ -7,7 +7,7 @@ use tracing::{info, instrument};
 use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
 use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
-use crate::metrics::{MetricId, SnapshotLoadMetricContext};
+use crate::metrics::{LogSegmentLoadType, MetricId, SnapshotLoadMetricContext};
 use crate::path::LogPathFileType;
 use crate::snapshot::SnapshotRef;
 use crate::utils::{require, try_parse_uri};
@@ -214,7 +214,7 @@ impl SnapshotBuilder {
     #[instrument(
         name = SNAPSHOT_COMPLETED_SPAN,
         skip_all,
-        fields(path = %self.table_path(), report, version = tracing::field::Empty, operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some(), correlation_id = self.correlation_id.as_deref().unwrap_or("")),
+        fields(path = %self.table_path(), report, version = tracing::field::Empty, operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some(), correlation_id = self.correlation_id.as_deref().unwrap_or(""), load_type = self.load_type().as_ref()),
         err
     )]
     pub fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
@@ -230,6 +230,8 @@ impl SnapshotBuilder {
             self.log_tail.len(),
             self.max_catalog_version
         );
+
+        let load_type = self.load_type();
 
         // Destructure self so fields can be moved independently
         let Self {
@@ -247,6 +249,7 @@ impl SnapshotBuilder {
             operation_id,
             is_catalog_managed: max_catalog_version.is_some(),
             correlation_id,
+            load_type,
         };
 
         let log_tail: Vec<_> = log_tail.into_iter().map(Into::into).collect();
@@ -329,10 +332,10 @@ impl SnapshotBuilder {
         for pair in log_tail.windows(2) {
             require!(
                 pair[0].version + 1 == pair[1].version,
-                Error::generic(format!(
-                    "log_tail must be sorted and contiguous, but found versions {} and {}",
-                    pair[0].version, pair[1].version
-                ))
+                Error::LogTailVersionsNotContiguous {
+                    first_version: pair[0].version,
+                    second_version: pair[1].version,
+                }
             );
         }
 
@@ -345,9 +348,10 @@ impl SnapshotBuilder {
         // Staged commits require max_catalog_version
         require!(
             !has_catalog_commits || max_catalog_version.is_some(),
-            Error::generic(
-                "Staged commits in log_tail require max_catalog_version to be set. \
-                 Use with_max_catalog_version() when providing staged commits."
+            Error::MaxCatalogVersion(
+                "Max catalog version is required when providing staged commits in the log tail. \
+                 Use with_max_catalog_version()."
+                    .to_string()
             )
         );
 
@@ -355,8 +359,8 @@ impl SnapshotBuilder {
         if let (Some(ver), Some(max_cv)) = (version, max_catalog_version) {
             require!(
                 ver <= max_cv,
-                Error::generic(format!(
-                    "Time-travel version {ver} exceeds max_catalog_version {max_cv}"
+                Error::MaxCatalogVersion(format!(
+                    "Requested version {ver} exceeds max catalog version {max_cv}"
                 ))
             );
         }
@@ -367,8 +371,9 @@ impl SnapshotBuilder {
                 // With time-travel: last log_tail entry must be >= requested version
                 require!(
                     last.version >= ver,
-                    Error::generic(format!(
-                        "Log tail last version {} is less than requested version {ver}",
+                    Error::MaxCatalogVersion(format!(
+                        "Log tail version {} is less than requested version {ver} for max catalog \
+                         version {max_cv}",
                         last.version
                     ))
                 );
@@ -376,8 +381,8 @@ impl SnapshotBuilder {
                 // Without time-travel: last log_tail entry must == max_catalog_version
                 require!(
                     last.version == max_cv,
-                    Error::generic(format!(
-                        "Log tail last version {} does not match max_catalog_version {max_cv}",
+                    Error::MaxCatalogVersion(format!(
+                        "Log tail version {} does not match max catalog version {max_cv}",
                         last.version
                     ))
                 );
@@ -397,15 +402,21 @@ impl SnapshotBuilder {
 
         require!(
             !is_catalog_managed || max_catalog_version.is_some(),
-            Error::generic(
-                "Catalog-managed table requires max_catalog_version to be set. \
-                 Use with_max_catalog_version() when loading a catalog-managed table."
+            Error::MaxCatalogVersion(
+                "Max catalog version is required when loading a catalog-managed table. \
+                 Use with_max_catalog_version()."
+                    .to_string()
             )
         );
-        require!(
-            is_catalog_managed || max_catalog_version.is_none(),
-            Error::generic("max_catalog_version must not be set for non-catalog-managed tables.")
-        );
+        if let Some(max_catalog_version) = max_catalog_version {
+            require!(
+                is_catalog_managed,
+                Error::MaxCatalogVersion(format!(
+                    "Max catalog version {max_catalog_version} must not be set for a \
+                     non-catalog-managed table"
+                ))
+            );
+        }
 
         Ok(())
     }
@@ -421,6 +432,16 @@ impl SnapshotBuilder {
                     .map(|s| s.table_root().as_str())
             })
             .unwrap_or("unknown")
+    }
+
+    /// A build from a table root is a fresh, full log listing; a build from an existing snapshot
+    /// reuses that snapshot's log root and lists only the commits above it (`table_root` is None).
+    fn load_type(&self) -> LogSegmentLoadType {
+        if self.table_root.is_some() {
+            LogSegmentLoadType::Full
+        } else {
+            LogSegmentLoadType::Incremental
+        }
     }
 
     fn target_version_str(&self) -> String {
@@ -617,13 +638,15 @@ mod tests {
             .build(engine.as_ref())
             .is_err());
 
-        assert!(
-            reporter
-                .events()
-                .iter()
-                .any(|e| matches!(e, MetricEvent::LogSegmentLoadFailure(_))),
-            "expected LogSegmentLoadFailure when the log has no commits"
-        );
+        let events = reporter.events();
+        let failure = events
+            .iter()
+            .find_map(|e| match e {
+                MetricEvent::LogSegmentLoadFailure(f) => Some(f),
+                _ => None,
+            })
+            .expect("expected LogSegmentLoadFailure when the log has no commits");
+        assert_eq!(failure.load_type, LogSegmentLoadType::Full);
         Ok(())
     }
 
@@ -862,10 +885,7 @@ mod tests {
                 .with_log_tail(log_tail)
                 .build(engine.as_ref());
 
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("Staged commits in log_tail require max_catalog_version"));
+            assert!(matches!(result, Err(Error::MaxCatalogVersion(_))));
 
             Ok(())
         }
@@ -880,10 +900,7 @@ mod tests {
                 .with_max_catalog_version(3)
                 .build(engine.as_ref());
 
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("Time-travel version 5 exceeds max_catalog_version 3"));
+            assert!(matches!(result, Err(Error::MaxCatalogVersion(_))));
 
             Ok(())
         }
@@ -908,10 +925,7 @@ mod tests {
                 .with_max_catalog_version(3)
                 .build(engine.as_ref());
 
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("Log tail last version 2 does not match max_catalog_version 3"));
+            assert!(matches!(result, Err(Error::MaxCatalogVersion(_))));
 
             Ok(())
         }
@@ -923,10 +937,7 @@ mod tests {
 
             let result = SnapshotBuilder::new_for(table_root).build(engine.as_ref());
 
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("Catalog-managed table requires max_catalog_version"));
+            assert!(matches!(result, Err(Error::MaxCatalogVersion(_))));
 
             Ok(())
         }
@@ -943,10 +954,7 @@ mod tests {
                 .with_max_catalog_version(0)
                 .build(engine.as_ref());
 
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("max_catalog_version must not be set for non-catalog-managed tables"));
+            assert!(matches!(result, Err(Error::MaxCatalogVersion(_))));
 
             Ok(())
         }
@@ -970,10 +978,7 @@ mod tests {
                 .with_max_catalog_version(3)
                 .build(engine.as_ref());
 
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("Log tail last version 1 is less than requested version 2"));
+            assert!(matches!(result, Err(Error::MaxCatalogVersion(_))));
 
             Ok(())
         }
@@ -1027,10 +1032,7 @@ mod tests {
             // Incremental update without mcv should fail
             let result = SnapshotBuilder::new_from(initial).build(engine.as_ref());
 
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("Catalog-managed table requires max_catalog_version"));
+            assert!(matches!(result, Err(Error::MaxCatalogVersion(_))));
 
             Ok(())
         }
@@ -1063,10 +1065,10 @@ mod tests {
                 .with_max_catalog_version(mcv)
                 .build(engine.as_ref());
 
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("log_tail must be sorted and contiguous"));
+            assert!(matches!(
+                result,
+                Err(Error::LogTailVersionsNotContiguous { .. })
+            ));
 
             Ok(())
         }
