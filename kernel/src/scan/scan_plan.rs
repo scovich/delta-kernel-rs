@@ -472,7 +472,7 @@ fn stats_skipping_predicate(state: &StateInfo) -> Option<Predicate> {
     let partition_column_names = state
         .physical_partition_schema
         .iter()
-        .flat_map(|s| s.fields().map(|f| f.name().to_string()))
+        .flat_map(|s| s.fields().map(|f| ColumnName::new([f.name()])))
         .collect();
     let skipping = as_sql_data_skipping_predicate_with_stats_columns(
         pred,
