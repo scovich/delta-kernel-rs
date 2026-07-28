@@ -12,6 +12,7 @@ use crate::arrow::util::pretty::pretty_format_batches;
 use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
+use crate::plans::ir::nodes::Operator;
 use crate::plans::Operation as PlanOperation;
 use crate::scan::{PartitionValuesOptions, Scan, StatsOptions};
 use crate::{DeltaResult, Engine, Snapshot};
@@ -184,6 +185,34 @@ fn declarative_metadata_matches_imperative_scan(
     let actual = declarative_metadata(&scan, engine.as_ref())?;
 
     assert_metadata_eq(&actual, &expected, &format!("table {table}"))
+}
+
+#[rstest]
+#[case::parquet_manifest("v2-checkpoints-parquet-with-sidecars")]
+#[case::json_manifest("v2-checkpoints-json-with-sidecars")]
+fn declarative_metadata_scans_sidecars_from_checkpoint_hint(
+    #[case] table: &str,
+) -> DeltaResult<()> {
+    let (engine, snapshot, _tempdir) = crate::utils::test_utils::load_test_table(table)?;
+    let plan = snapshot
+        .scan_builder()
+        .build()?
+        .declarative_metadata_scan_plan(engine.as_ref())?
+        .expect("metadata plan");
+
+    assert!(plan
+        .nodes
+        .iter()
+        .all(|node| !matches!(&node.op, Operator::Load(_))));
+    assert!(plan.nodes.iter().any(|node| {
+        let Operator::ScanParquet(scan) = &node.op else {
+            return false;
+        };
+        scan.files
+            .iter()
+            .any(|file| file.meta.location.path().contains("/_sidecars/"))
+    }));
+    Ok(())
 }
 
 #[rstest]

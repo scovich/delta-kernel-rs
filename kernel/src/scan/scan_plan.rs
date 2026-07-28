@@ -3,10 +3,6 @@
 //! [`build_metadata_scan_plan`] reconciles checkpoint and commit actions into live adds, applying
 //! metadata pruning before newest-action-wins replay.
 
-// The plan builders are exercised by unit tests but not yet called from `Scan` (that wiring is a
-// later phase). Allow dead code until then so the unwired prototype builds under `-D warnings`.
-#![allow(dead_code)]
-
 use std::borrow::Cow;
 use std::sync::{Arc, LazyLock};
 
@@ -23,6 +19,7 @@ use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
     col, column_name, joined_column_expr, ColumnName, Expression as Expr, Predicate,
 };
+use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::{FileType, Load, LoadColumnFileMeta, ScanFile};
 use crate::plans::ir::plan::Plan;
 use crate::schema::{
@@ -52,10 +49,8 @@ const VERSION: &str = "version";
 /// Returns `None` for an empty result or a statically false predicate.
 pub(crate) fn build_metadata_scan_plan(
     state: &StateInfo,
-    commit_files: Vec<ScanFile>,
-    checkpoint: Option<(FileType, Vec<ScanFile>)>,
+    log_segment: &LogSegment,
     shape: &CheckpointShape,
-    log_root: Url,
 ) -> DeltaResult<Option<Plan>> {
     // A statically-unsatisfiable predicate (e.g. `x > 10 AND FALSE`) skips the whole table.
     if state.physical_predicate == PhysicalPredicate::StaticSkipAll {
@@ -72,7 +67,7 @@ pub(crate) fn build_metadata_scan_plan(
     let add_field = add_field_with_parsed_stats_and_partitions(stats_schema, partition_schema)?;
     let output_schema = schema_ref! { (&add_field) };
 
-    let commit_actions = commit_arm(commit_files, stats_schema, partition_schema)?.try_fold_with(
+    let commit_actions = commit_arm(log_segment, stats_schema, partition_schema)?.try_fold_with(
         prune,
         |p, prune| {
             // We filter so that:
@@ -109,9 +104,8 @@ pub(crate) fn build_metadata_scan_plan(
         // We unwrap `add.add` to the top level now that MaxNonNullBy is complete.
         .project_patch(|patch| patch.replace(ADD_NAME, add_field.clone(), col!("add.add")))?;
 
-    let checkpoint_adds =
-        checkpoint_arm(checkpoint, shape, &log_root, stats_schema, partition_schema)?
-            .try_fold_with(prune, |p, prune| p.filter(prune.clone()))?;
+    let checkpoint_adds = checkpoint_arm(log_segment, shape, stats_schema, partition_schema)?
+        .try_fold_with(prune, |p, prune| p.filter(prune.clone()))?;
 
     let checkpoint_live_adds = checkpoint_adds
         .anti_join(
@@ -145,13 +139,13 @@ pub(crate) fn build_metadata_scan_plan(
 /// FROM checkpoint_actions
 /// WHERE add.path IS NOT NULL
 fn checkpoint_arm(
-    checkpoint: Option<(FileType, Vec<ScanFile>)>,
+    log_segment: &LogSegment,
     shape: &CheckpointShape,
-    log_root: &Url,
     stats_schema: Option<&SchemaRef>,
     partition_schema: Option<&SchemaRef>,
 ) -> DeltaResult<PlanBuilder> {
     let source_stats_schema = shape.parsed_stats_schema.as_ref();
+    let checkpoint = log_segment.checkpoint_version_tagged_scan_files()?;
 
     let actions = match (&shape.checkpoint_type, checkpoint) {
         (CheckpointType::Leaf, Some((FileType::Parquet, parts))) => {
@@ -166,11 +160,12 @@ fn checkpoint_arm(
             )
         }
         (CheckpointType::Manifest, Some((file_type, parts))) => {
-            // The root parts only reference sidecars; the sidecar files (always parquet) hold the
-            // actions. The Load read schema must match what the sidecars carry, hence the
-            // source-side schema.
             let schema = parquet_read_schema(source_stats_schema, None)?;
-            sidecar_actions(file_type, parts, schema, log_root)
+            match log_segment.checkpoint_hint_version_tagged_sidecar_scan_files()? {
+                Some(sidecars) => PlanBuilder::scan_parquet(sidecars, &[VERSION], schema),
+                // Without a complete hint, load the sidecars referenced by the manifest.
+                None => sidecar_actions(file_type, parts, schema, &log_segment.log_root),
+            }
         }
         (CheckpointType::None, _) | (_, None) => {
             PlanBuilder::values(json_read_schema(/* include_remove */ false), vec![])
@@ -207,10 +202,11 @@ fn checkpoint_arm(
 /// FROM json_commits
 /// WHERE add.path IS NOT NULL OR remove.path IS NOT NULL
 fn commit_arm(
-    commit_files: Vec<ScanFile>,
+    log_segment: &LogSegment,
     stats_schema: Option<&SchemaRef>,
     partition_schema: Option<&SchemaRef>,
 ) -> DeltaResult<PlanBuilder> {
+    let commit_files = log_segment.commit_cover_version_tagged_scan_files()?;
     PlanBuilder::scan_json(commit_files, &[VERSION], json_read_schema(true))?
         .filter(Predicate::or(
             col!("add.path").is_not_null(),
@@ -497,7 +493,8 @@ mod tests {
     use crate::arrow::array::{StringArray, StructArray};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::{lit, Scalar};
+    use crate::expressions::lit;
+    use crate::log_segment_files::LogSegmentFiles;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
@@ -506,7 +503,8 @@ mod tests {
     use crate::scan::state_info::tests::get_state_info_with_options;
     use crate::scan::{PartitionValuesOptions, StatsOptions};
     use crate::schema::StructType;
-    use crate::{Engine as _, FileMeta};
+    use crate::utils::test_utils::create_log_path;
+    use crate::Engine as _;
 
     fn state(
         schema: SchemaRef,
@@ -542,23 +540,44 @@ mod tests {
         ]))
     }
 
-    fn file(path: &str) -> FileMeta {
-        FileMeta {
-            location: Url::parse(path).unwrap(),
-            last_modified: 0,
-            size: 0,
-        }
-    }
-
-    fn scan_file(path: &str, version: i64) -> ScanFile {
-        ScanFile {
-            meta: file(path),
-            file_constants: vec![Scalar::from(version)],
-        }
-    }
-
     fn log_root() -> Url {
         Url::parse("file:///_delta_log/").unwrap()
+    }
+
+    fn log_segment(log_root: Url, commits: &[&str], checkpoint: Option<&str>) -> LogSegment {
+        let ascending_commit_files: Vec<_> =
+            commits.iter().map(|path| create_log_path(path)).collect();
+        let checkpoint_parts: Vec<_> = checkpoint.into_iter().map(create_log_path).collect();
+        let checkpoint_version = checkpoint_parts.first().map(|path| path.version);
+        let latest_commit_file = ascending_commit_files.last().cloned();
+        let end_version = latest_commit_file
+            .as_ref()
+            .map(|path| path.version)
+            .or(checkpoint_version)
+            .unwrap_or_default();
+        LogSegment {
+            end_version,
+            checkpoint_version,
+            log_root,
+            listed: LogSegmentFiles {
+                ascending_commit_files,
+                checkpoint_parts,
+                latest_commit_file,
+                max_published_version: Some(end_version),
+                ..Default::default()
+            },
+            last_checkpoint_metadata: None,
+        }
+    }
+
+    fn checkpoint_path(file_type: FileType) -> &'static str {
+        match file_type {
+            FileType::Json => concat!(
+                "file:///_delta_log/00000000000000000000.checkpoint.",
+                "11111111-1111-1111-1111-111111111111.json"
+            ),
+            FileType::Parquet => "file:///_delta_log/00000000000000000000.checkpoint.parquet",
+        }
     }
 
     fn shape(checkpoint_type: CheckpointType, parsed_stats: Option<SchemaRef>) -> CheckpointShape {
@@ -599,18 +618,6 @@ mod tests {
             panic!("add should be a struct");
         };
         add_struct
-    }
-
-    fn checkpoint_part(file_type: FileType) -> Option<(FileType, Vec<ScanFile>)> {
-        let path = match file_type {
-            FileType::Json => "file:///0.checkpoint.json",
-            FileType::Parquet => "file:///0.parquet",
-        };
-        checkpoint_part_at(file_type, path)
-    }
-
-    fn checkpoint_part_at(file_type: FileType, path: &str) -> Option<(FileType, Vec<ScanFile>)> {
-        Some((file_type, vec![scan_file(path, 0)]))
     }
 
     // One add with JSON stats and no `stats_parsed`.
@@ -724,14 +731,12 @@ mod tests {
             StatsOptions::default(),
             PartitionValuesOptions::default(),
         );
-        let plan = build_metadata_scan_plan(
-            &state,
-            vec![scan_file("file:///1.json", 1)],
-            checkpoint_part(file_type),
-            &shape,
+        let segment = log_segment(
             log_root(),
-        )?
-        .expect("non-empty");
+            &["file:///_delta_log/00000000000000000001.json"],
+            Some(checkpoint_path(file_type)),
+        );
+        let plan = build_metadata_scan_plan(&state, &segment, &shape)?.expect("non-empty");
 
         let mut expected: Vec<&str> = COMMIT_ARM_TAGS.to_vec();
         expected.extend(checkpoint_arm_tags);
@@ -754,12 +759,11 @@ mod tests {
             StatsOptions::all(),
             PartitionValuesOptions::with_struct(),
         );
+        let segment = log_segment(log_root(), &[], Some(checkpoint_path(FileType::Parquet)));
         let plan = build_metadata_scan_plan(
             &state,
-            vec![],
-            checkpoint_part(FileType::Parquet),
+            &segment,
             &shape(CheckpointType::Manifest, parsed_stats),
-            log_root(),
         )?
         .expect("non-empty");
 
@@ -793,14 +797,13 @@ mod tests {
             StatsOptions::default(),
             PartitionValuesOptions::default(),
         );
-        let plan = build_metadata_scan_plan(
-            &state,
-            vec![scan_file("file:///1.json", 1)],
-            None,
-            &no_checkpoint(),
+        let segment = log_segment(
             log_root(),
-        )?
-        .expect("non-empty");
+            &["file:///_delta_log/00000000000000000001.json"],
+            None,
+        );
+        let plan =
+            build_metadata_scan_plan(&state, &segment, &no_checkpoint())?.expect("non-empty");
         assert_eq!(tags(&plan), COMMIT_ARM_TAGS.to_vec());
         Ok(())
     }
@@ -822,14 +825,8 @@ mod tests {
             StatsOptions::default(),
             PartitionValuesOptions::default(),
         );
-        let plan = build_metadata_scan_plan(
-            &state,
-            vec![],
-            checkpoint_part(file_type),
-            &shape,
-            log_root(),
-        )?
-        .expect("non-empty");
+        let segment = log_segment(log_root(), &[], Some(checkpoint_path(file_type)));
+        let plan = build_metadata_scan_plan(&state, &segment, &shape)?.expect("non-empty");
         assert_eq!(tags(&plan), checkpoint_arm_tags);
         Ok(())
     }
@@ -843,9 +840,8 @@ mod tests {
             StatsOptions::default(),
             PartitionValuesOptions::default(),
         );
-        assert!(
-            build_metadata_scan_plan(&state, vec![], None, &no_checkpoint(), log_root())?.is_none()
-        );
+        let segment = log_segment(log_root(), &[], None);
+        assert!(build_metadata_scan_plan(&state, &segment, &no_checkpoint())?.is_none());
         Ok(())
     }
 
@@ -859,14 +855,11 @@ mod tests {
             PartitionValuesOptions::default(),
         );
         assert_eq!(state.physical_predicate, PhysicalPredicate::StaticSkipAll);
-        assert!(build_metadata_scan_plan(
-            &state,
-            vec![scan_file("file:///1.json", 1)],
-            checkpoint_part(FileType::Parquet),
-            &shape(CheckpointType::Leaf, None),
-            log_root(),
-        )?
-        .is_none());
+        let segment = log_segment(log_root(), &[], None);
+        assert!(
+            build_metadata_scan_plan(&state, &segment, &shape(CheckpointType::Leaf, None),)?
+                .is_none()
+        );
         Ok(())
     }
 
@@ -901,17 +894,16 @@ mod tests {
             StatsOptions::default(),
             PartitionValuesOptions::default(),
         );
-        let plan = build_metadata_scan_plan(
-            &state,
-            vec![
-                scan_file("memory:///_delta_log/00000000000000000000.json", 0),
-                scan_file("memory:///_delta_log/00000000000000000001.json", 1),
+        let segment = log_segment(
+            Url::parse("memory:///_delta_log/").unwrap(),
+            &[
+                "memory:///_delta_log/00000000000000000000.json",
+                "memory:///_delta_log/00000000000000000001.json",
             ],
             None,
-            &no_checkpoint(),
-            Url::parse("memory:///_delta_log/").unwrap(),
-        )?
-        .expect("non-empty");
+        );
+        let plan =
+            build_metadata_scan_plan(&state, &segment, &no_checkpoint())?.expect("non-empty");
 
         let engine = SyncEngine::new_with_store(store);
         let mut batches = engine
@@ -960,16 +952,16 @@ mod tests {
             StatsOptions::all(),
             PartitionValuesOptions::default(),
         );
+        let segment = log_segment(
+            Url::parse("memory:///_delta_log/").unwrap(),
+            &[],
+            Some("memory:///_delta_log/00000000000000000000.checkpoint.parquet"),
+        );
         let plan = build_metadata_scan_plan(
             &state,
-            vec![],
-            checkpoint_part_at(
-                FileType::Parquet,
-                "memory:///_delta_log/00000000000000000000.checkpoint.parquet",
-            ),
+            &segment,
             // Leaf with no compatible parsed stats -> parse add.stats instead.
             &shape(CheckpointType::Leaf, None),
-            Url::parse("memory:///_delta_log/").unwrap(),
         )?
         .expect("non-empty");
 

@@ -1033,8 +1033,6 @@ impl Scan {
     /// Returns an error if log discovery, checkpoint inspection, or plan construction fails.
     pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
         let log_segment = self.snapshot.log_segment();
-        let commit_files = log_segment.commit_cover_version_tagged_scan_files()?;
-        let checkpoint = log_segment.checkpoint_version_tagged_scan_files()?;
         // Resolve the checkpoint shape once: it selects the leaf-vs-manifest arm and reports
         // whether the checkpoint carries a compatible parsed-stats column.
         let plan_executor = engine.plan_executor();
@@ -1043,13 +1041,7 @@ impl Scan {
             &self.snapshot,
             self.state_info.physical_stats_schema.as_ref(),
         )?;
-        scan_plan::build_metadata_scan_plan(
-            &self.state_info,
-            commit_files,
-            checkpoint,
-            &shape,
-            log_segment.log_root.clone(),
-        )
+        scan_plan::build_metadata_scan_plan(&self.state_info, log_segment, &shape)
     }
 
     // Factored out to facilitate testing
