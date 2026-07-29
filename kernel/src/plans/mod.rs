@@ -36,8 +36,8 @@
 //!   so a node's inputs are already evaluated, or compile the DAG into the engine's own plan.
 //!
 //! Every operator, expression, and predicate a plan contains must be handled; returning an error
-//! for an unsupported one is fine, and kernel surfaces it to the caller. The `()` executor below
-//! does this, and the sync engine's `SyncPlanExecutor` is a complete reference implementation.
+//! for an unsupported one is fine, and kernel surfaces it to the caller. The sync engine's
+//! `SyncPlanExecutor` is a complete reference implementation.
 //!
 //! # Where to look
 //!
@@ -74,17 +74,6 @@ pub trait PlanExecutor: AsAny {
     fn read_parquet_footer(&self, file: FileMeta) -> DeltaResult<ParquetFooter> {
         self.execute_op(Operation::IoOperation(IoOperation::parquet_footer(file)))?
             .into_parquet_footer()
-    }
-}
-
-/// The unit type is a trivial [`PlanExecutor`] that rejects every operation. It backs
-/// [`Engine::plan_executor`](crate::Engine::plan_executor)'s default so callers can attempt plan
-/// execution unconditionally and fall back on the resulting error when no real executor exists.
-impl PlanExecutor for () {
-    fn execute_op(&self, _op: Operation) -> DeltaResult<PlanResult> {
-        Err(Error::unsupported(
-            "this engine does not provide a PlanExecutor",
-        ))
     }
 }
 
