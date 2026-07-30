@@ -47,6 +47,7 @@ fn raw_delta_client(url: &str, token: &str, catalog: &str, schema: &str) -> (Url
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a running UC server; run with --run-ignored (UC CI job or manual)"]
 async fn live_get_config_round_trips() {
     let Some((url, token)) = server_env() else {
         eprintln!("UC_SERVER_URL unset; skipping live_get_config_round_trips");
@@ -70,6 +71,7 @@ async fn live_get_config_round_trips() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a running UC server; run with --run-ignored (UC CI job or manual)"]
 async fn live_load_table_reads_metadata() {
     let Some((url, token)) = server_env() else {
         eprintln!("UC_SERVER_URL unset; skipping live_load_table_reads_metadata");
@@ -117,6 +119,7 @@ async fn live_load_table_reads_metadata() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a running UC server; run with --run-ignored (UC CI job or manual)"]
 async fn live_get_table_credentials() {
     let Some((url, token)) = server_env() else {
         eprintln!("UC_SERVER_URL unset; skipping live_get_table_credentials");
@@ -172,15 +175,12 @@ async fn live_get_table_credentials() {
 /// Validates the `CreateStagingTableRequest` / `CreateStagingTableResponse` wire types against a
 /// real server.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a running UC server; run with --run-ignored (UC CI job or manual)"]
 async fn live_create_staging_table() {
     let Some((url, token)) = server_env() else {
         eprintln!("UC_SERVER_URL unset; skipping live_create_staging_table");
         return;
     };
-    if std::env::var("UC_CREATE").is_err() {
-        eprintln!("UC_CREATE unset; skipping mutating live_create_staging_table");
-        return;
-    }
     let catalog = std::env::var("UC_TEST_CATALOG").unwrap_or_else(|_| "unity".to_string());
     let schema = std::env::var("UC_TEST_SCHEMA").unwrap_or_else(|_| "default".to_string());
     let table = "delta_rest_client_staging_test";
