@@ -241,6 +241,10 @@ pub struct Transaction<S = ExistingTable> {
     user_domain_removals: Vec<String>,
     // Whether this transaction contains any logical data changes.
     data_change: bool,
+    // TODO(#2499): Replace this state when Conntector responsibilities encode column-default
+    // handling. Whether the connector acknowledged responsibility for applying column
+    // defaults.
+    column_defaults_acknowledged: bool,
     // Whether this transaction should be marked as a blind append.
     is_blind_append: bool,
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
@@ -805,6 +809,23 @@ impl<S> Transaction<S> {
         Ok(())
     }
 
+    /// Rejects write-context creation when a table declares column defaults and the connector has
+    /// not acknowledged handling them.
+    fn ensure_column_defaults_acknowledged(&self) -> DeltaResult<()> {
+        require!(
+            self.column_defaults_acknowledged
+                || !self
+                    .effective_table_config
+                    .is_feature_enabled(&TableFeature::AllowColumnDefaults)
+                || !self.effective_table_config.has_column_with_default(),
+            Error::invalid_transaction_state(
+                "Writing data to a table with column defaults requires calling \
+                 Transaction::ack_column_defaults() first",
+            )
+        );
+        Ok(())
+    }
+
     /// Returns true if this is a create-table transaction.
     /// A create-table transaction has no read snapshot (no pre-existing table).
     fn is_create_table(&self) -> bool {
@@ -897,6 +918,18 @@ impl<S> Transaction<S> {
 // Data file methods -- only available on transaction types that support data files
 // =============================================================================
 impl<S: SupportsDataFiles> Transaction<S> {
+    // TODO(#2499): Remove this API when Engine responsibilities encode column-default handling.
+    /// Acknowledges that the connector applies column defaults before writing data files.
+    ///
+    /// Call this before requesting a write context for a table that enables the
+    /// `allowColumnDefaults` feature and declares at least one column default. The connector must
+    /// materialize every omitted column's default itself; this method records that responsibility
+    /// but does not apply any defaults. Without this acknowledgement, write-context creation fails
+    /// with an error.
+    pub fn ack_column_defaults(&mut self) {
+        self.column_defaults_acknowledged = true;
+    }
+
     /// Returns the expected schema for file statistics.
     ///
     /// The schema structure is derived from table configuration:
@@ -995,12 +1028,15 @@ impl<S: SupportsDataFiles> Transaction<S> {
         self.effective_table_config.logical_partition_columns()
     }
 
+    // TODO(#2630): Expose nested column defaults through the transaction API.
     /// Returns the column default for every top-level column in this table's logical schema that
     /// declares one, keyed by logical column name.
     ///
     /// Connectors use this to discover which columns have defaults, then call
     /// [`ColumnDefault::to_scalar`] on each (or fall back to [`ColumnDefault::raw_sql`] when the
-    /// kernel cannot parse the default) to materialize the column before writing.
+    /// kernel cannot parse the default) to materialize the column before writing. After handling
+    /// every omitted column, call [`ack_column_defaults`](Self::ack_column_defaults) before
+    /// requesting a write context.
     ///
     /// Keys are `String` rather than [`ColumnName`] because the kernel currently surfaces defaults
     /// only for top-level columns, consistent with partition columns. This is a kernel limitation,
@@ -1100,7 +1136,9 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// target directory (Hive-style paths when column mapping is off, random prefix when on).
     ///
     /// Returns an error if the table is not partitioned (use
-    /// [`unpartitioned_write_context`](Self::unpartitioned_write_context) instead).
+    /// [`unpartitioned_write_context`](Self::unpartitioned_write_context) instead), or if the
+    /// table enables `allowColumnDefaults`, declares at least one column default, and
+    /// [`ack_column_defaults`](Self::ack_column_defaults) has not been called.
     ///
     /// [`write_dir`]: WriteContext::write_dir
     /// [`logical_to_physical`]: WriteContext::logical_to_physical
@@ -1109,6 +1147,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
         partition_values: HashMap<String, Scalar>,
     ) -> DeltaResult<WriteContext> {
         self.ensure_schema_non_empty_for_write_context()?;
+        self.ensure_column_defaults_acknowledged()?;
         self.validate_for_data_write()?;
         let shared = self.shared_write_state()?;
         require!(
@@ -1156,9 +1195,12 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// Creates a write context for writing data to an unpartitioned table.
     ///
     /// Returns an error if the table has partition columns (use
-    /// [`partitioned_write_context`](Self::partitioned_write_context) instead).
+    /// [`partitioned_write_context`](Self::partitioned_write_context) instead), or if the table
+    /// enables `allowColumnDefaults`, declares at least one column default, and
+    /// [`ack_column_defaults`](Self::ack_column_defaults) has not been called.
     pub fn unpartitioned_write_context(&self) -> DeltaResult<WriteContext> {
         self.ensure_schema_non_empty_for_write_context()?;
+        self.ensure_column_defaults_acknowledged()?;
         self.validate_for_data_write()?;
         let shared = self.shared_write_state()?;
         require!(
