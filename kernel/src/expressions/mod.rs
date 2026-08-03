@@ -1336,7 +1336,7 @@ mod tests {
             Expression, ExpressionStructPatchBuilder, Predicate, Scalar, UnaryExpressionOp,
         };
         use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
-        use crate::utils::test_utils::assert_result_error_with_message;
+        use crate::unit_test_utils::assert_result_error_with_message;
 
         // ==================== Expression::Literal Tests ====================
 

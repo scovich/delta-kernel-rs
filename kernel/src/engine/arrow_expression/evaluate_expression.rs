@@ -1104,7 +1104,7 @@ mod tests {
         Expression as Expr, ExpressionStructPatchBuilder, JunctionPredicateOp, Predicate as Pred,
     };
     use crate::schema::{schema, schema_ref, ArrayType, DataType, StructField, StructType};
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::unit_test_utils::assert_result_error_with_message;
 
     fn create_test_batch() -> RecordBatch {
         let schema = ArrowSchema::new(vec![

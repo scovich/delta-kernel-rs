@@ -988,7 +988,7 @@ mod tests {
         PARQUET_FORMAT_VERSION,
     };
     use crate::transforms::SchemaTransform;
-    use crate::utils::test_utils::{
+    use crate::unit_test_utils::{
         assert_result_error_with_message, build_complex_nested_kernel_schema,
     };
 
