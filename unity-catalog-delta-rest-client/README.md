@@ -1,4 +1,4 @@
-# unity-catalog-delta-client-default
+# unity-catalog-delta-rest-client
 
 An experimental/under-construction Rust client for the Unity Catalog Delta APIs. This crate is not
 intended for production use.
@@ -14,12 +14,14 @@ It provides two REST structs:
 
 ```rust,no_run
 use unity_catalog_delta_client_api::Operation;
-use unity_catalog_delta_client_default::{ClientConfig, UCClient};
+use unity_catalog_delta_rest_client::{ClientConfig, UCClient};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Configure against a UC workspace (URL + token).
-    let config = ClientConfig::build("https://some.uc.org", "your-token").build()?;
+    // Configure against a UC workspace (URL + token + identity).
+    let config = ClientConfig::build("https://some.uc.org", "your-token")
+        .with_additional_user_agent([("MyEngine", "1.0.0"), ("MyConnector", "1.0.0")])
+        .build()?;
     let client = UCClient::new(config)?;
 
     // Load a table by its three-part name. The response carries the table
