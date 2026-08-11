@@ -29,7 +29,7 @@ trait AggUpdater {
 
 /// Bound aggregate operator: init/prepare/materialize with type-erased per-group state.
 trait BoundAggregate {
-    /// Creates a new agg state (i.e. NULL for MIN/MAX)
+    /// Creates a new agg state (i.e. NULL for MIN, 0 for COUNT)
     fn init_state(&self) -> Box<dyn Any>;
     /// Creates an `AggUpdater` for processing the rows of `batch`
     fn prepare<'a>(&'a self, batch: &'a RecordBatch) -> DeltaResult<Box<dyn AggUpdater + 'a>>;
@@ -38,8 +38,8 @@ trait BoundAggregate {
 }
 
 /// Evaluates an [`Aggregate`].
-///
-/// Currently supports Min, Max, MinNonNullBy, and MaxNonNullBy. Comparison operands are LONG-only.
+/// Currently supports Min, Max, Sum, Count, CountStar, MinNonNullBy, and MaxNonNullBy. Comparison
+/// and arithmetic operands are LONG-only; Count accepts an arbitrary column or `COUNT(*)`.
 pub(super) fn eval_aggregate(
     aggregate: &Aggregate,
     input: &[RecordBatch],
@@ -108,8 +108,17 @@ fn interleave_column_values(arrays: &[ArrayRef], indices: &[InputRow]) -> DeltaR
 
 fn bind_aggregate(agg: &Agg, output_type: &DataType) -> DeltaResult<Box<dyn BoundAggregate>> {
     match agg {
-        Agg::Min(value) => LongAccumulatorAgg::try_new(value, output_type, LongAccumulator::Min),
-        Agg::Max(value) => LongAccumulatorAgg::try_new(value, output_type, LongAccumulator::Max),
+        Agg::Min(value) => {
+            let op = LongAccumulator::MinMax(Comparison::Min);
+            LongAccumulatorAgg::try_new(value, output_type, op)
+        }
+        Agg::Max(value) => {
+            let op = LongAccumulator::MinMax(Comparison::Max);
+            LongAccumulatorAgg::try_new(value, output_type, op)
+        }
+        Agg::Sum(value) => LongAccumulatorAgg::try_new(value, output_type, LongAccumulator::Sum),
+        Agg::Count(value) => CountAgg::try_new(Some(value), output_type),
+        Agg::CountStar => CountAgg::try_new(None, output_type),
         Agg::MinNonNullBy(ops) => NonNullByAgg::try_new(ops, output_type, Comparison::Min),
         Agg::MaxNonNullBy(ops) => NonNullByAgg::try_new(ops, output_type, Comparison::Max),
     }
@@ -133,8 +142,8 @@ impl Comparison {
 
 #[derive(Clone, Copy)]
 enum LongAccumulator {
-    Min,
-    Max,
+    MinMax(Comparison),
+    Sum,
 }
 
 struct LongAccumulatorAgg {
@@ -150,7 +159,7 @@ impl LongAccumulatorAgg {
     ) -> DeltaResult<Box<dyn BoundAggregate>> {
         if output_type != &DataType::LONG {
             return Err(Error::unsupported(
-                "SyncPlanExecutor min/max aggregate with non-LONG value",
+                "SyncPlanExecutor min/max/sum aggregate with non-LONG value",
             ));
         }
         Ok(Box::new(Self {
@@ -194,17 +203,73 @@ impl AggUpdater for LongAccumulatorUpdater<'_> {
             let state = downcast_state_mut::<LongAccumulatorState>(state)?;
             let candidate = self.values.value(row_idx);
             match self.op {
-                LongAccumulator::Min => {
-                    if Comparison::Min.replaces(state.0, candidate) {
+                LongAccumulator::MinMax(cmp) => {
+                    if cmp.replaces(state.0, candidate) {
                         state.0 = Some(candidate);
                     }
                 }
-                LongAccumulator::Max => {
-                    if Comparison::Max.replaces(state.0, candidate) {
-                        state.0 = Some(candidate);
-                    }
+                LongAccumulator::Sum => {
+                    state.0 = Some(match state.0 {
+                        None => candidate,
+                        Some(sum) => i64::checked_add(sum, candidate).ok_or_else(|| {
+                            Error::generic("SyncPlanExecutor SUM aggregate overflowed i64")
+                        })?,
+                    });
                 }
             }
+        }
+        Ok(())
+    }
+}
+
+/// COUNT non-null values of Some column, else count rows as COUNT(*)
+struct CountAgg(Option<ColumnName>);
+
+impl CountAgg {
+    fn try_new(
+        value: Option<&ColumnName>,
+        output_type: &DataType,
+    ) -> DeltaResult<Box<dyn BoundAggregate>> {
+        if output_type != &DataType::LONG {
+            return Err(Error::unsupported(
+                "SyncPlanExecutor count aggregate with non-LONG output",
+            ));
+        }
+        Ok(Box::new(Self(value.cloned())))
+    }
+}
+
+struct CountState(i64);
+
+impl BoundAggregate for CountAgg {
+    fn init_state(&self) -> Box<dyn Any> {
+        Box::new(CountState(0))
+    }
+
+    fn prepare<'a>(&'a self, batch: &'a RecordBatch) -> DeltaResult<Box<dyn AggUpdater + 'a>> {
+        Ok(Box::new(CountUpdater(match &self.0 {
+            Some(name) => Some(extract_column_ref(batch, name)?),
+            None => None,
+        })))
+    }
+
+    fn finalize(&self, states: &[&dyn Any], _input: &[RecordBatch]) -> DeltaResult<ArrayRef> {
+        let values = states
+            .iter()
+            .map(|state| Ok(downcast_state::<CountState>(*state)?.0))
+            .collect::<DeltaResult<Vec<_>>>()?;
+        Ok(Arc::new(Int64Array::from(values)))
+    }
+}
+
+struct CountUpdater<'a>(Option<&'a ArrayRef>);
+
+impl AggUpdater for CountUpdater<'_> {
+    fn update(&self, state: &mut dyn Any, (_, row_idx): InputRow) -> DeltaResult<()> {
+        if self.0.is_none_or(|values| values.is_valid(row_idx)) {
+            let state = downcast_state_mut::<CountState>(state)?;
+            state.0 = i64::checked_add(state.0, 1)
+                .ok_or_else(|| Error::generic("SyncPlanExecutor COUNT aggregate overflowed i64"))?;
         }
         Ok(())
     }
@@ -377,6 +442,9 @@ mod tests {
                 ),
                 Agg::max(column_name!("key")),
                 Agg::min(column_name!("key")),
+                Agg::sum(column_name!("key")),
+                Agg::count(column_name!("sentinel")),
+                Agg::count_star(),
             ],
             schema: schema_ref! {
                 not_null "group": STRING,
@@ -384,18 +452,21 @@ mod tests {
                 nullable "minimum": STRING,
                 nullable "max_key": LONG,
                 nullable "min_key": LONG,
+                nullable "sum_key": LONG,
+                not_null "qualified": LONG,
+                not_null "rows": LONG,
             },
         };
 
         assert_batches_eq(
             &eval_aggregate(&aggregate, &[input])?,
             "\
-+-------+---------+---------+---------+---------+
-| group | maximum | minimum | max_key | min_key |
-+-------+---------+---------+---------+---------+
-| a     | high    | low     | 3       | 1       |
-| b     |         |         |         |         |
-+-------+---------+---------+---------+---------+",
++-------+---------+---------+---------+---------+---------+-----------+------+
+| group | maximum | minimum | max_key | min_key | sum_key | qualified | rows |
++-------+---------+---------+---------+---------+---------+-----------+------+
+| a     | high    | low     | 3       | 1       | 4       | 2         | 2    |
+| b     |         |         |         |         |         | 0         | 1    |
++-------+---------+---------+---------+---------+---------+-----------+------+",
         );
         Ok(())
     }
@@ -457,6 +528,9 @@ mod tests {
             aggs: vec![
                 Agg::min(column_name!("key")),
                 Agg::max(column_name!("key")),
+                Agg::sum(column_name!("key")),
+                Agg::count(column_name!("sentinel")),
+                Agg::count_star(),
                 Agg::min_non_null_by(
                     column_name!("value"),
                     column_name!("sentinel"),
@@ -471,19 +545,21 @@ mod tests {
             schema: schema_ref! {
                 nullable "minimum": LONG,
                 nullable "maximum": LONG,
+                nullable "total": LONG,
+                not_null "qualified": LONG,
+                not_null "rows": LONG,
                 nullable "first": STRING,
                 nullable "last": STRING,
             },
         };
-
         assert_batches_eq(
             &eval_aggregate(&ungrouped, &[])?,
             "\
-+---------+---------+-------+------+
-| minimum | maximum | first | last |
-+---------+---------+-------+------+
-|         |         |       |      |
-+---------+---------+-------+------+",
++---------+---------+-------+-----------+------+-------+------+
+| minimum | maximum | total | qualified | rows | first | last |
++---------+---------+-------+-----------+------+-------+------+
+|         |         |       | 0         | 0    |       |      |
++---------+---------+-------+-----------+------+-------+------+",
         );
 
         let grouped = Aggregate {
@@ -495,6 +571,94 @@ mod tests {
             },
         };
         assert!(eval_aggregate(&grouped, &[])?.is_empty());
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::all_null(
+        &[None, None],
+        "\
++-------+-----------+------+
+| total | non_nulls | rows |
++-------+-----------+------+
+|       | 0         | 2    |
++-------+-----------+------+"
+    )]
+    #[case::some_null(
+        &[None, Some(3), Some(1)],
+        "\
++-------+-----------+------+
+| total | non_nulls | rows |
++-------+-----------+------+
+| 4     | 2         | 3    |
++-------+-----------+------+"
+    )]
+    #[case::all_non_null(
+        &[Some(3), Some(1), Some(2)],
+        "\
++-------+-----------+------+
+| total | non_nulls | rows |
++-------+-----------+------+
+| 6     | 3         | 3    |
++-------+-----------+------+"
+    )]
+    fn sum_and_count_null_patterns(
+        #[case] values: &[Option<i64>],
+        #[case] expected: &str,
+    ) -> DeltaResult<()> {
+        let input = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int64Array::from(values.to_vec())) as ArrayRef,
+        )])?;
+        let aggregate = Aggregate {
+            group_by: vec![],
+            aggs: vec![
+                Agg::sum(column_name!("value")),
+                Agg::count(column_name!("value")),
+                Agg::count_star(),
+            ],
+            schema: schema_ref! {
+                nullable "total": LONG,
+                not_null "non_nulls": LONG,
+                not_null "rows": LONG,
+            },
+        };
+        assert_batches_eq(&eval_aggregate(&aggregate, &[input])?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn count_over_struct_counts_non_null_structs() -> DeltaResult<()> {
+        let nested = Arc::new(StructArray::from(vec![(
+            Arc::new(Field::new("x", ArrowDataType::Int64, true)),
+            Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])) as ArrayRef,
+        )]));
+        // Make the middle struct itself NULL while keeping child arrays aligned.
+        let validity = crate::arrow::buffer::BooleanBuffer::from(vec![true, false, true]);
+        let structs = Arc::new(StructArray::new(
+            nested.fields().clone(),
+            nested.columns().to_vec(),
+            Some(crate::arrow::buffer::NullBuffer::new(validity)),
+        ));
+        let input = RecordBatch::try_from_iter([("payload", structs as ArrayRef)])?;
+        let aggregate = Aggregate {
+            group_by: vec![],
+            aggs: vec![Agg::count(column_name!("payload")), Agg::count_star()],
+            schema: schema_ref! {
+                not_null "payloads": LONG,
+                not_null "rows": LONG,
+            },
+        };
+
+        assert_batches_eq(
+            &eval_aggregate(&aggregate, &[input])?,
+            "\
++----------+------+
+| payloads | rows |
++----------+------+
+| 2        | 3    |
++----------+------+",
+        );
         Ok(())
     }
 
@@ -532,6 +696,7 @@ mod tests {
             group_by: vec![column_name!("outer.group")],
             aggs: vec![
                 Agg::min(column_name!("outer.key")),
+                Agg::count(column_name!("outer.sentinel")),
                 Agg::max_non_null_by(
                     column_name!("outer.value"),
                     column_name!("outer.sentinel"),
@@ -541,6 +706,7 @@ mod tests {
             schema: schema_ref! {
                 not_null "group": STRING,
                 nullable "minimum": LONG,
+                not_null "qualified": LONG,
                 nullable "winner": STRING,
             },
         };
@@ -548,11 +714,11 @@ mod tests {
         assert_batches_eq(
             &eval_aggregate(&aggregate, &[input])?,
             "\
-+--------------+---------+--------------+
-| group        | minimum | winner       |
-+--------------+---------+--------------+
-| nested_group | 7       | nested_value |
-+--------------+---------+--------------+",
++--------------+---------+-----------+--------------+
+| group        | minimum | qualified | winner       |
++--------------+---------+-----------+--------------+
+| nested_group | 7       | 1         | nested_value |
++--------------+---------+-----------+--------------+",
         );
         Ok(())
     }
