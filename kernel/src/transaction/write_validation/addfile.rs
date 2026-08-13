@@ -91,7 +91,7 @@ mod tests {
     use crate::arrow::array::{Int64Array, StringArray};
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::expressions::ColumnName;
+    use crate::expressions::column_name;
     use crate::unit_test_utils::{
         add_files_with_partition_values, assert_result_error_with_message, nullable_add_file,
         nullable_add_files, replace_column, set_field_as_null,
@@ -113,16 +113,10 @@ mod tests {
     #[test]
     fn column_indices_match_schema_order() {
         let (names, _) = MANDATORY_ADD_FILE_COLUMNS.as_ref();
-        assert_eq!(names[PATH], ColumnName::new(["path"]));
-        assert_eq!(
-            names[PARTITION_VALUES],
-            ColumnName::new(["partitionValues"])
-        );
-        assert_eq!(names[SIZE], ColumnName::new(["size"]));
-        assert_eq!(
-            names[MODIFICATION_TIME],
-            ColumnName::new(["modificationTime"])
-        );
+        assert_eq!(names[PATH], column_name!("path"));
+        assert_eq!(names[PARTITION_VALUES], column_name!("partitionValues"));
+        assert_eq!(names[SIZE], column_name!("size"));
+        assert_eq!(names[MODIFICATION_TIME], column_name!("modificationTime"));
         assert_eq!(
             names.len(),
             [PATH, PARTITION_VALUES, SIZE, MODIFICATION_TIME].len()

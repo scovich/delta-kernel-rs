@@ -1261,7 +1261,7 @@ mod tests {
             column_name!("path"),
             column_name!("size"),
             column_name!("filemod"),
-            ColumnName::new(["metadata", "dv"]),
+            column_name!("metadata.dv"),
         )
         .unwrap();
     }
