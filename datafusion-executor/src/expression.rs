@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn embedded_predicate_delegates_to_predicate_converter() {
-        let kernel = KernelExpr::Predicate(Box::new(column_expr!("b").is_null()));
+        let kernel = KernelExpr::Predicate(Box::new(col!("b").is_null()));
         assert_eq!(lower(kernel), "b IS NULL");
     }
 
