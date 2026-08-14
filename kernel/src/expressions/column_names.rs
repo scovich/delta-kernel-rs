@@ -399,8 +399,8 @@ pub const fn __require_valid_simple_column_segment(s: &str) -> Option<&str> {
 /// Creates a nested column name whose field names are all simple column names (containing only
 /// alphanumeric characters and underscores), with optional runtime interpolation.
 ///
-/// Each **string-literal** argument is treated as a dot-separated path and split into segments, so
-/// multiple literals concatenate into a single path:
+/// Each **string-literal** argument is treated as a dot-separated path and split into
+/// segments, so multiple literals concatenate into a single path:
 ///
 /// ```
 /// # use delta_kernel::expressions::{column_name, ColumnName};
@@ -408,8 +408,8 @@ pub const fn __require_valid_simple_column_segment(s: &str) -> Option<&str> {
 /// assert_eq!(column_name!("a.b", "c.d"), ColumnName::new(["a", "b", "c", "d"]));
 /// ```
 ///
-/// Every **constant** argument is taken as a single segment (never split on `.`; its value is not
-/// visible at the call site, so a `.` is rejected):
+/// Every **constant** argument is taken as a single segment (never split on `.`; its value is
+/// not visible at the call site, so a `.` is rejected):
 ///
 /// ```
 /// # use delta_kernel::expressions::{column_name, ColumnName};
@@ -418,10 +418,10 @@ pub const fn __require_valid_simple_column_segment(s: &str) -> Option<&str> {
 /// assert_eq!(column_name!(VERSION, "a.b"), ColumnName::new(["version", "a", "b"]));
 /// ```
 ///
-/// Runtime values use paren interpolation: `(seg)` inserts one segment (`impl Into<String>`), and
-/// `..(path)` splices anything [`ColumnName::new`] accepts (a [`ColumnName`], segment list,
-/// etc.). A splice takes its argument by value; borrow with `..(&path)` to keep the source usable
-/// afterward:
+/// Runtime values use paren interpolation: `(seg)` inserts one segment (`impl Into<String>`),
+/// and `..(path)` splices anything [`ColumnName::new`] accepts (a [`ColumnName`], segment
+/// list, etc.). A splice takes its argument by value; borrow with `..(&path)` to keep the
+/// source usable afterward:
 ///
 /// ```
 /// # use delta_kernel::expressions::{column_name, ColumnName};
