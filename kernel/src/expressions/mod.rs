@@ -9,10 +9,7 @@ use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
 
 #[doc(hidden)]
 pub use self::column_names::{__require_valid_simple_column_segment, column_expr};
-pub use self::column_names::{
-    col, column_expr_ref, column_name, column_pred, joined_column_expr, joined_column_name,
-    ColumnName,
-};
+pub use self::column_names::{col, column_expr_ref, column_name, column_pred, ColumnName};
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
 use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,

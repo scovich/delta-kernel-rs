@@ -9,9 +9,8 @@ use crate::actions::visitors::SelectionVectorVisitor;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::error::DeltaResult;
 use crate::expressions::{
-    col, column_name, column_pred, lit, BinaryPredicateOp, ColumnName, Expression as Expr,
-    ExpressionRef, JunctionPredicateOp, OpaquePredicateOpRef, Predicate as Pred, PredicateRef,
-    Scalar,
+    col, column_pred, lit, BinaryPredicateOp, ColumnName, Expression as Expr, ExpressionRef,
+    JunctionPredicateOp, OpaquePredicateOpRef, Predicate as Pred, PredicateRef, Scalar,
 };
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
@@ -516,7 +515,7 @@ fn adjust_scalar_for_max_stat_truncation(val: &Scalar) -> Scalar {
 /// The `partitionValues_parsed.<col>` reference holding a partition column's exact value, which
 /// serves as both its min and max stat. `col` is a top-level physical partition name.
 fn partition_value_expr(col: &ColumnName) -> Expr {
-    Expr::from(column_name!(PARTITION_VALUES_PARSED_NAME).join(col))
+    col!(PARTITION_VALUES_PARSED_NAME, ..(col))
 }
 
 /// Whether a rewritten stat expression references `partitionValues_parsed`.
@@ -564,7 +563,7 @@ impl DataSkippingColumns<'_> {
             Some(partition_value_expr(col))
         } else {
             (self.is_stats_column(col) && has_min_max_stats(data_type))
-                .then(|| Expr::from(column_name!("stats_parsed", MIN_VALUES).join(col)))
+                .then(|| col!("stats_parsed", MIN_VALUES, ..(col)))
         }
     }
 
@@ -575,7 +574,7 @@ impl DataSkippingColumns<'_> {
             Some(partition_value_expr(col))
         } else {
             (self.is_stats_column(col) && has_min_max_stats(data_type))
-                .then(|| Expr::from(column_name!("stats_parsed", MAX_VALUES).join(col)))
+                .then(|| col!("stats_parsed", MAX_VALUES, ..(col)))
         }
     }
 
@@ -597,7 +596,7 @@ impl DataSkippingColumns<'_> {
             None
         } else {
             self.is_stats_column(col)
-                .then(|| Expr::from(column_name!("stats_parsed", NULL_COUNT).join(col)))
+                .then(|| col!("stats_parsed", NULL_COUNT, ..(col)))
         }
     }
 
