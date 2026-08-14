@@ -8,14 +8,92 @@ use crate::utils::CollectInto;
 use crate::{DeltaResult, Error};
 
 /// A (possibly nested) column name.
+///
+/// # Construction
+///
+/// Prefer [`column_name!`] (or [`col!`] / [`column_pred!`] for expressions/predicates) when working
+/// with literals, constants, and mixed paths. They are both more concise and more flexible in most
+/// cases, e.g.
+///
+/// ```
+/// # use delta_kernel::expressions::{col, column_name, column_pred, ColumnName, Expression, Predicate};
+/// assert_eq!(
+///     ColumnName::new(["x"]),
+///     column_name!("x"),
+/// );
+///
+/// assert_eq!(
+///     Expression::column(["x"]),
+///     col!("x"),
+/// );
+///
+/// assert_eq!(
+///     ColumnName::new(["a", "b", "c"]),
+///     column_name!("a.b.c"),
+/// );
+///
+/// assert_eq!(
+///     Predicate::column(["a", "b", "c"]),
+///     column_pred!("a.b.c"),
+/// );
+///
+/// const FOO: &str = "foo";
+/// let bar = "bar";
+/// let suffix = column_name!("deeply.nested.leaf");
+/// assert_eq!(
+///     ColumnName::new([FOO, bar, "baz"].into_iter().chain(suffix.iter().map(String::as_str))),
+///     column_name!(FOO, (bar), "baz", ..(suffix)),
+/// );
+///
+/// let middle = column_name!("x.y.z");
+/// assert_eq!(
+///     ColumnName::new(["a"]).join(&middle).join(["b"]),
+///     column_name!("a", ..(middle), "b"),
+/// );
+/// ```
+///
+/// Consider using constructors such as [`ColumnName::new`] and [`ColumnName::join`] directly when
+/// the macros are a poor fit, e.g.
+///
+/// ```
+/// # use delta_kernel::expressions::{column_name, ColumnName};
+/// # let (cond1, cond2) = (false, true);
+/// # let path = ["x", "y", "z"];
+/// // Path segments generated using complex control flow
+/// let mut segments = vec!["start"];
+/// if cond1 {
+///     segments.push("x");
+/// }
+/// if cond2 {
+///     segments.extend(path.iter().copied());
+/// }
+/// assert_eq!(
+///     ColumnName::new(segments),
+///     column_name!(
+///         "start",
+///         ..(cond1.then_some("x")),
+///         ..(cond2.then_some(path).into_iter().flatten()),
+///     ),
+/// );
+///
+/// // Joining two existing `ColumnName` instances
+/// # let left = column_name!("a.b");
+/// # let right = column_name!("c.d");
+/// assert_eq!(
+///     left.join(&right),
+///     column_name!(..(left), ..(right)),
+/// );
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, PartialOrd, Eq, Ord, Serialize, Deserialize)]
 pub struct ColumnName {
     path: Vec<String>,
 }
 
 impl ColumnName {
-    /// Creates a new column name from input satisfying `FromIterator for ColumnName`. The provided
-    /// field names are concatenated into a single path.
+    /// Collects path segments into a column name.
+    ///
+    /// NOTE: This is a low-level constructor; it's usually more convenient to use the
+    /// [`column_name!`] family of macros to create column names.
     pub fn new(iter: impl CollectInto<Self>) -> Self {
         iter.collect_into()
     }
@@ -69,23 +147,20 @@ impl ColumnName {
         Ok(cols)
     }
 
-    /// Joins this column with `right`, concatenating their fields into a single nested path.
+    /// Concatenates this path with `right`.
     ///
-    /// `right` accepts the same inputs as [`ColumnName::new`] (a [`ColumnName`], segment list,
-    /// etc.). Prefer [`column_name!`] for mixed literal / runtime construction when possible.
-    ///
-    /// NOTE: This copies `self` without consuming it. For more than two inputs, or when performance
-    /// matters, prefer [`FromIterator for
-    /// ColumnName`](#impl-FromIterator<ColumnName>-for-ColumnName) or [`column_name!`] with
-    /// `..(path)` splicing:
+    /// Prefer [`FromIterator`](#impl-FromIterator<ColumnName>-for-ColumnName) when concatenating
+    /// multiple [`ColumnName`]s, and prefer the [`column_name!`] family of macros for combining
+    /// column names with path parts.
     ///
     /// ```
     /// # use delta_kernel::expressions::{column_name, ColumnName};
     /// let x = column_name!("a.b");
     /// let y = column_name!("c.d");
-    /// let joined: ColumnName = [x.clone(), y].into_iter().collect();
-    /// assert_eq!(joined, column_name!("a.b.c.d"));
-    /// assert_eq!(x.join(["c", "d"]), column_name!("a.b.c.d"));
+    /// let z = column_name!("e.f");
+    /// assert_eq!(x.join(&y), column_name!("a.b.c.d"));
+    /// assert_eq!(ColumnName::from_iter([x.clone(), y, z]), column_name!("a.b.c.d.e.f"));
+    /// assert_eq!(column_name!("p", ..(x), "q"), column_name!("p.a.b.q"));
     /// ```
     pub fn join(&self, right: impl CollectInto<ColumnName>) -> ColumnName {
         [self.clone(), right.collect_into()].into_iter().collect()
@@ -106,11 +181,11 @@ impl ColumnName {
     /// # Examples
     ///
     /// ```
-    /// # use delta_kernel::expressions::ColumnName;
-    /// let path = ColumnName::new(["user", "address", "street"]);
-    /// assert_eq!(path.parent(), Some(ColumnName::new(["user", "address"])));
+    /// # use delta_kernel::expressions::column_name;
+    /// let path = column_name!("user.address.street");
+    /// assert_eq!(path.parent(), Some(column_name!("user.address")));
     ///
-    /// let path = ColumnName::new(["user"]);
+    /// let path = column_name!("user");
     /// assert_eq!(path.parent(), None);
     /// ```
     pub fn parent(&self) -> Option<ColumnName> {
@@ -131,7 +206,10 @@ impl<A: Into<String>> FromIterator<A> for ColumnName {
     }
 }
 
-/// Creates a new column name by joining multiple column names together.
+/// Joins multiple [`ColumnName`]s into one path. The argument can be any type accepted by
+/// [`ColumnName::new`], including `&str` (joining path parts) and `ColumnName` (joining paths).
+///
+/// NOTE: The [`column_name!`] macro family can express most use cases more clealy.
 impl FromIterator<ColumnName> for ColumnName {
     fn from_iter<T: IntoIterator<Item = ColumnName>>(iter: T) -> Self {
         let path = iter.into_iter().flat_map(|c| c.into_iter()).collect();
@@ -396,8 +474,11 @@ pub const fn __require_valid_simple_column_segment(s: &str) -> Option<&str> {
     Some(s)
 }
 
-/// Creates a nested column name whose field names are all simple column names (containing only
-/// alphanumeric characters and underscores), with optional runtime interpolation.
+/// Builds a [`ColumnName`] from simple path segments (alphanumeric and `_`), with optional
+/// runtime interpolation.
+///
+/// This is the simplest way to construct or manipulate [`ColumnName`] instances, replacing
+/// most uses of [`ColumnName::new`] and [`ColumnName::join`].
 ///
 /// Each **string-literal** argument is treated as a dot-separated path and split into
 /// segments, so multiple literals concatenate into a single path:
@@ -473,8 +554,9 @@ pub const fn __require_valid_simple_column_segment(s: &str) -> Option<&str> {
 #[doc(inline)]
 pub use delta_kernel_derive::column_name;
 
-/// Convenience macro that builds an [`Expression`](crate::expressions::Expression) column reference
-/// by forwarding all args to [`column_name!`]:
+/// Creates a column [`Expression`](crate::expressions::Expression) by forwarding all args to
+/// [`column_name!`]. This is the simplest way to create column name references, replacing almost
+/// all uses of [`Expression::column`](crate::expressions::Expression::column).
 ///
 /// ```
 /// # use delta_kernel::expressions::{col, ColumnName, Expression};
@@ -501,16 +583,22 @@ pub use __column_expr as column_expr;
 #[doc(inline)]
 pub use __column_expr as col;
 
+/// Creates an [`ExpressionRef`](crate::expressions::ExpressionRef) by wrapping [`col!`] in
+/// [`Arc`](std::sync::Arc). Prefer this over `Arc::new(col!(...))`.
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use delta_kernel::expressions::{col, col_ref, ExpressionRef};
+/// assert_eq!(col_ref!("a.b"), Arc::new(col!("a.b")) as ExpressionRef);
+/// ```
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __column_expr_ref {
     ( $($name:tt)* ) => {
-        std::sync::Arc::new($crate::expressions::Expression::from(
-            $crate::expressions::column_name!($($name)*),
-        ))
+        ::std::sync::Arc::new($crate::expressions::col!($($name)*))
     };
 }
-#[doc(inline)]
+#[doc(hidden)]
 pub use __column_expr_ref as column_expr_ref;
 
 #[macro_export]
