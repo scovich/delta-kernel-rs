@@ -588,8 +588,8 @@ pub use __column_expr as col;
 ///
 /// ```
 /// # use std::sync::Arc;
-/// # use delta_kernel::expressions::{col, col_ref, ExpressionRef};
-/// assert_eq!(col_ref!("a.b"), Arc::new(col!("a.b")) as ExpressionRef);
+/// # use delta_kernel::expressions::{col, column_expr_ref, ExpressionRef};
+/// assert_eq!(column_expr_ref!("a.b"), Arc::new(col!("a.b")));
 /// ```
 #[macro_export]
 #[doc(hidden)]
