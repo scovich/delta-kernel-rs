@@ -747,12 +747,21 @@ pub trait JsonHandler: AsAny {
     /// - `data` - Iterator of [`FilteredEngineData`] to write to the JSON file
     /// - `overwrite` - If true, overwrite the file if it exists. If false, the call must fail if
     ///   the file exists.
+    ///
+    /// # Returns
+    ///
+    /// The exact number of serialized bytes written to the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::FileAlreadyExists`] when `overwrite` is false and the destination exists,
+    /// or another error when serialization or storage fails.
     fn write_json_file(
         &self,
         path: &Url,
         data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
-    ) -> DeltaResult<()>;
+    ) -> DeltaResult<FileSize>;
 }
 
 /// Reserved field IDs for metadata columns in Delta tables.
