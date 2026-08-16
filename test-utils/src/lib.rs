@@ -196,7 +196,7 @@ use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{
-    ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
+    schema_ref, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructType,
 };
 use delta_kernel::table_features::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 use delta_kernel::transaction::{CommitResult, Transaction};
@@ -1184,20 +1184,17 @@ pub fn set_json_value(
 /// `[row_number: long, name: string, score: double, address: {street: string, city: string}, tag:
 /// string, value: int]`
 pub fn nested_schema() -> Result<SchemaRef, Box<dyn std::error::Error>> {
-    Ok(Arc::new(StructType::try_new(vec![
-        StructField::nullable("row_number", DataType::LONG),
-        StructField::nullable("name", DataType::STRING),
-        StructField::nullable("score", DataType::DOUBLE),
-        StructField::nullable(
-            "address",
-            StructType::try_new(vec![
-                StructField::nullable("street", DataType::STRING),
-                StructField::nullable("city", DataType::STRING),
-            ])?,
-        ),
-        StructField::nullable("tag", DataType::STRING),
-        StructField::nullable("value", DataType::INTEGER),
-    ])?))
+    Ok(schema_ref! {
+        nullable "row_number": LONG,
+        nullable "name": STRING,
+        nullable "score": DOUBLE,
+        nullable "address": {
+            nullable "street": STRING,
+            nullable "city": STRING,
+        },
+        nullable "tag": STRING,
+        nullable "value": INTEGER,
+    })
 }
 
 /// Returns two [`RecordBatch`]es with hardcoded test data matching [`nested_schema`].
@@ -1269,32 +1266,30 @@ pub fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> 
 
 /// Schema with one column of the given type: `(id INT, col <dtype>)`.
 pub fn schema_with_type(dtype: DataType) -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, true),
-        StructField::new("col", dtype, true),
-    ]))
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "col": (dtype),
+    }
 }
 
 /// Schema with the given type nested inside a struct:
 /// `(id INT, nested STRUCT<inner <dtype>>)`.
 pub fn nested_schema_with_type(dtype: DataType) -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, true),
-        StructField::new(
-            "nested",
-            StructType::new_unchecked(vec![StructField::new("inner", dtype, true)]),
-            true,
-        ),
-    ]))
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "nested": {
+            nullable "inner": (dtype),
+        },
+    }
 }
 
 /// Schema with two columns of the given type: `(id INT, col1 <dtype>, col2 <dtype>)`.
 pub fn multi_schema_with_type(dtype: DataType) -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, true),
-        StructField::new("col1", dtype.clone(), true),
-        StructField::new("col2", dtype, true),
-    ]))
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "col1": (dtype.clone()),
+        nullable "col2": (dtype),
+    }
 }
 
 pub fn top_level_ntz_schema() -> SchemaRef {
