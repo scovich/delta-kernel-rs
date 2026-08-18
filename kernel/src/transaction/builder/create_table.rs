@@ -32,15 +32,15 @@ use crate::table_features::{
     SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
-    TableProperties, APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_WRITE_STATS_AS_JSON,
-    CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE,
-    DATA_SKIPPING_NUM_INDEXED_COLS, DATA_SKIPPING_STATS_COLUMNS, DELETED_FILE_RETENTION_DURATION,
-    DELTA_PROPERTY_PREFIX, ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS,
-    ENABLE_EXPIRED_LOG_CLEANUP, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
-    ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
-    ENABLE_TYPE_WIDENING, LOG_RETENTION_DURATION, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
-    MATERIALIZED_ROW_ID_COLUMN_NAME, PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED,
-    SET_TRANSACTION_RETENTION_DURATION,
+    CheckpointPolicy, TableProperties, APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_POLICY,
+    CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID,
+    COLUMN_MAPPING_MODE, DATA_SKIPPING_NUM_INDEXED_COLS, DATA_SKIPPING_STATS_COLUMNS,
+    DELETED_FILE_RETENTION_DURATION, DELTA_PROPERTY_PREFIX, ENABLE_CHANGE_DATA_FEED,
+    ENABLE_DELETION_VECTORS, ENABLE_EXPIRED_LOG_CLEANUP, ENABLE_ICEBERG_COMPAT_V1,
+    ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
+    ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, LOG_RETENTION_DURATION,
+    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
+    PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED, SET_TRANSACTION_RETENTION_DURATION,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
@@ -124,6 +124,8 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     DELETED_FILE_RETENTION_DURATION,
     ENABLE_EXPIRED_LOG_CLEANUP,
     CHECKPOINT_INTERVAL,
+    // Checkpoint policy: "v2" auto-enables the v2Checkpoint feature.
+    CHECKPOINT_POLICY,
 ];
 
 /// Ensures that no Delta table exists at the given path.
@@ -484,6 +486,21 @@ fn maybe_enable_ict_for_catalog_managed(
             .or_insert_with(|| "true".to_string());
     }
     Ok(())
+}
+
+fn maybe_enable_v2_checkpoint_for_policy(validated: &mut ValidatedTableProperties) {
+    let is_v2_policy = validated
+        .properties
+        .get(CHECKPOINT_POLICY)
+        .and_then(|v| CheckpointPolicy::try_from(v.as_str()).ok())
+        == Some(CheckpointPolicy::V2);
+    if is_v2_policy {
+        add_feature_to_lists(
+            TableFeature::V2Checkpoint,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
 }
 
 /// Witness that all property-flipping passes which must run before column mapping is applied
@@ -930,6 +947,9 @@ impl CreateTableTransactionBuilder {
         // Auto-enable inCommitTimestamp for catalogManaged tables
         maybe_enable_ict_for_catalog_managed(&mut validated)?;
 
+        // Auto-enable v2Checkpoint when checkpointPolicy=v2
+        maybe_enable_v2_checkpoint_for_policy(&mut validated);
+
         // Set materialized row tracking column names when row tracking is enabled.
         maybe_set_materialized_row_tracking_column_name_properties(&mut validated);
 
@@ -1139,6 +1159,36 @@ mod tests {
         );
         assert!(validated.reader_features.is_empty());
         assert!(validated.writer_features.is_empty());
+    }
+
+    #[rstest::rstest]
+    #[case::v2(&[(CHECKPOINT_POLICY, "v2")], true)]
+    #[case::classic(&[(CHECKPOINT_POLICY, "classic")], false)]
+    fn test_checkpoint_policy_feature_enablement(
+        #[case] properties: &[(&str, &str)],
+        #[case] expect_v2_checkpoint_feature: bool,
+    ) {
+        let properties: HashMap<String, String> = properties
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+
+        maybe_enable_v2_checkpoint_for_policy(&mut validated);
+
+        assert_eq!(
+            validated
+                .reader_features
+                .contains(&TableFeature::V2Checkpoint),
+            expect_v2_checkpoint_feature,
+        );
+        assert_eq!(
+            validated
+                .writer_features
+                .contains(&TableFeature::V2Checkpoint),
+            expect_v2_checkpoint_feature,
+        );
+        assert!(validated.properties.contains_key(CHECKPOINT_POLICY));
     }
 
     #[test]
