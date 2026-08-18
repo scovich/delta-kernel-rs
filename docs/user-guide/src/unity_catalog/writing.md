@@ -152,7 +152,7 @@ retries](./overview.md#client-configuration-and-retries).  Once that budget is e
 (including rebasing after a `CommitResult::Conflicted`) are the connector's responsibility;
 `UCCommitter` does not retry commits itself.
 
-Under the hood, `UCCommitter::commit` does two things for versions >= 1:
+Under the hood, `UCCommitter`'s prepared-commit workflow does two things for versions >= 1:
 
 1. Writes the transaction's actions to
    `_delta_log/_staged_commits/<version>.<uuid>.json`

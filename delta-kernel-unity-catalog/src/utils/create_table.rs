@@ -28,6 +28,7 @@
 use std::collections::{HashMap, HashSet};
 
 use delta_kernel::actions::Protocol;
+use delta_kernel::coroutine::run_workflow_with_engine;
 use delta_kernel::{DeltaResult, Engine, Error, Snapshot};
 use unity_catalog_delta_client_api::{
     CreateTableRequest, Protocol as WireProtocol, StorageCredential,
@@ -143,15 +144,20 @@ pub fn build_uc_create_table_request(
     // UC only recognizes the `delta.clustering` and `delta.rowTracking` domain metadatas.
     let uc_recognized_domains = HashSet::from([CLUSTERING_DOMAIN_NAME, ROW_TRACKING_DOMAIN_NAME]);
     let mut domain_metadata: HashMap<String, serde_json::Value> = HashMap::new();
-    for (domain, dm) in
-        snapshot.get_domain_metadatas_internal(engine, Some(&uc_recognized_domains))?
-    {
+    let domain_metadatas = run_workflow_with_engine!(engine, async move |channel| {
+        snapshot
+            .get_domain_metadatas_internal(channel, Some(&uc_recognized_domains))
+            .await
+    })?;
+    for (domain, dm) in domain_metadatas {
         let value = serde_json::from_str(dm.configuration())
             .map_err(|e| Error::generic(format!("malformed {domain} domain metadata: {e}")))?;
         domain_metadata.insert(domain, value);
     }
 
-    let in_commit_timestamp_ms = snapshot.get_timestamp(engine)?;
+    let in_commit_timestamp_ms = run_workflow_with_engine!(engine, async move |channel| {
+        snapshot.get_timestamp_with_channel(channel).await
+    })?;
 
     Ok(CreateTableRequest {
         name: table_name.into(),

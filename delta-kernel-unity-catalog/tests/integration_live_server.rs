@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray, StructArray};
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
+use delta_kernel::coroutine::run_workflow_with_engine;
 use delta_kernel::expressions::column_name;
 use delta_kernel::schema::{schema_ref, SchemaRef};
 use delta_kernel::transaction::create_table::create_table;
@@ -308,9 +309,13 @@ async fn live_create_table() {
     let snapshot = snapshot_from_load_table(&post, engine.as_ref());
 
     // Appending 3 rows to a row-tracking table assigns IDs 0..=2, advancing the mark from -1 to 2.
-    let row_tracking = snapshot
-        .get_domain_metadata_internal("delta.rowTracking", engine.as_ref())
-        .expect("failed to read delta.rowTracking domain metadata");
+    let row_tracking_snapshot = Arc::clone(&snapshot);
+    let row_tracking = run_workflow_with_engine!(engine.as_ref(), async move |channel| {
+        row_tracking_snapshot
+            .get_domain_metadata_internal("delta.rowTracking", channel)
+            .await
+    })
+    .expect("failed to read delta.rowTracking domain metadata");
     assert_eq!(
         row_tracking.as_deref(),
         Some(r#"{"rowIdHighWaterMark":2}"#),
