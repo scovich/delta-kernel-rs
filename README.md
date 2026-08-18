@@ -21,9 +21,9 @@ is the Rust/C equivalent of [Java Delta Kernel][java-kernel].
 
 Delta-kernel-rs is split into a few different crates:
 
-- kernel: The actual core kernel crate
-- default-engine: The default Arrow/Tokio-based `Engine` implementation, published as
-  `delta_kernel_default_engine`
+- kernel: The core `delta_kernel` crate
+- default-engine: Arrow/Tokio connector execution, providing Engine-compatible `DefaultEngine` and
+  connector-driven `AsyncEngineConnector`, published as `delta_kernel_default_engine`
 - acceptance: Acceptance tests that validate correctness  via the [Delta Acceptance Tests][dat]
 - derive-macros: A crate for our [derive-macros] to live in
 - ffi: Functionality that enables delta-kernel-rs to be used from `C` or `C++` See the [ffi](ffi)
@@ -57,21 +57,24 @@ cargo check-no-default-engine
 cargo clippy-no-default-kernel-leaves
 ```
 
-In general, you will want to depend on `delta-kernel-rs` by adding it as a dependency to your
-`Cargo.toml`, (that is, for rust projects using cargo) for other projects please see the [FFI]
-module. The core kernel includes facilities for reading and writing delta tables, and allows the
-consumer to implement their own `Engine` trait in order to build engine-specific implementations of
-the various `Engine` APIs that the kernel relies on (e.g. implement an engine-specific
-`read_json_files()` using the native engine JSON reader). If you do not need a custom `Engine`,
-add the `delta_kernel_default_engine` crate to get the default asynchronous `Engine` implementation
-built with [Arrow] and [Tokio].
+Rust projects normally add `delta_kernel` to `Cargo.toml`; other languages use the [FFI] module.
+That crate implements Delta protocol operations as ordinary runtime-neutral Rust futures.
+Connector-driven coroutines surface typed requests to the connector instead of invoking connector
+operations directly.
+
+Driving Kernel's built-in request vocabulary uses public APIs; enable `internal-api` only to
+define a custom vocabulary. For maximum simplicity, use `DefaultEngine` through the synchronous
+compatibility adapter.
+
+Add `delta_kernel_default_engine` to use Arrow with `object_store`. It provides `DefaultEngine` for
+Engine compatibility and `AsyncEngineConnector`, which serves one workflow request at a time using
+native async I/O.
 
 ```toml
-# fewer dependencies, requires consumer to implement Engine trait.
-# allows consumers to implement their own in-memory format
+# Core protocol APIs and Engine traits
 delta_kernel = "0.28.0"
 
-# or pull in the default Arrow/Tokio engine alongside the kernel
+# Arrow/object_store Engine and async workflow driver
 delta_kernel = "0.28.0"
 delta_kernel_default_engine = { version = "0.28.0", features = ["rustls"] }
 ```
@@ -92,6 +95,7 @@ The `delta_kernel` crate itself exposes a few additional flags:
 | ------------- | ------------- |
 | `arrow-conversion`  | Conversion utilities for arrow/kernel schema interoperation |
 | `arrow-expression`  | Expression system implementation for arrow |
+| `internal-api` | Additional unstable implementation and extension APIs |
 
 ### Versions and Api Stability
 We intend to follow [Semantic Versioning](https://semver.org/). However, in the `0.x` line, the APIs
@@ -100,7 +104,8 @@ we will not break APIs in patch releases (`0.1.0` -> `0.1.1`).
 
 ## Arrow versioning
 If you depend on `delta_kernel_default_engine` (with either the `rustls` or `native-tls` feature),
-you get an implementation of the `Engine` trait that uses [Arrow] as its data format.
+you get Engine-compatible and connector-driven implementations that use [Arrow] as their data
+format.
 
 The [`arrow crate`](https://docs.rs/arrow/latest/arrow/) tends to release new major versions rather
 frequently. To enable engines that already integrate arrow to also integrate kernel and not force
@@ -146,24 +151,26 @@ projects.
 
 There are a few key concepts that will help in understanding kernel:
 
-1. The `Engine` trait encapsulates all the functionality an engine or connector needs to provide to
-   the Delta Kernel in order to read/write the Delta table.
-2. The `DefaultEngine` is our default implementation of the above trait. It lives in
-   `engine/default`, and provides a reference implementation for all `Engine`
-   functionality. `DefaultEngine` uses [arrow](https://docs.rs/arrow/latest/arrow/) as its in-memory
-   data format.
-3. A `Scan` is the entrypoint for reading data from a table.
-4. A `Transaction` is the entrypoint for writing data to a table.
+1. `Workflow` and `Generator` combine runtime-neutral futures with typed request/reply channels.
+   Connectors may drive them synchronously without a runtime or asynchronously on their own
+   executor; Kernel never calls connector operations on this path.
+2. The `Engine` trait is the synchronous compatibility interface. Kernel's adapter drives the same
+   protocol futures and calls Engine handlers for connector I/O and evaluation.
+3. The default-engine crate provides `DefaultEngine` for Engine compatibility and
+   `AsyncEngineConnector`, which serves one request at a time using async I/O. Both use
+   [Arrow](https://docs.rs/arrow/latest/arrow/) as their in-memory data format.
+4. A `Scan` is the entrypoint for reading data from a table.
+5. A `Transaction` is the entrypoint for writing data to a table.
 
 ### Design Principles
 
 Some design principles which should be considered:
 
-- async should live only in the `Engine` implementation. The core kernel does not use async at
-  all. We do not wish to impose the need for an entire async runtime on an engine or connector. The
-  `DefaultEngine` _does_ use async quite heavily. It doesn't depend on a particular runtime however,
-  and implementations could provide an "executor" based on tokio, smol, async-std, or whatever might
-  be needed. Currently only a `tokio` based executor is provided.
+- Kernel uses ordinary Rust futures without choosing or depending on an async runtime. Connectors
+  own task advancement and may execute requests synchronously, one at a time using async I/O, or
+  concurrently.
+- Engine-compatible methods remain synchronous. `DefaultEngine` bridges its async I/O through a
+  `TaskExecutor`.
 - Prefer builder style APIs over object oriented ones.
 - "Simple" set of default-features enabled to provide the basic functionality with the least
   necessary amount of dependencies possible. Putting more complex optimizations or APIs behind

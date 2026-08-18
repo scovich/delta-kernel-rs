@@ -6,7 +6,7 @@ from a URL and pass it to the engine builder. The `DefaultEngine` uses the
 local files, S3, GCS, and Azure out of the box.
 
 Before reading this page, make sure you understand
-[The Engine Trait](../concepts/engine_trait.md).
+[Installation](../getting_started/installation.md).
 
 > [!NOTE]
 > The storage APIs on this page come from the `delta_kernel_default_engine` crate. Add it

@@ -2,14 +2,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray};
+use delta_kernel::coroutine::{drive_async_workflow, kernel, workflow, StaticWorkflow};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::{Engine, Error, Snapshot};
+use delta_kernel::{DeltaResult, Engine, Error, Snapshot};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
-use delta_kernel_default_engine::DefaultEngine;
+use delta_kernel_default_engine::{AsyncEngineConnector, DefaultEngine};
 use delta_kernel_unity_catalog::{
-    get_required_properties_for_disk, snapshot_builder_from_load_table, UCCommitter,
+    coroutine as uc, get_required_properties_for_disk, snapshot_builder_from_load_table,
+    UCCommitter,
 };
 use test_utils::{insert_data_with, read_scan};
 use unity_catalog_delta_client_api::{
@@ -114,8 +116,59 @@ fn uc_committer(
     )
 }
 
+async fn run_kernel<O: Send + 'static>(
+    connector: &AsyncEngineConnector,
+    committer: &UCCommitter<InMemoryUpdateTableClient>,
+    workflow: StaticWorkflow<O>,
+) -> DeltaResult<O> {
+    Ok(drive_async_workflow!(workflow, |request| match request {
+        kernel::Request::Commit(commit, reply) => {
+            let workflow = committer.commit_workflow(*commit);
+            let result = drive_catalog_workflow(connector, committer, workflow).await;
+            reply.send(result);
+        }
+        kernel::Request::Publish(metadata, reply) => {
+            let workflow = committer.publish_workflow(metadata);
+            let result = drive_catalog_workflow(connector, committer, workflow).await;
+            reply.send(result);
+        }
+        request => connector.reply(request).await?,
+    }))
+}
+
+async fn drive_catalog_workflow<O>(
+    connector: &AsyncEngineConnector,
+    committer: &UCCommitter<InMemoryUpdateTableClient>,
+    workflow: workflow::StaticWorkflow<uc::Request, O>,
+) -> DeltaResult<O> {
+    Ok(drive_async_workflow!(workflow, |request| {
+        serve_catalog(connector, committer, request).await?;
+    }))
+}
+
+async fn serve_catalog(
+    connector: &AsyncEngineConnector,
+    committer: &UCCommitter<InMemoryUpdateTableClient>,
+    request: uc::Request,
+) -> DeltaResult<()> {
+    match request {
+        uc::Request::WriteJson(operation, reply) => {
+            let request = kernel::Request::WriteJson(operation, reply);
+            connector.reply(request).await
+        }
+        uc::Request::CopyAtomic(operation, reply) => {
+            let request = kernel::Request::CopyAtomic(operation, reply);
+            connector.reply(request).await
+        }
+        uc::Request::UpdateTable(operation, reply) => {
+            reply.send(committer.execute_update_table(operation).await);
+            Ok(())
+        }
+    }
+}
+
 /// Commits an empty transaction and returns the post-commit snapshot.
-fn commit(
+fn commit_empty_transaction(
     snapshot: &Arc<Snapshot>,
     update_table_client: &Arc<InMemoryUpdateTableClient>,
     engine: &DefaultEngine<TokioMultiThreadExecutor>,
@@ -171,6 +224,40 @@ async fn test_scan_returns_fixture_rows() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_native_coroutine_commit_and_publish() -> Result<(), TestError> {
+    let TestSetup {
+        update_table_client,
+        engine,
+        snapshot,
+        table_uri,
+        _tmp_dir,
+    } = setup().await?;
+    let connector = engine.async_connector();
+    let committer = uc_committer(&update_table_client);
+    let txn = run_kernel(&connector, &committer, snapshot.transaction_workflow()).await?;
+    let result = run_kernel(&connector, &committer, txn.commit_workflow()).await?;
+
+    assert!(result.is_committed());
+    assert_eq!(
+        update_table_client
+            .load_table_response(TABLE_ID, "")?
+            .latest_table_version,
+        Some(3)
+    );
+    let snapshot = result.unwrap_post_commit_snapshot();
+    run_kernel(&connector, &committer, snapshot.publish_workflow(true)).await?;
+    let published = connector
+        .run(
+            Snapshot::builder_for(table_uri)
+                .with_max_catalog_version(3)
+                .workflow(),
+        )
+        .await?;
+    assert_eq!(published.version(), 3);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_insert_without_publish_hits_limit() -> Result<(), TestError> {
     let TestSetup {
         update_table_client,
@@ -183,7 +270,7 @@ async fn test_insert_without_publish_hits_limit() -> Result<(), TestError> {
     // Start with 2 unpublished (v1, v2). Insert up to MAX, then the next should fail.
     let max = TableData::MAX_UNPUBLISHED_COMMITS as u64;
     for _ in 3..=max {
-        snapshot = commit(&snapshot, &update_table_client, &engine)?;
+        snapshot = commit_empty_transaction(&snapshot, &update_table_client, &engine)?;
     }
     assert_eq!(snapshot.version(), max);
 
@@ -237,7 +324,7 @@ async fn test_cannot_checkpoint_unpublished_snapshot() -> Result<(), TestError> 
         ..
     } = setup().await?;
 
-    let snapshot = commit(&snapshot, &update_table_client, &engine)?;
+    let snapshot = commit_empty_transaction(&snapshot, &update_table_client, &engine)?;
     let err = snapshot.checkpoint(&engine, None).unwrap_err();
     assert!(matches!(err, delta_kernel::Error::UnpublishedVersion(1)));
     Ok(())

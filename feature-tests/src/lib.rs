@@ -17,17 +17,43 @@ pub fn test_default_engine_feature_flags() {
     }
 }
 
-/// Regression tests for rustls crypto provider conflicts.
-///
-/// rustls 0.23 panics at runtime if both `aws-lc-rs` and `ring` features are active and no
-/// provider is explicitly installed. object_store always brings `ring` transitively, so kernel
-/// must avoid adding `aws-lc-rs` to the same rustls instance.
-///
-/// Two APIs are tested because they behave differently:
-///  - `rustls::ClientConfig::builder()` relies on auto-detection and panics on dual providers.
-///  - `reqwest::Client::new()` explicitly constructs its provider, so it always succeeds.
+/// Feature-boundary regression tests.
 #[cfg(test)]
 mod tests {
+    use delta_kernel::committer::{Commit, CommitResponse, FileSystemCommitter};
+    use delta_kernel::coroutine::{drive_async_workflow, drive_workflow, StaticWorkflow};
+    use delta_kernel::{DeltaResult, Snapshot, SnapshotRef};
+
+    fn drive_sync(workflow: StaticWorkflow<()>) -> DeltaResult<()> {
+        drive_workflow!(workflow, |request| drop(request));
+        Ok(())
+    }
+
+    async fn drive_async(workflow: StaticWorkflow<()>) -> DeltaResult<()> {
+        drive_async_workflow!(workflow, |request| drop(request));
+        Ok(())
+    }
+
+    #[test]
+    fn built_in_workflow_api_is_public_without_internal_api() {
+        let workflow: StaticWorkflow<SnapshotRef> = Snapshot::builder_for("memory:///").workflow();
+        drop(workflow);
+
+        let commit_workflow: fn(Commit) -> DeltaResult<StaticWorkflow<CommitResponse>> =
+            FileSystemCommitter::commit_workflow;
+        let _ = (commit_workflow, drive_sync, drive_async);
+    }
+
+    // === rustls provider compatibility ===
+    //
+    // rustls 0.23 panics at runtime if both `aws-lc-rs` and `ring` features are active and no
+    // provider is explicitly installed. object_store always brings `ring` transitively, so kernel
+    // must avoid adding `aws-lc-rs` to the same rustls instance.
+    //
+    // Two APIs are tested because they behave differently:
+    // - `rustls::ClientConfig::builder()` relies on auto-detection and panics on dual providers.
+    // - `reqwest::Client::new()` explicitly constructs its provider, so it always succeeds.
+
     // Verifies that `default-engine-native-tls` does not leak aws-lc-rs into the rustls
     // feature set. If this panics, kernel's reqwest is pulling in `default-tls` again.
     //

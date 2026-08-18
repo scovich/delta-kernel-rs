@@ -21,7 +21,7 @@ using Delta Kernel to fulfill them:
 
 ```text
 ┌─────────────────────────────────────────────────────────┐
-│                    Compute Engine                        │
+│                    Compute Engine                       │
 │          (Spark, Flink, DuckDB, Polars, ...)            │
 │                                                         │
 │  "I need a Table, a Scan, a Writer..."                  │
@@ -29,34 +29,34 @@ using Delta Kernel to fulfill them:
                         │ calls your DataSource API impl
                         ▼
 ┌─────────────────────────────────────────────────────────┐
-│                 Your Delta Connector                     │
+│                 Your Delta Connector                    │
 │                                                         │
-│  Implements the compute engine's DataSource interfaces   │
+│  Implements the compute engine's DataSource interfaces  │
 │  (e.g. Spark's Table/ScanBuilder/Scan/Batch/Writer)     │
 │                                                         │
 │  Uses Kernel to fulfill those interfaces:               │
 │    Snapshot  ->  table metadata, schema, version        │
 │    Scan      ->  which files to read, data skipping     │
 │    Transaction -> describe a table write                │
-│    Committer   -> commit atomically                      │
+│    Committer   -> commit atomically                     │
 └───────────────────────┬─────────────────────────────────┘
                         │ calls Kernel APIs
                         ▼
 ┌─────────────────────────────────────────────────────────┐
-│                    Delta Kernel                          │
+│                    Delta Kernel                         │
 │                                                         │
 │  Protocol logic, log replay, data skipping,             │
 │  schema enforcement, transaction coordination           │
 │                                                         │
-│  Calls into Engine trait for I/O and compute            │
+│  Returns typed requests or uses Engine compatibility    │
 └───────────────────────┬─────────────────────────────────┘
                         │
                         ▼
 ┌─────────────────────────────────────────────────────────┐
-│              Engine trait implementation                  │
+│                  Connector execution                    │
 │                                                         │
-│  DefaultEngine (Arrow + object_store)                   │
-│  ...or your custom Engine with native I/O & formats     │
+│  AsyncEngineConnector or your request driver            │
+│  DefaultEngine compatibility adapter                    │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -113,43 +113,48 @@ The key principle: **Kernel handles the Delta protocol, your connector handles e
 - Query planning integration (pushing filters and projections down to Kernel)
 - Resource management (memory budgets, connection pooling)
 
-## The Engine trait: pluggable I/O and compute
+## Choose an execution surface
 
-Kernel never does I/O directly. When it needs to list files, read Parquet, parse JSON, or
-evaluate expressions, it calls into the `Engine` trait. This is where you can plug in your
-engine's native implementations for maximum performance.
+Connector-driven entry points expose lazy `Workflow` and `Generator` operations. A workflow owns
+its request channel; a generator binds to an existing channel or to an owning `StaticGenerator`
+wrapper. Kernel protocol logic is async, but every operation requiring connector work passes
+through the channel as a typed `Request`. Your connector owns the coroutine and serves each request,
+so Kernel never calls connector operations. A synchronous connector can drive this surface without
+an async runtime; an async connector can use its own executor sequentially or concurrently. Use
+this surface when your connector should control scheduling, cancellation, or catalog requests. See
+[Driving connector workflows](./coroutines.md).
 
-Kernel provides a `DefaultEngine` (Arrow + `object_store` + Tokio). Many connectors
-start here and only replace specific handlers when they need better performance. See
-[The Engine trait](../concepts/engine_trait.md) for details on the four required handlers
-(`StorageHandler`, `JsonHandler`, `ParquetHandler`, `EvaluationHandler`) and the optional
-`MetricsReporter`.
+Engine-compatible entry points accept `&dyn Engine`. Kernel's synchronous compatibility adapter
+drives the same protocol futures and calls Engine handlers for each request. Use this surface when a
+blocking callback API fits your connector or when you need to preserve an existing Engine
+implementation.
 
-You need a custom `Engine` when:
+## The Engine trait compatibility surface
 
-- **Your engine has its own columnar data format** (not Arrow) and you want to avoid
-  conversion overhead
-- **Your engine has its own I/O layer** (e.g. a distributed file system client, encrypted
-  storage, or custom caching)
-- **You want engine-native expression evaluation** (e.g. vectorized execution, JIT
-  compilation)
+Kernel never does I/O directly. Engine-compatible methods call the `Engine` trait when they need
+to list files, read Parquet, parse JSON, or evaluate expressions.
 
-To use different cloud storage (S3, Azure, GCS), you do not need a custom engine.
-`DefaultEngine` supports all `object_store` backends without modification.
+Kernel provides `DefaultEngine` (Arrow + `object_store` + Tokio) as the simplest integration path.
+It supports local storage, S3, Azure, and GCS without custom handlers. If you need native data,
+custom I/O or evaluation, or finer execution control, drive workflow requests directly instead of
+implementing a custom Engine. Custom Engine implementations mainly preserve existing Engine-based
+integrations. See [The Engine trait](../concepts/engine_trait.md) for compatibility details.
 
 ## Getting started
 
 Building a connector typically involves these steps:
 
-1. **Choose or implement an Engine.** Start with `DefaultEngine` unless you have a reason
-   not to. See [Implementing the Engine trait](./implementing_engine.md).
+1. **Choose the execution surface.** Use `AsyncEngineConnector` or your own synchronous or async
+   request loop for connector-controlled execution. Use `DefaultEngine` when maximum simplicity is
+   more important than control. See [Driving connector workflows](./coroutines.md) and
+   [The Engine trait](../concepts/engine_trait.md).
 
 2. **Implement your DataSource's read interfaces** using Kernel's Scan API:
    - Create a `Snapshot` to discover the table schema and version
    - Use `ScanBuilder` to push down filters and column projections
    - Use `Scan` to get the list of files to read
    - Distribute those files across your engine's execution model
-   - Read and transform data using the Engine
+   - Serve read and transformation requests through your chosen execution surface
    - See [Building a scan](../reading/building_a_scan.md) and
      [Filter pushdown](../reading/filter_pushdown.md)
 
@@ -167,7 +172,8 @@ Building a connector typically involves these steps:
 
 ## What's next
 
-- [Implementing the Engine trait](./implementing_engine.md): when and how to customize the
-  Engine
+- [Driving connector workflows](./coroutines.md): connector-controlled execution
+- [Implementing Engine compatibility](./implementing_engine.md): the legacy compatibility
+  interface
 - [Building a scan](../reading/building_a_scan.md): the Kernel read API
 - [Appending data](../writing/append.md): the Kernel write API

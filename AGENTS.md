@@ -4,8 +4,9 @@
 
 Delta-kernel-rs is a Rust library for building Delta Lake connectors. It encapsulates the
 Delta protocol so connectors can read and write Delta tables without understanding protocol
-internals. Kernel never does I/O directly: it defines _what_ to do via its APIs
-(`Snapshot`, `Scan`, `Transaction`) and delegates _how_ to the `Engine` trait.
+internals. Kernel never does I/O directly. Connector-driven entry points return lazy `Workflow`
+and `Generator` values that expose typed requests to the connector. Synchronous
+compatibility entry points serve the same operations through the `Engine` trait.
 
 Current capabilities include table reads with predicates, data skipping, deletion vectors,
 change data feed, incremental scans (`incremental_scan_builder`) and commit ranges, checkpoints
@@ -59,7 +60,7 @@ cargo +nightly fmt \
 | Crate                                | Directory                             | Description                                                              |
 |--------------------------------------|---------------------------------------|--------------------------------------------------------------------------|
 | `delta_kernel`                       | `kernel/`                             | Core library                                                             |
-| `delta_kernel_default_engine`        | `default-engine/`                     | Default Arrow/Tokio `Engine` implementation                              |
+| `delta_kernel_default_engine`        | `default-engine/`                     | Arrow/Tokio Engine compatibility + async workflow driver                 |
 | `delta_kernel_default_engine_test_utils` | `default-engine/test-utils/`      | Default-engine test utilities                                            |
 | `delta_kernel_ffi`                   | `ffi/`                                | C/C++ FFI bindings                                                       |
 | `delta_kernel_ffi_macros`            | `ffi-proc-macros/`                    | FFI proc macros                                                          |
@@ -99,8 +100,8 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   in development). Gates `KernelSupport` for the `geospatial` reader+writer feature: with the
   cargo feature off, any table listing it is rejected; with it on, scans and CDF are supported
   but writes are still blocked.
-- `internal-api`: unstable APIs like `parallel_scan_metadata`. Items are marked with the
-  `#[internal_api]` proc macro attribute.
+- `internal-api`: unstable APIs including connector-driven coroutine internals and
+  `parallel_scan_metadata`. These items are marked with the `#[internal_api]` proc macro attribute.
 - `declarative-plans`: experimental declarative-plan IR (`kernel/src/plans/`) and the prost
   proto wire format mirroring it (`kernel/proto/`). Auto-enables `internal-api`, but not Arrow.
 - `vendored-protoc`: supplies `protoc` for `declarative-plans`; without it, set `PROTOC` to a
@@ -123,9 +124,24 @@ table at a specific version. From it you build a `Scan` (reads) or `Transaction`
 Kernel assembles commit actions, enforces protocol compliance, and delegates the atomic commit to a
 `Committer`.
 
-**Engine trait:** exposes `StorageHandler`, `JsonHandler`, `ParquetHandler`, and
-`EvaluationHandler`, plus an optional `PlanExecutor` under `declarative-plans`. Metrics use tracing
-layers rather than an engine handler. `DefaultEngine` lives in `default-engine/src/`.
+**Coroutine execution:** Kernel protocol logic is implemented as runtime-neutral Rust futures.
+Connector-driven workflows and generators pair those futures with typed request/reply channels, so
+Kernel awaits connector work instead of invoking connector operations directly. A synchronous
+driver replies to each request and calls `try_advance` again; no async runtime is required. Async
+drivers await `advance` and may serve requests one at a time or concurrently. Replies wake async
+drivers without polling them. Kernel code with an existing `Channel` awaits workflow implementations
+directly and passes that channel to child generators. Kernel coroutine code may compose
+channel-provided futures with runtime-neutral future/stream combinators, but it requests real work
+only through `Channel`. `AsyncEngineConnector` is the default native async driver and serves one
+request at a time, awaiting completion before advancing Kernel again. Authoring a custom request
+vocabulary requires the `internal-api` `Channel` and `ChannelExchange` surface; driving Kernel's
+vocabulary does not.
+
+**Engine compatibility:** `Engine` exposes `StorageHandler`, `JsonHandler`, `ParquetHandler`, and
+`EvaluationHandler`, plus an optional `PlanExecutor` under `declarative-plans`. `DefaultEngine`
+serves synchronous compatibility entry points through an adapter that drives the same coroutine
+logic and translates requests into Engine handler calls. Metrics use tracing layers rather than an
+engine handler.
 
 **EngineData:** opaque columnar data interface. NEVER access `EngineData` columns
 directly: ALWAYS use the visitor pattern (`visit_rows` with typed `GetData` accessors).
@@ -319,6 +335,11 @@ Keep this list updated when new protocol features are added to kernel.
   parallel threads in one test binary, while nextest normally runs each test in a separate
   process. Tests for global tracing subscribers and callbacks must not share capture buffers with
   thread-local dispatch tests or assume no other thread can emit an event.
+- **`Version::MAX` is a sentinel, not a practical table version:** It canonically means unbounded/no
+  upper version: `v..=Version::MAX` is invalid and `v..Version::MAX` is equivalent to `v..`. Real
+  Delta versions actually stop at `i64::MAX` because the JVM ecosystem has no `u64` equivalent. Use
+  saturating adds to avoid panic overflows when manipulating versions as bounds. NEVER attempt to
+  emulate inclusive upper bounds that include `Version::MAX` as a normal version.
 
 ## Code Style
 

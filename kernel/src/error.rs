@@ -253,6 +253,14 @@ pub enum Error {
     #[error("Internal error {0}. This is a kernel bug, please report.")]
     InternalError(String),
 
+    /// A non-blocking operation could not make immediate progress.
+    #[error("Operation would block")]
+    WouldBlock,
+
+    /// The connector rejected a request
+    #[error("Request rejected by the connector")]
+    RequestRejected,
+
     /// An error enountered while working with parquet data
     #[cfg(feature = "default-engine-base")]
     #[error("Arrow error: {0}")]
@@ -623,6 +631,12 @@ from_with_backtrace!(
     (serde_json::Error, MalformedJson),
     (std::io::Error, IOError)
 );
+
+impl<T> From<std::sync::PoisonError<T>> for Error {
+    fn from(_error: std::sync::PoisonError<T>) -> Self {
+        Self::internal_error("poisoned mutex")
+    }
+}
 
 #[cfg(feature = "default-engine-base")]
 impl From<ArrowError> for Error {

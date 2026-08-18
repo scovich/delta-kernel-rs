@@ -297,9 +297,8 @@ use std::sync::Arc;
 use delta_kernel::CancellationTokenRef;
 
 // `token` is your connector's cancellation handle, implementing `CancellationToken`.
-// It is commonly a thin wrapper over your runtime's primitive (e.g.
-// `tokio_util::sync::CancellationToken`). See "Cancellation-aware reads" in
-// Implementing the Engine Trait for how to build one.
+// It is commonly a thin wrapper over your runtime's primitive, such as
+// `tokio_util::sync::CancellationToken`.
 let token: CancellationTokenRef = my_request_token();
 
 let scan = snapshot
@@ -313,10 +312,11 @@ for metadata in scan.scan_metadata(engine)? {
 }
 ```
 
-Cancellation is cooperative. Kernel passes the token to the Engine's
-[cancellation-aware operations](../connector/implementing_engine.md#cancellation-aware-reads),
-which prevent new I/O after detecting cancellation. An Engine may also interrupt I/O already in
-flight.
+Cancellation is cooperative. This Engine-compatible API passes the token to
+[cancellation-aware Engine operations](../connector/implementing_engine.md#cancellation-aware-reads),
+which prevent new I/O after detecting cancellation and may interrupt I/O already in flight.
+Connector-driven execution instead applies the driver's cancellation policy;
+`AsyncEngineConnector::with_cancellation_token` provides the default implementation.
 
 Cancellation can race with successful completion. Work already initiated may complete and its
 results may still be returned. If cancellation stops replay before completion, it surfaces as

@@ -7,7 +7,7 @@ centralized governance, enforceable constraints, and multi-table coordination.
 
 Before reading this page, make sure you understand
 [Architecture overview](../concepts/architecture.md) and
-[The Engine trait](../concepts/engine_trait.md).
+[Driving connector workflows](../connector/coroutines.md).
 
 ## Filesystem-managed vs. catalog-managed
 

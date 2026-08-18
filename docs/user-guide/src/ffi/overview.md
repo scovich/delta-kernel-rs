@@ -459,7 +459,6 @@ free_engine(engine);
 
 ## What's next
 
-- [Building a Connector](../connector/overview.md): implementing a custom engine in
-  Rust
+- [Building a connector](../connector/overview.md): choosing a Rust execution surface
 - [The Engine Trait](../concepts/engine_trait.md): understanding the engine interface
   that the FFI wraps

@@ -23,11 +23,15 @@ Before diving in, here are the key terms used throughout this guide:
   exposes APIs (`Snapshot`, `Scan`, `Transaction`) that connectors use. It never does I/O
   directly.
 
-- **Engine trait** is the I/O and compute abstraction that Kernel calls into. It has four
+- **Workflow and Generator** are runtime-neutral async protocol operations. Each combines a Rust
+  future with a typed request/reply channel. Your connector owns the operation, decides when to
+  advance it, and serves its requests without Kernel invoking connector code.
+
+- **Engine trait** is the synchronous compatibility abstraction that Kernel calls into. It has four
   required handlers (`StorageHandler`, `ParquetHandler`, `JsonHandler`,
-  `EvaluationHandler`) and one optional handler (`MetricsReporter`).
-  A `DefaultEngine` is provided. Connectors can implement their own for better performance
-  with their native data formats and I/O.
+  `EvaluationHandler`) and an optional `PlanExecutor`. Metrics use tracing layers.
+  `DefaultEngine` provides the simplest integration. Custom implementations mainly preserve
+  existing Engine-based compatibility boundaries.
 
 ## Layered design
 
@@ -53,21 +57,20 @@ interface to the layer above and below it.
  │  Snapshot · Scan · Transaction · Log Replay │
  │  Data Skipping · Predicate Pushdown         │
  │  Protocol Compliance · Table Features       │
- └──────────────────┬──────────────────────────┘
-                    │  calls into
- ┌──────────────────▼──────────────────────────┐
- │           Engine trait (abstraction)        │
- │                                             │
- │  EvaluationHandler · StorageHandler         │
- │  JsonHandler · ParquetHandler               │
- │  MetricsReporter (optional)                 │
- └──────────────────┬─────────────────────────┘
-                    │  implemented by
- ┌──────────────────▼──────────────────────────┐
- │     DefaultEngine  (or your custom engine)  │
- │                                             │
- │  Arrow-based evaluation · object_store I/O  │
- └──────────────────┬──────────────────────────┘
+ └──────────────┬───────────────────┬───────────┘
+                │ typed requests    │ Engine compatibility calls
+ ┌──────────────▼─────────────┐ ┌────▼────────────────────────┐
+ │ Connector-owned driver     │ │ Engine trait implementation │
+ │                            │ │                             │
+ │ Sync or async request loop │ │ DefaultEngine               │
+ │ AsyncEngineConnector       │ │ legacy custom handlers      │
+ └──────────────┬─────────────┘ └────┬────────────────────────┘
+                └─────────────┬─────┘
+                              │ I/O and compute
+ ┌────────────────────────────▼─────────────────┐
+ │ Arrow or native data · object_store or       │
+ │ connector-native storage                     │
+ └────────────────────────────┬─────────────────┘
                     │
  ┌──────────────────▼──────────────────────────┐
  │              Storage                        │
@@ -78,9 +81,18 @@ interface to the layer above and below it.
 **Kernel** contains all Delta protocol logic: log replay, data skipping,
 schema enforcement, table features, and transaction coordination. It never does I/O directly.
 
-**Engine** is a trait that the kernel calls whenever it needs I/O or expression evaluation.
-You can use the built-in `DefaultEngine` (Arrow + `object_store`) or implement your own.
-See [The Engine Trait](./engine_trait.md).
+**Connector-driven execution** returns lazy workflows and generators. Typed request/reply channels
+surface work back to the connector and prevent control inversion. Rust futures let Kernel await
+replies without blocking. Your connector may drive the same coroutine synchronously without a
+runtime or asynchronously on its executor. An async driver may serve one request at a time or
+advance again before previous requests complete to handle them concurrently. Kernel code with a
+parent channel calls async workflow implementations directly and awaits `Generator::next` for
+streams. See [Driving connector workflows](../connector/coroutines.md).
+
+**Engine compatibility** is a synchronous coroutine driver inside Kernel. It translates each
+request into a call to the corresponding Engine handler. This intentionally retains the
+Kernel-to-Engine callback direction for callers using the built-in `DefaultEngine` (Arrow +
+`object_store`) or a custom implementation. See [The Engine trait](./engine_trait.md).
 
 **Your connector** implements your compute engine's DataSource API and calls kernel APIs
 (`Snapshot`, `Scan`, `Transaction`) to do the Delta work. The kernel handles the protocol;
@@ -187,7 +199,7 @@ instead of `transaction()`. See
 
 See [Quick Start: Writing a Table](../getting_started/quick_start_write.md) for a complete example.
 
-## How a read works
+## How an Engine-compatible read works
 
 When you call `scan.execute(engine)`, here is what happens internally:
 
@@ -215,6 +227,9 @@ When you call `scan.execute(engine)`, here is what happens internally:
 The kernel handles steps 1, 2, and 4. The engine handles step 3. This separation means
 the kernel never touches raw bytes. It works purely with metadata and delegates all I/O.
 
+The connector-driven path performs the same stages, but Kernel returns typed requests instead of
+calling Engine handlers. Your driver decides how to execute each request.
+
 ## How a write works
 
 ```text
@@ -239,11 +254,11 @@ the kernel never touches raw bytes. It works purely with metadata and delegates 
    Retryable: transient I/O error, safe to retry.
 ```
 
-## EngineData: staying engine-agnostic
+## EngineData: staying compute-engine-agnostic
 
-The kernel never assumes your data is Arrow. Instead, it uses the `EngineData` trait, an
-opaque interface that any engine can implement. The kernel accesses data through visitor
-callbacks, not by inspecting columns directly.
+Kernel never assumes your data is Arrow. Instead, it uses the `EngineData` trait, an opaque
+interface that connectors can implement for their native representation. Kernel accesses data
+through visitor callbacks, not by inspecting columns directly.
 
 ```text
  Kernel                          Engine
@@ -256,12 +271,11 @@ callbacks, not by inspecting columns directly.
  Visits rows via GetData
 ```
 
-The `DefaultEngine` implements `EngineData` with `ArrowEngineData` (wrapping Arrow
-`RecordBatch`). If you use the default engine, you can convert back to `RecordBatch`
-with the `EngineDataArrowExt` trait. If you build a custom engine, you implement
-`EngineData` for your own columnar format.
-
-See [The Engine Trait](./engine_trait.md) for more on how this works.
+`DefaultEngine` implements `EngineData` with `ArrowEngineData` (wrapping Arrow `RecordBatch`). If
+you use the default engine, `EngineDataArrowExt` converts it back to `RecordBatch`. A
+connector-driven implementation can instead implement `EngineData` for its native columnar
+representation and return those values when serving Kernel requests; no custom `Engine`
+implementation is required. See [The EngineData trait](../connector/engine_data.md).
 
 ## Crate structure
 
@@ -269,7 +283,8 @@ The project is organized into several crates:
 
 | Crate | Description |
 |-------|-------------|
-| `delta_kernel` | Core library: protocol logic, table operations, trait definitions, default engine |
+| `delta_kernel` | Core library: protocol logic, table operations, coroutine types, and Engine traits |
+| `delta_kernel_default_engine` | Arrow and `object_store` implementations for Engine compatibility and connector-driven coroutine execution |
 | `delta_kernel_ffi` | C/C++ Foreign Function Interface for cross-language integration |
 | `delta_kernel_derive` | Procedural macros for internal code generation |
 | `delta_kernel_unity_catalog` | Unity Catalog integration for catalog-managed tables (see [Unity Catalog Integration](../unity_catalog/overview.md)) |
@@ -282,6 +297,7 @@ The project is organized into several crates:
 ## What's next
 
 - [The Engine Trait](./engine_trait.md) explains the `Engine` abstraction and its handlers in detail.
+- [Driving Connector Workflows](../connector/coroutines.md) explains connector-owned execution.
 - [Building a Scan](../reading/building_a_scan.md) walks through reading data from a Delta table.
 - [Building a Connector](../connector/overview.md) describes how to integrate Kernel with a compute engine.
 

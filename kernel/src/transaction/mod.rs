@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::iter;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -7,17 +6,21 @@ use std::time::{Duration, Instant};
 use delta_kernel_derive::internal_api;
 use tracing::instrument;
 
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::BackReference;
 use crate::actions::{
     as_log_add_schema, CommitInfo, DomainMetadata, Metadata, Protocol, SetTransaction,
-    LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_REMOVE_SCHEMA, LOG_TXN_SCHEMA, MAX_VALUES,
-    MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
+    LOG_DOMAIN_METADATA_SCHEMA, LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_REMOVE_SCHEMA,
+    LOG_TXN_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::{BackReference, LOG_CHECKPOINT_SCHEMA};
 use crate::committer::{
-    CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
+    Commit, CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
     FileSystemCommitter,
 };
+use crate::coroutine::engine::EngineConnector;
+use crate::coroutine::generator::static_generator;
+use crate::coroutine::kernel::{static_workflow, unbound_generator, Channel, UnboundGenerator};
+use crate::coroutine::{ChannelExt as _, Request, StaticWorkflow};
 use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
@@ -51,8 +54,8 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::utils::{require, PhantomType};
 use crate::{
-    create_row, version_as_i64, DataType, DeltaResult, DeltaResultIterator, Engine, EngineData,
-    Expression, FileMeta, Predicate, RowVisitor, Version,
+    version_as_i64, DataType, DeltaResult, Engine, EngineData, Expression, FileMeta, Predicate,
+    RowVisitor, Version,
 };
 
 #[cfg(feature = "internal-api")]
@@ -96,8 +99,18 @@ use stats_verifier::StatsColumnVerifier;
 use update::{intermediate_dv_schema, new_dv_column_schema};
 pub use write_state::{BoundWriteContextBuilder, RowTrackingMetadataColumns, WriteState};
 
-/// Type alias for an iterator of [`EngineData`] results.
-pub(crate) type EngineDataResultIterator<'a> = DeltaResultIterator<'a, Box<dyn EngineData>>;
+struct GeneratedAdds {
+    actions: UnboundGenerator<Box<dyn EngineData>>,
+    row_tracking_domain_metadata: Option<RowTrackingDomainMetadata>,
+}
+
+struct PreparedCommit<S> {
+    transaction: Transaction<S>,
+    commit: Commit,
+    in_commit_timestamp: Option<i64>,
+    domain_metadata_changes: Vec<DomainMetadata>,
+    prepare_duration: Duration,
+}
 
 /// The static instance referenced by [`add_files_schema`] that doesn't contain the dataChange
 /// column.
@@ -201,7 +214,7 @@ impl SupportsDataFiles for CreateTable {}
 ///
 /// ```rust,ignore
 /// // create a transaction
-/// let mut txn = table.new_transaction(&engine)?;
+/// let mut txn = snapshot.transaction(&engine)?;
 /// // stage table changes (right now only commit info)
 /// txn.commit_info(Box::new(ArrowEngineData::new(engine_commit_info)));
 /// // commit! (consume the transaction)
@@ -227,9 +240,9 @@ pub struct Transaction<S = ExistingTable> {
     should_emit_metadata: bool,
     operation: Option<String>,
     engine_info: Option<String>,
-    engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
-    add_files_metadata: Vec<Box<dyn EngineData>>,
-    remove_files_metadata: Vec<FilteredEngineData>,
+    engine_commit_info: Option<(Arc<dyn EngineData>, SchemaRef)>,
+    add_files_metadata: Vec<Arc<dyn EngineData>>,
+    remove_files_metadata: Vec<Arc<FilteredEngineData>>,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
     // key/payload. HashSet requires Borrow<&str> with matching Eq, Ord, and Hash. Plus,
     // HashSet::insert drops the to-be-inserted value without returning the existing one, which
@@ -261,7 +274,7 @@ pub struct Transaction<S = ExistingTable> {
     is_blind_append: bool,
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
     // to generate remove/add action pairs during commit, ensuring file statistics are preserved.
-    dv_matched_files: Vec<FilteredEngineData>,
+    dv_matched_files: Vec<Arc<FilteredEngineData>>,
     // Count of files whose deletion vector was updated.
     num_dv_updates: usize,
     // Caller-supplied root manifest file to commit, set via with_root_manifest_file().
@@ -376,9 +389,21 @@ impl<S> TransactionWithCommitter<S> {
     }
 
     /// Commits this transaction through `engine` using its bound committer.
-    pub fn commit(self, engine: &dyn Engine) -> DeltaResult<(CommitResult<S>, Box<dyn Committer>)> {
-        let result = self.transaction.commit(engine, self.committer.as_ref())?;
-        Ok((result, self.committer))
+    pub fn commit(self, engine: &dyn Engine) -> DeltaResult<(CommitResult<S>, Box<dyn Committer>)>
+    where
+        S: Send + 'static,
+    {
+        let Self {
+            transaction,
+            committer,
+        } = self;
+        let workflow = transaction.commit_workflow();
+        let result = EngineConnector::new(engine).drive_with_committer(
+            workflow,
+            engine,
+            committer.as_ref(),
+        )?;
+        Ok((result, committer))
     }
 }
 
@@ -439,38 +464,41 @@ fn build_add_action_projection(
 
 /// Transforms add file metadata into commit-ready add actions by converting stats to JSON and
 /// setting the `dataChange` field.
-fn build_add_actions<'a, I, T>(
-    engine: &dyn Engine,
+fn build_add_actions<I, T>(
     add_files_metadata: I,
     input_schema: SchemaRef,
     data_change: bool,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a>
+) -> DeltaResult<UnboundGenerator<Box<dyn EngineData>>>
 where
-    I: Iterator<Item = DeltaResult<T>> + Send + 'a,
-    T: Deref<Target = dyn EngineData> + Send + 'a,
+    I: Iterator<Item = DeltaResult<T>> + Send + 'static,
+    T: Into<Arc<dyn EngineData>> + Send + 'static,
 {
-    let evaluation_handler = engine.evaluation_handler();
     let (output_schema, adds_expr) = build_add_action_projection(&input_schema, data_change)?;
     let adds_expr = Arc::new(adds_expr);
-    Ok(add_files_metadata.map(move |add_files_batch| {
-        let adds_evaluator = evaluation_handler.new_expression_evaluator(
-            input_schema.clone(),
-            adds_expr.clone(),
-            as_log_add_schema(output_schema.clone()).into(),
-        )?;
-        adds_evaluator.evaluate(add_files_batch?.deref())
-    }))
+    let output_type: DataType = as_log_add_schema(output_schema).into();
+    let generator = unbound_generator!(async move |channel| {
+        let evaluator = channel
+            .create_expression_evaluator(input_schema, adds_expr, output_type)
+            .await?;
+        for add_files_batch in add_files_metadata {
+            let output = channel
+                .evaluate_expression(&evaluator, add_files_batch?.into())
+                .await?;
+            channel.yield_item(output).await?;
+        }
+        Ok(())
+    });
+    Ok(generator)
 }
 
 // =============================================================================
 // Shared methods available on ALL transaction types
 // =============================================================================
 impl<S> Transaction<S> {
-    /// Consume the transaction and commit it to the table using `committer`. The result is a result
-    /// of [CommitResult] with the following semantics:
-    /// - Ok(CommitResult) for either success or a recoverable error (includes the failed
-    ///   transaction in case of a conflict so the user can retry, etc.)
-    /// - Err(Error) indicates a non-retryable error (e.g. logic/validation error).
+    /// Return a lazy connector-driven commit workflow.
+    ///
+    /// The workflow validates and prepares this transaction, then delegates its metadata and
+    /// action generator to the connector's committer.
     #[instrument(
         parent = &self.span,
         name = TRANSACTION_COMMIT_SPAN,
@@ -493,13 +521,40 @@ impl<S> Transaction<S> {
             committer_duration_ns,
             failure_reason,
         ),
-        err
     )]
-    fn commit(
-        self,
-        engine: &dyn Engine,
-        committer: &dyn Committer,
-    ) -> DeltaResult<CommitResult<S>> {
+    pub fn commit_workflow(self) -> StaticWorkflow<CommitResult<S>>
+    where
+        S: Send + 'static,
+    {
+        static_workflow!(async move |channel| self.commit_with_channel(channel).await)
+    }
+
+    async fn commit_with_channel(self, channel: &Channel) -> DeltaResult<CommitResult<S>>
+    where
+        S: Send + 'static,
+    {
+        let PreparedCommit {
+            transaction,
+            commit,
+            in_commit_timestamp,
+            domain_metadata_changes,
+            prepare_duration,
+        } = self.prepare_commit(channel).await?;
+        let committer_start = Instant::now();
+        let commit_response = channel.commit(commit).await;
+        transaction.finish_commit(
+            commit_response,
+            in_commit_timestamp,
+            domain_metadata_changes,
+            prepare_duration,
+            committer_start.elapsed(),
+        )
+    }
+
+    async fn prepare_commit(self, channel: &Channel) -> DeltaResult<PreparedCommit<S>>
+    where
+        S: Send + 'static,
+    {
         let commit_start = Instant::now();
 
         // Kernel cannot distinguish Remove actions and DV updates that only delete rows from those
@@ -583,15 +638,50 @@ impl<S> Transaction<S> {
         write_validation::StagedDataValidator::staged_remove_file()
             .validate_filtered(&self.remove_files_metadata)?;
 
-        // Step 1: Generate SetTransaction actions
-        let set_transaction_actions = self
-            .set_transactions
-            .clone()
-            .into_iter()
-            .map(|txn| create_row(engine, LOG_TXN_SCHEMA.clone(), txn));
+        self.validate_domain_metadata_operations()?;
 
-        // Step 2: Construct commit info with ICT if enabled
-        let in_commit_timestamp = self.get_in_commit_timestamp(engine)?;
+        let has_ict = self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::InCommitTimestamp);
+        let needs_row_tracking_hwm = (self
+            .effective_table_config
+            .should_assign_fresh_row_tracking_metadata()
+            && !self.add_files_metadata.is_empty())
+            || self.provided_row_tracking_high_water_mark.is_some();
+        let is_create = self.is_create_table();
+        let read_snapshot = self.read_snapshot_opt.as_deref();
+        let in_commit_timestamp = if !has_ict {
+            None
+        } else if is_create {
+            Some(self.commit_timestamp)
+        } else {
+            read_snapshot
+                .ok_or_else(|| Error::internal_error("existing transaction has no snapshot"))?
+                .get_in_commit_timestamp(channel)
+                .await?
+                .map(|previous| self.commit_timestamp.max(previous + 1))
+        };
+        let row_id_high_water_mark = if is_create || !needs_row_tracking_hwm {
+            None
+        } else {
+            read_snapshot
+                .ok_or_else(|| Error::internal_error("existing transaction has no snapshot"))?
+                .get_row_tracking_high_water_mark_with_channel(channel)
+                .await?
+        };
+        let user_domain_removal_actions = if is_create {
+            Vec::new()
+        } else {
+            Transaction::<S>::generate_user_domain_removal_actions(
+                read_snapshot
+                    .ok_or_else(|| Error::internal_error("existing transaction has no snapshot"))?,
+                &self.user_domain_removals,
+                channel,
+            )
+            .await?
+        };
+
+        // Construct commit info with ICT if enabled.
         let mut kernel_commit_info = CommitInfo::new(
             self.commit_timestamp,
             in_commit_timestamp,
@@ -610,72 +700,128 @@ impl<S> Transaction<S> {
         {
             kernel_commit_info.set_row_tracking_preserved();
         }
-        let commit_info_action = self.generate_commit_info(engine, kernel_commit_info);
+        let engine_commit_info = self.engine_commit_info.clone();
 
-        // Step 3: Generate Protocol and Metadata actions based on emit flags
-        let (protocol_action, protocol) = if self.should_emit_protocol {
-            let protocol = self.effective_table_config.protocol().clone();
-            let schema = LOG_PROTOCOL_SCHEMA.clone();
-            let action = create_row(engine, schema, protocol.clone())?;
-            (Some(action), Some(protocol))
+        // Resolve Protocol and Metadata state based on emit flags.
+        let protocol = if self.should_emit_protocol {
+            Some(self.effective_table_config.protocol().clone())
         } else {
-            (None, None)
+            None
         };
-        let (metadata_action, metadata) = if self.should_emit_metadata {
-            let metadata = self.effective_table_config.metadata().clone();
-            let schema = LOG_METADATA_SCHEMA.clone();
-            let action = create_row(engine, schema, metadata.clone())?;
-            (Some(action), Some(metadata))
+        let metadata = if self.should_emit_metadata {
+            Some(self.effective_table_config.metadata().clone())
         } else {
-            (None, None)
+            None
         };
 
-        // Step 4: Generate add actions and get data for domain metadata actions (e.g. row tracking
-        // high watermark)
+        // Prepare add actions and data for domain metadata actions (e.g. row tracking HWM).
         let commit_version = self.get_commit_version();
-        let (add_actions, row_tracking_domain_metadata) =
-            self.generate_adds(engine, commit_version)?;
+        let GeneratedAdds {
+            actions: add_actions,
+            row_tracking_domain_metadata,
+        } = self.generate_adds(row_id_high_water_mark, commit_version)?;
 
-        // Step 4b: Generate all domain metadata actions (user and system domains)
-        let (domain_metadata_actions, dm_changes) =
-            self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
+        // Generate all domain metadata actions (user and system domains).
+        let dm_changes = self.generate_domain_metadata_actions(
+            row_tracking_domain_metadata,
+            user_domain_removal_actions,
+        )?;
 
-        // Step 5: Generate DV update actions (remove/add pairs) if any DV updates are present
-        let dv_update_actions = self.generate_dv_update_actions(engine)?;
-
-        // Step 6: Generate remove actions (collect to avoid borrowing self)
+        // Prepare DV update actions (remove/add pairs) and explicit remove actions.
+        let dv_update_actions = self.generate_dv_update_actions()?;
         let remove_actions = self.generate_remove_actions(
-            engine,
-            self.remove_files_metadata.iter(),
+            self.remove_files_metadata.clone().into_iter(),
             false, /* has_dv_update_columns */
         )?;
 
-        // Step 6b: checkpoint action for a root manifest file commit, if configured.
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        let checkpoint_action =
-            self.generate_checkpoint_action(engine, commit_version, &dm_changes)?;
+        let checkpoint_action = Transaction::<S>::generate_checkpoint_action(
+            self.root_manifest_file.as_ref(),
+            channel,
+            commit_version,
+            &self.effective_table_config,
+            &dm_changes,
+            &self.set_transactions,
+        )
+        .await?;
         #[cfg(not(feature = "adaptive-metadata-in-dev"))]
         let checkpoint_action: Option<Box<dyn EngineData>> = None;
 
-        // Build the action chain
-        // For create-table: CommitInfo -> Protocol -> Metadata -> checkpoint -> adds -> txns ->
-        // domain_metadata -> removes
-        // For existing table: CommitInfo -> checkpoint -> adds -> txns -> domain_metadata ->
-        // removes
-        let actions = iter::once(commit_info_action)
-            .chain(protocol_action.map(Ok))
-            .chain(metadata_action.map(Ok))
-            .chain(checkpoint_action.map(Ok))
-            .chain(add_actions)
-            .chain(set_transaction_actions)
-            .chain(domain_metadata_actions);
+        let protocol_action = protocol.clone();
+        let metadata_action = metadata.clone();
+        let set_transactions = self.set_transactions.clone();
+        let domain_metadata = dm_changes.clone();
+        let actions = static_generator!(Request, async move |channel| {
+            let action = Transaction::<S>::generate_commit_info_with_channel(
+                &channel,
+                engine_commit_info,
+                kernel_commit_info,
+            )
+            .await?;
+            channel
+                .yield_item(FilteredEngineData::with_all_rows_selected(action))
+                .await?;
 
-        let filtered_actions = actions
-            .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected))
-            .chain(remove_actions)
-            .chain(dv_update_actions);
+            if let Some(protocol) = protocol_action {
+                let action = channel
+                    .create_row(LOG_PROTOCOL_SCHEMA.clone(), protocol)
+                    .await?;
+                channel
+                    .yield_item(FilteredEngineData::with_all_rows_selected(action))
+                    .await?;
+            }
 
-        // Step 7: Commit via the committer
+            if let Some(metadata) = metadata_action {
+                let action = channel
+                    .create_row(LOG_METADATA_SCHEMA.clone(), metadata)
+                    .await?;
+                channel
+                    .yield_item(FilteredEngineData::with_all_rows_selected(action))
+                    .await?;
+            }
+
+            if let Some(action) = checkpoint_action {
+                channel
+                    .yield_item(FilteredEngineData::with_all_rows_selected(action))
+                    .await?;
+            }
+
+            let mut add_actions = add_actions.bind(&channel);
+            while let Some(action) = add_actions.next().await? {
+                channel
+                    .yield_item(FilteredEngineData::with_all_rows_selected(action))
+                    .await?;
+            }
+
+            if !set_transactions.is_empty() {
+                let rows = set_transactions
+                    .into_iter()
+                    .map(|transaction| vec![transaction.into()])
+                    .collect();
+                let action = channel.create_many(LOG_TXN_SCHEMA.clone(), rows).await?;
+                channel
+                    .yield_item(FilteredEngineData::with_all_rows_selected(action))
+                    .await?;
+            }
+
+            if !domain_metadata.is_empty() {
+                let rows = domain_metadata
+                    .into_iter()
+                    .map(|metadata| vec![metadata.into()])
+                    .collect();
+                let action = channel
+                    .create_many(LOG_DOMAIN_METADATA_SCHEMA.clone(), rows)
+                    .await?;
+                channel
+                    .yield_item(FilteredEngineData::with_all_rows_selected(action))
+                    .await?;
+            }
+
+            channel.yield_from(remove_actions).await?;
+            channel.yield_from(dv_update_actions).await?;
+            Ok(())
+        });
+
         let commit_metadata = self.create_commit_metadata(
             commit_version,
             in_commit_timestamp,
@@ -683,11 +829,23 @@ impl<S> Transaction<S> {
             metadata,
             dm_changes.clone(),
         )?;
-        commit_metadata.validate_committer(committer.is_catalog_committer())?;
-        let prepare_duration = commit_start.elapsed();
-        let committer_start = Instant::now();
-        let commit_response = committer.commit(engine, Box::new(filtered_actions), commit_metadata);
-        let committer_duration = committer_start.elapsed();
+        Ok(PreparedCommit {
+            transaction: self,
+            commit: Commit::new(commit_metadata, actions),
+            in_commit_timestamp,
+            domain_metadata_changes: dm_changes,
+            prepare_duration: commit_start.elapsed(),
+        })
+    }
+
+    fn finish_commit(
+        self,
+        commit_response: DeltaResult<CommitResponse>,
+        in_commit_timestamp: Option<i64>,
+        domain_metadata_changes: Vec<DomainMetadata>,
+        prepare_duration: Duration,
+        committer_duration: Duration,
+    ) -> DeltaResult<CommitResult<S>> {
         match commit_response {
             Ok(CommitResponse::Committed { file_meta }) => {
                 // TODO(#2717): the commit already succeeded atomically; the post-commit `?`
@@ -709,7 +867,7 @@ impl<S> Transaction<S> {
                     committer_duration,
                 );
                 let crc_delta =
-                    self.build_crc_delta(file_stats, in_commit_timestamp, dm_changes)?;
+                    self.build_crc_delta(file_stats, in_commit_timestamp, domain_metadata_changes)?;
                 Ok(CommitResult::Committed(
                     self.into_committed(file_meta, crc_delta)?,
                 ))
@@ -817,7 +975,7 @@ impl<S> Transaction<S> {
         engine_commit_info: Box<dyn EngineData>,
         commit_info_schema: SchemaRef,
     ) -> Self {
-        self.engine_commit_info = Some((engine_commit_info, commit_info_schema));
+        self.engine_commit_info = Some((engine_commit_info.into(), commit_info_schema));
         self
     }
 
@@ -978,25 +1136,30 @@ impl<S> Transaction<S> {
     /// Builds the `checkpoint` action committing the configured root manifest file, or `None` if
     /// this transaction has none.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn generate_checkpoint_action(
-        &self,
-        engine: &dyn Engine,
+    async fn generate_checkpoint_action(
+        root_manifest_file: Option<&RootManifestFile>,
+        channel: &Channel,
         commit_version: Version,
+        table_config: &TableConfiguration,
         dm_changes: &[DomainMetadata],
+        set_transactions: &[SetTransaction],
     ) -> DeltaResult<Option<Box<dyn EngineData>>> {
-        self.root_manifest_file
-            .as_ref()
-            .map(|root_manifest_file| {
-                let action = root_manifest_file.compute_checkpoint_action(
-                    engine,
-                    commit_version,
-                    &self.effective_table_config,
-                    dm_changes,
-                    &self.set_transactions,
-                )?;
-                action.into_engine_data(engine)
-            })
-            .transpose()
+        let Some(root_manifest_file) = root_manifest_file else {
+            return Ok(None);
+        };
+        let action = root_manifest_file
+            .compute_checkpoint_action_with_channel(
+                channel,
+                commit_version,
+                table_config,
+                dm_changes,
+                set_transactions,
+            )
+            .await?;
+        let action = channel
+            .create_row(LOG_CHECKPOINT_SCHEMA.clone(), action.try_into_scalar()?)
+            .await?;
+        Ok(Some(action))
     }
 
     // Reject data-file removals / DV updates on appendOnly tables when `data_change` is true.
@@ -1013,6 +1176,7 @@ impl<S> Transaction<S> {
             .remove_files_metadata
             .iter()
             .chain(&self.dv_matched_files)
+            .map(Arc::as_ref)
             .any(HasSelectionVector::has_selected_rows);
         require!(
             !removes_data,
@@ -1109,34 +1273,6 @@ impl<S> Transaction<S> {
         self.read_snapshot_opt.as_deref().ok_or_else(|| {
             Error::internal_error("read_snapshot() called on create-table transaction")
         })
-    }
-
-    /// Computes the in-commit timestamp for this transaction if ICT is enabled.
-    /// Returns `None` if ICT is not enabled on the table. A feature being in the protocol
-    /// (`is_feature_supported`) is not sufficient -- the `delta.enableInCommitTimestamps`
-    /// property must also be `true` (`is_feature_enabled`).
-    fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
-        let has_ict = self
-            .effective_table_config
-            .is_feature_enabled(&TableFeature::InCommitTimestamp);
-
-        if !has_ict {
-            return Ok(None);
-        }
-
-        if self.is_create_table() {
-            // For CREATE TABLE there are no prior commits -- use the wall-clock time directly.
-            return Ok(Some(self.commit_timestamp));
-        }
-
-        // Existing table: enforce monotonicity per the Delta protocol. The timestamp
-        // must be the larger of:
-        // - The time at which the writer attempted the commit
-        // - One millisecond later than the previous commit's inCommitTimestamp
-        Ok(self
-            .read_snapshot()?
-            .get_in_commit_timestamp(engine)?
-            .map(|prev_ict| self.commit_timestamp.max(prev_ict + 1)))
     }
 
     /// Returns the commit version for this transaction.
@@ -1335,7 +1471,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
     ///
     /// The expected schema for `add_metadata` is given by [`Transaction::add_files_schema`].
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
-        self.add_files_metadata.push(add_metadata);
+        self.add_files_metadata.push(add_metadata.into());
     }
 }
 
@@ -1356,7 +1492,10 @@ impl<S> Transaction<S> {
     /// Only add files are validated(remove files do not carry statistics).
     ///
     /// [`requires_stats_num_records`]: crate::table_configuration::TableConfiguration::requires_stats_num_records
-    fn validate_add_files_stats(&self, add_files: &[Box<dyn EngineData>]) -> DeltaResult<()> {
+    fn validate_add_files_stats(
+        &self,
+        add_files: &[impl AsRef<dyn EngineData>],
+    ) -> DeltaResult<()> {
         if add_files.is_empty() {
             return Ok(());
         }
@@ -1393,14 +1532,11 @@ impl<S> Transaction<S> {
 
     /// Generates add actions and row tracking domain metadata for a commit.
     #[instrument(name = "txn.gen_adds", skip_all, err)]
-    fn generate_adds<'a>(
-        &'a self,
-        engine: &dyn Engine,
+    fn generate_adds(
+        &self,
+        row_id_high_water_mark: Option<i64>,
         commit_version: u64,
-    ) -> DeltaResult<(
-        EngineDataResultIterator<'a>,
-        Option<RowTrackingDomainMetadata>,
-    )> {
+    ) -> DeltaResult<GeneratedAdds> {
         // Note: this does not require delta.enableRowTracking=true. "supported" is sufficient
         // for writers to assign row IDs.
         let assign_fresh_row_tracking_metadata = self
@@ -1410,25 +1546,36 @@ impl<S> Transaction<S> {
         if self.add_files_metadata.is_empty() {
             // No files to add. For an empty CREATE TABLE with row tracking, emit the initial
             // high water mark domain metadata (rowIdHighWaterMark = -1) so subsequent writes
-            // have a valid starting point. For all other empty commits (metadata-only, etc.),
-            // nothing row-tracking-related needs to be written.
-            let row_tracking_dm = (assign_fresh_row_tracking_metadata && self.is_create_table())
-                .then(RowTrackingDomainMetadata::initial);
-            return Ok((Box::new(iter::empty()), row_tracking_dm));
+            // have a valid starting point. If the caller provided a high-water mark, pass
+            // through the existing mark so it can be validated against that value. Other
+            // empty commits write nothing row-tracking-related.
+            let row_tracking_dm = row_id_high_water_mark
+                .map(RowTrackingDomainMetadata::new)
+                .or_else(|| {
+                    (assign_fresh_row_tracking_metadata && self.is_create_table())
+                        .then(RowTrackingDomainMetadata::initial)
+                });
+            return Ok(GeneratedAdds {
+                actions: unbound_generator!(async |_| Ok(())),
+                row_tracking_domain_metadata: row_tracking_dm,
+            });
         }
 
         let commit_version = version_as_i64(commit_version)?;
 
         if assign_fresh_row_tracking_metadata {
-            self.generate_adds_with_row_tracking(engine, commit_version)
+            self.generate_adds_with_row_tracking(row_id_high_water_mark, commit_version)
         } else {
             let add_actions = build_add_actions(
-                engine,
-                self.add_files_metadata.iter().map(|a| Ok(a.deref())),
+                self.add_files_metadata.clone().into_iter().map(Ok),
                 self.add_files_schema().clone(),
                 self.data_change,
             )?;
-            Ok((Box::new(add_actions), None))
+            Ok(GeneratedAdds {
+                actions: add_actions,
+                row_tracking_domain_metadata: row_id_high_water_mark
+                    .map(RowTrackingDomainMetadata::new),
+            })
         }
     }
 
@@ -1439,21 +1586,11 @@ impl<S> Transaction<S> {
     /// non-overlapping `baseRowId` range to each file and computing the final high water mark
     /// for the domain metadata action. The initial high water mark is read from the snapshot
     /// for existing tables, or defaults to -1 for create-table (no prior log to read from).
-    fn generate_adds_with_row_tracking<'a>(
-        &'a self,
-        engine: &dyn Engine,
+    fn generate_adds_with_row_tracking(
+        &self,
+        row_id_high_water_mark: Option<i64>,
         commit_version: i64,
-    ) -> DeltaResult<(
-        EngineDataResultIterator<'a>,
-        Option<RowTrackingDomainMetadata>,
-    )> {
-        let row_id_high_water_mark = if self.is_create_table() {
-            None
-        } else {
-            self.read_snapshot()?
-                .get_row_tracking_high_water_mark(engine)?
-        };
-
+    ) -> DeltaResult<GeneratedAdds> {
         // Create a row tracking visitor and visit all files to collect row tracking information
         let mut row_tracking_visitor =
             RowTrackingVisitor::new(row_id_high_water_mark, Some(self.add_files_metadata.len()));
@@ -1461,7 +1598,7 @@ impl<S> Transaction<S> {
         // We visit all files with the row visitor before creating the add action iterator because
         // we need to know the final row ID high water mark to create the domain metadata action.
         for add_files_batch in &self.add_files_metadata {
-            row_tracking_visitor.visit_rows_of(add_files_batch.deref())?;
+            row_tracking_visitor.visit_rows_of(add_files_batch.as_ref())?;
         }
 
         // Destructure the visitor to move base_row_id_batches into the add-files iterator
@@ -1472,7 +1609,8 @@ impl<S> Transaction<S> {
         } = row_tracking_visitor;
 
         // Create extended add files with row tracking columns
-        let extended_add_files = self.add_files_metadata.iter().zip(base_row_id_batches).map(
+        let extended_add_files = self.add_files_metadata.clone();
+        let extended_add_files = extended_add_files.into_iter().zip(base_row_id_batches).map(
             move |(add_files_batch, base_row_ids)| {
                 let commit_versions = vec![commit_version; base_row_ids.len()];
                 let base_row_ids_array =
@@ -1490,7 +1628,6 @@ impl<S> Transaction<S> {
 
         // Generate add actions including row tracking metadata
         let add_actions = build_add_actions(
-            engine,
             extended_add_files,
             with_row_tracking_cols(self.add_files_schema())?,
             self.data_change,
@@ -1500,7 +1637,10 @@ impl<S> Transaction<S> {
         let row_tracking_domain_metadata: RowTrackingDomainMetadata =
             RowTrackingDomainMetadata::new(row_id_high_water_mark);
 
-        Ok((Box::new(add_actions), Some(row_tracking_domain_metadata)))
+        Ok(GeneratedAdds {
+            actions: add_actions,
+            row_tracking_domain_metadata: Some(row_tracking_domain_metadata),
+        })
     }
 
     fn into_committed(
@@ -1557,6 +1697,20 @@ impl<S> Transaction<S> {
         })
     }
 
+    fn into_conflicted(self, conflict_version: Version) -> ConflictedTransaction<S> {
+        ConflictedTransaction {
+            transaction: self,
+            conflict_version,
+        }
+    }
+
+    fn into_retryable(self, error: Error) -> RetryableTransaction<S> {
+        RetryableTransaction {
+            transaction: self,
+            error,
+        }
+    }
+
     /// Build a [`CrcDelta`] from the transaction's commit state and a precomputed
     /// [`FileStatsDelta`].
     fn build_crc_delta(
@@ -1602,46 +1756,20 @@ impl<S> Transaction<S> {
         })
     }
 
-    fn into_conflicted(self, conflict_version: Version) -> ConflictedTransaction<S> {
-        ConflictedTransaction {
-            transaction: self,
-            conflict_version,
-        }
-    }
-
-    fn into_retryable(self, error: Error) -> RetryableTransaction<S> {
-        RetryableTransaction {
-            transaction: self,
-            error,
-        }
-    }
-
     /// Generates Remove actions from scan file metadata.
     ///
     /// This internal method transforms scan row metadata into Remove actions for the Delta log.
     /// It's called during commit to process files staged via [`remove_files`] or files being
     /// updated with new deletion vectors via [`update_deletion_vectors`].
     ///
-    /// # Parameters
-    ///
-    /// - `engine`: The engine used for expression evaluation
-    /// - `remove_files_metadata`: Iterator over scan file metadata to transform into Remove actions
-    /// - `has_dv_update_columns`: Whether `remove_files_metadata` contains the temporary columns
-    ///   added for a deletion vector update
-    ///
-    /// # Returns
-    ///
-    /// An iterator of FilteredEngineData containing Remove actions in the log schema format.
-    ///
     /// [`remove_files`]: Transaction::remove_files
     /// [`update_deletion_vectors`]: Transaction::update_deletion_vectors
     #[instrument(name = "txn.gen_removes", skip_all, err)]
-    fn generate_remove_actions<'a>(
-        &'a self,
-        engine: &dyn Engine,
-        remove_files_metadata: impl Iterator<Item = &'a FilteredEngineData> + Send + 'a,
+    fn generate_remove_actions(
+        &self,
+        remove_files_metadata: impl Iterator<Item = Arc<FilteredEngineData>> + Send + 'static,
         has_dv_update_columns: bool,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
+    ) -> DeltaResult<UnboundGenerator<FilteredEngineData>> {
         // Create-table transactions should not have any remove actions.
         // Only error if there are actually files queued for removal.
         if self.is_create_table() && !self.remove_files_metadata.is_empty() {
@@ -1651,7 +1779,6 @@ impl<S> Transaction<S> {
         }
 
         let target_schema = schema_with_all_fields_nullable(&LOG_REMOVE_SCHEMA);
-        let evaluation_handler = engine.evaluation_handler();
         // TODO(#3263): `remove_files_metadata` may contain `stats_parsed` and
         // `partitionValues_parsed`; provide its full schema to both evaluators.
         let input_schema = if has_dv_update_columns {
@@ -1671,7 +1798,7 @@ impl<S> Transaction<S> {
             .effective_table_config
             .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview);
 
-        let make_eval = |coalesce_stats_with_parsed: bool| {
+        let make_expr = |coalesce_stats_with_parsed: bool| -> DeltaResult<_> {
             let columns_to_drop: Vec<_> = columns_to_drop.iter().map(String::as_str).collect();
             let patch = build_remove_struct_patch(
                 self.commit_timestamp,
@@ -1680,12 +1807,9 @@ impl<S> Transaction<S> {
                 coalesce_stats_with_parsed,
                 adaptive_metadata_enabled,
             )?;
-            let expr = Arc::new(Expression::struct_from([Expression::struct_patch(patch)?]));
-            evaluation_handler.new_expression_evaluator(
-                input_schema.clone(),
-                expr,
-                target_schema.clone().into(),
-            )
+            Ok(Arc::new(Expression::struct_from([
+                Expression::struct_patch(patch)?,
+            ])))
         };
 
         // Build two evaluators: one for the common case where scan files do not include a
@@ -1693,23 +1817,31 @@ impl<S> Transaction<S> {
         // The stats_parsed evaluator coalesces stats with ToJson(stats_parsed) to handle the
         // case where stats is null (e.g., on V2 checkpoints with writeStatsAsJson=false) and
         // then drops the stats_parsed column.
-        let base_eval = make_eval(false /* coalesce_stats_with_parsed */)?;
-        let stats_parsed_eval = make_eval(true /* coalesce_stats_with_parsed */)?;
+        let base_expr = make_expr(false)?;
+        let stats_parsed_expr = make_expr(true)?;
         let stats_parsed_col = column_name!(STATS_PARSED_NAME);
-
-        Ok(remove_files_metadata.map(move |file_metadata_batch| {
-            let data = file_metadata_batch.data();
-            let evaluator = if data.has_field(&stats_parsed_col) {
-                &stats_parsed_eval
-            } else {
-                &base_eval
-            };
-            let updated_engine_data = evaluator.evaluate(data)?;
-            FilteredEngineData::try_new(
-                updated_engine_data,
-                file_metadata_batch.selection_vector().to_vec(),
-            )
-        }))
+        let generator = unbound_generator!(async move |channel| {
+            let output_type: DataType = target_schema.into();
+            let base_evaluator = channel
+                .create_expression_evaluator(input_schema.clone(), base_expr, output_type.clone())
+                .await?;
+            let stats_parsed_evaluator = channel
+                .create_expression_evaluator(input_schema, stats_parsed_expr, output_type)
+                .await?;
+            for file_metadata_batch in remove_files_metadata {
+                let evaluator = if file_metadata_batch.data().has_field(&stats_parsed_col) {
+                    &stats_parsed_evaluator
+                } else {
+                    &base_evaluator
+                };
+                let action = channel
+                    .evaluate_filtered_expression(evaluator, file_metadata_batch)
+                    .await?;
+                channel.yield_item(action).await?;
+            }
+            Ok(())
+        });
+        Ok(generator)
     }
 }
 
@@ -1961,6 +2093,7 @@ mod tests {
     };
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::PublishMetadata;
+    use crate::coroutine::drive_workflow;
     use crate::engine::arrow_conversion::{TryFromArrow, TryIntoArrow};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
@@ -1987,7 +2120,7 @@ mod tests {
     };
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::unit_test_utils::{MockProtocolBuilder, MockTableConfigurationBuilder};
-    use crate::{DeltaResultIterator, EvaluationHandler, Snapshot};
+    use crate::{DeltaResultIteratorStatic, EvaluationHandler, Snapshot};
 
     impl Transaction {
         /// Set clustering columns for testing purposes without needing a table
@@ -2005,7 +2138,7 @@ mod tests {
         fn commit(
             &self,
             _engine: &dyn Engine,
-            _actions: DeltaResultIterator<'_, FilteredEngineData>,
+            _actions: DeltaResultIteratorStatic<FilteredEngineData>,
             _commit_metadata: CommitMetadata,
         ) -> DeltaResult<CommitResponse> {
             Err(Error::IOError(std::io::Error::other("simulated IO error")))
@@ -2030,7 +2163,7 @@ mod tests {
         fn commit(
             &self,
             _engine: &dyn Engine,
-            _actions: DeltaResultIterator<'_, FilteredEngineData>,
+            _actions: DeltaResultIteratorStatic<FilteredEngineData>,
             _commit_metadata: CommitMetadata,
         ) -> DeltaResult<CommitResponse> {
             Err(Error::generic("simulated commit error"))
@@ -2054,7 +2187,7 @@ mod tests {
         fn commit(
             &self,
             _engine: &dyn Engine,
-            _actions: DeltaResultIterator<'_, FilteredEngineData>,
+            _actions: DeltaResultIteratorStatic<FilteredEngineData>,
             _commit_metadata: CommitMetadata,
         ) -> DeltaResult<CommitResponse> {
             // This won't be reached in tests — the validation error fires before commit.
@@ -3039,9 +3172,9 @@ mod tests {
         let (engine, snapshot) = setup_dv_enabled_table();
         let mut txn = create_dv_transaction(snapshot.clone(), &engine)?;
         txn.dv_matched_files
-            .push(FilteredEngineData::with_all_rows_selected(
+            .push(Arc::new(FilteredEngineData::with_all_rows_selected(
                 string_array_to_engine_data(StringArray::from(vec!["sentinel"])),
-            ));
+            )));
         let staged_len_before = txn.dv_matched_files.len();
         let scan = snapshot.scan_builder().build()?;
         let scan_metadata = scan
@@ -3186,7 +3319,7 @@ mod tests {
         let data = make_scan_files(selection_vector);
         match removal {
             DataRemoval::RemoveFile => txn.remove_files(data),
-            DataRemoval::DeletionVectorUpdate => txn.dv_matched_files.push(data),
+            DataRemoval::DeletionVectorUpdate => txn.dv_matched_files.push(Arc::new(data)),
         }
     }
 
@@ -3311,7 +3444,7 @@ mod tests {
         let dv_data = FilteredEngineData::with_all_rows_selected(string_array_to_engine_data(
             StringArray::from(vec!["dv"]),
         ));
-        txn.dv_matched_files.push(dv_data);
+        txn.dv_matched_files.push(Arc::new(dv_data));
         let result = txn.validate_blind_append_semantics();
         assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
         Ok(())
@@ -3437,6 +3570,14 @@ mod tests {
                 "Blind append validation should have passed, got: {e}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn commit_workflow_drives_path_based_transaction_without_legacy_committer() -> DeltaResult<()> {
+        let (engine, txn, _tempdir) = create_existing_table_txn()?;
+        let result = drive_workflow(engine.as_ref(), txn.commit_workflow())?;
+        assert!(result.is_committed());
         Ok(())
     }
 
@@ -3972,7 +4113,7 @@ mod tests {
         fn commit(
             &self,
             _engine: &dyn Engine,
-            _actions: DeltaResultIterator<'_, FilteredEngineData>,
+            _actions: DeltaResultIteratorStatic<FilteredEngineData>,
             commit_metadata: CommitMetadata,
         ) -> DeltaResult<CommitResponse> {
             *self.captured.lock().unwrap() = Some(commit_metadata.in_commit_timestamp());
@@ -4045,7 +4186,7 @@ mod tests {
         let engine = SyncEngine::new();
         let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
 
-        let prev_ict = snapshot.get_in_commit_timestamp(&engine)?;
+        let prev_ict = snapshot.get_in_commit_timestamp_with_engine(&engine)?;
         assert_eq!(prev_ict, Some(future_ict));
 
         let (committer, captured_ts) = CapturingCommitter::new();

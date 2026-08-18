@@ -47,7 +47,7 @@ checkpoint Parquet file, and updates the `_last_checkpoint` hint file.
 > [!NOTE]
 > `checkpoint()` calls `ParquetHandler::write_parquet_file` to write the checkpoint and
 > `StorageHandler::head` to retrieve its metadata. The `DefaultEngine` implements both.
-> If you use a custom engine, make sure it provides working implementations of both.
+> Custom Engine integrations must provide working implementations of both handlers.
 
 ## After a commit
 

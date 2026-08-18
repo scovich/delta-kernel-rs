@@ -32,16 +32,14 @@ making it usable from virtually any language.
                   │  Delta Kernel  │
                   │  (core logic)  │
                   └───────┬────────┘
-                          │ calls into
-                  ┌───────▼────────┐
-                  │  Engine trait   │
-                  │  (abstraction)  │
-                  └───────┬────────┘
-                          │ implemented by
-                  ┌───────▼────────┐
-                  │  DefaultEngine │
-                  │  (or custom)   │
-                  └───────┬────────┘
+                          │ requests I/O and compute
+                ┌─────────┴──────────┐
+                │                    │
+      ┌─────────▼──────────┐ ┌───────▼─────────┐
+      │ Connector driver   │ │ Engine trait    │
+      │ (sync or async)    │ │ (compatibility) │
+      └─────────┬──────────┘ └───────┬─────────┘
+                └─────────┬──────────┘
                           │
                   ┌───────▼────────┐
                   │  Delta Table   │
@@ -49,10 +47,13 @@ making it usable from virtually any language.
                   └────────────────┘
 ```
 
-The **Engine trait** is the boundary between Kernel and your connector. Kernel defines
-_what_ needs to happen (read JSON, read Parquet, evaluate expressions); the engine
-defines _how_. A batteries-included `DefaultEngine` is provided for common use cases.
-See [Architecture Overview](./concepts/architecture.md) for details.
+Kernel implements protocol logic as ordinary runtime-neutral Rust futures. Connector-driven
+coroutines surface every I/O or compute operation as a typed request, allowing a Rust connector to
+drive Kernel synchronously or with its own async executor. The synchronous **Engine trait**
+compatibility adapter uses Engine handlers to fulfill those requests. The
+[Architecture overview](./concepts/architecture.md) describes the default-engine crate's two
+options: `AsyncEngineConnector`, which serves one request at a time using native async I/O, and
+`DefaultEngine`, which provides Engine compatibility.
 
 ## Key APIs
 
@@ -90,8 +91,8 @@ without writing any Rust. See the [FFI overview](./ffi/overview.md) for details.
 
 1. **Protocol abstraction.** Kernel encapsulates the Delta protocol. Connectors pick up
    new protocol features by updating their Kernel dependency.
-2. **Engine-agnostic.** Kernel defines _what_ to do; engines define _how_. The `Engine`
-   trait is the only integration point.
+2. **Execution-policy agnostic.** Kernel defines _what_ to do. Connectors may serve typed requests
+   directly or use the synchronous `Engine` compatibility interface.
 3. **Feature flag modularity.** Core functionality works without optional dependencies.
    Pay only for what you use via Cargo feature flags.
 4. **Clear I/O boundaries.** APIs clearly indicate when I/O operations occur, giving
@@ -101,7 +102,8 @@ without writing any Rust. See the [FFI overview](./ffi/overview.md) for details.
 
 | Crate | Purpose |
 |-------|---------|
-| `delta_kernel` | Core library: protocol logic, table operations, trait definitions, default engine |
+| `delta_kernel` | Core library: protocol logic, table operations, coroutine APIs, compatibility traits |
+| `delta_kernel_default_engine` | Arrow/Tokio Engine compatibility and async workflow driver |
 | `delta_kernel_ffi` | C/C++ FFI bindings ([overview](./ffi/overview.md)) |
 | `delta_kernel_derive` | Procedural macros for internal code generation |
 | `acceptance` | Delta Acceptance Tests (DAT) validation suite |

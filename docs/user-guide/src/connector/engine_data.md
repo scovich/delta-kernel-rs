@@ -5,7 +5,7 @@ kernel and your connector is represented as `EngineData`.
 
 If you use the `DefaultEngine`, you get `ArrowEngineData`, a wrapper around an arrow `RecordBatch`
 that implements the `EngineData` trait, and don't need to implement this trait. This page is for
-connector builders who want to use a different columnar data format.
+connector builders whose request handlers use a different in-memory columnar representation.
 
 ## The trait
 
@@ -50,8 +50,7 @@ nested fields, each non-leaf element of the path must be a struct field at that 
 
 Kernel uses a visitor pattern to access the actual data that's inside an `EngineData`. This pattern
 means the connector can call into kernel with a reference to the data, which makes reasoning about
-data lifetimes simpler. In particular, engines don't need to worry about keeping data alive past the
-invocation of the visitor.
+data lifetimes simpler. In particular, connectors can discard data after the visitor call returns.
 
 `visit_rows` is the core data extraction method. The kernel never inspects your columns
 directly. Instead, it passes a `RowVisitor` that knows which columns it needs, and your
@@ -165,8 +164,8 @@ fn append_columns(
 ```
 
 - **`schema`** describes only the new columns being appended (not the full result schema)
-- **`columns`** contains the data as `ArrayData`, the kernel's generic columnar
-  representation that you will need to convert to your engine's format.
+- **`columns`** contains the data as `ArrayData`, Kernel's generic columnar representation that you
+  convert to your connector's native representation.
 - Returns a new `EngineData` with the original columns plus the appended columns
 - The row count of the new columns must match the existing data
 
@@ -283,7 +282,7 @@ connector's use. This trait is implemented for both `Box<dyn EngineData>` and
 
 ## What's next
 
-- [Implementing the Engine trait](./implementing_engine.md) covers the four handler traits
-  your engine must provide
+- [Driving connector workflows](./coroutines.md) explains how request handlers provide data to
+  Kernel
 - [Building a Scan](../reading/building_a_scan.md) shows how scan results flow through
   `EngineData`

@@ -4,7 +4,7 @@ The Delta Kernel ships as two crates on crates.io:
 
 - [`delta_kernel`](https://crates.io/crates/delta_kernel): the core library. No I/O, no Arrow.
 - [`delta_kernel_default_engine`](https://crates.io/crates/delta_kernel_default_engine): the default
-  Arrow + Tokio implementation of the `Engine` trait.
+  Arrow + Tokio execution crate, providing `DefaultEngine` and `AsyncEngineConnector`.
 
 Cargo feature flags keep both crates dependency-light.
 
@@ -26,13 +26,16 @@ delta_kernel_default_engine = { version = "0.23", features = ["rustls"] }
 That gives you Kernel plus a default engine that handles I/O and expression evaluation for you,
 backed by Arrow with `rustls` for TLS.
 
-If you're building a custom engine and don't need the default, depend on just `delta_kernel`
-and enable whatever Arrow interop flags you want:
+If your connector drives workflow requests through its own I/O and evaluation code, depend on just
+`delta_kernel`:
 
 ```toml
 [dependencies]
-delta_kernel = { version = "0.23", features = ["arrow-conversion", "arrow-expression"] }
+delta_kernel = "0.23"
 ```
+
+Enable `arrow-conversion` or `arrow-expression` only if your request handlers use Kernel's Arrow
+interop helpers.
 
 ## Feature flags
 
@@ -47,7 +50,7 @@ You only pay for what you enable.
 | `arrow` | Use the latest Arrow version Kernel supports. Currently maps to Arrow 59. |
 
 You need exactly one of `rustls` or `native-tls`. See
-[Building a Connector](../connector/overview.md) for when a custom engine makes sense instead.
+[Building a connector](../connector/overview.md) for choosing an execution surface.
 
 ### Arrow version pinning
 
@@ -72,8 +75,8 @@ For more details on managing Arrow version compatibility, see
 | `schema-diff` | Experimental schema diffing |
 
 The `arrow-conversion` and `arrow-expression` flags are pulled in automatically by
-`delta_kernel_default_engine`, so you typically only set them when building a custom Arrow-based
-engine yourself.
+`delta_kernel_default_engine`, so set them directly only when connector request handlers use
+Kernel's Arrow helpers without that crate.
 
 ## Example `Cargo.toml`
 

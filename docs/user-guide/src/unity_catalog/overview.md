@@ -104,9 +104,8 @@ See [Creating UC Tables](./creating_tables.md) for the end-to-end creation
 flow and how these two utilities fit together.
 
 > [!NOTE]
-> `UCCommitter` requires a multi-threaded tokio runtime. The default Kernel
-> Engine uses tokio, so this is compatible. If you use a custom Engine, ensure
-> your runtime is multi-threaded.
+> `UCCommitter` requires a multi-threaded Tokio runtime. Use one when driving UC workflows
+> directly; `DefaultEngine`'s Tokio executor is also compatible.
 
 ## How the crates map to catalog-managed concepts
 

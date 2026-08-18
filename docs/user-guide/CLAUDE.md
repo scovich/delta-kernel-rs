@@ -83,7 +83,7 @@ Right amount:
 because of this detail? If yes, explain enough for them to write correct code.
 If no, one sentence of context at most.
 
-**Exception zones:** Catalog integration pages and custom Engine implementation
+**Exception zones:** Catalog integration pages and Engine compatibility implementation
 pages necessarily carry more protocol context than the reading/writing how-to
 pages. The commit type taxonomy (staged, ratified, published) is required
 vocabulary for catalog committer authors. Apply the decision test per-paragraph
@@ -153,6 +153,7 @@ full trait signatures rather than inlining them all.
 | `catalog_managed/committer.md` | How-to | "To implement a catalog committer, do this" |
 | `catalog_managed/reading.md`, `writing.md` | How-to | "To read/write catalog-managed tables, do this" |
 | `connector/overview.md` | Explanation | What a connector is, Kernel vs. connector responsibilities |
+| `connector/coroutines.md` | How-to | Drive workflows while retaining connector control |
 | `configuring_storage.md` | How-to | "To configure S3/GCS/Azure storage, pass these options" |
 | `checkpointing.md` | How-to | "To checkpoint a table, call these APIs" |
 | `ffi/overview.md` | Explanation + Reference | Consider splitting if it grows |
@@ -165,7 +166,7 @@ instead. It is OK to USE concepts (traits, `Result`, `Arc`) before they are
 formally explained. This is the spiral curriculum pattern: hook the reader with
 a working result, then circle back to explain the mechanics in later chapters.
 Use explicit forward references: "We're using the default engine here.
-[The Engine Trait](../concepts/engine_trait.md) explains how to customize it."
+[Driving connector workflows](../connector/coroutines.md) explains how to customize execution."
 
 **How-to pages:** Assume competence. Lead with the goal, not the page
 description. Follow the recipe model: specific steps, specific outcome.
@@ -346,8 +347,8 @@ interest (Google developer style guide). Reserve for genuinely important info:
 - When deferring a concept, name the destination explicitly: "Deletion vectors
   are covered in [Scan Metadata](./scan_metadata.md)."
 - Use explicit forward references in tutorials: "We're using the default engine
-  here. [The Engine Trait](../concepts/engine_trait.md) explains how to
-  customize it."
+  here. [Driving connector workflows](../connector/coroutines.md) explains how
+  to customize execution."
 
 ## Diagrams
 

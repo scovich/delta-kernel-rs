@@ -7,7 +7,7 @@ is opt-in.
 
 ## Recommended starting point
 
-For most connectors that use the built-in engine with Arrow:
+For most connectors using the default-engine crate's Arrow and `object_store` implementations:
 
 ```toml
 [dependencies]
@@ -61,17 +61,17 @@ delta_kernel = "0.23"
 delta_kernel_default_engine = { version = "0.23", features = ["rustls"] }
 ```
 
-**Custom engine using Arrow (no default engine):**
+**Connector request handlers using Kernel's Arrow helpers:**
 
 ```toml
 delta_kernel = { version = "0.23", features = ["arrow-conversion", "arrow-expression"] }
 ```
 
-**Minimal custom engine with no Arrow dependency at all:**
+**Connector-driven execution with no Arrow dependency:**
 
 ```toml
 delta_kernel = "0.23"
 ```
 
-That gives you only the core Kernel types and traits. You implement `Engine` and `EngineData`
-entirely in your own data format.
+That gives you only the core Kernel types and traits. Your request handlers provide I/O and
+evaluation, and may implement `EngineData` for their native columnar representation.

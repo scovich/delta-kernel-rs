@@ -1,8 +1,10 @@
-# Implementing the Engine trait
+# Implementing Engine compatibility
 
-The `Engine` trait is the main integration point between your connector and Delta Kernel. For
-background on what the Engine trait is and when you need a custom one, see the
-[Connector Overview](./overview.md) and [The Engine Trait](../concepts/engine_trait.md).
+The `Engine` trait is Kernel's legacy synchronous compatibility interface. New connectors should
+normally use `DefaultEngine` for maximum simplicity or drive workflow requests directly for
+customization and control. Implement `Engine` when maintaining an existing Engine-based integration
+or compatibility boundary. See the [Connector overview](./overview.md) and
+[The Engine trait](../concepts/engine_trait.md) for context.
 
 ## The Engine trait
 
@@ -17,10 +19,9 @@ pub trait Engine {
 }
 ```
 
-You don't have to implement all four handlers from scratch. A common approach is to start
-with `DefaultEngine` and selectively replace handlers. For example, you might provide a
-custom `ParquetHandler` that reads into your engine's native columnar format while reusing
-the default handlers for everything else.
+If you must implement `Engine`, you don't have to build all four handlers from scratch. You can
+start with `DefaultEngine` and selectively replace handlers, such as a `ParquetHandler` that reads
+into your engine's native columnar representation.
 
 Many of the `Engine` handlers take or return `EngineData`. See [EngineData](engine_data.md) for more
 information about this type.

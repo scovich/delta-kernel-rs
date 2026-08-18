@@ -17,8 +17,8 @@ Appending data to a Delta table follows these steps:
 6. Commit the transaction
 
 The following example assumes you already have an `engine: DefaultEngine`, which provides
-an async `write_parquet` helper. If you use a custom `Engine`, the step 4
-may differ.
+an async `write_parquet` helper. If your connector writes Parquet through its own request handling,
+step 4 differs.
 
 ```rust,no_run
 # extern crate delta_kernel;
@@ -179,30 +179,25 @@ let file_metadata = engine
 writes the file, collects statistics, and returns file metadata that you pass to
 `txn.add_files()`.
 
-### Using a custom engine
+### Using connector-native writing
 
-If you do not use `DefaultEngine`, write the files yourself. The expected flow is:
+If your connector doesn't use `DefaultEngine`, perform the same steps with its native evaluation
+and Parquet implementation:
 
-1. Evaluate `write_context.logical_to_physical()` to transform your logical data into
-   physical data.
-2. Write the physical data under `write_context.write_dir()`, then pass the corresponding
-   add-file metadata to `txn.add_files()`.
+1. Evaluate `write_context.logical_to_physical()` against the logical data.
+2. Write the resulting physical data under `write_context.write_dir()`.
+3. Build add-file metadata matching `txn.add_files_schema()` and pass it to `txn.add_files()`.
 
 ```rust,ignore
-// Assume: data: Box<dyn EngineData> (logical), engine: impl Engine,
-// write_context: BoundWriteContext.
-
-// 1. Transform logical data into physical data
-let evaluator = engine.evaluation_handler().new_expression_evaluator(
-    write_context.logical_data_schema().clone(),
+let physical_data = evaluate_with_connector(
+    logical_data,
     write_context.logical_to_physical(),
-    write_context.physical_data_schema().clone().into(),
 )?;
-let physical_data = evaluator.evaluate(data.as_ref())?;
-
-// 2. Write `physical_data` under `write_context.write_dir()` in whatever way your
-// engine writes Parquet, producing `add_file_metadata` for the written file.
-
+let add_file_metadata = write_parquet_with_connector(
+    physical_data,
+    write_context.write_dir(),
+    txn.add_files_schema(),
+)?;
 txn.add_files(add_file_metadata);
 ```
 

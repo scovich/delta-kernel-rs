@@ -25,7 +25,11 @@ The `DataType` enum represents all types supported by the Delta protocol:
 | `DataType::TIMESTAMP` | N/A | Microsecond precision, adjusted to UTC |
 | `DataType::TIMESTAMP_NTZ` | N/A | Microsecond precision, no timezone |
 
-Both timestamp types are microsecond precision. A Parquet file can store timestamps at a coarser physical precision, such as millisecond, when it was written by a non-kernel writer. Kernel always expects microsecond values, so the reader must rescale them to microseconds. The default engine does this for you. If you implement your own engine, your handlers must perform this conversion themselves when reading both data files and metadata, such as checkpoint statistics.
+Both timestamp types are microsecond precision. A Parquet file can store timestamps at a coarser
+physical precision, such as millisecond, when it was written by a non-kernel writer. Kernel always
+expects microsecond values, so the reader must rescale them to microseconds. The default engine does
+this for you. Connector-native read handlers must perform this conversion themselves when reading
+both data files and metadata, such as checkpoint statistics.
 
 #### Decimal
 
