@@ -444,9 +444,9 @@ async fn commit_rejects_add_missing_required_field() -> Result<(), Box<dyn std::
         let err = txn
             .commit(engine.as_ref())
             .err()
-            .expect(&format!(
-                "commit should reject an add missing required field '{field}'"
-            ))
+            .unwrap_or_else(|| {
+                panic!("commit should reject an add missing required field '{field}'")
+            })
             .to_string();
         assert!(
             err.contains(&format!("missing required field '{field}'")),

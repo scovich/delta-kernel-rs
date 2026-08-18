@@ -144,7 +144,7 @@ pub fn build_uc_create_table_request(
     let uc_recognized_domains = HashSet::from([CLUSTERING_DOMAIN_NAME, ROW_TRACKING_DOMAIN_NAME]);
     let mut domain_metadata: HashMap<String, serde_json::Value> = HashMap::new();
     for (domain, dm) in
-        snapshot.get_domain_metadatas_internal(engine, Some(&uc_recognized_domains))?
+        snapshot.get_domain_metadatas_internal_with_engine(engine, Some(&uc_recognized_domains))?
     {
         let value = serde_json::from_str(dm.configuration())
             .map_err(|e| Error::generic(format!("malformed {domain} domain metadata: {e}")))?;

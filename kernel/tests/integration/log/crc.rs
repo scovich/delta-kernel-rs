@@ -1161,7 +1161,7 @@ async fn test_write_checksum_with_no_dms_writes_empty_list(
 
     let snapshot = committed.post_commit_snapshot().unwrap();
     assert!(snapshot
-        .get_all_domain_metadata(engine.as_ref())?
+        .get_all_domain_metadata_with_engine(engine.as_ref())?
         .is_empty());
     let crc = write_and_verify_crc(snapshot, &table_path, engine.as_ref());
     // CREATE TABLE without any DM actions produces an authoritative empty map.
@@ -1228,12 +1228,12 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> DeltaResult<()>
             None
         );
         assert!(snapshot
-            .get_domain_metadata_internal("delta.clustering", engine)
+            .get_domain_metadata_internal_with_engine("delta.clustering", engine)
             .unwrap()
             .is_some());
         assert_eq!(
             snapshot
-                .get_domain_metadatas_internal(engine, None)
+                .get_domain_metadatas_internal_with_engine(engine, None)
                 .unwrap()
                 .len(),
             3
@@ -1341,14 +1341,15 @@ async fn test_partial_dm_serves_hits_and_falls_through_for_misses() -> DeltaResu
     // Multi-key filter with a mixed hit ("foo") and miss ("zip"): the first miss
     // short-circuits the cache lookup and the full result comes from log replay.
     let filter = HashSet::from(["foo", "zip"]);
-    let map = snapshot_v1.get_domain_metadatas_internal(engine.as_ref(), Some(&filter))?;
+    let map =
+        snapshot_v1.get_domain_metadatas_internal_with_engine(engine.as_ref(), Some(&filter))?;
     assert_eq!(map.len(), 2);
     assert_eq!(map["foo"].configuration(), "bar");
     assert_eq!(map["zip"].configuration(), "zap0");
 
     // "All" queries against Partial always fall through. The replay-derived set must
     // include BOTH entries.
-    let mut all = snapshot_v1.get_all_domain_metadata(engine.as_ref())?;
+    let mut all = snapshot_v1.get_all_domain_metadata_with_engine(engine.as_ref())?;
     all.sort_by(|a, b| a.domain().cmp(b.domain()));
     assert_eq!(all.len(), 2);
     assert_eq!(all[0].domain(), "foo");
@@ -2284,7 +2285,7 @@ async fn test_stale_crc_fresh_build_advance_matrix(
     // - If no CRC, then we must re-read the latest commit -> need real engine.
     // - Else, we did CRC replay and cached the result -> use fake engine.
     assert!(fresh
-        .get_in_commit_timestamp(real_engine_iff_crc_missing)?
+        .get_in_commit_timestamp_with_engine(real_engine_iff_crc_missing)?
         .is_some());
 
     // For both domain metadata and set transaction checks below:
@@ -2298,7 +2299,7 @@ async fn test_stale_crc_fresh_build_advance_matrix(
     // === Check: domain metadata written *before* the CRC ===
     for domain in ["domain_at_create", "delta.clustering"] {
         assert!(fresh
-            .get_domain_metadata_internal(
+            .get_domain_metadata_internal_with_engine(
                 domain,
                 real_engine_iff_crc_missing_or_crc_missing_opt_fields
             )?
@@ -2308,7 +2309,7 @@ async fn test_stale_crc_fresh_build_advance_matrix(
     // === Check: domain metadata written *after* the CRC ===
     for domain in ["domain", "delta.rowTracking"] {
         assert!(fresh
-            .get_domain_metadata_internal(domain, real_engine_iff_crc_missing)?
+            .get_domain_metadata_internal_with_engine(domain, real_engine_iff_crc_missing)?
             .is_some());
     }
 
@@ -2563,7 +2564,7 @@ async fn test_dm_query_rooted_in_stale_complete_crc(#[case] query: Query) -> Del
         Query::Filter(keys) => {
             let filter = keys.iter().copied().collect();
             let got: HashMap<String, String> = fresh
-                .get_domain_metadatas_internal(&engine, Some(&filter))?
+                .get_domain_metadatas_internal_with_engine(&engine, Some(&filter))?
                 .into_iter()
                 .map(|(domain, dm)| (domain, dm.configuration().to_string()))
                 .collect();
@@ -2571,7 +2572,7 @@ async fn test_dm_query_rooted_in_stale_complete_crc(#[case] query: Query) -> Del
         }
         Query::All => {
             let all: HashMap<String, String> = fresh
-                .get_all_domain_metadata(&engine)?
+                .get_all_domain_metadata_with_engine(&engine)?
                 .into_iter()
                 .map(|dm| (dm.domain().to_string(), dm.configuration().to_string()))
                 .collect();
