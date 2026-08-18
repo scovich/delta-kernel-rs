@@ -6,12 +6,13 @@ use url::Url;
 
 use super::*;
 use crate::engine::sync::SyncEngine;
+use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path as ObjectPath;
 use crate::object_store::ObjectStoreExt as _;
 use crate::path::tests::multipart_checkpoint_name;
 use crate::unit_test_utils::TestCancellationToken;
-use crate::{Engine as _, FileMeta};
+use crate::{Engine as _, FileMeta, StorageHandler};
 
 // size markers used to identify commit sources in tests
 const FILESYSTEM_SIZE_MARKER: u64 = 10;
