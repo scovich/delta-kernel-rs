@@ -91,6 +91,8 @@ pub mod commit_range;
 pub mod committer;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 mod content_tree;
+#[allow(unused)]
+pub mod coroutine;
 #[cfg(feature = "internal-api")]
 pub mod crc;
 #[cfg(not(feature = "internal-api"))]
