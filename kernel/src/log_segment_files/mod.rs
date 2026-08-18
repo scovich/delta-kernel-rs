@@ -255,6 +255,31 @@ struct ListingAccumulator {
 }
 
 impl ListingAccumulator {
+    /// Update max published commit version to account for for this file
+    fn observe_published_file(&mut self, file: &ParsedLogPath) {
+        if matches!(file.file_type, LogPathFileType::Commit) {
+            self.output.max_published_version =
+                self.output.max_published_version.max(Some(file.version));
+        }
+    }
+
+    /// Called before processing each new file. If `file_version` differs from the current
+    /// `group_version`, finalizes the current group by calling `select_checkpoint_for_group`,
+    /// then advances `group_version` to the new version. On the first call (when
+    /// `group_version` is `None`), simply initializes it.
+    fn maybe_flush_and_advance(&mut self, file_version: Version) {
+        match self.group_version {
+            Some(gv) if file_version != gv => {
+                self.select_checkpoint_for_group(gv);
+                self.group_version = Some(file_version);
+            }
+            None => {
+                self.group_version = Some(file_version);
+            }
+            _ => {} // same version, no flush needed
+        }
+    }
+
     fn process_file(&mut self, file: ParsedLogPath) {
         if !should_process_log_file(&file) {
             return;
@@ -287,23 +312,6 @@ impl ListingAccumulator {
                     file.filename, file.file_type, file.version
                 );
             }
-        }
-    }
-
-    /// Called before processing each new file. If `file_version` differs from the current
-    /// `group_version`, finalizes the current group by calling `select_checkpoint_for_group`,
-    /// then advances `group_version` to the new version. On the first call (when
-    /// `group_version` is `None`), simply initializes it.
-    fn maybe_flush_and_advance(&mut self, file_version: Version) {
-        match self.group_version {
-            Some(gv) if file_version != gv => {
-                self.select_checkpoint_for_group(gv);
-                self.group_version = Some(file_version);
-            }
-            None => {
-                self.group_version = Some(file_version);
-            }
-            _ => {} // same version, no flush needed
         }
     }
 
@@ -387,10 +395,7 @@ impl LogSegmentFiles {
 
             // Track max published commit version from ALL filesystem Commit files,
             // including those that will be skipped because log_tail takes precedence.
-            if matches!(file.file_type, LogPathFileType::Commit) {
-                acc.output.max_published_version =
-                    acc.output.max_published_version.max(Some(file.version));
-            }
+            acc.observe_published_file(&file);
 
             // Skip filesystem commits at versions covered by the log_tail (the log_tail
             // is authoritative for commits). Non-commit files are always kept.
@@ -418,11 +423,7 @@ impl LogSegmentFiles {
             .filter(|entry| entry.version >= start_version && entry.version <= end);
         for file in filtered_log_tail {
             // Track max published version for published commits from the log_tail
-            if matches!(file.file_type, LogPathFileType::Commit) {
-                acc.output.max_published_version =
-                    acc.output.max_published_version.max(Some(file.version));
-            }
-
+            acc.observe_published_file(&file);
             acc.maybe_flush_and_advance(file.version);
             acc.process_file(file);
         }

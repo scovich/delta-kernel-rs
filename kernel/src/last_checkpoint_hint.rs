@@ -144,6 +144,15 @@ impl LastCheckpointHint {
         Ok(hint.drop_oversized_fields())
     }
 
+    /// Parses raw `_last_checkpoint` bytes, returning `None` for invalid JSON.
+    pub(crate) fn try_from_bytes(bytes: &[u8]) -> Option<Self> {
+        let result = Self::from_bytes_with_oversized_fields_dropped(bytes)
+            .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
+            .ok();
+        info!(hint = result.as_ref().map(|h| h.summary()));
+        result
+    }
+
     /// Drops `sidecarFiles` / `nonFileActions` over the threshold. Drops the whole field, never
     /// truncates. Absent means info missing, so this only loses an optimization.
     fn drop_oversized_fields(mut self) -> Self {
@@ -198,14 +207,7 @@ impl LastCheckpointHint {
     ) -> DeltaResult<Option<LastCheckpointHint>> {
         let file_path = Self::path(log_root)?;
         match storage.read_files(vec![(file_path, None)])?.next() {
-            Some(Ok(data)) => {
-                let result: Option<LastCheckpointHint> =
-                    Self::from_bytes_with_oversized_fields_dropped(&data)
-                        .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
-                        .ok();
-                info!(hint = result.as_ref().map(|h| h.summary()));
-                Ok(result)
-            }
+            Some(Ok(data)) => Ok(Self::try_from_bytes(&data)),
             Some(Err(Error::FileNotFound(_))) => {
                 info!("_last_checkpoint file not found");
                 Ok(None)
