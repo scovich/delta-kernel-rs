@@ -655,6 +655,53 @@ async fn test_non_commit_files_at_log_tail_versions_are_preserved() {
 
 // ===== list_with_backward_checkpoint_scan() tests =====
 
+#[test]
+fn backward_checkpoint_search_carries_version_group_across_pages() {
+    let checkpoint_part_1 = multipart_checkpoint_name(5, 1, 3);
+    let checkpoint_part_2 = multipart_checkpoint_name(5, 2, 3);
+    let checkpoint_part_3 = multipart_checkpoint_name(5, 3, 3);
+    let high_page = vec![
+        parse_log_path(&checkpoint_part_2),
+        parse_log_path(&checkpoint_part_3),
+        parse_log_path("00000000000000000006.json"),
+    ];
+    let low_page = vec![parse_log_path(&checkpoint_part_1)];
+    let mut search = BackwardCheckpointSearch::default();
+
+    assert!(!search.push_page(high_page, false));
+    assert!(search.push_page(low_page, true));
+    let (pages, checkpoint_version) = search.finish();
+
+    assert_eq!(checkpoint_version, Some(5));
+    assert_eq!(
+        pages
+            .into_iter()
+            .rev()
+            .flatten()
+            .map(|file| file.filename)
+            .collect::<Vec<_>>(),
+        vec![
+            checkpoint_part_1.as_str(),
+            checkpoint_part_2.as_str(),
+            checkpoint_part_3.as_str(),
+            "00000000000000000006.json",
+        ]
+    );
+}
+
+#[test]
+fn backward_checkpoint_search_closes_unknown_boundary_at_eof() {
+    let page = (1..=3)
+        .map(|part_num| parse_log_path(&multipart_checkpoint_name(5, part_num, 3)))
+        .collect();
+    let mut search = BackwardCheckpointSearch::default();
+
+    assert!(!search.push_page(page, false));
+    let (_, checkpoint_version) = search.finish();
+
+    assert_eq!(checkpoint_version, Some(5));
+}
+
 // Log from v0 to v1005. Each case places an optional single-part checkpoint and
 // verifies the expected commits, checkpoint version, and number of storage listings.
 //
