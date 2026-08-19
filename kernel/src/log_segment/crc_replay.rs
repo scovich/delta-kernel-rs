@@ -682,6 +682,7 @@ mod tests {
     use super::*;
     use crate::crc::{DomainMetadataState, FileStats, FileStatsState, SetTransactionState};
     use crate::engine::sync::SyncEngine;
+    use crate::log_segment::for_snapshot_from_storage;
     use crate::object_store::memory::InMemory;
     use crate::table_features::TableFeature;
 
@@ -946,7 +947,7 @@ mod tests {
 "#.to_string()).await.unwrap();
 
         let log_root = url::Url::parse(root).unwrap().join("_delta_log/").unwrap();
-        let segment = LogSegment::for_snapshot_impl(
+        let segment = for_snapshot_from_storage(
             engine.storage_handler().as_ref(),
             log_root,
             vec![],
@@ -1023,7 +1024,7 @@ mod tests {
         .await
         .unwrap();
         let log_root = url::Url::parse(root).unwrap().join("_delta_log/").unwrap();
-        let segment = LogSegment::for_snapshot_impl(
+        let segment = for_snapshot_from_storage(
             engine.storage_handler().as_ref(),
             log_root,
             vec![],
@@ -1053,7 +1054,7 @@ mod tests {
         .await
         .unwrap();
         let log_root = url::Url::parse(root).unwrap().join("_delta_log/").unwrap();
-        let segment = LogSegment::for_snapshot_impl(
+        let segment = for_snapshot_from_storage(
             engine.storage_handler().as_ref(),
             log_root,
             vec![],

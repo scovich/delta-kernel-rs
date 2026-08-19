@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -5,6 +6,9 @@ use rstest::rstest;
 use url::Url;
 
 use super::*;
+use crate::coroutine::engine::EngineRequestState;
+use crate::coroutine::listing::{ListFiles, ListFilesResult};
+use crate::coroutine::{self, Resume};
 use crate::engine::sync::SyncEngine;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::object_store::memory::InMemory;
@@ -200,6 +204,106 @@ impl StorageHandler for CountingStorageHandler {
     }
 }
 
+type ListingResume = Resume<LogSegmentFiles, ListingRequest, ListFilesResult>;
+
+struct ListingRequest(ListFiles, ListingResume);
+
+fn drive_listing<F, Fut>(storage: &dyn StorageHandler, workflow: F) -> DeltaResult<LogSegmentFiles>
+where
+    F: FnOnce(Channel<LogSegmentFiles, ListingRequest>) -> Fut + Send + 'static,
+    Fut: Future<Output = DeltaResult<LogSegmentFiles>> + Send + 'static,
+{
+    let mut engine_state = EngineRequestState::default();
+    coroutine::drive_to_completion!(coroutine::start(workflow), |request| match request {
+        ListingRequest(request, resume) => {
+            resume.resume(engine_state.execute_list_files(storage, request))
+        }
+    })
+}
+
+fn list(
+    storage: &dyn StorageHandler,
+    log_root: &Url,
+    log_tail: Vec<ParsedLogPath>,
+    start_version: Option<Version>,
+    end_version: Option<Version>,
+) -> DeltaResult<LogSegmentFiles> {
+    let log_root = log_root.clone();
+    drive_listing(storage, async move |mut channel| {
+        LogSegmentFiles::list(
+            &mut channel,
+            ListingRequest,
+            &log_root,
+            log_tail,
+            start_version,
+            end_version,
+        )
+        .await
+    })
+}
+
+fn list_commits(
+    storage: &dyn StorageHandler,
+    log_root: &Url,
+    log_tail: Vec<ParsedLogPath>,
+    start_version: Option<Version>,
+    end_version: Option<Version>,
+) -> DeltaResult<LogSegmentFiles> {
+    let log_root = log_root.clone();
+    drive_listing(storage, async move |mut channel| {
+        LogSegmentFiles::list_commits(
+            &mut channel,
+            ListingRequest,
+            &log_root,
+            log_tail,
+            start_version,
+            end_version,
+        )
+        .await
+    })
+}
+
+fn list_with_checkpoint_hint(
+    checkpoint_hint: &LastCheckpointHint,
+    storage: &dyn StorageHandler,
+    log_root: &Url,
+    log_tail: Vec<ParsedLogPath>,
+    end_version: Option<Version>,
+) -> DeltaResult<LogSegmentFiles> {
+    let checkpoint_hint = checkpoint_hint.clone();
+    let log_root = log_root.clone();
+    drive_listing(storage, async move |mut channel| {
+        LogSegmentFiles::list_with_checkpoint_hint(
+            &checkpoint_hint,
+            &mut channel,
+            ListingRequest,
+            &log_root,
+            log_tail,
+            end_version,
+        )
+        .await
+    })
+}
+
+fn list_with_backward_checkpoint_scan(
+    storage: &dyn StorageHandler,
+    log_root: &Url,
+    log_tail: Vec<ParsedLogPath>,
+    end_version: Version,
+) -> DeltaResult<LogSegmentFiles> {
+    let log_root = log_root.clone();
+    drive_listing(storage, async move |mut channel| {
+        LogSegmentFiles::list_with_backward_checkpoint_scan(
+            &mut channel,
+            ListingRequest,
+            &log_root,
+            log_tail,
+            end_version,
+        )
+        .await
+    })
+}
+
 /// Helper to call `LogSegmentFiles::list()` and destructure the result for assertions.
 /// Returns (ascending_commit_files, ascending_compaction_files, checkpoint_parts,
 ///          latest_crc_file, latest_commit_file, max_published_version).
@@ -218,7 +322,7 @@ fn list_and_destructure(
     Option<ParsedLogPath>,
     Option<Version>,
 ) {
-    let r = LogSegmentFiles::list(storage, log_root, log_tail, start_version, end_version).unwrap();
+    let r = list(storage, log_root, log_tail, start_version, end_version).unwrap();
     (
         r.ascending_commit_files,
         r.ascending_compaction_files,
@@ -737,9 +841,7 @@ async fn backward_scan_single_checkpoint_cases(
     let (storage, log_root) = create_storage(log_files).await;
     let counter = CountingStorageHandler::new(storage);
 
-    let result =
-        LogSegmentFiles::list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 1005)
-            .unwrap();
+    let result = list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 1005).unwrap();
 
     assert_eq!(counter.call_count(), expected_listings);
 
@@ -861,13 +963,8 @@ async fn backward_scan_multipart_checkpoint_cases(
     let (storage, log_root) = create_storage(log_files).await;
     let counter = CountingStorageHandler::new(storage);
 
-    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
-        &counter,
-        &log_root,
-        vec![],
-        end_version,
-    )
-    .unwrap();
+    let result =
+        list_with_backward_checkpoint_scan(&counter, &log_root, vec![], end_version).unwrap();
 
     assert_eq!(counter.call_count(), expected_listings);
     assert_eq!(result.checkpoint_parts.len(), expected_checkpoint_parts);
@@ -911,13 +1008,8 @@ async fn backward_scan_with_log_tail_derives_lower_bound_from_checkpoint() {
         })
         .collect();
 
-    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
-        storage.as_ref(),
-        &log_root,
-        log_tail,
-        10,
-    )
-    .unwrap();
+    let result =
+        list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, log_tail, 10).unwrap();
 
     assert_eq!(result.checkpoint_parts.len(), 1);
     assert_eq!(result.checkpoint_parts[0].version, 5);
@@ -961,13 +1053,8 @@ async fn backward_scan_with_log_tail_starting_before_checkpoint() {
         })
         .collect();
 
-    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
-        storage.as_ref(),
-        &log_root,
-        log_tail,
-        8,
-    )
-    .unwrap();
+    let result =
+        list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, log_tail, 8).unwrap();
 
     assert_eq!(result.checkpoint_parts.len(), 1);
     assert_eq!(result.checkpoint_parts[0].version, 5);
@@ -1003,13 +1090,8 @@ async fn backward_scan_log_tail_defines_latest_version() {
         CommitSource::Catalog,
     )];
 
-    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
-        storage.as_ref(),
-        &log_root,
-        log_tail,
-        5,
-    )
-    .unwrap();
+    let result =
+        list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, log_tail, 5).unwrap();
 
     let expected = [
         (0, CommitSource::Filesystem),
@@ -1064,8 +1146,7 @@ async fn test_zero_byte_commit_kept_in_listing() {
     ];
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
-    let result =
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
+    let result = list(storage.as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
     assert_eq!(result.ascending_commit_files.len(), 3);
     assert_eq!(result.ascending_commit_files[0].version, 0);
     assert_eq!(result.ascending_commit_files[1].version, 1);
@@ -1094,10 +1175,9 @@ async fn test_zero_byte_compaction_skipped_commits_used(#[case] use_backward_sca
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result = if use_backward_scan {
-        LogSegmentFiles::list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, vec![], 4)
-            .unwrap()
+        list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, vec![], 4).unwrap()
     } else {
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(4)).unwrap()
+        list(storage.as_ref(), &log_root, vec![], Some(0), Some(4)).unwrap()
     };
 
     assert!(
@@ -1134,10 +1214,9 @@ async fn test_zero_byte_checkpoint_skipped_older_used(#[case] use_backward_scan:
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result = if use_backward_scan {
-        LogSegmentFiles::list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, vec![], 10)
-            .unwrap()
+        list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, vec![], 10).unwrap()
     } else {
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(10)).unwrap()
+        list(storage.as_ref(), &log_root, vec![], Some(0), Some(10)).unwrap()
     };
 
     // Should fall back to checkpoint at v5 (the empty v10 checkpoint is skipped)
@@ -1162,8 +1241,7 @@ async fn test_zero_byte_crc_kept() {
     ];
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
-    let result =
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
+    let result = list(storage.as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
 
     // The 0-byte CRC at v2 is kept (latest_crc_file tracks the highest version)
     let crc = result.latest_crc_file.unwrap();
@@ -1186,9 +1264,7 @@ async fn test_zero_byte_checkpoint_backward_scan_crosses_windows() {
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
     let counter = CountingStorageHandler::new(storage);
 
-    let result =
-        LogSegmentFiles::list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 1005)
-            .unwrap();
+    let result = list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 1005).unwrap();
 
     // Needed 2 windows because the 0-byte checkpoint at v1005 was skipped
     assert_eq!(counter.call_count(), 2);
@@ -1210,9 +1286,7 @@ async fn test_list_commits_zero_byte_commit_kept() {
     ];
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
-    let result =
-        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, vec![], Some(0), Some(2))
-            .unwrap();
+    let result = list_commits(storage.as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
     assert_eq!(result.ascending_commit_files.len(), 3);
     assert_eq!(result.ascending_commit_files[2].version, 2);
     assert_eq!(result.ascending_commit_files[2].location.size, 0);
@@ -1282,8 +1356,7 @@ async fn list_commits_merges_log_tail(
         })
         .collect();
 
-    let result =
-        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, log_tail, start, end).unwrap();
+    let result = list_commits(storage.as_ref(), &log_root, log_tail, start, end).unwrap();
 
     let commits = &result.ascending_commit_files;
     assert_eq!(commits.len(), expected.len());
@@ -1309,9 +1382,7 @@ async fn test_list_commits_keeps_commits_across_checkpoint() {
     ));
     let (storage, log_root) = create_storage(files).await;
 
-    let result =
-        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, vec![], Some(0), Some(5))
-            .unwrap();
+    let result = list_commits(storage.as_ref(), &log_root, vec![], Some(0), Some(5)).unwrap();
     let versions: Vec<_> = result
         .ascending_commit_files
         .iter()
@@ -1637,14 +1708,8 @@ async fn last_checkpoint_hint_applies_iff_it_names_the_selected_checkpoint(
     )
     .await;
 
-    let listed = LogSegmentFiles::list_with_checkpoint_hint(
-        &hint,
-        storage.as_ref(),
-        &log_root,
-        vec![],
-        None,
-    )
-    .unwrap();
+    let listed =
+        list_with_checkpoint_hint(&hint, storage.as_ref(), &log_root, vec![], None).unwrap();
 
     // The winner is the same no matter what the hint names.
     assert_eq!(listed.checkpoint_parts.len(), 1);

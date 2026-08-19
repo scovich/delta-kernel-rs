@@ -11,9 +11,11 @@ use url::Url;
 use crate::actions::{
     CheckpointMetadata, DomainMetadata, Metadata, Protocol, SetTransaction, Sidecar,
 };
+use crate::coroutine::read::{ReadFiles, ReadFilesConstructor};
+use crate::coroutine::{self, Channel};
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, Error, FileMeta, StorageHandler, Version};
+use crate::{DeltaResult, Error, FileMeta, Version};
 
 /// Name of the _last_checkpoint file that provides metadata about the last checkpoint
 /// created for the table. This file is used as a hint for the engine to quickly locate
@@ -198,16 +200,25 @@ impl LastCheckpointHint {
     /// failing the read. Thus, the semantics of this function are to return `None` if the file is
     /// not found or is invalid JSON. Unexpected/unrecoverable errors are returned as `Err` case and
     /// are assumed to cause failure.
-    // TODO(#1047): weird that we propagate FileNotFound as part of the iterator instead of top-
-    // level result coming from storage.read_files
     #[instrument(name = "last_checkpoint.read", skip_all, err)]
-    pub(crate) fn try_read(
-        storage: &dyn StorageHandler,
+    pub(crate) async fn try_read<O: Send + 'static, Q: Send + 'static>(
+        channel: &mut Channel<O, Q>,
+        read_files: ReadFilesConstructor<O, Q>,
         log_root: &Url,
     ) -> DeltaResult<Option<LastCheckpointHint>> {
         let file_path = Self::path(log_root)?;
-        match storage.read_files(vec![(file_path, None)])?.next() {
-            Some(Ok(data)) => Ok(Self::try_from_bytes(&data)),
+        let request = ReadFiles::Start(vec![(file_path, None)]);
+        match coroutine::offload(channel, read_files, request)
+            .await
+            .transpose()
+        {
+            Some(Ok(data)) => {
+                let Some(data) = data.first() else {
+                    warn!("empty _last_checkpoint file");
+                    return Ok(None);
+                };
+                Ok(Self::try_from_bytes(data))
+            }
             Some(Err(Error::FileNotFound(_))) => {
                 info!("_last_checkpoint file not found");
                 Ok(None)
@@ -578,9 +589,11 @@ mod tests {
             config: expected_config,
         } = expected;
 
-        let (engine, snapshot, _tempdir) = load_test_table(table)?;
+        let (_engine, snapshot, _tempdir) = load_test_table(table)?;
         let seg = snapshot.log_segment();
-        let hint = LastCheckpointHint::try_read(engine.storage_handler().as_ref(), &seg.log_root)?
+        let hint = seg
+            .last_checkpoint_metadata
+            .as_ref()
             .expect("table has a _last_checkpoint");
         let v2 = hint.v2_checkpoint.as_ref().expect("V2 checkpoint hint");
 

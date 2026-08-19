@@ -3,11 +3,15 @@
 //! Public API: `Snapshot::builder_from(existing).build(engine)`. The case-by-case
 //! behavior lives in [`Snapshot::try_new_from`].
 
+use std::future::Future;
 use std::sync::Arc;
 
 use tracing::instrument;
 
 use super::{IncrementalReplay, Snapshot};
+use crate::coroutine::engine::EngineRequestState;
+use crate::coroutine::listing::{ListFiles, ListFilesResult};
+use crate::coroutine::{self, Channel, Resume};
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::{
@@ -29,6 +33,24 @@ enum NewSegment {
     Rebuild(LogSegment),
     /// New commits merged into the existing segment; ready for incremental P&M.
     Combined(LogSegment),
+}
+
+type NewSegmentResume = Resume<NewSegment, NewSegmentRequest, ListFilesResult>;
+
+struct NewSegmentRequest(ListFiles, NewSegmentResume);
+
+fn drive_new_segment<F, Fut>(engine: &dyn Engine, workflow: F) -> DeltaResult<NewSegment>
+where
+    F: FnOnce(Channel<NewSegment, NewSegmentRequest>) -> Fut + Send + 'static,
+    Fut: Future<Output = DeltaResult<NewSegment>> + Send + 'static,
+{
+    let storage = engine.storage_handler();
+    let mut engine_state = EngineRequestState::default();
+    coroutine::drive_to_completion!(coroutine::start(workflow), |request| match request {
+        NewSegmentRequest(request, resume) => {
+            resume.resume(engine_state.execute_list_files(storage.as_ref(), request))
+        }
+    })
 }
 
 impl Snapshot {
@@ -108,7 +130,6 @@ impl Snapshot {
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
     ) -> DeltaResult<Arc<Self>> {
-        let existing_log_segment = &existing_snapshot.log_segment;
         let existing_snapshot_version = existing_snapshot.version();
         let requested_version = target_version.into();
         if let Some(requested_version) = requested_version {
@@ -133,8 +154,7 @@ impl Snapshot {
         let segment_load_start = std::time::Instant::now();
         let (combined_log_segment, new_end_version) = match Self::build_new_segment(
             engine,
-            existing_log_segment,
-            existing_snapshot_version,
+            Arc::clone(&existing_snapshot),
             log_tail,
             requested_version,
         )
@@ -233,24 +253,45 @@ impl Snapshot {
     /// propagated `Err` is a genuine listing/assembly failure.
     fn build_new_segment(
         engine: &dyn Engine,
-        existing_log_segment: &LogSegment,
-        existing_snapshot_version: Version,
+        existing_snapshot: Arc<Snapshot>,
         log_tail: Vec<ParsedLogPath>,
         requested_version: Option<Version>,
     ) -> DeltaResult<NewSegment> {
+        drive_new_segment(engine, async move |mut channel| {
+            Self::construct_new_segment(
+                &mut channel,
+                NewSegmentRequest,
+                &existing_snapshot,
+                log_tail,
+                requested_version,
+            )
+            .await
+        })
+    }
+
+    async fn construct_new_segment<O: Send + 'static, Q: Send + 'static>(
+        channel: &mut Channel<O, Q>,
+        list_files: fn(ListFiles, Resume<O, Q, ListFilesResult>) -> Q,
+        existing_snapshot: &Snapshot,
+        log_tail: Vec<ParsedLogPath>,
+        requested_version: Option<Version>,
+    ) -> DeltaResult<NewSegment> {
+        let existing_log_segment = &existing_snapshot.log_segment;
+        let existing_snapshot_version = existing_snapshot.version();
         let log_root = existing_log_segment.log_root.clone();
-        let storage = engine.storage_handler();
 
         // Start listing just after the previous segment's checkpoint, if any.
         let listing_start = existing_log_segment.checkpoint_version.unwrap_or(0) + 1;
 
         let new_listed_files = LogSegmentFiles::list(
-            storage.as_ref(),
+            channel,
+            list_files,
             &log_root,
             log_tail,
             Some(listing_start),
             requested_version,
-        )?;
+        )
+        .await?;
 
         // NB: we need to check both checkpoints and commits since we filter commits at and below
         // the checkpoint version. Example: if we have a checkpoint + commit at version 1, the log

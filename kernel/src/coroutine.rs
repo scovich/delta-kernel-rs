@@ -14,7 +14,7 @@
 //! The work item's type is specific to each kernel workflow, an enum whose two-field tuple variants
 //! document the work items kernel might delegate to the connector. The first field describes the
 //! actual work to be done, and the second field is a [`Resume`] instance matched to the responses
-//! kernel expects back. The [`while_next_step!`] macro simplifies the `ControlFlow` loop by
+//! kernel expects back. The [`drive_to_completion!`] macro simplifies the `ControlFlow` loop by
 //! repeatedly dispatching `Continue` cases as needed, and returning the content of the final
 //! `Break`.
 //!
@@ -108,7 +108,7 @@
 //! // The connector drives the kernel workflow by looping on `ControlFlow::Continue`: performing
 //! // each work item kernel requests and resuming the workflow with the response.
 //! //
-//! // NOTE: Connectors should normally use the `while_next_step!` macro instead of a manual loop.
+//! // NOTE: Connectors should prefer the `drive_to_completion!` macro instead of a manual loop.
 //! fn connector_quotient_as_string(dividend: u32, divisor: u32) -> DeltaResult<String> {
 //!     let mut next = quotient_as_string(dividend, divisor)?;
 //!     loop {
@@ -127,7 +127,9 @@
 //! assert_eq!("0.25", connector_quotient_as_string(1, 4)?);
 //! # Ok::<(), delta_kernel::Error>(())
 //! ```
+pub(crate) mod engine;
 pub mod listing;
+pub mod read;
 
 use std::any::Any;
 use std::fmt;
@@ -155,7 +157,7 @@ use crate::{DeltaResult, Error};
 /// # use std::ops::ControlFlow;
 /// # use delta_kernel::coroutine::{self, Channel};
 /// # use delta_kernel::DeltaResult;
-/// use delta_kernel::coroutine::{while_next_step, Resume};
+/// use delta_kernel::coroutine::Resume;
 ///
 /// /// The kernel-provided workflow-specific `Resume` type for `QuotientAsStringRequest`.
 /// pub type QuotientAsStringResume<R> = Resume<String, QuotientAsStringRequest, R>;
@@ -193,7 +195,9 @@ use crate::{DeltaResult, Error};
 /// # }
 ///
 /// // Use the macro to drive the `kernel_quotient_as_string` workflow.
-/// let output = while_next_step!(kernel_quotient_as_string(1, 4), |request| match request {
+/// let output = coroutine::drive_to_completion!(
+///     kernel_quotient_as_string(1, 4),
+///     |request| match request {
 ///     QuotientAsStringRequest::Divide((dividend, divisor), resume) => {
 ///         resume.resume(Ok(dividend as f64 / divisor as f64))
 ///     }
@@ -206,7 +210,7 @@ use crate::{DeltaResult, Error};
 /// ```
 #[macro_export]
 #[doc(hidden)]
-macro_rules! __while_next_step {
+macro_rules! __drive_to_completion {
     ($step:expr, |$request:ident| $handler:expr $(,)?) => {{
         let mut next = $step;
         loop {
@@ -226,7 +230,7 @@ macro_rules! __while_next_step {
 }
 
 #[doc(inline)]
-pub use crate::__while_next_step as while_next_step;
+pub use crate::__drive_to_completion as drive_to_completion;
 
 // === Implementation ===
 //
@@ -329,12 +333,7 @@ pub struct Resume<O, Q, R> {
     response_type: PhantomData<R>,
 }
 
-impl<O, Q, R> Resume<O, Q, R>
-where
-    O: Send + 'static,
-    Q: Send + 'static,
-    R: Send + 'static,
-{
+impl<O: Send + 'static, Q: Send + 'static, R: Send + 'static> Resume<O, Q, R> {
     /// Submit `response` and run kernel until its next request or completion.
     ///
     /// Returns [`ControlFlow::Continue`] with the next connector request, or
@@ -415,14 +414,10 @@ where
 }
 
 // Advances the generator by `response` and translates the result to `ControlFlow`.
-fn advance<O, Q>(
+fn advance<O: Send + 'static, Q: Send + 'static>(
     mut generator: Generator<O, Q>,
     response: ErasedResponse,
-) -> DeltaResult<ControlFlow<O, Q>>
-where
-    O: Send + 'static,
-    Q: Send + 'static,
-{
+) -> DeltaResult<ControlFlow<O, Q>> {
     match generator.resume_with(response) {
         GeneratorState::Yielded(pending) => Ok(ControlFlow::Continue(pending.attach(generator))),
         GeneratorState::Complete(result) => result.map(ControlFlow::Break),

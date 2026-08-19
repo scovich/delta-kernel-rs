@@ -1325,6 +1325,9 @@ mod tests {
     use crate::arrow::array::StringArray;
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::FileSystemCommitter;
+    use crate::coroutine;
+    use crate::coroutine::engine::EngineRequestState;
+    use crate::coroutine::read::{ReadFiles, ReadFilesResume};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -1494,6 +1497,26 @@ mod tests {
         assert_eq!(snapshot.schema(), expected);
     }
 
+    fn read_last_checkpoint(
+        storage: &dyn crate::StorageHandler,
+        log_root: &Url,
+    ) -> DeltaResult<Option<LastCheckpointHint>> {
+        type LastCheckpointRequest = ReadFilesResume<Option<LastCheckpointHint>, ReadFilesRequest>;
+        struct ReadFilesRequest(ReadFiles, LastCheckpointRequest);
+
+        let log_root = log_root.clone();
+        let next = coroutine::start(async move |mut channel| {
+            LastCheckpointHint::try_read(&mut channel, ReadFilesRequest, &log_root).await
+        });
+
+        let mut engine_state = EngineRequestState::default();
+        coroutine::drive_to_completion!(next, |request| match request {
+            ReadFilesRequest(request, resume) => {
+                resume.resume(engine_state.execute_read_files(storage, request))
+            }
+        })
+    }
+
     #[test]
     fn test_read_table_with_missing_last_checkpoint() {
         // this table doesn't have a _last_checkpoint file
@@ -1505,7 +1528,7 @@ mod tests {
 
         let engine = SyncEngine::new();
         let storage = engine.storage_handler();
-        let cp = LastCheckpointHint::try_read(storage.as_ref(), &url).unwrap();
+        let cp = read_last_checkpoint(storage.as_ref(), &url).unwrap();
         assert!(cp.is_none());
     }
 
@@ -1564,8 +1587,7 @@ mod tests {
         let engine = SyncEngine::new_with_store(store);
         let storage = engine.storage_handler();
         let url = Url::parse("memory:///invalid/").expect("valid url");
-        let invalid =
-            LastCheckpointHint::try_read(storage.as_ref(), &url).expect("read last checkpoint");
+        let invalid = read_last_checkpoint(storage.as_ref(), &url).expect("read last checkpoint");
         assert!(invalid.is_none())
     }
 
@@ -1600,7 +1622,7 @@ mod tests {
         for (path_prefix, _, expected_result) in test_cases {
             let url = Url::parse(&format!("memory:///{path_prefix}/")).expect("valid url");
             let result =
-                LastCheckpointHint::try_read(storage.as_ref(), &url).expect("read last checkpoint");
+                read_last_checkpoint(storage.as_ref(), &url).expect("read last checkpoint");
             assert_eq!(result, expected_result);
         }
     }

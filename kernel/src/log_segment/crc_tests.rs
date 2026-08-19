@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use test_utils::{assert_result_error_with_message, delta_path_for_version};
 use url::Url;
 
-use super::LogSegment;
+use super::for_snapshot_from_storage;
 use crate::actions::{DomainMetadata, Format, Metadata, Protocol, SetTransaction};
 use crate::crc::{
     try_read_crc_file, Crc, DomainMetadataState, FileSizeHistogram, SetTransactionState,
@@ -395,7 +395,7 @@ impl BuiltCrcTest {
         let storage = self.engine.storage_handler();
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
-            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None)?;
+            for_snapshot_from_storage(storage.as_ref(), log_root, vec![], None, None)?;
         log_segment.build_crc_from_base(&self.engine, base)
     }
 
@@ -407,7 +407,7 @@ impl BuiltCrcTest {
         let storage = self.engine.storage_handler();
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
-            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None)?;
+            for_snapshot_from_storage(storage.as_ref(), log_root, vec![], None, None)?;
         Ok(log_segment
             .pick_latest_base_crc(&self.engine, in_memory_base)
             .map(|c| c.version))

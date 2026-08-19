@@ -21,6 +21,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::num::NonZero;
 
 use error::{LogHistoryError, NearestTimestamp};
@@ -29,8 +30,11 @@ use search::{binary_search_by_key_with_bounds, Bound, SearchError};
 use tracing::{info, trace, warn};
 use url::Url;
 
+use crate::coroutine::engine::EngineRequestState;
+use crate::coroutine::listing::{log_listing_request, ListFiles, ListFilesResult};
+use crate::coroutine::{self, Channel, Resume};
 use crate::log_segment::LogSegment;
-use crate::log_segment_files::{list_delta_log_from_storage, should_process_log_file};
+use crate::log_segment_files::{parse_delta_log_listing, should_process_log_file};
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::InCommitTimestampEnablement;
@@ -85,6 +89,11 @@ enum TimestampSearchBounds {
         ict_enablement_timestamp: Timestamp,
     },
 }
+
+type HistoryListingResume<O> = Resume<O, HistoryListingRequest<O>, ListFilesResult>;
+type HistoryListingChannel<O> = Channel<O, HistoryListingRequest<O>>;
+
+struct HistoryListingRequest<O>(ListFiles, HistoryListingResume<O>);
 
 /// Determines the search strategy for timestamp-to-version conversion based on ICT enablement.
 ///
@@ -692,6 +701,21 @@ pub fn timestamp_range_to_versions(
     Ok((start_version, end_version))
 }
 
+fn drive_history_listing<O, F, Fut>(engine: &dyn Engine, workflow: F) -> DeltaResult<O>
+where
+    O: Send + 'static,
+    F: FnOnce(HistoryListingChannel<O>) -> Fut + Send + 'static,
+    Fut: Future<Output = DeltaResult<O>> + Send + 'static,
+{
+    let storage = engine.storage_handler();
+    let mut engine_state = EngineRequestState::default();
+    coroutine::drive_to_completion!(coroutine::start(workflow), |request| match request {
+        HistoryListingRequest(request, resume) => {
+            resume.resume(engine_state.execute_list_files(storage.as_ref(), request))
+        }
+    })
+}
+
 /// Returns the earliest commit version available on the file system for this table.
 ///
 /// The returned version is the version of the lowest-numbered `*.json` commit file present in
@@ -718,22 +742,50 @@ fn get_earliest_published_commit_version(
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
 ) -> DeltaResult<Version> {
-    list_delta_log_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?
-        .filter_ok(|f| f.file_type == LogPathFileType::Commit)
-        .next()
-        .transpose()?
-        .map(|f| f.version)
-        .ok_or_else(|| {
-            if earliest_ratified_commit_version == Some(0) {
-                return DeltaError::generic(format!(
-                    "expected a published v0 commit for catalog-managed table {log_root}, \
-                       but the log listing returned no commits"
-                ));
+    fn first_published_commit_version(
+        files: impl Iterator<Item = DeltaResult<ParsedLogPath>>,
+    ) -> DeltaResult<Option<Version>> {
+        Ok(files
+            .filter_ok(|f| f.file_type == LogPathFileType::Commit)
+            .next()
+            .transpose()?
+            .map(|f| f.version))
+    }
+
+    let listing_root = log_root.clone();
+    drive_history_listing(engine, async move |mut channel| {
+        let request = log_listing_request(&listing_root, 0, Version::MAX, true)?;
+        let mut cursor = None;
+        loop {
+            let work = ListFiles {
+                request: request.clone(),
+                cursor,
+            };
+            let page = coroutine::offload(&mut channel, HistoryListingRequest, work).await?;
+            let files =
+                parse_delta_log_listing(page.entries.into_iter(), &listing_root, Version::MAX);
+            let version = first_published_commit_version(files)?;
+            if let Some(version) = version {
+                return Ok(Some(version));
             }
-            DeltaError::from(LogHistoryError::NoCommitsFound {
-                log_root: log_root.clone(),
-            })
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(None)
+    })?
+    .ok_or_else(|| {
+        if earliest_ratified_commit_version == Some(0) {
+            return DeltaError::generic(format!(
+                "expected a published v0 commit for catalog-managed table {log_root}, \
+                 but the log listing returned no commits"
+            ));
+        }
+        DeltaError::from(LogHistoryError::NoCommitsFound {
+            log_root: log_root.clone(),
         })
+    })
 }
 
 /// Returns the earliest table version that can be fully reconstructed, and from which we can replay
@@ -762,63 +814,90 @@ fn get_earliest_recreatable_commit(
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
 ) -> DeltaResult<Version> {
-    let mut last_complete_checkpoint: Option<Version> = None;
-    // Tracks (version, num_parts) -> set of part numbers observed so far, for multi-part
-    // checkpoint completeness.
+    let listing_root = log_root.clone();
+    let mut last_complete_checkpoint = None;
     let mut multi_part_checkpoint_progress = HashMap::<(Version, u32), HashSet<u32>>::new();
-    let mut earliest_commit_version: Option<Version> = None;
-
-    let listing =
-        list_delta_log_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?;
-    for parsed_result in listing {
-        let parsed_log_path = parsed_result?;
-        if !should_process_log_file(&parsed_log_path) {
-            continue;
-        }
-        match parsed_log_path.file_type {
-            LogPathFileType::Commit => {
-                if parsed_log_path.version == 0 {
-                    return Ok(0);
+    let mut observe_files =
+        move |listing, earliest_commit_version: &mut Option<_>| -> DeltaResult<_> {
+            for parsed_result in listing {
+                let parsed_log_path = parsed_result?;
+                if !should_process_log_file(&parsed_log_path) {
+                    continue;
                 }
+                match parsed_log_path.file_type {
+                    LogPathFileType::Commit => {
+                        if parsed_log_path.version == 0 {
+                            return Ok(Some(0));
+                        }
 
-                let earliest_version =
-                    *earliest_commit_version.get_or_insert(parsed_log_path.version);
+                        let earliest_version =
+                            *earliest_commit_version.get_or_insert(parsed_log_path.version);
 
-                if let Some(checkpoint_version) = last_complete_checkpoint {
-                    if checkpoint_version >= earliest_version {
-                        // Given the contiguity assumption of delta_log commits,
-                        // when a full checkpoint has contiguous commits starting before or at
-                        // checkpoint_version that table can be
-                        // recreated at checkpoint_version.
-                        return Ok(checkpoint_version);
+                        if let Some(checkpoint_version) = last_complete_checkpoint {
+                            if checkpoint_version >= earliest_version {
+                                // Given the contiguity assumption of delta_log commits, when a full
+                                // checkpoint has contiguous commits starting before or at
+                                // checkpoint_version, the table can be recreated at
+                                // checkpoint_version.
+                                return Ok(Some(checkpoint_version));
+                            }
+                        }
                     }
+                    LogPathFileType::ClassicCheckpoint | LogPathFileType::UuidCheckpoint => {
+                        last_complete_checkpoint = Some(parsed_log_path.version);
+                    }
+                    LogPathFileType::MultiPartCheckpoint {
+                        part_num,
+                        num_parts,
+                    } => {
+                        let parts = multi_part_checkpoint_progress
+                            .entry((parsed_log_path.version, num_parts))
+                            .or_default();
+                        parts.insert(part_num);
+                        if parts.len() == num_parts as usize {
+                            last_complete_checkpoint = Some(parsed_log_path.version);
+                        }
+                    }
+                    LogPathFileType::StagedCommit
+                    | LogPathFileType::CompactedCommit { .. }
+                    | LogPathFileType::Crc
+                    | LogPathFileType::Unknown => {}
                 }
             }
-            LogPathFileType::ClassicCheckpoint | LogPathFileType::UuidCheckpoint => {
-                last_complete_checkpoint = Some(parsed_log_path.version);
-            }
-            LogPathFileType::MultiPartCheckpoint {
-                part_num,
-                num_parts,
-            } => {
-                let parts = multi_part_checkpoint_progress
-                    .entry((parsed_log_path.version, num_parts))
-                    .or_default();
-                parts.insert(part_num);
-                if parts.len() == num_parts as usize {
-                    last_complete_checkpoint = Some(parsed_log_path.version);
-                }
-            }
-            LogPathFileType::StagedCommit
-            | LogPathFileType::CompactedCommit { .. }
-            | LogPathFileType::Crc
-            | LogPathFileType::Unknown => {}
-        }
-    }
+            Ok(None)
+        };
 
+    let (recreatable_version, earliest_commit_version) =
+        drive_history_listing(engine, async move |mut channel| {
+            let mut earliest_commit_version = None;
+
+            let request = log_listing_request(&listing_root, 0, Version::MAX, true)?;
+            let mut cursor = None;
+            loop {
+                let work = ListFiles {
+                    request: request.clone(),
+                    cursor,
+                };
+                let page = coroutine::offload(&mut channel, HistoryListingRequest, work).await?;
+                let files =
+                    parse_delta_log_listing(page.entries.into_iter(), &listing_root, Version::MAX);
+                if let Some(version) = observe_files(files, &mut earliest_commit_version)? {
+                    return Ok((Some(version), earliest_commit_version));
+                }
+                let Some(next_cursor) = page.next_cursor else {
+                    break;
+                };
+                cursor = Some(next_cursor);
+            }
+            Ok((None, earliest_commit_version))
+        })?;
+
+    if let Some(version) = recreatable_version {
+        return Ok(version);
+    }
     // Files are listed in ascending lexicography order, so any recreatable version, e.g commit 0,
     // or a complete checkpoint immediately followed by its contiguous commit, is detected and
-    // returned inside the loop above. Reaching here therefore means no such version exists,
+    // returned above. Reaching here with a commit therefore means no such version exists,
     // which is always an error.
     if earliest_commit_version.is_some() {
         // Commits exist, but none is anchored by commit 0 or a complete checkpoint.

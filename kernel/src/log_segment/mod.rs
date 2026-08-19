@@ -1,5 +1,6 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of checkpoint and commit
 //! files.
+use std::future::Future;
 use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
 
@@ -14,6 +15,10 @@ use crate::actions::{
 };
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 use crate::committer::CatalogCommit;
+use crate::coroutine::engine::EngineRequestState;
+use crate::coroutine::listing::{ListFiles, ListFilesResult};
+use crate::coroutine::read::{ReadFiles, ReadFilesResume};
+use crate::coroutine::{self, Channel, Resume};
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_reader::commit::CommitReader;
@@ -47,6 +52,50 @@ pub(crate) use domain_metadata_replay::DomainMetadataMap;
 mod crc_tests;
 #[cfg(test)]
 mod tests;
+
+type LogSegmentResume<R> = Resume<LogSegment, LogSegmentRequest, R>;
+
+enum LogSegmentRequest {
+    ListFiles(ListFiles, LogSegmentResume<ListFilesResult>),
+    ReadFiles(ReadFiles, ReadFilesResume<LogSegment, LogSegmentRequest>),
+}
+
+fn drive_log_segment<F, Fut>(storage: &dyn StorageHandler, workflow: F) -> DeltaResult<LogSegment>
+where
+    F: FnOnce(Channel<LogSegment, LogSegmentRequest>) -> Fut + Send + 'static,
+    Fut: Future<Output = DeltaResult<LogSegment>> + Send + 'static,
+{
+    let mut engine_state = EngineRequestState::default();
+    coroutine::drive_to_completion!(coroutine::start(workflow), |request| match request {
+        LogSegmentRequest::ListFiles(request, resume) => {
+            resume.resume(engine_state.execute_list_files(storage, request))
+        }
+        LogSegmentRequest::ReadFiles(request, resume) => {
+            resume.resume(engine_state.execute_read_files(storage, request))
+        }
+    })
+}
+
+#[cfg(test)]
+fn for_snapshot_from_storage(
+    storage: &dyn StorageHandler,
+    log_root: Url,
+    log_tail: Vec<ParsedLogPath>,
+    checkpoint_hint: Option<LastCheckpointHint>,
+    time_travel_version: Option<Version>,
+) -> DeltaResult<LogSegment> {
+    drive_log_segment(storage, async move |mut channel| {
+        LogSegment::for_snapshot_impl(
+            &mut channel,
+            LogSegmentRequest::ListFiles,
+            log_root,
+            log_tail,
+            checkpoint_hint,
+            time_travel_version,
+        )
+        .await
+    })
+}
 
 /// Information about checkpoint reading for data skipping optimization.
 ///
@@ -327,18 +376,21 @@ impl LogSegment {
     ) -> DeltaResult<Self> {
         let time_travel_version = time_travel_version.into();
         let start = std::time::Instant::now();
-        let build = || {
-            let checkpoint_hint = LastCheckpointHint::try_read(storage, &log_root)?;
+        let log_segment = drive_log_segment(storage, async move |mut channel| {
+            let checkpoint_hint =
+                LastCheckpointHint::try_read(&mut channel, LogSegmentRequest::ReadFiles, &log_root)
+                    .await?;
             Self::for_snapshot_impl(
-                storage,
+                &mut channel,
+                LogSegmentRequest::ListFiles,
                 log_root,
                 log_tail,
                 checkpoint_hint,
                 time_travel_version,
             )
-        };
-        let log_segment =
-            build().inspect_err(|_| emit_log_segment_load_failure(&metric_context))?;
+            .await
+        })
+        .inspect_err(|_| emit_log_segment_load_failure(&metric_context))?;
 
         emit_log_segment_load(&metric_context, &log_segment, start.elapsed());
         Ok(log_segment)
@@ -356,8 +408,9 @@ impl LogSegment {
     }
 
     // factored out for testing
-    pub(crate) fn for_snapshot_impl(
-        storage: &dyn StorageHandler,
+    async fn for_snapshot_impl<O: Send + 'static, Q: Send + 'static>(
+        channel: &mut Channel<O, Q>,
+        list_files: fn(ListFiles, Resume<O, Q, ListFilesResult>) -> Q,
         log_root: Url,
         log_tail: Vec<ParsedLogPath>,
         checkpoint_hint: Option<LastCheckpointHint>,
@@ -387,19 +440,28 @@ impl LogSegment {
 
         let listed_files = match (usable_hint, end_version) {
             // Cases 1 and 2
-            (Some(cp), end_version) => LogSegmentFiles::list_with_checkpoint_hint(
-                cp,
-                storage,
-                &log_root,
-                log_tail,
-                end_version,
-            )?,
+            (Some(cp), end_version) => {
+                LogSegmentFiles::list_with_checkpoint_hint(
+                    cp,
+                    channel,
+                    list_files,
+                    &log_root,
+                    log_tail,
+                    end_version,
+                )
+                .await?
+            }
             // Case 3
-            (None, Some(end)) => LogSegmentFiles::list_with_backward_checkpoint_scan(
-                storage, &log_root, log_tail, end,
-            )?,
+            (None, Some(end)) => {
+                LogSegmentFiles::list_with_backward_checkpoint_scan(
+                    channel, list_files, &log_root, log_tail, end,
+                )
+                .await?
+            }
             // Case 4
-            (None, None) => LogSegmentFiles::list(storage, &log_root, log_tail, None, None)?,
+            (None, None) => {
+                LogSegmentFiles::list(channel, list_files, &log_root, log_tail, None, None).await?
+            }
         };
 
         LogSegment::try_new(listed_files, log_root, time_travel_version, checkpoint_hint)
@@ -418,6 +480,25 @@ impl LogSegment {
         end_version: impl Into<Option<Version>>,
     ) -> DeltaResult<Self> {
         let end_version = end_version.into();
+        drive_log_segment(storage, async move |mut channel| {
+            Self::construct_for_table_changes(
+                &mut channel,
+                LogSegmentRequest::ListFiles,
+                log_root,
+                start_version,
+                end_version,
+            )
+            .await
+        })
+    }
+
+    async fn construct_for_table_changes<O: Send + 'static, Q: Send + 'static>(
+        channel: &mut Channel<O, Q>,
+        list_files: fn(ListFiles, Resume<O, Q, ListFilesResult>) -> Q,
+        log_root: Url,
+        start_version: Version,
+        end_version: Option<Version>,
+    ) -> DeltaResult<Self> {
         if let Some(end_version) = end_version {
             if start_version > end_version {
                 return Err(Error::generic(
@@ -430,12 +511,14 @@ impl LogSegment {
         // TODO(#2796): table-changes does not supply a log_tail yet. CDF over a catalog-managed
         // table will need the catalog's commits passed here to see unbackfilled staged commits.
         let listed_files = LogSegmentFiles::list_commits(
-            storage,
+            channel,
+            list_files,
             &log_root,
             vec![], // log-tail
             Some(start_version),
             end_version,
-        )?;
+        )
+        .await?;
         // - Here check that the start version is correct.
         // - [`LogSegment::try_new`] will verify that the `end_version` is correct if present.
         // - [`LogSegmentFiles::list_commits`] also checks that there are no gaps between commits.
@@ -472,6 +555,27 @@ impl LogSegment {
         limit: Option<NonZero<usize>>,
         log_tail: Vec<ParsedLogPath>,
     ) -> DeltaResult<Self> {
+        drive_log_segment(storage, async move |mut channel| {
+            Self::construct_for_timestamp_conversion(
+                &mut channel,
+                LogSegmentRequest::ListFiles,
+                log_root,
+                end_version,
+                limit,
+                log_tail,
+            )
+            .await
+        })
+    }
+
+    async fn construct_for_timestamp_conversion<O: Send + 'static, Q: Send + 'static>(
+        channel: &mut Channel<O, Q>,
+        list_files: fn(ListFiles, Resume<O, Q, ListFilesResult>) -> Q,
+        log_root: Url,
+        end_version: Version,
+        limit: Option<NonZero<usize>>,
+        log_tail: Vec<ParsedLogPath>,
+    ) -> DeltaResult<Self> {
         // Compute the version to start listing from.
         let start_from = limit
             .map(|limit| match NonZero::<Version>::try_from(limit) {
@@ -485,12 +589,14 @@ impl LogSegment {
         // this is a list of commits with possible gaps, we want to take the latest contiguous
         // chunk of commits
         let mut listed_commits = LogSegmentFiles::list_commits(
-            storage,
+            channel,
+            list_files,
             &log_root,
             log_tail,
             start_from,
             Some(end_version),
-        )?;
+        )
+        .await?;
 
         // remove gaps - return latest contiguous chunk of commits
         let commits = listed_commits.ascending_commit_files_mut();

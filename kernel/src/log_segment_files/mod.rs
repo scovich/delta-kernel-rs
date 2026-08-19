@@ -4,8 +4,8 @@
 //! 2. `list`: Lists all commit and checkpoint files between the provided start and end versions.
 //! 3. `list_with_checkpoint_hint`: Lists all commit and checkpoint files after the provided
 //!    checkpoint hint.
-//! 4. `list_with_backward_checkpoint_scan`: Scans backward from an end version in 1000-version
-//!    windows until a complete checkpoint is found or the log is exhausted.
+//! 4. `list_with_backward_checkpoint_scan`: Scans backward from an end version in
+//!    connector-selected pages until a complete checkpoint is found or the log is exhausted.
 //!
 //! After listing, one can leverage the [`LogSegmentFiles`] to construct a [`LogSegment`].
 //!
@@ -18,15 +18,19 @@ use itertools::Itertools;
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 
+use crate::coroutine::listing::{log_listing_request, ListFiles, ListFilesResult};
+use crate::coroutine::{self, Channel, Resume};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
 use crate::path::{
     may_begin_listable_log_path, CheckpointInstance, LogPathFileType, ParsedLogPath,
 };
-use crate::{DeltaResult, Error, FileMeta, StorageHandler, Version};
+use crate::{DeltaResult, Error, FileMeta, Version};
 
 #[cfg(test)]
 mod tests;
+
+type ListFilesConstructor<O, Q> = fn(ListFiles, Resume<O, Q, ListFilesResult>) -> Q;
 
 /// Represents the set of log files found during a listing operation in the Delta log directory.
 ///
@@ -53,30 +57,6 @@ pub(crate) struct LogSegmentFiles {
     pub latest_crc_file: Option<ParsedLogPath>,
     pub latest_commit_file: Option<ParsedLogPath>,
     pub max_published_version: Option<Version>,
-}
-
-/// Returns a lazy iterator of [`ParsedLogPath`]s from the filesystem over versions
-/// `[start_version, end_version]`. The iterator handles parsing, filtering out irrelevant
-/// files (e.g. dot-prefixed files), and stopping at `end_version`. It stops consuming the
-/// underlying listing at the first path past the version-named region, so directories like
-/// `_staged_commits/` and `_sidecars/` are never paged through.
-///
-/// This is a thin wrapper around [`StorageHandler::list_from`] that provides the standard
-/// Delta log file discovery pipeline. Callers are responsible for handling the `log_tail`
-/// (catalog-provided commits) and tracking `max_published_version`.
-#[internal_api]
-pub(crate) fn list_delta_log_from_storage(
-    storage: &dyn StorageHandler,
-    log_root: &Url,
-    start_version: Version,
-    end_version: Version,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<ParsedLogPath>>> {
-    let start_from = log_root.join(&format!("{start_version:020}"))?;
-    Ok(parse_delta_log_listing(
-        storage.list_from(&start_from)?,
-        log_root,
-        end_version,
-    ))
 }
 
 /// Parses and filters an ascending Delta log listing through the standard discovery pipeline.
@@ -364,10 +344,6 @@ impl ListingAccumulator {
     }
 }
 
-/// Number of versions covered by each backward-scan window in
-/// `LogSegmentFiles::list_with_backward_checkpoint_scan`
-const BACKWARD_SCAN_WINDOW_SIZE: u64 = 1000;
-
 impl LogSegmentFiles {
     /// Assembles a `LogSegmentFiles` from `fs_files` (an iterator of files
     /// listed from storage) and `log_tail` (catalog-provided commits).
@@ -552,8 +528,9 @@ impl LogSegmentFiles {
     /// `log_tail` is a contiguous run of commits ending at the table's latest version. It takes
     /// precedence over the filesystem listing, and is required for catalog-managed tables, whose
     /// unbackfilled staged commits exist only here.
-    pub(crate) fn list_commits(
-        storage: &dyn StorageHandler,
+    pub(crate) async fn list_commits<O: Send + 'static, Q: Send + 'static>(
+        channel: &mut Channel<O, Q>,
+        list_files: ListFilesConstructor<O, Q>,
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         start_version: Option<Version>,
@@ -565,23 +542,35 @@ impl LogSegmentFiles {
         );
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);
-        let fs_iter = list_delta_log_from_storage(storage, log_root, start, end)?;
-
+        let request = log_listing_request(log_root, start, end, true)?;
+        let mut cursor = None;
         let log_tail_start_version = log_tail.first().map(|f| f.version);
         let mut listed_commits = Vec::new();
         let mut max_published_version: Option<Version> = None;
-        // Filesystem commits, skipping any covered by the log_tail.
-        for file_result in fs_iter {
-            let file = file_result?;
-            if file.file_type != LogPathFileType::Commit {
-                continue;
+
+        loop {
+            let work = ListFiles {
+                request: request.clone(),
+                cursor,
+            };
+            let page = coroutine::offload(channel, list_files, work).await?;
+            // Filesystem commits, skipping any covered by the log_tail.
+            for file_result in parse_delta_log_listing(page.entries.into_iter(), log_root, end) {
+                let file = file_result?;
+                if file.file_type != LogPathFileType::Commit {
+                    continue;
+                }
+                max_published_version = max_published_version.max(Some(file.version));
+                if log_tail_start_version.is_some_and(|tail_start| file.version >= tail_start) {
+                    continue;
+                }
+                should_process_log_file(&file);
+                listed_commits.push(file);
             }
-            max_published_version = max_published_version.max(Some(file.version));
-            if log_tail_start_version.is_some_and(|tail_start| file.version >= tail_start) {
-                continue;
-            }
-            should_process_log_file(&file); // warns if 0 bytes
-            listed_commits.push(file);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
         }
 
         // Log_tail commits, extending the filesystem prefix in ascending order.
@@ -618,8 +607,9 @@ impl LogSegmentFiles {
     // - CheckpointParts: Vec<ParsedLogPath>, checkpoint_version: Version (guarantee all same
     //   version)
     #[instrument(name = "log.list", skip_all, fields(start = ?start_version, end = ?end_version), err)]
-    pub(crate) fn list(
-        storage: &dyn StorageHandler,
+    pub(crate) async fn list<O: Send + 'static, Q: Send + 'static>(
+        channel: &mut Channel<O, Q>,
+        list_files: ListFilesConstructor<O, Q>,
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         start_version: Option<Version>,
@@ -627,8 +617,26 @@ impl LogSegmentFiles {
     ) -> DeltaResult<Self> {
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);
-        let fs_iter = list_delta_log_from_storage(storage, log_root, start, end)?;
-        Self::build_log_segment_files(fs_iter, log_tail, start, end_version)
+        let request = log_listing_request(log_root, start, end, true)?;
+        let mut cursor = None;
+        let mut builder = LogListingBuilder::new(log_tail, start, end_version);
+
+        loop {
+            let work = ListFiles {
+                request: request.clone(),
+                cursor,
+            };
+            let page = coroutine::offload(channel, list_files, work).await?;
+            let files = parse_delta_log_listing(page.entries.into_iter(), log_root, end);
+            builder.extend_filesystem_files(files)?;
+
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+
+        Ok(builder.finish())
     }
 
     /// List all commit and checkpoint files after the provided checkpoint. It is guaranteed that
@@ -638,20 +646,23 @@ impl LogSegmentFiles {
     /// The hint only tells us where to start listing; it never influences which checkpoint is
     /// selected at a version. A hint that turns out to describe a different checkpoint than the one
     /// selected is logged and ignored, not an error.
-    pub(crate) fn list_with_checkpoint_hint(
+    pub(crate) async fn list_with_checkpoint_hint<O: Send + 'static, Q: Send + 'static>(
         checkpoint_metadata: &LastCheckpointHint,
-        storage: &dyn StorageHandler,
+        channel: &mut Channel<O, Q>,
+        list_files: ListFilesConstructor<O, Q>,
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
         Self::list(
-            storage,
+            channel,
+            list_files,
             log_root,
             log_tail,
             Some(checkpoint_metadata.version),
             end_version,
-        )?
+        )
+        .await?
         .validate_checkpoint_hint(checkpoint_metadata)
     }
 
@@ -712,48 +723,53 @@ impl LogSegmentFiles {
     /// Returns a [`LogSegmentFiles`] ending at `end_version`, rooted at the most recent complete
     /// checkpoint at or before `end_version`, or rooted at version 0 if no checkpoint is found.
     ///
-    /// To find the checkpoint without a full forward listing from version 0, this scans backward
-    /// from `end_version` in windows of size [`BACKWARD_SCAN_WINDOW_SIZE`], stopping as soon as
-    /// a complete checkpoint is found (or version 0 is reached).
-    /// Then, all files from the windows that were scanned are combined with `log_tail` to produce a
-    /// log segment rooted at the checkpoint version (or version 0 if no checkpoint) with all
-    /// commits after the checkpoint version. A log_tail commit at exactly the checkpoint
+    /// To find the checkpoint without a full forward listing from version 0, this requests pages
+    /// backward from `end_version`, stopping as soon as a complete checkpoint is found (or version
+    /// 0 is reached). All files from the pages that were scanned are combined with `log_tail` to
+    /// produce a log segment rooted at the checkpoint version (or version 0 if no checkpoint) with
+    /// all commits after the checkpoint version. A log_tail commit at exactly the checkpoint
     /// version may be included at this stage but will be filtered out by `LogSegment::try_new`.
     ///
-    /// For example, given the desired end_version = 12500 and a checkpoint at v8900:
-    /// - Window 1 [11501, 12501): no checkpoint -> continue
-    /// - Window 2 [10501, 11501): no checkpoint -> continue
-    /// - Window 3 [9501, 10501): no checkpoint -> continue
-    /// - Window 4 [8501, 9501): checkpoint at v8900 found -> stop
-    /// All files from windows 1-4 are combined with `log_tail` to produce a log segment
-    /// rooted at the checkpoint at v8900 with all commits from v8901 to v12500.
+    /// For example, if the connector chooses 1000-version pages, given `end_version = 12500` and a
+    /// checkpoint at v8900:
+    /// - Page 1 `[11501, 12501)`: no checkpoint -> continue
+    /// - Page 2 `[10501, 11501)`: no checkpoint -> continue
+    /// - Page 3 `[9501, 10501)`: no checkpoint -> continue
+    /// - Page 4 `[8501, 9501)`: checkpoint at v8900 -> stop
+    ///
+    /// Files from these pages are combined with `log_tail`, producing a log segment rooted at v8900
+    /// with commits v8901 through v12500.
     #[instrument(name = "log.list_with_backward_checkpoint_scan", skip_all, fields(end = end_version), err)]
-    pub(crate) fn list_with_backward_checkpoint_scan(
-        storage: &dyn StorageHandler,
+    pub(crate) async fn list_with_backward_checkpoint_scan<O: Send + 'static, Q: Send + 'static>(
+        channel: &mut Channel<O, Q>,
+        list_files: ListFilesConstructor<O, Q>,
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         end_version: Version,
     ) -> DeltaResult<Self> {
-        // Scan backward in 1000-version windows, collecting ALL file types, until a complete
-        // checkpoint is found or the log is exhausted.
+        let request = log_listing_request(log_root, 0, end_version, false)?;
+        let mut cursor = None;
         let mut checkpoint_search = BackwardCheckpointSearch::default();
-        // upper is the exclusive upper bound of the next window; adding 1 includes end_version
-        // in the first window. The inclusive range passed to list_delta_log_from_storage is
-        // [lower, upper - 1].
-        let mut upper = end_version + 1;
-        while upper > 0 {
-            let lower = upper.saturating_sub(BACKWARD_SCAN_WINDOW_SIZE);
-            let window_files: Vec<_> =
-                list_delta_log_from_storage(storage, log_root, lower, upper - 1)?.try_collect()?;
 
-            if checkpoint_search.push_page(window_files, true) {
+        loop {
+            let work = ListFiles {
+                request: request.clone(),
+                cursor,
+            };
+            let page = coroutine::offload(channel, list_files, work).await?;
+            let files = parse_delta_log_listing(page.entries.into_iter(), log_root, end_version)
+                .try_collect()?;
+            if checkpoint_search.push_page(files, page.known_version_boundary) {
                 break;
             }
-            upper = lower;
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
         }
 
-        let (windows, found_checkpoint_version) = checkpoint_search.finish();
-        let fs_iter = windows.into_iter().rev().flatten().map(Ok);
+        let (pages, found_checkpoint_version) = checkpoint_search.finish();
+        let fs_iter = pages.into_iter().rev().flatten().map(Ok);
         let start = found_checkpoint_version.unwrap_or(0);
         Self::build_log_segment_files(fs_iter, log_tail, start, Some(end_version))
     }
