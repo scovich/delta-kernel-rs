@@ -6,8 +6,7 @@ use rstest::rstest;
 use url::Url;
 
 use super::*;
-use crate::coroutine::engine::{self as coroutine_engine, ListingPagination};
-use crate::coroutine::listing::ListFiles;
+use crate::coroutine::engine::{self as engine_coroutine, ListingPagination, ListingResume};
 use crate::coroutine::{self, Channel};
 use crate::engine::sync::SyncEngine;
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -205,8 +204,8 @@ impl StorageHandler for CountingStorageHandler {
 }
 
 struct ListingRequest(
-    ListFiles,
-    ListingPagination<LogSegmentFiles, ListingRequest>,
+    ListingPagination,
+    ListingResume<LogSegmentFiles, ListingRequest>,
 );
 
 fn drive_listing<F, Fut>(storage: &dyn StorageHandler, workflow: F) -> DeltaResult<LogSegmentFiles>
@@ -215,8 +214,8 @@ where
     Fut: Future<Output = DeltaResult<LogSegmentFiles>> + Send + 'static,
 {
     coroutine::drive_to_completion!(coroutine::start(workflow), |request| match request {
-        ListingRequest(request, pagination) => {
-            coroutine_engine::resume_list_files(storage, request, pagination)
+        ListingRequest(pagination, resume) => {
+            engine_coroutine::resume_list_files(storage, pagination, resume)
         }
     })
 }

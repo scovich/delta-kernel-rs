@@ -6,11 +6,13 @@ use tracing::instrument;
 
 use super::Crc;
 #[cfg(test)]
-use crate::coroutine::engine::{self as coroutine_engine, ReadPagination};
-use crate::coroutine::read::{ReadFiles, ReadFilesConstructor};
-use crate::coroutine::{self, Channel};
+use crate::coroutine::engine::{self as engine_coroutine, ReadPagination, ReadResume};
+use crate::coroutine::read::ReadFilesConstructor;
+use crate::coroutine::{self, Channel, Pagination};
 use crate::metrics::events::CRC_READ_COMPLETED_SPAN;
 use crate::path::{AsUrl as _, ParsedLogPath};
+#[cfg(test)]
+use crate::Engine;
 use crate::{DeltaResult, Error};
 
 /// Attempt to read and parse a CRC file.
@@ -29,8 +31,8 @@ pub(crate) async fn try_read_crc_file<O: Send + 'static, Q: Send + 'static, S: S
     crc_path: &ParsedLogPath,
 ) -> DeltaResult<Crc> {
     let url = crc_path.location.as_url().clone();
-    let request = ReadFiles::Start(vec![(url, None)]);
-    let data = coroutine::offload_paginated(channel, read_files, request, None)
+    let request = Pagination::Start(vec![(url, None)]);
+    let data = coroutine::offload_paginated(channel, read_files, request)
         .await?
         .0
         .and_then(|page| page.into_iter().next())
@@ -58,13 +60,13 @@ pub(crate) async fn read_crc_file_or_none<
         .map(Arc::new)
 }
 
-/// Test helper that drives [`try_read_crc_file`] through a legacy [`crate::Engine`].
+/// Test helper that drives [`try_read_crc_file`] through a legacy [`Engine`].
 #[cfg(test)]
 pub(crate) fn try_read_crc_file_with_engine(
-    engine: &dyn crate::Engine,
+    engine: &dyn Engine,
     crc_path: &ParsedLogPath,
 ) -> DeltaResult<Crc> {
-    struct CrcReadRequest(ReadFiles, ReadPagination<Crc, CrcReadRequest>);
+    struct CrcReadRequest(ReadPagination, ReadResume<Crc, CrcReadRequest>);
 
     let crc_path = crc_path.clone();
     let storage = engine.storage_handler();
@@ -73,8 +75,8 @@ pub(crate) fn try_read_crc_file_with_engine(
             try_read_crc_file(&mut channel, CrcReadRequest, &crc_path).await
         }),
         |request| {
-            let CrcReadRequest(request, pagination) = request;
-            coroutine_engine::resume_read_files(storage.as_ref(), request, pagination)
+            let CrcReadRequest(pagination, resume) = request;
+            engine_coroutine::resume_read_files(storage.as_ref(), pagination, resume)
         },
     )
 }

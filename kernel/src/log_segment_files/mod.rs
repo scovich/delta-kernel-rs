@@ -18,8 +18,10 @@ use itertools::Itertools;
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 
-use crate::coroutine::listing::{log_listing_request, ListFilesConstructor};
-use crate::coroutine::{self, Channel};
+use crate::coroutine::listing::{
+    backward_log_listing_request, forward_log_listing_request, ListFilesConstructor,
+};
+use crate::coroutine::{self, Channel, Pagination};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
 use crate::path::{
@@ -540,16 +542,15 @@ impl LogSegmentFiles {
         );
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);
-        let request = log_listing_request(log_root, start, end, true)?;
-        let mut cursor = None;
+        let request = forward_log_listing_request(log_root, start, end)?;
+        let mut pagination = Pagination::Start(request);
         let log_tail_start_version = log_tail.first().map(|f| f.version);
         let mut listed_commits = Vec::new();
         let mut max_published_version: Option<Version> = None;
 
         loop {
             let (page, next_cursor) =
-                coroutine::offload_paginated(channel, list_files, request.clone(), cursor).await?;
-            cursor = next_cursor;
+                coroutine::offload_paginated(channel, list_files, pagination).await?;
             // Filesystem commits, skipping any covered by the log_tail.
             for file_result in parse_delta_log_listing(page.entries.into_iter(), log_root, end) {
                 let file = file_result?;
@@ -563,9 +564,10 @@ impl LogSegmentFiles {
                 should_process_log_file(&file);
                 listed_commits.push(file);
             }
-            if cursor.is_none() {
-                break;
-            }
+            pagination = match next_cursor {
+                Some(cursor) => Pagination::Continue(cursor),
+                None => break,
+            };
         }
 
         // Log_tail commits, extending the filesystem prefix in ascending order.
@@ -612,20 +614,20 @@ impl LogSegmentFiles {
     ) -> DeltaResult<Self> {
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);
-        let request = log_listing_request(log_root, start, end, true)?;
-        let mut cursor = None;
+        let request = forward_log_listing_request(log_root, start, end)?;
+        let mut pagination = Pagination::Start(request);
         let mut builder = LogListingBuilder::new(log_tail, start, end_version);
 
         loop {
             let (page, next_cursor) =
-                coroutine::offload_paginated(channel, list_files, request.clone(), cursor).await?;
-            cursor = next_cursor;
+                coroutine::offload_paginated(channel, list_files, pagination).await?;
             let files = parse_delta_log_listing(page.entries.into_iter(), log_root, end);
             builder.extend_filesystem_files(files)?;
 
-            if cursor.is_none() {
-                break;
-            }
+            pagination = match next_cursor {
+                Some(cursor) => Pagination::Continue(cursor),
+                None => break,
+            };
         }
 
         Ok(builder.finish())
@@ -747,22 +749,22 @@ impl LogSegmentFiles {
         log_tail: Vec<ParsedLogPath>,
         end_version: Version,
     ) -> DeltaResult<Self> {
-        let request = log_listing_request(log_root, 0, end_version, false)?;
-        let mut cursor = None;
+        let request = backward_log_listing_request(log_root, 0, end_version)?;
+        let mut pagination = Pagination::Start(request);
         let mut checkpoint_search = BackwardCheckpointSearch::default();
 
         loop {
             let (page, next_cursor) =
-                coroutine::offload_paginated(channel, list_files, request.clone(), cursor).await?;
-            cursor = next_cursor;
+                coroutine::offload_paginated(channel, list_files, pagination).await?;
             let files = parse_delta_log_listing(page.entries.into_iter(), log_root, end_version)
                 .try_collect()?;
             if checkpoint_search.push_page(files, page.known_version_boundary) {
                 break;
             }
-            if cursor.is_none() {
-                break;
-            }
+            pagination = match next_cursor {
+                Some(cursor) => Pagination::Continue(cursor),
+                None => break,
+            };
         }
 
         let (pages, found_checkpoint_version) = checkpoint_search.finish();

@@ -7,15 +7,14 @@ use std::sync::Arc;
 
 use tracing::{info, instrument};
 
-use super::LogSegment;
+use super::{checkpoint_action_projection_predicate, LogSegment};
 use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
 #[cfg(feature = "declarative-plans")]
 use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
 #[cfg(feature = "declarative-plans")]
-use crate::coroutine::read::ExecutePlan;
+use crate::coroutine::read::ExecutePlanConstructor;
 use crate::coroutine::read::{
-    ReadFileFormatStart, ReadJsonFiles, ReadJsonFilesConstructor, ReadParquetFiles,
-    ReadParquetFilesConstructor,
+    ReadFileFormatStart, ReadJsonFilesConstructor, ReadParquetFilesConstructor,
 };
 use crate::coroutine::{self, Channel, Pagination, PaginationResponse, Resume};
 use crate::crc::Crc;
@@ -26,7 +25,7 @@ use crate::metrics::ProtocolMetadataSource;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::FileType;
 #[cfg(feature = "declarative-plans")]
-use crate::plans::PlanBuilder;
+use crate::plans::{Operation, PlanBuilder};
 #[cfg(feature = "declarative-plans")]
 use crate::schema::column_name;
 use crate::schema::schema_ref;
@@ -52,8 +51,7 @@ impl LogSegment {
         read_parquet: ReadParquetFilesConstructor<O, Q, S>,
         crc: Option<&Arc<Crc>>,
         use_plans: bool,
-        #[cfg(feature = "declarative-plans")]
-        execute_plan: crate::coroutine::read::ExecutePlanConstructor<O, Q, S>,
+        #[cfg(feature = "declarative-plans")] execute_plan: ExecutePlanConstructor<O, Q, S>,
     ) -> DeltaResult<(Metadata, Protocol, ProtocolMetadataSource)> {
         match self
             .read_protocol_metadata_opt(
@@ -95,8 +93,7 @@ impl LogSegment {
         read_parquet: ReadParquetFilesConstructor<O, Q, S>,
         crc: Option<&Arc<Crc>>,
         use_plans: bool,
-        #[cfg(feature = "declarative-plans")]
-        execute_plan: crate::coroutine::read::ExecutePlanConstructor<O, Q, S>,
+        #[cfg(feature = "declarative-plans")] execute_plan: ExecutePlanConstructor<O, Q, S>,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>, ProtocolMetadataSource)> {
         // Case 1: If CRC at target version, use it directly and exit early.
         if let Some(crc) = crc.filter(|c| c.version == self.end_version) {
@@ -180,8 +177,7 @@ impl LogSegment {
         read_json: ReadJsonFilesConstructor<O, Q, S>,
         read_parquet: ReadParquetFilesConstructor<O, Q, S>,
         use_plans: bool,
-        #[cfg(feature = "declarative-plans")]
-        execute_plan: crate::coroutine::read::ExecutePlanConstructor<O, Q, S>,
+        #[cfg(feature = "declarative-plans")] execute_plan: ExecutePlanConstructor<O, Q, S>,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
         // Providing a plan executor opts the engine into declarative P&M replay.
         #[cfg(feature = "declarative-plans")]
@@ -203,12 +199,11 @@ impl LogSegment {
             && consume_pm_batches(
                 channel,
                 read_json,
-                ReadJsonFiles::Start(ReadFileFormatStart {
+                ReadFileFormatStart {
                     files: commit_files,
                     physical_schema: schema.clone(),
                     predicate: None,
-                }),
-                || ReadJsonFiles::Continue,
+                },
                 &mut metadata_opt,
                 &mut protocol_opt,
             )
@@ -226,17 +221,16 @@ impl LogSegment {
             .iter()
             .map(|f| f.location.clone())
             .collect();
-        let checkpoint_predicate = super::checkpoint_action_projection_predicate(&schema);
+        let checkpoint_predicate = checkpoint_action_projection_predicate(&schema);
         if first.is_json() {
             consume_pm_batches(
                 channel,
                 read_json,
-                ReadJsonFiles::Start(ReadFileFormatStart {
+                ReadFileFormatStart {
                     files: checkpoint_files,
                     physical_schema: schema,
                     predicate: checkpoint_predicate,
-                }),
-                || ReadJsonFiles::Continue,
+                },
                 &mut metadata_opt,
                 &mut protocol_opt,
             )
@@ -245,12 +239,11 @@ impl LogSegment {
             consume_pm_batches(
                 channel,
                 read_parquet,
-                ReadParquetFiles::Start(ReadFileFormatStart {
+                ReadFileFormatStart {
                     files: checkpoint_files,
                     physical_schema: schema,
                     predicate: checkpoint_predicate,
-                }),
-                || ReadParquetFiles::Continue,
+                },
                 &mut metadata_opt,
                 &mut protocol_opt,
             )
@@ -263,7 +256,7 @@ impl LogSegment {
     async fn replay_for_pm_via_plan<O: Send + 'static, Q: Send + 'static, S: Send + 'static>(
         &self,
         channel: &mut Channel<O, Q>,
-        execute_plan: crate::coroutine::read::ExecutePlanConstructor<O, Q, S>,
+        execute_plan: ExecutePlanConstructor<O, Q, S>,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
         let versioned_schema = schema_ref! {
             (&PROTOCOL_FIELD),
@@ -306,8 +299,7 @@ impl LogSegment {
         consume_pm_batches(
             channel,
             execute_plan,
-            ExecutePlan::Start(crate::plans::Operation::QueryPlan(plan)),
-            || ExecutePlan::Continue,
+            Operation::QueryPlan(plan),
             &mut metadata_opt,
             &mut protocol_opt,
         )
@@ -333,11 +325,10 @@ impl LogSegment {
 async fn consume_pm_batches<O, Q, W, S>(
     channel: &mut Channel<O, Q>,
     constructor: fn(
-        W,
-        Pagination<S, Resume<O, Q, PaginationResponse<Option<Box<dyn EngineData>>, S>>>,
+        Pagination<W, S>,
+        Resume<O, Q, PaginationResponse<Option<Box<dyn EngineData>>, S>>,
     ) -> Q,
-    mut request: W,
-    continue_request: fn() -> W,
+    work: W,
     metadata_opt: &mut Option<Metadata>,
     protocol_opt: &mut Option<Protocol>,
 ) -> DeltaResult<bool>
@@ -347,10 +338,10 @@ where
     W: Send + 'static,
     S: Send + 'static,
 {
-    let mut cursor = None;
+    let mut pagination = Pagination::Start(work);
     loop {
         let (batch, next_cursor) =
-            coroutine::offload_paginated(channel, constructor, request, cursor).await?;
+            coroutine::offload_paginated(channel, constructor, pagination).await?;
         match batch {
             Some(batch) => {
                 if metadata_opt.is_none() {
@@ -365,11 +356,10 @@ where
             }
             None => return Ok(false),
         }
-        let Some(next_cursor) = next_cursor else {
-            return Ok(false);
+        pagination = match next_cursor {
+            Some(cursor) => Pagination::Continue(cursor),
+            None => return Ok(false),
         };
-        cursor = Some(next_cursor);
-        request = continue_request();
     }
 }
 

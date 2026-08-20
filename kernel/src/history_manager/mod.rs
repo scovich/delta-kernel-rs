@@ -30,9 +30,9 @@ use search::{binary_search_by_key_with_bounds, Bound, SearchError};
 use tracing::{info, trace, warn};
 use url::Url;
 
-use crate::coroutine::engine::{self as coroutine_engine, ListingPagination};
-use crate::coroutine::listing::{log_listing_request, ListFiles};
-use crate::coroutine::{self, Channel};
+use crate::coroutine::engine::{self as engine_coroutine, ListingPagination, ListingResume};
+use crate::coroutine::listing::forward_log_listing_request;
+use crate::coroutine::{self, Channel, Pagination};
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::{parse_delta_log_listing, should_process_log_file};
 use crate::path::{LogPathFileType, ParsedLogPath};
@@ -92,7 +92,10 @@ enum TimestampSearchBounds {
 
 type HistoryListingChannel<O> = Channel<O, HistoryListingRequest<O>>;
 
-struct HistoryListingRequest<O>(ListFiles, ListingPagination<O, HistoryListingRequest<O>>);
+struct HistoryListingRequest<O>(
+    ListingPagination,
+    ListingResume<O, HistoryListingRequest<O>>,
+);
 
 /// Determines the search strategy for timestamp-to-version conversion based on ICT enablement.
 ///
@@ -708,8 +711,8 @@ where
 {
     let storage = engine.storage_handler();
     coroutine::drive_to_completion!(coroutine::start(workflow), |request| match request {
-        HistoryListingRequest(request, pagination) => {
-            coroutine_engine::resume_list_files(storage.as_ref(), request, pagination)
+        HistoryListingRequest(pagination, resume) => {
+            engine_coroutine::resume_list_files(storage.as_ref(), pagination, resume)
         }
     })
 }
@@ -752,26 +755,22 @@ fn get_earliest_published_commit_version(
 
     let listing_root = log_root.clone();
     drive_history_listing(engine, async move |mut channel| {
-        let request = log_listing_request(&listing_root, 0, Version::MAX, true)?;
-        let mut cursor = None;
+        let request = forward_log_listing_request(&listing_root, 0, Version::MAX)?;
+        let mut pagination = Pagination::Start(request);
         loop {
-            let (page, next_cursor) = coroutine::offload_paginated(
-                &mut channel,
-                HistoryListingRequest,
-                request.clone(),
-                cursor,
-            )
-            .await?;
-            cursor = next_cursor;
+            let (page, next_cursor) =
+                coroutine::offload_paginated(&mut channel, HistoryListingRequest, pagination)
+                    .await?;
             let files =
                 parse_delta_log_listing(page.entries.into_iter(), &listing_root, Version::MAX);
             let version = first_published_commit_version(files)?;
             if let Some(version) = version {
                 return Ok(Some(version));
             }
-            if cursor.is_none() {
-                break;
-            }
+            pagination = match next_cursor {
+                Some(cursor) => Pagination::Continue(cursor),
+                None => break,
+            };
         }
         Ok(None)
     })?
@@ -871,25 +870,21 @@ fn get_earliest_recreatable_commit(
         drive_history_listing(engine, async move |mut channel| {
             let mut earliest_commit_version = None;
 
-            let request = log_listing_request(&listing_root, 0, Version::MAX, true)?;
-            let mut cursor = None;
+            let request = forward_log_listing_request(&listing_root, 0, Version::MAX)?;
+            let mut pagination = Pagination::Start(request);
             loop {
-                let (page, next_cursor) = coroutine::offload_paginated(
-                    &mut channel,
-                    HistoryListingRequest,
-                    request.clone(),
-                    cursor,
-                )
-                .await?;
-                cursor = next_cursor;
+                let (page, next_cursor) =
+                    coroutine::offload_paginated(&mut channel, HistoryListingRequest, pagination)
+                        .await?;
                 let files =
                     parse_delta_log_listing(page.entries.into_iter(), &listing_root, Version::MAX);
                 if let Some(version) = observe_files(files, &mut earliest_commit_version)? {
                     return Ok((Some(version), earliest_commit_version));
                 }
-                if cursor.is_none() {
-                    break;
-                }
+                pagination = match next_cursor {
+                    Some(cursor) => Pagination::Continue(cursor),
+                    None => break,
+                };
             }
             Ok((None, earliest_commit_version))
         })?;

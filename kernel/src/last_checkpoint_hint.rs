@@ -11,8 +11,8 @@ use url::Url;
 use crate::actions::{
     CheckpointMetadata, DomainMetadata, Metadata, Protocol, SetTransaction, Sidecar,
 };
-use crate::coroutine::read::{ReadFiles, ReadFilesConstructor};
-use crate::coroutine::{self, Channel};
+use crate::coroutine::read::ReadFilesConstructor;
+use crate::coroutine::{self, Channel, Pagination};
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Error, FileMeta, Version};
@@ -207,8 +207,8 @@ impl LastCheckpointHint {
         log_root: &Url,
     ) -> DeltaResult<Option<LastCheckpointHint>> {
         let file_path = Self::path(log_root)?;
-        let request = ReadFiles::Start(vec![(file_path, None)]);
-        match coroutine::offload_paginated(channel, read_files, request, None).await {
+        let request = Pagination::Start(vec![(file_path, None)]);
+        match coroutine::offload_paginated(channel, read_files, request).await {
             Ok((Some(data), _)) => {
                 let Some(data) = data.first() else {
                     warn!("empty _last_checkpoint file");

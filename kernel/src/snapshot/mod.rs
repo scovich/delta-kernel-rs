@@ -17,7 +17,7 @@ use crate::checkpoint::{
 };
 use crate::clustering::{parse_clustering_columns, ClusteringColumnInfo, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
-use crate::coroutine::engine::{self as coroutine_engine, EngineDataPagination};
+use crate::coroutine::engine::{self as engine_coroutine, EngineDataPagination, EngineDataResume};
 use crate::coroutine::read::ReadJsonFiles;
 use crate::coroutine::{self, Channel};
 use crate::crc::{
@@ -1050,7 +1050,10 @@ impl Snapshot {
     /// The `root` span field records which root resolved the CRC.
     #[instrument(parent = &self.span, name = "snap.resolve_crc_for_write", skip_all, err, fields(root))]
     fn resolve_crc_for_write(&self, engine: &dyn Engine) -> DeltaResult<Arc<Crc>> {
-        struct ReadJsonRequest<T>(ReadJsonFiles, EngineDataPagination<T, ReadJsonRequest<T>>);
+        struct ReadJsonRequest<T>(
+            EngineDataPagination<ReadJsonFiles>,
+            EngineDataResume<T, ReadJsonRequest<T>>,
+        );
 
         fn drive_json<T, F, Fut>(engine: &dyn Engine, workflow: F) -> DeltaResult<T>
         where
@@ -1059,11 +1062,11 @@ impl Snapshot {
             Fut: Future<Output = DeltaResult<T>> + Send + 'static,
         {
             coroutine::drive_to_completion!(coroutine::start(workflow), |request| {
-                let ReadJsonRequest(request, pagination) = request;
-                coroutine_engine::resume_read_json_files(
+                let ReadJsonRequest(pagination, resume) = request;
+                engine_coroutine::resume_read_json_files(
                     engine.json_handler().as_ref(),
-                    request,
                     pagination,
+                    resume,
                 )
             },)
         }
@@ -1383,8 +1386,7 @@ mod tests {
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::FileSystemCommitter;
     use crate::coroutine;
-    use crate::coroutine::engine::{self as coroutine_engine, ReadPagination};
-    use crate::coroutine::read::ReadFiles;
+    use crate::coroutine::engine::{self as engine_coroutine, ReadPagination, ReadResume};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -1559,8 +1561,8 @@ mod tests {
         log_root: &Url,
     ) -> DeltaResult<Option<LastCheckpointHint>> {
         struct ReadFilesRequest(
-            ReadFiles,
-            ReadPagination<Option<LastCheckpointHint>, ReadFilesRequest>,
+            ReadPagination,
+            ReadResume<Option<LastCheckpointHint>, ReadFilesRequest>,
         );
 
         let log_root = log_root.clone();
@@ -1569,8 +1571,8 @@ mod tests {
         });
 
         coroutine::drive_to_completion!(next, |request| match request {
-            ReadFilesRequest(request, pagination) => {
-                coroutine_engine::resume_read_files(storage, request, pagination)
+            ReadFilesRequest(pagination, resume) => {
+                engine_coroutine::resume_read_files(storage, pagination, resume)
             }
         })
     }

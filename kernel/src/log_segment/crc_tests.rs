@@ -14,8 +14,10 @@ use url::Url;
 
 use super::for_snapshot_from_storage;
 use crate::actions::{DomainMetadata, Format, Metadata, Protocol, SetTransaction};
-use crate::coroutine::engine::{self as coroutine_engine, EngineDataPagination, ReadPagination};
-use crate::coroutine::read::{ReadFiles, ReadJsonFiles};
+use crate::coroutine::engine::{
+    self as engine_coroutine, EngineDataPagination, EngineDataResume, ReadPagination, ReadResume,
+};
+use crate::coroutine::read::ReadJsonFiles;
 use crate::coroutine::{self, Channel};
 use crate::crc::{
     try_read_crc_file_with_engine, Crc, DomainMetadataState, FileSizeHistogram, SetTransactionState,
@@ -28,8 +30,11 @@ use crate::snapshot::{IncrementalReplay, SnapshotBuilder, SnapshotRef};
 use crate::utils::FoldWithOption as _;
 use crate::{DeltaResult, Engine, Snapshot, Version};
 
-struct ReadFilesRequest<T>(ReadFiles, ReadPagination<T, ReadFilesRequest<T>>);
-struct ReadJsonRequest<T>(ReadJsonFiles, EngineDataPagination<T, ReadJsonRequest<T>>);
+struct ReadFilesRequest<T>(ReadPagination, ReadResume<T, ReadFilesRequest<T>>);
+struct ReadJsonRequest<T>(
+    EngineDataPagination<ReadJsonFiles>,
+    EngineDataResume<T, ReadJsonRequest<T>>,
+);
 
 fn drive_read_files<T, F, Fut>(engine: &dyn Engine, workflow: F) -> DeltaResult<T>
 where
@@ -39,8 +44,8 @@ where
 {
     let storage = engine.storage_handler();
     coroutine::drive_to_completion!(coroutine::start(workflow), |request| {
-        let ReadFilesRequest(request, pagination) = request;
-        coroutine_engine::resume_read_files(storage.as_ref(), request, pagination)
+        let ReadFilesRequest(pagination, resume) = request;
+        engine_coroutine::resume_read_files(storage.as_ref(), pagination, resume)
     },)
 }
 
@@ -51,12 +56,8 @@ where
     Fut: Future<Output = DeltaResult<T>> + Send + 'static,
 {
     coroutine::drive_to_completion!(coroutine::start(workflow), |request| {
-        let ReadJsonRequest(request, pagination) = request;
-        coroutine_engine::resume_read_json_files(
-            engine.json_handler().as_ref(),
-            request,
-            pagination,
-        )
+        let ReadJsonRequest(pagination, resume) = request;
+        engine_coroutine::resume_read_json_files(engine.json_handler().as_ref(), pagination, resume)
     },)
 }
 

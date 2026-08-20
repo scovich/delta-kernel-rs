@@ -23,10 +23,8 @@ use crate::actions::{
     DomainMetadata, SetTransaction, ADD_NAME, COMMIT_INFO_NAME, DOMAIN_METADATA_FIELD,
     METADATA_FIELD, PROTOCOL_FIELD, REMOVE_NAME, SET_TRANSACTION_FIELD,
 };
-use crate::coroutine::read::{
-    ReadFileFormatStart, ReadFilesConstructor, ReadJsonFiles, ReadJsonFilesConstructor,
-};
-use crate::coroutine::{self, Channel};
+use crate::coroutine::read::{ReadFileFormatStart, ReadFilesConstructor, ReadJsonFilesConstructor};
+use crate::coroutine::{self, Channel, Pagination};
 use crate::crc::{
     is_incremental_safe_operation, read_crc_file_or_none, size_to_u64, Crc, CrcDelta,
     FileSizeHistogram, FileStatsDelta,
@@ -316,15 +314,14 @@ impl LogSegment {
             .map(|c| c.location.clone())
             .collect();
         let mut acc = CrcReplayAccumulator::new(seed_histogram);
-        let mut request = ReadJsonFiles::Start(ReadFileFormatStart {
+        let mut pagination = Pagination::Start(ReadFileFormatStart {
             files: locations,
             physical_schema: REPLAY_SCHEMA.clone(),
             predicate: None,
         });
-        let mut cursor = None;
         loop {
             let (batch, next_cursor) =
-                coroutine::offload_paginated(channel, read_json, request, cursor).await?;
+                coroutine::offload_paginated(channel, read_json, pagination).await?;
             match batch {
                 Some(batch) => {
                     // Transient visitor borrows the shared accumulator for the duration of the
@@ -334,11 +331,10 @@ impl LogSegment {
                 }
                 None => break,
             }
-            let Some(next_cursor) = next_cursor else {
-                break;
+            pagination = match next_cursor {
+                Some(cursor) => Pagination::Continue(cursor),
+                None => break,
             };
-            cursor = Some(next_cursor);
-            request = ReadJsonFiles::Continue;
         }
 
         // Run the per-commit invariant on the final (oldest) commit; no successor batch
@@ -741,7 +737,10 @@ mod tests {
     use test_utils::{add_commit, assert_result_error_with_message};
 
     use super::*;
-    use crate::coroutine::engine::{self as coroutine_engine, EngineDataPagination};
+    use crate::coroutine::engine::{
+        self as engine_coroutine, EngineDataPagination, EngineDataResume,
+    };
+    use crate::coroutine::read::ReadJsonFiles;
     use crate::coroutine::Channel;
     use crate::crc::{DomainMetadataState, FileStats, FileStatsState, SetTransactionState};
     use crate::engine::sync::SyncEngine;
@@ -749,7 +748,10 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::table_features::TableFeature;
 
-    struct ReadJsonRequest<T>(ReadJsonFiles, EngineDataPagination<T, ReadJsonRequest<T>>);
+    struct ReadJsonRequest<T>(
+        EngineDataPagination<ReadJsonFiles>,
+        EngineDataResume<T, ReadJsonRequest<T>>,
+    );
 
     fn drive_json<T, F, Fut>(engine: &dyn Engine, workflow: F) -> DeltaResult<T>
     where
@@ -758,11 +760,11 @@ mod tests {
         Fut: Future<Output = DeltaResult<T>> + Send + 'static,
     {
         coroutine::drive_to_completion!(coroutine::start(workflow), |request| {
-            let ReadJsonRequest(request, pagination) = request;
-            coroutine_engine::resume_read_json_files(
+            let ReadJsonRequest(pagination, resume) = request;
+            engine_coroutine::resume_read_json_files(
                 engine.json_handler().as_ref(),
-                request,
                 pagination,
+                resume,
             )
         },)
     }

@@ -15,8 +15,8 @@ use crate::actions::{
 };
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 use crate::committer::CatalogCommit;
-use crate::coroutine::engine::{self as coroutine_engine, ListingPagination};
-use crate::coroutine::listing::{ListFiles, ListFilesConstructor};
+use crate::coroutine::engine::{self as engine_coroutine, ListingPagination, ListingResume};
+use crate::coroutine::listing::ListFilesConstructor;
 use crate::coroutine::read::ReadFilesConstructor;
 use crate::coroutine::{self, Channel};
 use crate::expressions::ColumnName;
@@ -54,7 +54,10 @@ mod crc_tests;
 mod tests;
 
 enum LogSegmentRequest {
-    ListFiles(ListFiles, ListingPagination<LogSegment, LogSegmentRequest>),
+    ListFiles(
+        ListingPagination,
+        ListingResume<LogSegment, LogSegmentRequest>,
+    ),
 }
 
 fn drive_log_segment<F, Fut>(storage: &dyn StorageHandler, workflow: F) -> DeltaResult<LogSegment>
@@ -63,8 +66,8 @@ where
     Fut: Future<Output = DeltaResult<LogSegment>> + Send + 'static,
 {
     coroutine::drive_to_completion!(coroutine::start(workflow), |request| match request {
-        LogSegmentRequest::ListFiles(request, pagination) => {
-            coroutine_engine::resume_list_files(storage, request, pagination)
+        LogSegmentRequest::ListFiles(pagination, resume) => {
+            engine_coroutine::resume_list_files(storage, pagination, resume)
         }
     })
 }

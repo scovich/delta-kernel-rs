@@ -130,9 +130,9 @@
 //!
 //! # Pagination
 //!
-//! Paginated requests pair optional connector state with an ordinary [`Resume`]. Kernel retains
-//! only an opaque [`PaginationCursor`] between requests, so unrelated work can be interleaved
-//! without losing the connector's state.
+//! [`Pagination::Start`] carries initial work; [`Pagination::Continue`] carries connector state
+//! from the preceding response. Kernel retains only an opaque [`PaginationCursor`] between
+//! requests, so unrelated work can be interleaved without losing connector state.
 //!
 //! ```
 //! use delta_kernel::coroutine::{
@@ -140,38 +140,37 @@
 //! };
 //! use delta_kernel::DeltaResult;
 //!
-//! type Numbers = std::vec::IntoIter<u32>;
+//! type Numbers = (usize, std::vec::IntoIter<u32>);
 //! type NumbersResume = Resume<Vec<u32>, Request, PaginationResponse<Vec<u32>, Numbers>>;
 //! type DoubleResume = Resume<Vec<u32>, Request, u32>;
 //!
 //! enum Request {
-//!     Numbers(usize, Pagination<Numbers, NumbersResume>),
+//!     Numbers(Pagination<usize, Numbers>, NumbersResume),
 //!     Double(u32, DoubleResume),
 //! }
 //!
 //! async fn kernel_workflow(mut channel: Channel<Vec<u32>, Request>) -> DeltaResult<Vec<u32>> {
-//!     let mut cursor = None;
+//!     let mut pagination = Pagination::Start(2);
 //!     let mut output = Vec::new();
 //!     loop {
 //!         let (numbers, next_cursor) = coroutine::offload_paginated(
 //!             &mut channel,
 //!             Request::Numbers,
-//!             2,
-//!             cursor,
+//!             pagination,
 //!         )
 //!         .await?;
-//!         cursor = next_cursor;
 //!
-//!         // This unrelated request runs while the connector's Numbers iterator is in `cursor`.
+//!         // This unrelated request runs while connector state is held in `next_cursor`.
 //!         for number in numbers {
 //!             output.push(
 //!                 coroutine::offload(&mut channel, Request::Double, number).await?,
 //!             );
 //!         }
 //!
-//!         if cursor.is_none() {
-//!             return Ok(output);
-//!         }
+//!         pagination = match next_cursor {
+//!             Some(cursor) => Pagination::Continue(cursor),
+//!             None => return Ok(output),
+//!         };
 //!     }
 //! }
 //!
@@ -179,13 +178,19 @@
 //!     coroutine::drive_to_completion!(
 //!         coroutine::start(kernel_workflow),
 //!         |request| match request {
-//!             Request::Numbers(limit, Pagination(state, resume)) => {
-//!                 let mut numbers = state.unwrap_or_else(|| vec![1, 2, 3].into_iter());
+//!             Request::Numbers(pagination, resume) => {
+//!                 let (limit, mut numbers) = match pagination {
+//!                     Pagination::Start(limit) => (limit, vec![1, 2, 3].into_iter()),
+//!                     Pagination::Continue(state) => state,
+//!                 };
 //!                 let response = numbers.by_ref().take(limit).collect();
 //!                 if numbers.len() == 0 {
 //!                     resume.resume(Ok(PaginationResponse::Done(response)))
 //!                 } else {
-//!                     resume.resume(Ok(PaginationResponse::More(response, numbers)))
+//!                     resume.resume(Ok(PaginationResponse::More(
+//!                         response,
+//!                         (limit, numbers),
+//!                     )))
 //!                 }
 //!             }
 //!             Request::Double(number, resume) => resume.resume(Ok(number * 2)),
@@ -307,8 +312,8 @@ pub use crate::__drive_to_completion as drive_to_completion;
 //
 // A workflow-specific request enum `Q` (defined by kernel) serves as the shared contract between
 // kernel and connector. A one-shot variant pairs concrete work `W` with a `Resume<R>`. A paginated
-// variant instead pairs `W` with `Pagination<S, Resume<PaginationResponse<R, S>>>`, adding typed
-// connector state `S` while preserving the ordinary one-shot resume mechanism.
+// variant instead pairs `Pagination<W, S>` with `Resume<PaginationResponse<R, S>>`, preserving the
+// ordinary one-shot resume mechanism while distinguishing initial work from continuation state.
 //
 // Around that shared contract, this module deliberately presents different strongly typed APIs to
 // kernel and connector authors. Kernel calls `offload(&mut channel, Q::Variant, work: W).await?`
@@ -409,12 +414,14 @@ impl<S> fmt::Debug for PaginationCursor<S> {
     }
 }
 
-/// Connector context for one pagination request.
-///
-/// The first field contains connector state from the preceding request, or `None` for the initial
-/// request. The second field resumes the kernel coroutine with a [`PaginationResponse`].
+/// Work or connector state for one pagination request.
 #[derive(Debug)]
-pub struct Pagination<S, R>(pub Option<S>, pub R);
+pub enum Pagination<W, S> {
+    /// Starts pagination with the initial work.
+    Start(W),
+    /// Continues pagination with connector state returned by the preceding response.
+    Continue(S),
+}
 
 /// Connector response to one pagination request.
 #[derive(Debug)]
@@ -426,7 +433,7 @@ pub enum PaginationResponse<R, S> {
 }
 
 type PaginationConstructor<O, Q, W, R, S> =
-    fn(W, Pagination<S, Resume<O, Q, PaginationResponse<R, S>>>) -> Q;
+    fn(Pagination<W, S>, Resume<O, Q, PaginationResponse<R, S>>) -> Q;
 
 /// One-shot continuation accepting the response type required by its request.
 #[must_use = "the kernel workflow remains suspended until this continuation is resumed"]
@@ -502,8 +509,7 @@ where
 
 /// Preserves a typed paginated work/response/state relationship while suspended.
 struct PaginatedPending<O, Q, W, R, S> {
-    work: W,
-    cursor: Option<PaginationCursor<S>>,
+    request: Pagination<W, PaginationCursor<S>>,
     constructor: PaginationConstructor<O, Q, W, R, S>,
 }
 
@@ -516,12 +522,15 @@ where
     S: Send + 'static,
 {
     fn attach(self: Box<Self>, generator: Generator<O, Q>) -> Q {
-        let state = self.cursor.map(|cursor| cursor.0);
+        let request = match self.request {
+            Pagination::Start(work) => Pagination::Start(work),
+            Pagination::Continue(cursor) => Pagination::Continue(cursor.0),
+        };
         let resume = Resume {
             generator,
             response_type: PhantomData,
         };
-        (self.constructor)(self.work, Pagination(state, resume))
+        (self.constructor)(request, resume)
     }
 }
 
@@ -545,11 +554,11 @@ where
     suspend(channel, pending).await
 }
 
-/// Yield paginated `work` and resume with its typed response and optional continuation state.
+/// Yield a pagination request and resume with its typed response and optional continuation state.
 ///
-/// `cursor` is `None` for the first request in a pagination sequence. A cursor returned by this
-/// function may be retained across unrelated offloads and supplied to a later call using the same
-/// request constructor and connector state type `S`.
+/// Start with [`Pagination::Start`]. A cursor returned by this function may be retained across
+/// unrelated offloads and supplied through [`Pagination::Continue`] using the same request
+/// constructor and connector state type `S`.
 ///
 /// Returns the connector response and `Some` cursor when more pagination work remains, or `None`
 /// when the connector completed the sequence.
@@ -560,8 +569,7 @@ where
 pub(crate) async fn offload_paginated<O, Q, W, R, S>(
     channel: &mut Channel<O, Q>,
     constructor: PaginationConstructor<O, Q, W, R, S>,
-    work: W,
-    cursor: Option<PaginationCursor<S>>,
+    request: Pagination<W, PaginationCursor<S>>,
 ) -> DeltaResult<(R, Option<PaginationCursor<S>>)>
 where
     O: Send + 'static,
@@ -571,8 +579,7 @@ where
     S: Send + 'static,
 {
     let pending: Pending<O, Q> = Box::new(PaginatedPending {
-        work,
-        cursor,
+        request,
         constructor,
     });
     let response: PaginationResponse<R, S> = suspend(channel, pending).await?;

@@ -6,12 +6,12 @@ use std::sync::Arc;
 use tracing::{info, instrument};
 
 use crate::coroutine::engine::{
-    self as coroutine_engine, EngineDataPagination, ListingPagination, ReadPagination,
+    self as engine_coroutine, EngineDataPagination, EngineDataResume, ListingPagination,
+    ListingResume, ReadPagination, ReadResume,
 };
-use crate::coroutine::listing::ListFiles;
 #[cfg(feature = "declarative-plans")]
 use crate::coroutine::read::ExecutePlan;
-use crate::coroutine::read::{ReadFiles, ReadJsonFiles, ReadParquetFiles};
+use crate::coroutine::read::{ReadJsonFiles, ReadParquetFiles};
 use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
 use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
@@ -24,22 +24,25 @@ use crate::{coroutine, DeltaResult, Engine, Error, Snapshot, Version};
 /// Work items delegated while constructing a snapshot.
 pub(super) enum SnapshotBuildRequest {
     List(
-        ListFiles,
-        ListingPagination<SnapshotRef, SnapshotBuildRequest>,
+        ListingPagination,
+        ListingResume<SnapshotRef, SnapshotBuildRequest>,
     ),
-    ReadBytes(ReadFiles, ReadPagination<SnapshotRef, SnapshotBuildRequest>),
+    ReadBytes(
+        ReadPagination,
+        ReadResume<SnapshotRef, SnapshotBuildRequest>,
+    ),
     ReadJson(
-        ReadJsonFiles,
-        EngineDataPagination<SnapshotRef, SnapshotBuildRequest>,
+        EngineDataPagination<ReadJsonFiles>,
+        EngineDataResume<SnapshotRef, SnapshotBuildRequest>,
     ),
     ReadParquet(
-        ReadParquetFiles,
-        EngineDataPagination<SnapshotRef, SnapshotBuildRequest>,
+        EngineDataPagination<ReadParquetFiles>,
+        EngineDataResume<SnapshotRef, SnapshotBuildRequest>,
     ),
     #[cfg(feature = "declarative-plans")]
     ExecutePlan(
-        ExecutePlan,
-        EngineDataPagination<SnapshotRef, SnapshotBuildRequest>,
+        EngineDataPagination<ExecutePlan>,
+        EngineDataResume<SnapshotRef, SnapshotBuildRequest>,
     ),
 }
 
@@ -50,25 +53,25 @@ impl SnapshotBuildRequest {
     ) -> DeltaResult<ControlFlow<SnapshotRef, SnapshotBuildRequest>> {
         let storage = engine.storage_handler();
         match self {
-            Self::List(request, pagination) => {
-                coroutine_engine::resume_list_files(storage.as_ref(), request, pagination)
+            Self::List(pagination, resume) => {
+                engine_coroutine::resume_list_files(storage.as_ref(), pagination, resume)
             }
-            Self::ReadBytes(request, pagination) => {
-                coroutine_engine::resume_read_files(storage.as_ref(), request, pagination)
+            Self::ReadBytes(pagination, resume) => {
+                engine_coroutine::resume_read_files(storage.as_ref(), pagination, resume)
             }
-            Self::ReadJson(request, pagination) => coroutine_engine::resume_read_json_files(
+            Self::ReadJson(pagination, resume) => engine_coroutine::resume_read_json_files(
                 engine.json_handler().as_ref(),
-                request,
                 pagination,
+                resume,
             ),
-            Self::ReadParquet(request, pagination) => coroutine_engine::resume_read_parquet_files(
+            Self::ReadParquet(pagination, resume) => engine_coroutine::resume_read_parquet_files(
                 engine.parquet_handler().as_ref(),
-                request,
                 pagination,
+                resume,
             ),
             #[cfg(feature = "declarative-plans")]
-            Self::ExecutePlan(request, pagination) => {
-                coroutine_engine::resume_plan(engine, request, pagination)
+            Self::ExecutePlan(pagination, resume) => {
+                engine_coroutine::resume_plan(engine, pagination, resume)
             }
         }
     }
