@@ -28,19 +28,17 @@ impl StorageHandler for PlanBasedStorageHandler {
     fn list_from(
         &self,
         path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
-        Ok(self
-            .execute_io(IoOperation::file_listing(path.clone()))?
-            .into_file_meta()?)
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>> + Send>> {
+        self.execute_io(IoOperation::file_listing(path.clone()))?
+            .into_file_meta()
     }
 
     fn read_files(
         &self,
         files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
-        Ok(self
-            .execute_io(IoOperation::read_bytes(files))?
-            .into_bytes()?)
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>> + Send>> {
+        self.execute_io(IoOperation::read_bytes(files))?
+            .into_bytes()
     }
 
     fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {

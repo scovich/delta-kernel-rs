@@ -1,9 +1,17 @@
 //! Builder for creating [`Snapshot`] instances.
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use tracing::{info, instrument};
 
+use crate::coroutine::engine::{
+    self as coroutine_engine, EngineDataPagination, ListingPagination, ReadPagination,
+};
+use crate::coroutine::listing::ListFiles;
+#[cfg(feature = "declarative-plans")]
+use crate::coroutine::read::ExecutePlan;
+use crate::coroutine::read::{ReadFiles, ReadJsonFiles, ReadParquetFiles};
 use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
 use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
@@ -11,7 +19,60 @@ use crate::metrics::{LogSegmentLoadType, MetricId, SnapshotLoadMetricContext};
 use crate::path::LogPathFileType;
 use crate::snapshot::SnapshotRef;
 use crate::utils::{require, try_parse_uri};
-use crate::{DeltaResult, Engine, Error, Snapshot, Version};
+use crate::{coroutine, DeltaResult, Engine, Error, Snapshot, Version};
+
+/// Work items delegated while constructing a snapshot.
+pub(super) enum SnapshotBuildRequest {
+    List(
+        ListFiles,
+        ListingPagination<SnapshotRef, SnapshotBuildRequest>,
+    ),
+    ReadBytes(ReadFiles, ReadPagination<SnapshotRef, SnapshotBuildRequest>),
+    ReadJson(
+        ReadJsonFiles,
+        EngineDataPagination<SnapshotRef, SnapshotBuildRequest>,
+    ),
+    ReadParquet(
+        ReadParquetFiles,
+        EngineDataPagination<SnapshotRef, SnapshotBuildRequest>,
+    ),
+    #[cfg(feature = "declarative-plans")]
+    ExecutePlan(
+        ExecutePlan,
+        EngineDataPagination<SnapshotRef, SnapshotBuildRequest>,
+    ),
+}
+
+impl SnapshotBuildRequest {
+    pub(super) fn resume(
+        self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<ControlFlow<SnapshotRef, SnapshotBuildRequest>> {
+        let storage = engine.storage_handler();
+        match self {
+            Self::List(request, pagination) => {
+                coroutine_engine::resume_list_files(storage.as_ref(), request, pagination)
+            }
+            Self::ReadBytes(request, pagination) => {
+                coroutine_engine::resume_read_files(storage.as_ref(), request, pagination)
+            }
+            Self::ReadJson(request, pagination) => coroutine_engine::resume_read_json_files(
+                engine.json_handler().as_ref(),
+                request,
+                pagination,
+            ),
+            Self::ReadParquet(request, pagination) => coroutine_engine::resume_read_parquet_files(
+                engine.parquet_handler().as_ref(),
+                request,
+                pagination,
+            ),
+            #[cfg(feature = "declarative-plans")]
+            Self::ExecutePlan(request, pagination) => {
+                coroutine_engine::resume_plan(engine, request, pagination)
+            }
+        }
+    }
+}
 
 /// Builder for creating [`Snapshot`] instances.
 ///
@@ -266,44 +327,58 @@ impl SnapshotBuilder {
         // requested version is exactly the max_catalog_version.
         let built_as_latest = version.is_none() || version == max_catalog_version;
 
-        let result = if let Some(table_root) = table_root {
-            try_parse_uri(table_root).and_then(|table_url| {
-                let log_segment = LogSegment::for_snapshot(
-                    engine.storage_handler().as_ref(),
-                    table_url.join("_delta_log/")?,
-                    log_tail,
-                    effective_version,
-                    metric_context.clone(),
-                )?;
-                Snapshot::try_new_from_log_segment(
-                    table_url,
-                    log_segment,
-                    engine,
-                    metric_context,
-                    incremental_replay,
-                    built_as_latest,
-                )
-                .map(Into::into)
-            })
-        } else {
-            existing_snapshot
-                .ok_or_else(|| {
-                    Error::internal_error(
-                        "SnapshotBuilder should have either table_root or existing_snapshot",
+        #[cfg(feature = "declarative-plans")]
+        let use_plans = engine.plan_executor().is_some();
+        #[cfg(not(feature = "declarative-plans"))]
+        let use_plans = false;
+
+        let result = coroutine::drive_to_completion!(
+            coroutine::start(async move |mut channel| {
+                if let Some(table_root) = table_root {
+                    let table_url = try_parse_uri(table_root)?;
+                    let log_segment = LogSegment::for_snapshot(
+                        &mut channel,
+                        SnapshotBuildRequest::List,
+                        SnapshotBuildRequest::ReadBytes,
+                        table_url.join("_delta_log/")?,
+                        log_tail,
+                        effective_version,
+                        metric_context.clone(),
                     )
-                })
-                .and_then(|existing_snapshot| {
+                    .await?;
+
+                    Snapshot::try_new_from_log_segment(
+                        table_url,
+                        log_segment,
+                        &mut channel,
+                        metric_context,
+                        incremental_replay,
+                        built_as_latest,
+                        use_plans,
+                    )
+                    .await
+                    .map(Arc::new)
+                } else {
+                    let existing_snapshot = existing_snapshot.ok_or_else(|| {
+                        Error::internal_error(
+                            "SnapshotBuilder should have either table_root or existing_snapshot",
+                        )
+                    })?;
                     Snapshot::try_new_from(
+                        &mut channel,
                         existing_snapshot,
                         log_tail,
-                        engine,
                         effective_version,
                         metric_context,
                         incremental_replay,
                         built_as_latest,
+                        use_plans,
                     )
-                })
-        };
+                    .await
+                }
+            }),
+            |request| request.resume(engine),
+        );
 
         // Post-build validations for catalog-managed tables
         let result = result.and_then(|snapshot| {

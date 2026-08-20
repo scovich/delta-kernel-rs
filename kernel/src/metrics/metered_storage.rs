@@ -45,7 +45,7 @@ impl StorageHandler for MeteredStorageHandler {
     fn list_from(
         &self,
         path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>> + Send>> {
         let start = Instant::now();
         let inner = self.inner.list_from(path)?;
         Ok(Box::new(MetricsIterator::<_, FileMeta>::new(
@@ -58,7 +58,7 @@ impl StorageHandler for MeteredStorageHandler {
     fn read_files(
         &self,
         files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>> + Send>> {
         let start = Instant::now();
         let inner = self.inner.read_files(files)?;
         Ok(Box::new(MetricsIterator::<_, Bytes>::new(
@@ -107,7 +107,7 @@ mod tests {
         fn list_from(
             &self,
             _path: &Url,
-        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>> + Send>> {
             let results: Vec<_> = self.list_results.iter().cloned().map(Ok).collect();
             Ok(Box::new(results.into_iter()))
         }
@@ -115,7 +115,7 @@ mod tests {
         fn read_files(
             &self,
             _files: Vec<FileSlice>,
-        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>> + Send>> {
             let results: Vec<_> = self.read_results.iter().cloned().map(Ok).collect();
             Ok(Box::new(results.into_iter()))
         }

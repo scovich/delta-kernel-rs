@@ -30,9 +30,9 @@ use search::{binary_search_by_key_with_bounds, Bound, SearchError};
 use tracing::{info, trace, warn};
 use url::Url;
 
-use crate::coroutine::engine::EngineRequestState;
-use crate::coroutine::listing::{log_listing_request, ListFiles, ListFilesResult};
-use crate::coroutine::{self, Channel, Resume};
+use crate::coroutine::engine::{self as coroutine_engine, ListingPagination};
+use crate::coroutine::listing::{log_listing_request, ListFiles};
+use crate::coroutine::{self, Channel};
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::{parse_delta_log_listing, should_process_log_file};
 use crate::path::{LogPathFileType, ParsedLogPath};
@@ -90,10 +90,9 @@ enum TimestampSearchBounds {
     },
 }
 
-type HistoryListingResume<O> = Resume<O, HistoryListingRequest<O>, ListFilesResult>;
 type HistoryListingChannel<O> = Channel<O, HistoryListingRequest<O>>;
 
-struct HistoryListingRequest<O>(ListFiles, HistoryListingResume<O>);
+struct HistoryListingRequest<O>(ListFiles, ListingPagination<O, HistoryListingRequest<O>>);
 
 /// Determines the search strategy for timestamp-to-version conversion based on ICT enablement.
 ///
@@ -708,10 +707,9 @@ where
     Fut: Future<Output = DeltaResult<O>> + Send + 'static,
 {
     let storage = engine.storage_handler();
-    let mut engine_state = EngineRequestState::default();
     coroutine::drive_to_completion!(coroutine::start(workflow), |request| match request {
-        HistoryListingRequest(request, resume) => {
-            resume.resume(engine_state.execute_list_files(storage.as_ref(), request))
+        HistoryListingRequest(request, pagination) => {
+            coroutine_engine::resume_list_files(storage.as_ref(), request, pagination)
         }
     })
 }
@@ -757,21 +755,23 @@ fn get_earliest_published_commit_version(
         let request = log_listing_request(&listing_root, 0, Version::MAX, true)?;
         let mut cursor = None;
         loop {
-            let work = ListFiles {
-                request: request.clone(),
+            let (page, next_cursor) = coroutine::offload_paginated(
+                &mut channel,
+                HistoryListingRequest,
+                request.clone(),
                 cursor,
-            };
-            let page = coroutine::offload(&mut channel, HistoryListingRequest, work).await?;
+            )
+            .await?;
+            cursor = next_cursor;
             let files =
                 parse_delta_log_listing(page.entries.into_iter(), &listing_root, Version::MAX);
             let version = first_published_commit_version(files)?;
             if let Some(version) = version {
                 return Ok(Some(version));
             }
-            let Some(next_cursor) = page.next_cursor else {
+            if cursor.is_none() {
                 break;
-            };
-            cursor = Some(next_cursor);
+            }
         }
         Ok(None)
     })?
@@ -874,20 +874,22 @@ fn get_earliest_recreatable_commit(
             let request = log_listing_request(&listing_root, 0, Version::MAX, true)?;
             let mut cursor = None;
             loop {
-                let work = ListFiles {
-                    request: request.clone(),
+                let (page, next_cursor) = coroutine::offload_paginated(
+                    &mut channel,
+                    HistoryListingRequest,
+                    request.clone(),
                     cursor,
-                };
-                let page = coroutine::offload(&mut channel, HistoryListingRequest, work).await?;
+                )
+                .await?;
+                cursor = next_cursor;
                 let files =
                     parse_delta_log_listing(page.entries.into_iter(), &listing_root, Version::MAX);
                 if let Some(version) = observe_files(files, &mut earliest_commit_version)? {
                     return Ok((Some(version), earliest_commit_version));
                 }
-                let Some(next_cursor) = page.next_cursor else {
+                if cursor.is_none() {
                     break;
-                };
-                cursor = Some(next_cursor);
+                }
             }
             Ok((None, earliest_commit_version))
         })?;

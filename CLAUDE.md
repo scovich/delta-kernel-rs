@@ -292,6 +292,11 @@ Keep this list updated when new protocol features are added to kernel.
 
 ## Common Gotchas
 
+- **`Version::MAX` is a sentinel, not a practical table version:** It canonically means unbounded/no
+  upper version: `v..=Version::MAX` is invalid and `v..Version::MAX` is equivalent to `v..`. Real
+  Delta versions actually stop at `i64::MAX` because the JVM ecosystem has no `u64` equivalent. Use
+  saturating adds to avoid panic overflows when manipulating versions as bounds. NEVER attempt to
+  emulate inclusive upper bounds that include `Version::MAX` as a normal version.
 - **EngineData is opaque:** NEVER downcast to `ArrowEngineData` or any concrete type
   in production code (ok in tests). NEVER assume one batch per file: ALWAYS iterate.
 - **Column mapping:** Physical column names can differ from logical names. ALWAYS use

@@ -4,6 +4,7 @@
 //! then verifies that Protocol & Metadata loading and ICT reads resolve correctly.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 
 use rstest::rstest;
@@ -13,8 +14,11 @@ use url::Url;
 
 use super::for_snapshot_from_storage;
 use crate::actions::{DomainMetadata, Format, Metadata, Protocol, SetTransaction};
+use crate::coroutine::engine::{self as coroutine_engine, EngineDataPagination, ReadPagination};
+use crate::coroutine::read::{ReadFiles, ReadJsonFiles};
+use crate::coroutine::{self, Channel};
 use crate::crc::{
-    try_read_crc_file, Crc, DomainMetadataState, FileSizeHistogram, SetTransactionState,
+    try_read_crc_file_with_engine, Crc, DomainMetadataState, FileSizeHistogram, SetTransactionState,
 };
 use crate::engine::sync::SyncEngine;
 use crate::object_store::memory::InMemory;
@@ -23,6 +27,38 @@ use crate::path::ParsedLogPath;
 use crate::snapshot::{IncrementalReplay, SnapshotBuilder, SnapshotRef};
 use crate::utils::FoldWithOption as _;
 use crate::{DeltaResult, Engine, Snapshot, Version};
+
+struct ReadFilesRequest<T>(ReadFiles, ReadPagination<T, ReadFilesRequest<T>>);
+struct ReadJsonRequest<T>(ReadJsonFiles, EngineDataPagination<T, ReadJsonRequest<T>>);
+
+fn drive_read_files<T, F, Fut>(engine: &dyn Engine, workflow: F) -> DeltaResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce(Channel<T, ReadFilesRequest<T>>) -> Fut + Send + 'static,
+    Fut: Future<Output = DeltaResult<T>> + Send + 'static,
+{
+    let storage = engine.storage_handler();
+    coroutine::drive_to_completion!(coroutine::start(workflow), |request| {
+        let ReadFilesRequest(request, pagination) = request;
+        coroutine_engine::resume_read_files(storage.as_ref(), request, pagination)
+    },)
+}
+
+fn drive_read_json<T, F, Fut>(engine: &dyn Engine, workflow: F) -> DeltaResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce(Channel<T, ReadJsonRequest<T>>) -> Fut + Send + 'static,
+    Fut: Future<Output = DeltaResult<T>> + Send + 'static,
+{
+    coroutine::drive_to_completion!(coroutine::start(workflow), |request| {
+        let ReadJsonRequest(request, pagination) = request;
+        coroutine_engine::resume_read_json_files(
+            engine.json_handler().as_ref(),
+            request,
+            pagination,
+        )
+    },)
+}
 
 // ============================================================================
 // Expected values
@@ -396,7 +432,12 @@ impl BuiltCrcTest {
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
             for_snapshot_from_storage(storage.as_ref(), log_root, vec![], None, None)?;
-        log_segment.build_crc_from_base(&self.engine, base)
+        let base = base.clone();
+        drive_read_json(&self.engine, async move |mut channel| {
+            log_segment
+                .build_crc_from_base(&mut channel, ReadJsonRequest, &base)
+                .await
+        })
     }
 
     /// Run `pick_latest_base_crc` against a directly-listed `LogSegment`, using `in_memory_base`.
@@ -408,14 +449,18 @@ impl BuiltCrcTest {
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
             for_snapshot_from_storage(storage.as_ref(), log_root, vec![], None, None)?;
-        Ok(log_segment
-            .pick_latest_base_crc(&self.engine, in_memory_base)
-            .map(|c| c.version))
+        let in_memory_base = in_memory_base.cloned();
+        drive_read_files(&self.engine, async move |mut channel| {
+            Ok(log_segment
+                .pick_latest_base_crc(&mut channel, ReadFilesRequest, in_memory_base.as_ref())
+                .await
+                .map(|c| c.version))
+        })
     }
 
     /// Read the on-disk CRC at `version` from this test's log.
     fn read_crc_at(&self, version: u64) -> DeltaResult<Crc> {
-        try_read_crc_file(
+        try_read_crc_file_with_engine(
             &self.engine,
             &ParsedLogPath::create_parsed_crc(&self.url, version),
         )

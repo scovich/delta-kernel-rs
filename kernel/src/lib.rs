@@ -206,7 +206,13 @@ pub use snapshot::{Snapshot, SnapshotRef};
 ))]
 pub mod engine;
 
-/// Delta table version is 8 byte unsigned int
+/// Delta table version represented as an 8-byte unsigned integer.
+///
+/// NOTE: In practice, versions are 63-bit unsigned values (`0..=i64::MAX`) because The Java
+/// ecosystem lacks an unsigned 64-bit int type. In bounds and searches, `Version::MAX` is the
+/// sentinel value for a missing/open upper bound, and code using versions MUST treat
+/// `v..Version::MAX` as equivalent to `v..`. Use saturating adds when increasing a version number
+/// to preserve the sentinel while avoiding overflow panics. See also [`version_as_i64`].
 pub type Version = u64;
 
 /// Converts a [`Version`] to `i64`, returning an error if the version exceeds `i64::MAX`.
@@ -618,14 +624,16 @@ pub trait StorageHandler: AsAny {
     ///   contains all files at or below that directory.
     /// - Otherwise, the parent is the directory containing `path`, and only files (at any depth
     ///   under that parent) whose full path sorts strictly greater than `path` are returned.
-    fn list_from(&self, path: &Url)
-        -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>>;
+    fn list_from(
+        &self,
+        path: &Url,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>> + Send>>;
 
     /// Read data specified by the start and end offset from the file.
     fn read_files(
         &self,
         files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>>;
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>> + Send>>;
 
     /// Copy a file atomically from source to destination. If the destination file already exists,
     /// it must return Err(Error::FileAlreadyExists).

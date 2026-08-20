@@ -1,13 +1,14 @@
 //! Paginated file listing for connector-driven log discovery.
 //!
 //! Kernel fixes an exclusive lexicographic interval `(low, high)` and search direction. The
-//! connector chooses page size and how to emulate reverse search. Pagination uses an opaque
-//! continuation token on [`ListFiles::cursor`].
+//! connector chooses page size and how to emulate reverse search. Pagination state is carried by
+//! the coroutine infrastructure.
 
 use std::sync::Arc;
 
 use url::Url;
 
+use super::{Pagination, PaginationResponse, Resume};
 use crate::{DeltaResult, FileMeta, Version};
 
 /// Bounds and direction shared by every page of one listing.
@@ -25,15 +26,8 @@ pub struct ListFilesRequest {
     pub is_forward_listing: bool,
 }
 
-/// One page request within a bounded listing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ListFiles {
-    /// Bounds and direction shared by all pages of this listing.
-    pub request: Arc<ListFilesRequest>,
-    /// `None` starts a new listing at the direction-appropriate end of `(low, high)`. `Some`
-    /// resumes with a connector-opaque token from a prior [`ListFilesResult::next_cursor`].
-    pub cursor: Option<String>,
-}
+/// Bounds shared by every page request in one listing.
+pub type ListFiles = Arc<ListFilesRequest>;
 
 /// Result of one [`ListFiles`] page.
 #[derive(Debug)]
@@ -43,10 +37,11 @@ pub struct ListFilesResult {
     /// Whether the page ends at a known version boundary. The boundary is after the highest
     /// version in a forward page and before the lowest version in a backward page.
     pub known_version_boundary: bool,
-    /// Opaque continuation for the next [`ListFiles::cursor`], or `None` when the listing is
-    /// exhausted under the request's bounds and direction.
-    pub next_cursor: Option<String>,
 }
+
+/// Constructor for a workflow request variant that delegates paginated file listing.
+pub(crate) type ListFilesConstructor<O, Q, S> =
+    fn(ListFiles, Pagination<S, Resume<O, Q, PaginationResponse<ListFilesResult, S>>>) -> Q;
 
 /// Builds the bare version path used as an exclusive lexicographic listing bound.
 ///

@@ -201,30 +201,27 @@ impl LastCheckpointHint {
     /// not found or is invalid JSON. Unexpected/unrecoverable errors are returned as `Err` case and
     /// are assumed to cause failure.
     #[instrument(name = "last_checkpoint.read", skip_all, err)]
-    pub(crate) async fn try_read<O: Send + 'static, Q: Send + 'static>(
+    pub(crate) async fn try_read<O: Send + 'static, Q: Send + 'static, S: Send + 'static>(
         channel: &mut Channel<O, Q>,
-        read_files: ReadFilesConstructor<O, Q>,
+        read_files: ReadFilesConstructor<O, Q, S>,
         log_root: &Url,
     ) -> DeltaResult<Option<LastCheckpointHint>> {
         let file_path = Self::path(log_root)?;
         let request = ReadFiles::Start(vec![(file_path, None)]);
-        match coroutine::offload(channel, read_files, request)
-            .await
-            .transpose()
-        {
-            Some(Ok(data)) => {
+        match coroutine::offload_paginated(channel, read_files, request, None).await {
+            Ok((Some(data), _)) => {
                 let Some(data) = data.first() else {
                     warn!("empty _last_checkpoint file");
                     return Ok(None);
                 };
                 Ok(Self::try_from_bytes(data))
             }
-            Some(Err(Error::FileNotFound(_))) => {
+            Err(Error::FileNotFound(_)) => {
                 info!("_last_checkpoint file not found");
                 Ok(None)
             }
-            Some(Err(err)) => Err(err),
-            None => {
+            Err(err) => Err(err),
+            Ok((None, _)) => {
                 warn!("empty _last_checkpoint file");
                 Ok(None)
             }

@@ -2,6 +2,7 @@
 //! has schema etc.)
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
@@ -16,6 +17,9 @@ use crate::checkpoint::{
 };
 use crate::clustering::{parse_clustering_columns, ClusteringColumnInfo, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
+use crate::coroutine::engine::{self as coroutine_engine, EngineDataPagination};
+use crate::coroutine::read::ReadJsonFiles;
+use crate::coroutine::{self, Channel};
 use crate::crc::{
     try_write_crc_file, Crc, CrcDelta, DomainMetadataState, FileSizeHistogram, FileStats,
     SetTransactionState,
@@ -41,6 +45,7 @@ use crate::{DeltaResult, Engine, Error, LogCompactionWriter, Version};
 mod builder;
 mod incremental;
 mod snapshot_crc;
+use builder::SnapshotBuildRequest;
 pub use builder::{IncrementalReplay, SnapshotBuilder};
 use snapshot_crc::SnapshotCrc;
 
@@ -191,22 +196,31 @@ impl Snapshot {
     /// from the latest on-disk CRC, advanced to the segment's end version when `incremental_replay`
     /// permits, or used to root Protocol and Metadata log replay otherwise. Falls back to full log
     /// replay when no CRC is present.
-    #[instrument(err, fields(version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(engine))]
-    fn try_new_from_log_segment(
+    #[instrument(err, fields(version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(channel))]
+    async fn try_new_from_log_segment(
         location: Url,
         log_segment: LogSegment,
-        engine: &dyn Engine,
+        channel: &mut Channel<SnapshotRef, SnapshotBuildRequest>,
         metric_context: SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
+        use_plans: bool,
     ) -> DeltaResult<Self> {
         let pm_start = std::time::Instant::now();
 
         // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
         //         (or use it as-is when already there) per `incremental_replay`.
-        let base_crc = log_segment.read_latest_crc(engine);
+        let base_crc = log_segment
+            .read_latest_crc(channel, SnapshotBuildRequest::ReadBytes)
+            .await;
         let crc_at_version = log_segment
-            .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
+            .try_build_crc_within_budget(
+                channel,
+                SnapshotBuildRequest::ReadJson,
+                base_crc.as_ref(),
+                incremental_replay,
+            )
+            .await
             .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?;
 
         // Step 2: P&M from that CRC, else log replay rooted at the base CRC, checkpoint, or
@@ -214,7 +228,16 @@ impl Snapshot {
         let (metadata, protocol, source) = match &crc_at_version {
             Some((crc, source)) => (crc.metadata.clone(), crc.protocol.clone(), *source),
             None => log_segment
-                .read_protocol_metadata(engine, base_crc.as_ref())
+                .read_protocol_metadata(
+                    channel,
+                    SnapshotBuildRequest::ReadJson,
+                    SnapshotBuildRequest::ReadParquet,
+                    base_crc.as_ref(),
+                    use_plans,
+                    #[cfg(feature = "declarative-plans")]
+                    SnapshotBuildRequest::ExecutePlan,
+                )
+                .await
                 .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?,
         };
         emit_protocol_metadata_load(&metric_context, source, pm_start.elapsed());
@@ -1027,6 +1050,24 @@ impl Snapshot {
     /// The `root` span field records which root resolved the CRC.
     #[instrument(parent = &self.span, name = "snap.resolve_crc_for_write", skip_all, err, fields(root))]
     fn resolve_crc_for_write(&self, engine: &dyn Engine) -> DeltaResult<Arc<Crc>> {
+        struct ReadJsonRequest<T>(ReadJsonFiles, EngineDataPagination<T, ReadJsonRequest<T>>);
+
+        fn drive_json<T, F, Fut>(engine: &dyn Engine, workflow: F) -> DeltaResult<T>
+        where
+            T: Send + 'static,
+            F: FnOnce(Channel<T, ReadJsonRequest<T>>) -> Fut + Send + 'static,
+            Fut: Future<Output = DeltaResult<T>> + Send + 'static,
+        {
+            coroutine::drive_to_completion!(coroutine::start(workflow), |request| {
+                let ReadJsonRequest(request, pagination) = request;
+                coroutine_engine::resume_read_json_files(
+                    engine.json_handler().as_ref(),
+                    request,
+                    pagination,
+                )
+            },)
+        }
+
         let span = tracing::Span::current();
         // Case 1: an in-memory CRC at this version is ready to write as-is.
         if let Some(crc) = self.crc_at_version() {
@@ -1041,7 +1082,13 @@ impl Snapshot {
         // tail commits (a held base is always at or above the checkpoint, so a tail exists).
         if let Some(base) = self.base_crc() {
             span.record("root", "stale_crc");
-            let crc = log_segment.build_crc_from_base(engine, base)?;
+            let log_segment = log_segment.clone();
+            let base = base.clone();
+            let crc = drive_json(engine, async move |mut channel| {
+                log_segment
+                    .build_crc_from_base(&mut channel, ReadJsonRequest, &base)
+                    .await
+            })?;
             return Ok(Arc::new(crc));
         }
 
@@ -1061,11 +1108,17 @@ impl Snapshot {
             }
             // Replay the tail commits first: a non-incremental tail dooms file stats no matter
             // what the checkpoint holds, so skip the larger checkpoint read in that case.
-            let delta = log_segment.build_crc_delta_from_base(
-                engine,
-                checkpoint_version,
-                Some(FileSizeHistogram::create_default()),
-            )?;
+            let log_segment_for_delta = log_segment.clone();
+            let delta = drive_json(engine, async move |mut channel| {
+                log_segment_for_delta
+                    .build_crc_delta_from_base(
+                        &mut channel,
+                        ReadJsonRequest,
+                        checkpoint_version,
+                        Some(FileSizeHistogram::create_default()),
+                    )
+                    .await
+            })?;
             require!(
                 delta.is_incremental_safe,
                 unresolved_crc("commits after the checkpoint are not incremental-safe")
@@ -1079,9 +1132,13 @@ impl Snapshot {
 
         // Case 4: neither CRC nor checkpoint, so reverse-replay the full commit history.
         span.record("root", "version_zero");
-        let crc = log_segment
-            .build_crc_from_version_zero(engine)?
-            .ok_or_else(|| unresolved_crc("commit history is missing protocol or metadata"))?;
+        let log_segment = log_segment.clone();
+        let crc = drive_json(engine, async move |mut channel| {
+            log_segment
+                .build_crc_from_version_zero(&mut channel, ReadJsonRequest)
+                .await
+        })?
+        .ok_or_else(|| unresolved_crc("commit history is missing protocol or metadata"))?;
         Ok(Arc::new(crc))
     }
 
@@ -1326,8 +1383,8 @@ mod tests {
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::FileSystemCommitter;
     use crate::coroutine;
-    use crate::coroutine::engine::EngineRequestState;
-    use crate::coroutine::read::{ReadFiles, ReadFilesResume};
+    use crate::coroutine::engine::{self as coroutine_engine, ReadPagination};
+    use crate::coroutine::read::ReadFiles;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -1501,18 +1558,19 @@ mod tests {
         storage: &dyn crate::StorageHandler,
         log_root: &Url,
     ) -> DeltaResult<Option<LastCheckpointHint>> {
-        type LastCheckpointRequest = ReadFilesResume<Option<LastCheckpointHint>, ReadFilesRequest>;
-        struct ReadFilesRequest(ReadFiles, LastCheckpointRequest);
+        struct ReadFilesRequest(
+            ReadFiles,
+            ReadPagination<Option<LastCheckpointHint>, ReadFilesRequest>,
+        );
 
         let log_root = log_root.clone();
         let next = coroutine::start(async move |mut channel| {
             LastCheckpointHint::try_read(&mut channel, ReadFilesRequest, &log_root).await
         });
 
-        let mut engine_state = EngineRequestState::default();
         coroutine::drive_to_completion!(next, |request| match request {
-            ReadFilesRequest(request, resume) => {
-                resume.resume(engine_state.execute_read_files(storage, request))
+            ReadFilesRequest(request, pagination) => {
+                coroutine_engine::resume_read_files(storage, request, pagination)
             }
         })
     }

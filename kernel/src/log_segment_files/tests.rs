@@ -6,9 +6,9 @@ use rstest::rstest;
 use url::Url;
 
 use super::*;
-use crate::coroutine::engine::EngineRequestState;
-use crate::coroutine::listing::{ListFiles, ListFilesResult};
-use crate::coroutine::{self, Resume};
+use crate::coroutine::engine::{self as coroutine_engine, ListingPagination};
+use crate::coroutine::listing::ListFiles;
+use crate::coroutine::{self, Channel};
 use crate::engine::sync::SyncEngine;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::object_store::memory::InMemory;
@@ -171,7 +171,7 @@ impl StorageHandler for CountingStorageHandler {
     fn list_from(
         &self,
         path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>> + Send>> {
         self.list_from_count.fetch_add(1, Ordering::Relaxed);
         let items_listed = self.items_listed.clone();
         let iter = self.inner.list_from(path)?;
@@ -183,7 +183,7 @@ impl StorageHandler for CountingStorageHandler {
     fn read_files(
         &self,
         _files: Vec<crate::FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>> + Send>> {
         panic!("read_files should not be called during listing");
     }
 
@@ -204,19 +204,19 @@ impl StorageHandler for CountingStorageHandler {
     }
 }
 
-type ListingResume = Resume<LogSegmentFiles, ListingRequest, ListFilesResult>;
-
-struct ListingRequest(ListFiles, ListingResume);
+struct ListingRequest(
+    ListFiles,
+    ListingPagination<LogSegmentFiles, ListingRequest>,
+);
 
 fn drive_listing<F, Fut>(storage: &dyn StorageHandler, workflow: F) -> DeltaResult<LogSegmentFiles>
 where
     F: FnOnce(Channel<LogSegmentFiles, ListingRequest>) -> Fut + Send + 'static,
     Fut: Future<Output = DeltaResult<LogSegmentFiles>> + Send + 'static,
 {
-    let mut engine_state = EngineRequestState::default();
     coroutine::drive_to_completion!(coroutine::start(workflow), |request| match request {
-        ListingRequest(request, resume) => {
-            resume.resume(engine_state.execute_list_files(storage, request))
+        ListingRequest(request, pagination) => {
+            coroutine_engine::resume_list_files(storage, request, pagination)
         }
     })
 }
@@ -465,13 +465,13 @@ fn test_log_tail_covers_entire_range_empty_filesystem() {
         fn list_from(
             &self,
             _path: &Url,
-        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>> + Send>> {
             Ok(Box::new(std::iter::empty()))
         }
         fn read_files(
             &self,
             _files: Vec<crate::FileSlice>,
-        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>> + Send>> {
             panic!("read_files should not be called during listing");
         }
         fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {

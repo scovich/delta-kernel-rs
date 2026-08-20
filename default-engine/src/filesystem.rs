@@ -191,7 +191,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
     fn list_from(
         &self,
         path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>> + Send>> {
         let future = list_from_impl(self.inner.clone(), path.clone());
         let iter = super::stream_future_to_iter(self.task_executor.clone(), future)?;
         Ok(iter) // type coercion drops the unneeded Send bound
@@ -206,10 +206,10 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
     fn read_files(
         &self,
         files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>> + Send>> {
         let future = read_files_impl(self.inner.clone(), files, self.readahead);
         let iter = super::stream_future_to_iter(self.task_executor.clone(), future)?;
-        Ok(iter) // type coercion drops the unneeded Send bound
+        Ok(iter)
     }
 
     fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()> {

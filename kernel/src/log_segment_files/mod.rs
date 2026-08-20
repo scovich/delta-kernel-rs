@@ -18,8 +18,8 @@ use itertools::Itertools;
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 
-use crate::coroutine::listing::{log_listing_request, ListFiles, ListFilesResult};
-use crate::coroutine::{self, Channel, Resume};
+use crate::coroutine::listing::{log_listing_request, ListFilesConstructor};
+use crate::coroutine::{self, Channel};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
 use crate::path::{
@@ -29,8 +29,6 @@ use crate::{DeltaResult, Error, FileMeta, Version};
 
 #[cfg(test)]
 mod tests;
-
-type ListFilesConstructor<O, Q> = fn(ListFiles, Resume<O, Q, ListFilesResult>) -> Q;
 
 /// Represents the set of log files found during a listing operation in the Delta log directory.
 ///
@@ -528,9 +526,9 @@ impl LogSegmentFiles {
     /// `log_tail` is a contiguous run of commits ending at the table's latest version. It takes
     /// precedence over the filesystem listing, and is required for catalog-managed tables, whose
     /// unbackfilled staged commits exist only here.
-    pub(crate) async fn list_commits<O: Send + 'static, Q: Send + 'static>(
+    pub(crate) async fn list_commits<O: Send + 'static, Q: Send + 'static, S: Send + 'static>(
         channel: &mut Channel<O, Q>,
-        list_files: ListFilesConstructor<O, Q>,
+        list_files: ListFilesConstructor<O, Q, S>,
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         start_version: Option<Version>,
@@ -549,11 +547,9 @@ impl LogSegmentFiles {
         let mut max_published_version: Option<Version> = None;
 
         loop {
-            let work = ListFiles {
-                request: request.clone(),
-                cursor,
-            };
-            let page = coroutine::offload(channel, list_files, work).await?;
+            let (page, next_cursor) =
+                coroutine::offload_paginated(channel, list_files, request.clone(), cursor).await?;
+            cursor = next_cursor;
             // Filesystem commits, skipping any covered by the log_tail.
             for file_result in parse_delta_log_listing(page.entries.into_iter(), log_root, end) {
                 let file = file_result?;
@@ -567,10 +563,9 @@ impl LogSegmentFiles {
                 should_process_log_file(&file);
                 listed_commits.push(file);
             }
-            let Some(next_cursor) = page.next_cursor else {
+            if cursor.is_none() {
                 break;
-            };
-            cursor = Some(next_cursor);
+            }
         }
 
         // Log_tail commits, extending the filesystem prefix in ascending order.
@@ -607,9 +602,9 @@ impl LogSegmentFiles {
     // - CheckpointParts: Vec<ParsedLogPath>, checkpoint_version: Version (guarantee all same
     //   version)
     #[instrument(name = "log.list", skip_all, fields(start = ?start_version, end = ?end_version), err)]
-    pub(crate) async fn list<O: Send + 'static, Q: Send + 'static>(
+    pub(crate) async fn list<O: Send + 'static, Q: Send + 'static, S: Send + 'static>(
         channel: &mut Channel<O, Q>,
-        list_files: ListFilesConstructor<O, Q>,
+        list_files: ListFilesConstructor<O, Q, S>,
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         start_version: Option<Version>,
@@ -622,18 +617,15 @@ impl LogSegmentFiles {
         let mut builder = LogListingBuilder::new(log_tail, start, end_version);
 
         loop {
-            let work = ListFiles {
-                request: request.clone(),
-                cursor,
-            };
-            let page = coroutine::offload(channel, list_files, work).await?;
+            let (page, next_cursor) =
+                coroutine::offload_paginated(channel, list_files, request.clone(), cursor).await?;
+            cursor = next_cursor;
             let files = parse_delta_log_listing(page.entries.into_iter(), log_root, end);
             builder.extend_filesystem_files(files)?;
 
-            let Some(next_cursor) = page.next_cursor else {
+            if cursor.is_none() {
                 break;
-            };
-            cursor = Some(next_cursor);
+            }
         }
 
         Ok(builder.finish())
@@ -646,10 +638,14 @@ impl LogSegmentFiles {
     /// The hint only tells us where to start listing; it never influences which checkpoint is
     /// selected at a version. A hint that turns out to describe a different checkpoint than the one
     /// selected is logged and ignored, not an error.
-    pub(crate) async fn list_with_checkpoint_hint<O: Send + 'static, Q: Send + 'static>(
+    pub(crate) async fn list_with_checkpoint_hint<
+        O: Send + 'static,
+        Q: Send + 'static,
+        S: Send + 'static,
+    >(
         checkpoint_metadata: &LastCheckpointHint,
         channel: &mut Channel<O, Q>,
-        list_files: ListFilesConstructor<O, Q>,
+        list_files: ListFilesConstructor<O, Q, S>,
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         end_version: Option<Version>,
@@ -740,9 +736,13 @@ impl LogSegmentFiles {
     /// Files from these pages are combined with `log_tail`, producing a log segment rooted at v8900
     /// with commits v8901 through v12500.
     #[instrument(name = "log.list_with_backward_checkpoint_scan", skip_all, fields(end = end_version), err)]
-    pub(crate) async fn list_with_backward_checkpoint_scan<O: Send + 'static, Q: Send + 'static>(
+    pub(crate) async fn list_with_backward_checkpoint_scan<
+        O: Send + 'static,
+        Q: Send + 'static,
+        S: Send + 'static,
+    >(
         channel: &mut Channel<O, Q>,
-        list_files: ListFilesConstructor<O, Q>,
+        list_files: ListFilesConstructor<O, Q, S>,
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         end_version: Version,
@@ -752,20 +752,17 @@ impl LogSegmentFiles {
         let mut checkpoint_search = BackwardCheckpointSearch::default();
 
         loop {
-            let work = ListFiles {
-                request: request.clone(),
-                cursor,
-            };
-            let page = coroutine::offload(channel, list_files, work).await?;
+            let (page, next_cursor) =
+                coroutine::offload_paginated(channel, list_files, request.clone(), cursor).await?;
+            cursor = next_cursor;
             let files = parse_delta_log_listing(page.entries.into_iter(), log_root, end_version)
                 .try_collect()?;
             if checkpoint_search.push_page(files, page.known_version_boundary) {
                 break;
             }
-            let Some(next_cursor) = page.next_cursor else {
+            if cursor.is_none() {
                 break;
-            };
-            cursor = Some(next_cursor);
+            }
         }
 
         let (pages, found_checkpoint_version) = checkpoint_search.finish();

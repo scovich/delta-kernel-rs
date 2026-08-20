@@ -127,6 +127,75 @@
 //! assert_eq!("0.25", connector_quotient_as_string(1, 4)?);
 //! # Ok::<(), delta_kernel::Error>(())
 //! ```
+//!
+//! # Pagination
+//!
+//! Paginated requests pair optional connector state with an ordinary [`Resume`]. Kernel retains
+//! only an opaque [`PaginationCursor`] between requests, so unrelated work can be interleaved
+//! without losing the connector's state.
+//!
+//! ```
+//! use delta_kernel::coroutine::{
+//!     self, Channel, Pagination, PaginationResponse, Resume,
+//! };
+//! use delta_kernel::DeltaResult;
+//!
+//! type Numbers = std::vec::IntoIter<u32>;
+//! type NumbersResume = Resume<Vec<u32>, Request, PaginationResponse<Vec<u32>, Numbers>>;
+//! type DoubleResume = Resume<Vec<u32>, Request, u32>;
+//!
+//! enum Request {
+//!     Numbers(usize, Pagination<Numbers, NumbersResume>),
+//!     Double(u32, DoubleResume),
+//! }
+//!
+//! async fn kernel_workflow(mut channel: Channel<Vec<u32>, Request>) -> DeltaResult<Vec<u32>> {
+//!     let mut cursor = None;
+//!     let mut output = Vec::new();
+//!     loop {
+//!         let (numbers, next_cursor) = coroutine::offload_paginated(
+//!             &mut channel,
+//!             Request::Numbers,
+//!             2,
+//!             cursor,
+//!         )
+//!         .await?;
+//!         cursor = next_cursor;
+//!
+//!         // This unrelated request runs while the connector's Numbers iterator is in `cursor`.
+//!         for number in numbers {
+//!             output.push(
+//!                 coroutine::offload(&mut channel, Request::Double, number).await?,
+//!             );
+//!         }
+//!
+//!         if cursor.is_none() {
+//!             return Ok(output);
+//!         }
+//!     }
+//! }
+//!
+//! fn connector_workflow() -> DeltaResult<Vec<u32>> {
+//!     coroutine::drive_to_completion!(
+//!         coroutine::start(kernel_workflow),
+//!         |request| match request {
+//!             Request::Numbers(limit, Pagination(state, resume)) => {
+//!                 let mut numbers = state.unwrap_or_else(|| vec![1, 2, 3].into_iter());
+//!                 let response = numbers.by_ref().take(limit).collect();
+//!                 if numbers.len() == 0 {
+//!                     resume.resume(Ok(PaginationResponse::Done(response)))
+//!                 } else {
+//!                     resume.resume(Ok(PaginationResponse::More(response, numbers)))
+//!                 }
+//!             }
+//!             Request::Double(number, resume) => resume.resume(Ok(number * 2)),
+//!         }
+//!     )
+//! }
+//!
+//! assert_eq!(connector_workflow()?, vec![2, 4, 6]);
+//! # Ok::<(), delta_kernel::Error>(())
+//! ```
 pub(crate) mod engine;
 pub mod listing;
 pub mod read;
@@ -237,11 +306,9 @@ pub use crate::__drive_to_completion as drive_to_completion;
 // See module-level documentation for an overview of kernel/connector communication via coroutines.
 //
 // A workflow-specific request enum `Q` (defined by kernel) serves as the shared contract between
-// kernel and connector. Each variant is a two-field tuple:
-// * The first field carries a concrete work item (of type `W`) that kernel might delegate to
-//   connector as part of the workflow.
-// * The second field is an opaque `Resume` instance that connector uses to communicate its response
-//   (of type `R`) back to kernel so the workflow can continue.
+// kernel and connector. A one-shot variant pairs concrete work `W` with a `Resume<R>`. A paginated
+// variant instead pairs `W` with `Pagination<S, Resume<PaginationResponse<R, S>>>`, adding typed
+// connector state `S` while preserving the ordinary one-shot resume mechanism.
 //
 // Around that shared contract, this module deliberately presents different strongly typed APIs to
 // kernel and connector authors. Kernel calls `offload(&mut channel, Q::Variant, work: W).await?`
@@ -254,9 +321,9 @@ pub use crate::__drive_to_completion as drive_to_completion;
 // implementation reads as ordinary sequential async code.
 //
 // Meanwhile, connector code sees `DeltaResult<ControlFlow<O, Q>>`. Matching a `Q` variant tells the
-// connector both what to do and what response type kernel expects. Its `Resume<R>` provides a
-// `resume` method that accepts `DeltaResult<R>`, consumes `self`, resumes kernel, and returns
-// kernel's next `DeltaResult<ControlFlow<O, Q>>` back to the connector.
+// connector both what to do and what response type kernel expects. Its `Resume<R>` accepts the
+// typed response, consumes itself, resumes kernel, and returns kernel's next step. For pagination,
+// connector additionally receives `Option<S>` and returns either `More(R, S)` or `Done(R)`.
 //
 // Rust compiles the async workflow into a `Future` that stores kernel's locals and control flow
 // across each `.await`. `genawaiter2` wraps and polls that future in a `Generator`, an object that
@@ -266,12 +333,12 @@ pub use crate::__drive_to_completion as drive_to_completion;
 // continuation. While kernel runs, `advance` owns it. While the connector performs work, the
 // request's `Resume` owns it. No additional kernel-owned state table connects the two calls.
 //
-// Each `offload` call selects one variant of `Q` and its corresponding `(W, R)` pair. Multiple
-// variants could have the same signature while still representing logically distinct work items.
-// To fit all `(W, R)` pairs through the generator's fixed transport types, this module erases each
-// outbound pair behind a `dyn PendingRequest` and each inbound `R` behind `Any`. The typed
-// constructor and `Resume<R>` preserve their relationship so the concrete types can be restored
-// before kernel or connector code handles them.
+// Each offload selects one variant of `Q` and its corresponding typed contract. Multiple variants
+// could have the same signature while still representing logically distinct work items. To fit
+// heterogeneous contracts through the generator's fixed transport types, this module erases each
+// outbound request behind `dyn PendingRequest` and each inbound response behind `Any`. Typed
+// constructors preserve the relationships so concrete types are restored before kernel or
+// connector handles them.
 //
 // From `offload` to `Continue`:
 //
@@ -301,13 +368,16 @@ pub use crate::__drive_to_completion as drive_to_completion;
 // The downcast is structurally guaranteed: `TypedPending<W, R>` can construct only a `Resume<R>`,
 // and that `Resume<R>` can accept only an `R` before resuming the exact generator suspended by the
 // matching `offload<W, R>`.
+//
+// Pagination applies the same pattern to `(W, R, S)`. `PaginationCursor<S>` retains typed connector
+// state in the async workflow, while `PaginatedPending<W, R, S>` restores it to `Pagination`.
 
-/// Erases the work/response pair only while the generator is suspended.
+/// Erases a typed request contract only while the generator is suspended.
 trait PendingRequest<O, Q>: Send {
     fn attach(self: Box<Self>, generator: Generator<O, Q>) -> Q;
 }
 
-/// Erases heterogeneous work/response pairs into the generator's single yield type.
+/// Erases heterogeneous request contracts into the generator's single yield type.
 type Pending<O, Q> = Box<dyn PendingRequest<O, Q>>;
 
 /// Erases successful connector responses into the generator's single resume type.
@@ -326,6 +396,38 @@ const UNOBSERVABLE_INITIAL_RESPONSE: ErasedResponse = Err(Error::InternalError(S
 #[internal_api]
 pub(crate) struct Channel<O, Q>(Co<Pending<O, Q>, ErasedResponse>);
 
+/// Connector state retained by kernel between pagination requests.
+///
+/// The state field is private, so kernel can only move or drop a cursor. Pagination machinery
+/// returns the state to the connector with its original type.
+#[must_use = "dropping the cursor abandons the connector's pagination state"]
+pub struct PaginationCursor<S>(S);
+
+impl<S> fmt::Debug for PaginationCursor<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PaginationCursor")
+    }
+}
+
+/// Connector context for one pagination request.
+///
+/// The first field contains connector state from the preceding request, or `None` for the initial
+/// request. The second field resumes the kernel coroutine with a [`PaginationResponse`].
+#[derive(Debug)]
+pub struct Pagination<S, R>(pub Option<S>, pub R);
+
+/// Connector response to one pagination request.
+#[derive(Debug)]
+pub enum PaginationResponse<R, S> {
+    /// Returns a response and connector state for another pagination request.
+    More(R, S),
+    /// Returns the final response and completes this pagination sequence.
+    Done(R),
+}
+
+type PaginationConstructor<O, Q, W, R, S> =
+    fn(W, Pagination<S, Resume<O, Q, PaginationResponse<R, S>>>) -> Q;
+
 /// One-shot continuation accepting the response type required by its request.
 #[must_use = "the kernel workflow remains suspended until this continuation is resumed"]
 pub struct Resume<O, Q, R> {
@@ -341,6 +443,17 @@ impl<O: Send + 'static, Q: Send + 'static, R: Send + 'static> Resume<O, Q, R> {
     pub fn resume(self, response: DeltaResult<R>) -> DeltaResult<ControlFlow<O, Q>> {
         let response = response.map(|response| Box::new(response) as _);
         advance(self.generator, response)
+    }
+
+    /// Produce a response and submit its result to the suspended kernel workflow.
+    ///
+    /// Errors produced by `response` are delivered to kernel rather than returned directly by the
+    /// connector driver.
+    pub fn resume_with(
+        self,
+        response: impl FnOnce() -> DeltaResult<R>,
+    ) -> DeltaResult<ControlFlow<O, Q>> {
+        self.resume(response())
     }
 }
 
@@ -387,6 +500,31 @@ where
     }
 }
 
+/// Preserves a typed paginated work/response/state relationship while suspended.
+struct PaginatedPending<O, Q, W, R, S> {
+    work: W,
+    cursor: Option<PaginationCursor<S>>,
+    constructor: PaginationConstructor<O, Q, W, R, S>,
+}
+
+impl<O, Q, W, R, S> PendingRequest<O, Q> for PaginatedPending<O, Q, W, R, S>
+where
+    O: Send + 'static,
+    Q: Send + 'static,
+    W: Send + 'static,
+    R: Send + 'static,
+    S: Send + 'static,
+{
+    fn attach(self: Box<Self>, generator: Generator<O, Q>) -> Q {
+        let state = self.cursor.map(|cursor| cursor.0);
+        let resume = Resume {
+            generator,
+            response_type: PhantomData,
+        };
+        (self.constructor)(self.work, Pagination(state, resume))
+    }
+}
+
 /// Yield `work` and resume with the response type encoded by `constructor`.
 #[allow(dead_code)]
 #[internal_api]
@@ -403,11 +541,54 @@ where
 {
     // The generator has one yield type, so erase this work/response pair while suspended.
     // `TypedPending` preserves `R` until it can attach the generator to a typed `Resume<R>`.
-    let pending = Box::new(TypedPending { work, constructor });
-    let response = channel.0.yield_(pending).await?;
+    let pending: Pending<O, Q> = Box::new(TypedPending { work, constructor });
+    suspend(channel, pending).await
+}
 
-    // `Resume<R>` can only box an `R` before resuming this exact suspended generator, so this
-    // downcast is guaranteed to succeed.
+/// Yield paginated `work` and resume with its typed response and optional continuation state.
+///
+/// `cursor` is `None` for the first request in a pagination sequence. A cursor returned by this
+/// function may be retained across unrelated offloads and supplied to a later call using the same
+/// request constructor and connector state type `S`.
+///
+/// Returns the connector response and `Some` cursor when more pagination work remains, or `None`
+/// when the connector completed the sequence.
+///
+/// Errors if the connector reports an error.
+#[allow(dead_code)]
+#[internal_api]
+pub(crate) async fn offload_paginated<O, Q, W, R, S>(
+    channel: &mut Channel<O, Q>,
+    constructor: PaginationConstructor<O, Q, W, R, S>,
+    work: W,
+    cursor: Option<PaginationCursor<S>>,
+) -> DeltaResult<(R, Option<PaginationCursor<S>>)>
+where
+    O: Send + 'static,
+    Q: Send + 'static,
+    W: Send + 'static,
+    R: Send + 'static,
+    S: Send + 'static,
+{
+    let pending: Pending<O, Q> = Box::new(PaginatedPending {
+        work,
+        cursor,
+        constructor,
+    });
+    let response: PaginationResponse<R, S> = suspend(channel, pending).await?;
+    match response {
+        PaginationResponse::More(response, state) => Ok((response, Some(PaginationCursor(state)))),
+        PaginationResponse::Done(response) => Ok((response, None)),
+    }
+}
+
+async fn suspend<O, Q, R>(channel: &mut Channel<O, Q>, pending: Pending<O, Q>) -> DeltaResult<R>
+where
+    O: Send + 'static,
+    Q: Send + 'static,
+    R: Send + 'static,
+{
+    let response = channel.0.yield_(pending).await?;
     response.downcast().map(|response| *response).map_err(|_| {
         Error::internal_error("coroutine resumed with an unexpected connector response type")
     })

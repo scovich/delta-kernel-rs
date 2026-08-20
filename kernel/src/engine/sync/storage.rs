@@ -31,7 +31,7 @@ impl StorageHandler for SyncStorageHandler {
     fn list_from(
         &self,
         url_path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>> + Send>> {
         let (store, base_url, offset) = resolve_scope(self.store.as_ref(), url_path)?;
 
         // For directory URLs, prefix == offset and the offset acts as a lower bound that still
@@ -72,7 +72,7 @@ impl StorageHandler for SyncStorageHandler {
     fn read_files(
         &self,
         files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>> + Send>> {
         let store = self.store.clone();
         let results: Vec<DeltaResult<Bytes>> = files
             .into_iter()

@@ -2875,14 +2875,8 @@ async fn test_latest_commit_file_field_is_captured() {
     )
     .await;
 
-    let log_segment = LogSegment::for_snapshot(
-        storage.as_ref(),
-        log_root.clone(),
-        vec![],
-        None,
-        SnapshotLoadMetricContext::for_test(),
-    )
-    .unwrap();
+    let log_segment =
+        for_snapshot_from_storage(storage.as_ref(), log_root.clone(), vec![], None, None).unwrap();
 
     // The latest commit should be version 5
     assert_eq!(log_segment.listed.latest_commit_file.unwrap().version, 5);
@@ -2908,14 +2902,8 @@ async fn test_latest_commit_file_with_checkpoint_filtering() {
     )
     .await;
 
-    let log_segment = LogSegment::for_snapshot(
-        storage.as_ref(),
-        log_root.clone(),
-        vec![],
-        None,
-        SnapshotLoadMetricContext::for_test(),
-    )
-    .unwrap();
+    let log_segment =
+        for_snapshot_from_storage(storage.as_ref(), log_root.clone(), vec![], None, None).unwrap();
 
     // The latest commit should be version 4
     assert_eq!(log_segment.listed.latest_commit_file.unwrap().version, 4);
@@ -2935,14 +2923,8 @@ async fn test_latest_commit_file_with_no_commits() {
     )
     .await;
 
-    let log_segment = LogSegment::for_snapshot(
-        storage.as_ref(),
-        log_root.clone(),
-        vec![],
-        None,
-        SnapshotLoadMetricContext::for_test(),
-    )
-    .unwrap();
+    let log_segment =
+        for_snapshot_from_storage(storage.as_ref(), log_root.clone(), vec![], None, None).unwrap();
 
     // latest_commit_file should be None when there are no commits
     assert!(log_segment.listed.latest_commit_file.is_none());
@@ -2965,14 +2947,8 @@ async fn test_latest_commit_file_with_checkpoint_at_same_version() {
     )
     .await;
 
-    let log_segment = LogSegment::for_snapshot(
-        storage.as_ref(),
-        log_root.clone(),
-        vec![],
-        None,
-        SnapshotLoadMetricContext::for_test(),
-    )
-    .unwrap();
+    let log_segment =
+        for_snapshot_from_storage(storage.as_ref(), log_root.clone(), vec![], None, None).unwrap();
 
     // The latest commit should be version 1 (saved before filtering)
     assert_eq!(log_segment.listed.latest_commit_file.unwrap().version, 1);
@@ -2997,14 +2973,8 @@ async fn test_latest_commit_file_edge_case_commit_before_checkpoint() {
     )
     .await;
 
-    let log_segment = LogSegment::for_snapshot(
-        storage.as_ref(),
-        log_root.clone(),
-        vec![],
-        None,
-        SnapshotLoadMetricContext::for_test(),
-    )
-    .unwrap();
+    let log_segment =
+        for_snapshot_from_storage(storage.as_ref(), log_root.clone(), vec![], None, None).unwrap();
 
     // latest_commit_file should be None since there's no commit at the checkpoint version
     assert!(log_segment.listed.latest_commit_file.is_none());

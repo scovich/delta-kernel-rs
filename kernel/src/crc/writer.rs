@@ -55,9 +55,9 @@ mod tests {
 
     use super::*;
     use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
-    use crate::crc::reader::try_read_crc_file;
     use crate::crc::{
-        DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState, SetTransactionState,
+        try_read_crc_file_with_engine, DomainMetadataState, FileSizeHistogram, FileStats,
+        FileStatsState, SetTransactionState,
     };
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
@@ -143,7 +143,7 @@ mod tests {
 
         try_write_crc_file(&engine, crc_path.location.as_url(), &crc).unwrap();
 
-        let read_back = try_read_crc_file(&engine, &crc_path).unwrap();
+        let read_back = try_read_crc_file_with_engine(&engine, &crc_path).unwrap();
         assert_eq!(read_back, crc);
         assert_eq!(read_back.version, version);
     }

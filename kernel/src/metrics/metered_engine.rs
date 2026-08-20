@@ -108,14 +108,14 @@ mod tests {
         fn list_from(
             &self,
             _path: &Url,
-        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>> + Send>> {
             let results: Vec<_> = self.list_results.iter().cloned().map(Ok).collect();
             Ok(Box::new(results.into_iter()))
         }
         fn read_files(
             &self,
             _files: Vec<FileSlice>,
-        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>> + Send>> {
             Ok(Box::new(std::iter::empty()))
         }
         fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {

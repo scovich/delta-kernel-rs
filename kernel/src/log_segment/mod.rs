@@ -15,10 +15,10 @@ use crate::actions::{
 };
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 use crate::committer::CatalogCommit;
-use crate::coroutine::engine::EngineRequestState;
-use crate::coroutine::listing::{ListFiles, ListFilesResult};
-use crate::coroutine::read::{ReadFiles, ReadFilesResume};
-use crate::coroutine::{self, Channel, Resume};
+use crate::coroutine::engine::{self as coroutine_engine, ListingPagination};
+use crate::coroutine::listing::{ListFiles, ListFilesConstructor};
+use crate::coroutine::read::ReadFilesConstructor;
+use crate::coroutine::{self, Channel};
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_reader::commit::CommitReader;
@@ -53,11 +53,8 @@ mod crc_tests;
 #[cfg(test)]
 mod tests;
 
-type LogSegmentResume<R> = Resume<LogSegment, LogSegmentRequest, R>;
-
 enum LogSegmentRequest {
-    ListFiles(ListFiles, LogSegmentResume<ListFilesResult>),
-    ReadFiles(ReadFiles, ReadFilesResume<LogSegment, LogSegmentRequest>),
+    ListFiles(ListFiles, ListingPagination<LogSegment, LogSegmentRequest>),
 }
 
 fn drive_log_segment<F, Fut>(storage: &dyn StorageHandler, workflow: F) -> DeltaResult<LogSegment>
@@ -65,13 +62,9 @@ where
     F: FnOnce(Channel<LogSegment, LogSegmentRequest>) -> Fut + Send + 'static,
     Fut: Future<Output = DeltaResult<LogSegment>> + Send + 'static,
 {
-    let mut engine_state = EngineRequestState::default();
     coroutine::drive_to_completion!(coroutine::start(workflow), |request| match request {
-        LogSegmentRequest::ListFiles(request, resume) => {
-            resume.resume(engine_state.execute_list_files(storage, request))
-        }
-        LogSegmentRequest::ReadFiles(request, resume) => {
-            resume.resume(engine_state.execute_read_files(storage, request))
+        LogSegmentRequest::ListFiles(request, pagination) => {
+            coroutine_engine::resume_list_files(storage, request, pagination)
         }
     })
 }
@@ -367,8 +360,16 @@ impl LogSegment {
     ///
     /// Reports metrics: `LogSegmentLoadSuccess` or `LogSegmentLoadFailure`.
     #[internal_api]
-    pub(crate) fn for_snapshot(
-        storage: &dyn StorageHandler,
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn for_snapshot<
+        O: Send + 'static,
+        Q: Send + 'static,
+        LS: Send + 'static,
+        RS: Send + 'static,
+    >(
+        channel: &mut Channel<O, Q>,
+        list_files: ListFilesConstructor<O, Q, LS>,
+        read_files: ReadFilesConstructor<O, Q, RS>,
         log_root: Url,
         log_tail: Vec<ParsedLogPath>,
         time_travel_version: impl Into<Option<Version>>,
@@ -376,20 +377,20 @@ impl LogSegment {
     ) -> DeltaResult<Self> {
         let time_travel_version = time_travel_version.into();
         let start = std::time::Instant::now();
-        let log_segment = drive_log_segment(storage, async move |mut channel| {
+        let log_segment = async {
             let checkpoint_hint =
-                LastCheckpointHint::try_read(&mut channel, LogSegmentRequest::ReadFiles, &log_root)
-                    .await?;
+                LastCheckpointHint::try_read(channel, read_files, &log_root).await?;
             Self::for_snapshot_impl(
-                &mut channel,
-                LogSegmentRequest::ListFiles,
+                channel,
+                list_files,
                 log_root,
                 log_tail,
                 checkpoint_hint,
                 time_travel_version,
             )
             .await
-        })
+        }
+        .await
         .inspect_err(|_| emit_log_segment_load_failure(&metric_context))?;
 
         emit_log_segment_load(&metric_context, &log_segment, start.elapsed());
@@ -408,9 +409,9 @@ impl LogSegment {
     }
 
     // factored out for testing
-    async fn for_snapshot_impl<O: Send + 'static, Q: Send + 'static>(
+    async fn for_snapshot_impl<O: Send + 'static, Q: Send + 'static, S: Send + 'static>(
         channel: &mut Channel<O, Q>,
-        list_files: fn(ListFiles, Resume<O, Q, ListFilesResult>) -> Q,
+        list_files: ListFilesConstructor<O, Q, S>,
         log_root: Url,
         log_tail: Vec<ParsedLogPath>,
         checkpoint_hint: Option<LastCheckpointHint>,
@@ -492,9 +493,13 @@ impl LogSegment {
         })
     }
 
-    async fn construct_for_table_changes<O: Send + 'static, Q: Send + 'static>(
+    async fn construct_for_table_changes<
+        O: Send + 'static,
+        Q: Send + 'static,
+        S: Send + 'static,
+    >(
         channel: &mut Channel<O, Q>,
-        list_files: fn(ListFiles, Resume<O, Q, ListFilesResult>) -> Q,
+        list_files: ListFilesConstructor<O, Q, S>,
         log_root: Url,
         start_version: Version,
         end_version: Option<Version>,
@@ -568,9 +573,13 @@ impl LogSegment {
         })
     }
 
-    async fn construct_for_timestamp_conversion<O: Send + 'static, Q: Send + 'static>(
+    async fn construct_for_timestamp_conversion<
+        O: Send + 'static,
+        Q: Send + 'static,
+        S: Send + 'static,
+    >(
         channel: &mut Channel<O, Q>,
-        list_files: fn(ListFiles, Resume<O, Q, ListFilesResult>) -> Q,
+        list_files: ListFilesConstructor<O, Q, S>,
         log_root: Url,
         end_version: Version,
         limit: Option<NonZero<usize>>,

@@ -11,17 +11,28 @@ use super::LogSegment;
 use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
 #[cfg(feature = "declarative-plans")]
 use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
+#[cfg(feature = "declarative-plans")]
+use crate::coroutine::read::ExecutePlan;
+use crate::coroutine::read::{
+    ReadFileFormatStart, ReadJsonFiles, ReadJsonFilesConstructor, ReadParquetFiles,
+    ReadParquetFilesConstructor,
+};
+use crate::coroutine::{self, Channel, Pagination, PaginationResponse, Resume};
 use crate::crc::Crc;
+use crate::engine_data::EngineData;
+#[cfg(test)]
 use crate::log_replay::ActionsBatch;
 use crate::metrics::ProtocolMetadataSource;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::FileType;
 #[cfg(feature = "declarative-plans")]
-use crate::plans::{Operation, PlanBuilder, PlanExecutor};
+use crate::plans::PlanBuilder;
 #[cfg(feature = "declarative-plans")]
 use crate::schema::column_name;
 use crate::schema::schema_ref;
-use crate::{DeltaResult, Engine, Error};
+#[cfg(test)]
+use crate::Engine;
+use crate::{DeltaResult, Error};
 
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
@@ -30,12 +41,32 @@ impl LogSegment {
     ///
     /// This is the checked variant of [`Self::read_protocol_metadata_opt`], used for fresh
     /// snapshot creation where both Protocol and Metadata must exist.
-    pub(crate) fn read_protocol_metadata(
+    pub(crate) async fn read_protocol_metadata<
+        O: Send + 'static,
+        Q: Send + 'static,
+        S: Send + 'static,
+    >(
         &self,
-        engine: &dyn Engine,
+        channel: &mut Channel<O, Q>,
+        read_json: ReadJsonFilesConstructor<O, Q, S>,
+        read_parquet: ReadParquetFilesConstructor<O, Q, S>,
         crc: Option<&Arc<Crc>>,
+        use_plans: bool,
+        #[cfg(feature = "declarative-plans")]
+        execute_plan: crate::coroutine::read::ExecutePlanConstructor<O, Q, S>,
     ) -> DeltaResult<(Metadata, Protocol, ProtocolMetadataSource)> {
-        match self.read_protocol_metadata_opt(engine, crc)? {
+        match self
+            .read_protocol_metadata_opt(
+                channel,
+                read_json,
+                read_parquet,
+                crc,
+                use_plans,
+                #[cfg(feature = "declarative-plans")]
+                execute_plan,
+            )
+            .await?
+        {
             (Some(m), Some(p), source) => Ok((m, p, source)),
             (None, Some(_), _) => Err(Error::MissingMetadata),
             (Some(_), None, _) => Err(Error::MissingProtocol),
@@ -53,10 +84,19 @@ impl LogSegment {
     /// The `crc` parameter is the CRC eagerly resolved by the caller; it is used to
     /// short-circuit or seed the replay.
     #[instrument(name = "log_seg.load_p_m", skip_all, err)]
-    pub(crate) fn read_protocol_metadata_opt(
+    pub(crate) async fn read_protocol_metadata_opt<
+        O: Send + 'static,
+        Q: Send + 'static,
+        S: Send + 'static,
+    >(
         &self,
-        engine: &dyn Engine,
+        channel: &mut Channel<O, Q>,
+        read_json: ReadJsonFilesConstructor<O, Q, S>,
+        read_parquet: ReadParquetFilesConstructor<O, Q, S>,
         crc: Option<&Arc<Crc>>,
+        use_plans: bool,
+        #[cfg(feature = "declarative-plans")]
+        execute_plan: crate::coroutine::read::ExecutePlanConstructor<O, Q, S>,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>, ProtocolMetadataSource)> {
         // Case 1: If CRC at target version, use it directly and exit early.
         if let Some(crc) = crc.filter(|c| c.version == self.end_version) {
@@ -84,7 +124,16 @@ impl LogSegment {
                 crc.version
             );
             let pruned = self.segment_after_version(crc.version);
-            let (metadata_opt, protocol_opt) = pruned.replay_for_pm(engine)?;
+            let (metadata_opt, protocol_opt) = pruned
+                .replay_for_pm(
+                    channel,
+                    read_json,
+                    read_parquet,
+                    use_plans,
+                    #[cfg(feature = "declarative-plans")]
+                    execute_plan,
+                )
+                .await?;
 
             if metadata_opt.is_some() && protocol_opt.is_some() {
                 info!("Found P&M from pruned log replay");
@@ -107,7 +156,16 @@ impl LogSegment {
         }
 
         // Case 3: Full P&M log replay.
-        let (metadata_opt, protocol_opt) = self.replay_for_pm(engine)?;
+        let (metadata_opt, protocol_opt) = self
+            .replay_for_pm(
+                channel,
+                read_json,
+                read_parquet,
+                use_plans,
+                #[cfg(feature = "declarative-plans")]
+                execute_plan,
+            )
+            .await?;
         Ok((
             metadata_opt,
             protocol_opt,
@@ -116,42 +174,97 @@ impl LogSegment {
     }
 
     /// Replays the log segment for Protocol and Metadata, stopping early once both are found.
-    fn replay_for_pm(
+    async fn replay_for_pm<O: Send + 'static, Q: Send + 'static, S: Send + 'static>(
         &self,
-        engine: &dyn Engine,
+        channel: &mut Channel<O, Q>,
+        read_json: ReadJsonFilesConstructor<O, Q, S>,
+        read_parquet: ReadParquetFilesConstructor<O, Q, S>,
+        use_plans: bool,
+        #[cfg(feature = "declarative-plans")]
+        execute_plan: crate::coroutine::read::ExecutePlanConstructor<O, Q, S>,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
         // Providing a plan executor opts the engine into declarative P&M replay.
         #[cfg(feature = "declarative-plans")]
-        let actions_batches = match engine.plan_executor() {
-            Some(executor) => self.read_pm_batches_via_plan(executor.as_ref())?,
-            None => Box::new(self.read_pm_batches(engine)?) as _,
-        };
-
+        if use_plans {
+            return self.replay_for_pm_via_plan(channel, execute_plan).await;
+        }
         #[cfg(not(feature = "declarative-plans"))]
-        let actions_batches = self.read_pm_batches(engine)?;
+        let _ = use_plans;
 
+        let schema = schema_ref! {
+            (&PROTOCOL_FIELD),
+            (&METADATA_FIELD),
+        };
         let mut metadata_opt = None;
         let mut protocol_opt = None;
-        for actions_batch in actions_batches {
-            let actions = actions_batch?.actions;
-            if metadata_opt.is_none() {
-                metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
-            }
-            if protocol_opt.is_none() {
-                protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
-            }
-            if metadata_opt.is_some() && protocol_opt.is_some() {
-                break;
-            }
+
+        let commit_files = self.find_commit_cover();
+        if !commit_files.is_empty()
+            && consume_pm_batches(
+                channel,
+                read_json,
+                ReadJsonFiles::Start(ReadFileFormatStart {
+                    files: commit_files,
+                    physical_schema: schema.clone(),
+                    predicate: None,
+                }),
+                || ReadJsonFiles::Continue,
+                &mut metadata_opt,
+                &mut protocol_opt,
+            )
+            .await?
+        {
+            return Ok((metadata_opt, protocol_opt));
+        }
+
+        let Some(first) = self.listed.checkpoint_parts.first() else {
+            return Ok((metadata_opt, protocol_opt));
+        };
+        let checkpoint_files: Vec<_> = self
+            .listed
+            .checkpoint_parts
+            .iter()
+            .map(|f| f.location.clone())
+            .collect();
+        let checkpoint_predicate = super::checkpoint_action_projection_predicate(&schema);
+        if first.is_json() {
+            consume_pm_batches(
+                channel,
+                read_json,
+                ReadJsonFiles::Start(ReadFileFormatStart {
+                    files: checkpoint_files,
+                    physical_schema: schema,
+                    predicate: checkpoint_predicate,
+                }),
+                || ReadJsonFiles::Continue,
+                &mut metadata_opt,
+                &mut protocol_opt,
+            )
+            .await?;
+        } else {
+            consume_pm_batches(
+                channel,
+                read_parquet,
+                ReadParquetFiles::Start(ReadFileFormatStart {
+                    files: checkpoint_files,
+                    physical_schema: schema,
+                    predicate: checkpoint_predicate,
+                }),
+                || ReadParquetFiles::Continue,
+                &mut metadata_opt,
+                &mut protocol_opt,
+            )
+            .await?;
         }
         Ok((metadata_opt, protocol_opt))
     }
 
     #[cfg(feature = "declarative-plans")]
-    fn read_pm_batches_via_plan(
+    async fn replay_for_pm_via_plan<O: Send + 'static, Q: Send + 'static, S: Send + 'static>(
         &self,
-        executor: &dyn PlanExecutor,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
+        channel: &mut Channel<O, Q>,
+        execute_plan: crate::coroutine::read::ExecutePlanConstructor<O, Q, S>,
+    ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
         let versioned_schema = schema_ref! {
             (&PROTOCOL_FIELD),
             (&METADATA_FIELD),
@@ -188,15 +301,22 @@ impl LogSegment {
             })?
             .build()?;
 
-        // NOTE: The plan dedupes all actions, so mark all results as coming from checkpoint
-        let batches = executor
-            .execute_op(Operation::QueryPlan(plan))?
-            .into_data()?
-            .map(|batch| Ok(ActionsBatch::new(batch?, true)));
-        Ok(Box::new(batches))
+        let mut metadata_opt = None;
+        let mut protocol_opt = None;
+        consume_pm_batches(
+            channel,
+            execute_plan,
+            ExecutePlan::Start(crate::plans::Operation::QueryPlan(plan)),
+            || ExecutePlan::Continue,
+            &mut metadata_opt,
+            &mut protocol_opt,
+        )
+        .await?;
+        Ok((metadata_opt, protocol_opt))
     }
 
     // Replay the commit log, projecting rows to only contain Protocol and Metadata action columns.
+    #[cfg(test)]
     fn read_pm_batches(
         &self,
         engine: &dyn Engine,
@@ -206,6 +326,50 @@ impl LogSegment {
             (&METADATA_FIELD),
         };
         self.read_actions(engine, schema)
+    }
+}
+
+#[allow(clippy::type_complexity)]
+async fn consume_pm_batches<O, Q, W, S>(
+    channel: &mut Channel<O, Q>,
+    constructor: fn(
+        W,
+        Pagination<S, Resume<O, Q, PaginationResponse<Option<Box<dyn EngineData>>, S>>>,
+    ) -> Q,
+    mut request: W,
+    continue_request: fn() -> W,
+    metadata_opt: &mut Option<Metadata>,
+    protocol_opt: &mut Option<Protocol>,
+) -> DeltaResult<bool>
+where
+    O: Send + 'static,
+    Q: Send + 'static,
+    W: Send + 'static,
+    S: Send + 'static,
+{
+    let mut cursor = None;
+    loop {
+        let (batch, next_cursor) =
+            coroutine::offload_paginated(channel, constructor, request, cursor).await?;
+        match batch {
+            Some(batch) => {
+                if metadata_opt.is_none() {
+                    *metadata_opt = Metadata::try_new_from_data(batch.as_ref())?;
+                }
+                if protocol_opt.is_none() {
+                    *protocol_opt = Protocol::try_new_from_data(batch.as_ref())?;
+                }
+                if metadata_opt.is_some() && protocol_opt.is_some() {
+                    return Ok(true);
+                }
+            }
+            None => return Ok(false),
+        }
+        let Some(next_cursor) = next_cursor else {
+            return Ok(false);
+        };
+        cursor = Some(next_cursor);
+        request = continue_request();
     }
 }
 
