@@ -6,7 +6,7 @@
 
 use url::Url;
 
-use super::{Operation, PaginatedOperation, Pagination, PaginationResponse, Resume};
+use super::{Operation, PaginatedOperation, Pagination, Resume};
 use crate::{DeltaResult, FileMeta, Version};
 
 /// Exclusive lexicographic bounds shared by every page of one listing.
@@ -59,7 +59,7 @@ pub struct ListFilesResult {
 
 /// Constructor for a workflow request variant that delegates paginated file listing.
 pub(crate) type ListFilesConstructor<O, Q, S> =
-    fn(Pagination<ListFiles, S>, Resume<O, Q, PaginationResponse<ListFilesResult, S>>) -> Q;
+    fn(Pagination<ListFiles, S>, Resume<O, Q, (ListFilesResult, Option<S>)>) -> Q;
 
 /// Builds the bare version path used as an exclusive lexicographic listing bound.
 ///

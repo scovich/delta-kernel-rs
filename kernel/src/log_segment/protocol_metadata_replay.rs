@@ -16,7 +16,7 @@ use crate::coroutine::read::ExecutePlanConstructor;
 use crate::coroutine::read::{
     ReadFileFormatStart, ReadJsonFilesConstructor, ReadParquetFilesConstructor,
 };
-use crate::coroutine::{self, Channel, Pagination, PaginationResponse, Resume};
+use crate::coroutine::{self, Channel, Pagination, Resume};
 use crate::crc::Crc;
 use crate::engine_data::EngineData;
 #[cfg(test)]
@@ -324,10 +324,7 @@ impl LogSegment {
 #[allow(clippy::type_complexity)]
 async fn consume_pm_batches<O, Q, W, S>(
     channel: &mut Channel<O, Q>,
-    constructor: fn(
-        Pagination<W, S>,
-        Resume<O, Q, PaginationResponse<Option<Box<dyn EngineData>>, S>>,
-    ) -> Q,
+    constructor: fn(Pagination<W, S>, Resume<O, Q, (Option<Box<dyn EngineData>>, Option<S>)>) -> Q,
     work: W,
     metadata_opt: &mut Option<Metadata>,
     protocol_opt: &mut Option<Protocol>,

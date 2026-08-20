@@ -13,7 +13,7 @@ use super::listing::{
 #[cfg(feature = "declarative-plans")]
 use super::read::ExecutePlan;
 use super::read::{ReadFiles, ReadJsonFiles, ReadParquetFiles};
-use super::{coroutine_request, Pagination, PaginationResponse, Resume, SupportsPaginated};
+use super::{coroutine_request, Pagination, Resume, SupportsPaginated};
 use crate::engine_data::EngineData;
 use crate::path::may_begin_listable_log_path;
 use crate::{
@@ -47,13 +47,11 @@ pub(crate) enum ListingState {
 }
 
 pub(crate) type ListingPagination = Pagination<ListFiles, ListingState>;
-pub(crate) type ListingResume<O, Q> =
-    Resume<O, Q, PaginationResponse<ListFilesResult, ListingState>>;
+pub(crate) type ListingResume<O, Q> = Resume<O, Q, (ListFilesResult, Option<ListingState>)>;
 pub(crate) type ReadPagination = Pagination<ReadFiles, ReadIterator>;
-pub(crate) type ReadResume<O, Q> =
-    Resume<O, Q, PaginationResponse<Option<Vec<Bytes>>, ReadIterator>>;
+pub(crate) type ReadResume<O, Q> = Resume<O, Q, (Option<Vec<Bytes>>, Option<ReadIterator>)>;
 pub(crate) type EngineDataResume<O, Q> =
-    Resume<O, Q, PaginationResponse<Option<Box<dyn EngineData>>, EngineDataIterator>>;
+    Resume<O, Q, (Option<Box<dyn EngineData>>, Option<EngineDataIterator>)>;
 pub(crate) type EngineDataPagination<W> = Pagination<W, EngineDataIterator>;
 
 /// Owned compatibility adapter for serving coroutine requests through an [`Engine`].
@@ -79,18 +77,14 @@ impl EngineConnector {
 impl SupportsPaginated<ForwardListing> for EngineConnector {
     type State = ListingIterator;
 
-    fn start(
-        &mut self,
-        bounds: ListingBounds,
-    ) -> DeltaResult<PaginationResponse<ForwardListingResult, Self::State>> {
-        let listing = start_forward_listing(self.storage.as_ref(), bounds)?;
-        Ok(next_forward_listing(listing))
+    fn start(&mut self, bounds: ListingBounds) -> DeltaResult<Self::State> {
+        start_forward_listing(self.storage.as_ref(), bounds)
     }
 
     fn next(
         &mut self,
         listing: Self::State,
-    ) -> DeltaResult<PaginationResponse<ForwardListingResult, Self::State>> {
+    ) -> DeltaResult<(ForwardListingResult, Option<Self::State>)> {
         Ok(next_forward_listing(listing))
     }
 }
@@ -102,18 +96,13 @@ pub(crate) fn resume_list_files<O: Send + 'static, Q: Send + 'static>(
     resume: ListingResume<O, Q>,
 ) -> DeltaResult<ControlFlow<O, Q>> {
     resume.resume_with(|| {
-        let forward_page = |listing: ListingIterator| match next_forward_listing(listing) {
-            PaginationResponse::More(result, listing) => PaginationResponse::More(
-                ListFilesResult {
-                    entries: result.entries,
-                    known_version_boundary: false,
-                },
-                ListingState::Forward(listing),
-            ),
-            PaginationResponse::Done(result) => PaginationResponse::Done(ListFilesResult {
+        let forward_page = |listing: ListingIterator| {
+            let (result, listing) = next_forward_listing(listing);
+            let list_files_result = ListFilesResult {
                 entries: result.entries,
-                known_version_boundary: true,
-            }),
+                known_version_boundary: listing.is_none(),
+            };
+            (list_files_result, listing.map(ListingState::Forward))
         };
         let backward_page = |bounds: Box<ListingBounds>, high: Version| -> DeltaResult<_> {
             let start = version_bound(&bounds.low)?;
@@ -129,17 +118,11 @@ pub(crate) fn resume_list_files<O: Send + 'static, Q: Send + 'static>(
                 entries,
                 known_version_boundary: true,
             };
-            Ok(if lower > start {
-                PaginationResponse::More(
-                    result,
-                    ListingState::Backward {
-                        bounds,
-                        high: lower,
-                    },
-                )
-            } else {
-                PaginationResponse::Done(result)
-            })
+            let state = (lower > start).then_some(ListingState::Backward {
+                bounds,
+                high: lower,
+            });
+            Ok((result, state))
         };
 
         match pagination {
@@ -175,23 +158,19 @@ pub(crate) fn resume_read_files<O: Send + 'static, Q: Send + 'static>(
             .take(READ_PAGE_SIZE)
             .collect::<DeltaResult<Vec<_>>>()?;
         Ok(if data.is_empty() {
-            PaginationResponse::Done(None)
+            (None, None)
         } else {
-            PaginationResponse::More(Some(data), reads)
+            (Some(data), Some(reads))
         })
     })
 }
 
 /// Serves one paginated JSON read through a legacy [`JsonHandler`].
-pub(crate) fn resume_read_json_files<O, Q>(
+pub(crate) fn resume_read_json_files<O: Send + 'static, Q: Send + 'static>(
     json: &dyn JsonHandler,
     pagination: EngineDataPagination<ReadJsonFiles>,
     resume: EngineDataResume<O, Q>,
-) -> DeltaResult<ControlFlow<O, Q>>
-where
-    O: Send + 'static,
-    Q: Send + 'static,
-{
+) -> DeltaResult<ControlFlow<O, Q>> {
     let reads = match pagination {
         Pagination::Start(start) => {
             json.read_json_files(&start.files, start.physical_schema, start.predicate)
@@ -202,15 +181,11 @@ where
 }
 
 /// Serves one paginated Parquet read through a legacy [`ParquetHandler`].
-pub(crate) fn resume_read_parquet_files<O, Q>(
+pub(crate) fn resume_read_parquet_files<O: Send + 'static, Q: Send + 'static>(
     parquet: &dyn ParquetHandler,
     pagination: EngineDataPagination<ReadParquetFiles>,
     resume: EngineDataResume<O, Q>,
-) -> DeltaResult<ControlFlow<O, Q>>
-where
-    O: Send + 'static,
-    Q: Send + 'static,
-{
+) -> DeltaResult<ControlFlow<O, Q>> {
     let reads = match pagination {
         Pagination::Start(start) => {
             parquet.read_parquet_files(&start.files, start.physical_schema, start.predicate)
@@ -222,15 +197,11 @@ where
 
 /// Serves one paginated declarative-plan execution through a legacy [`Engine`].
 #[cfg(feature = "declarative-plans")]
-pub(crate) fn resume_plan<O, Q>(
+pub(crate) fn resume_plan<O: Send + 'static, Q: Send + 'static>(
     engine: &dyn Engine,
     pagination: EngineDataPagination<ExecutePlan>,
     resume: EngineDataResume<O, Q>,
-) -> DeltaResult<ControlFlow<O, Q>>
-where
-    O: Send + 'static,
-    Q: Send + 'static,
-{
+) -> DeltaResult<ControlFlow<O, Q>> {
     let reads = match pagination {
         Pagination::Start(operation) => engine
             .plan_executor()
@@ -265,30 +236,22 @@ fn start_forward_listing(
 
 fn next_forward_listing(
     mut listing: ListingIterator,
-) -> PaginationResponse<ForwardListingResult, ListingIterator> {
+) -> (ForwardListingResult, Option<ListingIterator>) {
     let entries = Vec::from_iter(listing.by_ref().take(FORWARD_LISTING_PAGE_SIZE));
     let may_have_more = entries.len() == FORWARD_LISTING_PAGE_SIZE;
     let result = ForwardListingResult { entries };
-    if may_have_more {
-        PaginationResponse::More(result, listing)
-    } else {
-        PaginationResponse::Done(result)
-    }
+    (result, may_have_more.then_some(listing))
 }
 
-fn resume_engine_data<O, Q>(
+fn resume_engine_data<O: Send + 'static, Q: Send + 'static>(
     reads: DeltaResult<EngineDataIterator>,
     resume: EngineDataResume<O, Q>,
-) -> DeltaResult<ControlFlow<O, Q>>
-where
-    O: Send + 'static,
-    Q: Send + 'static,
-{
+) -> DeltaResult<ControlFlow<O, Q>> {
     resume.resume_with(|| {
         let mut reads = reads?;
         Ok(match reads.next().transpose()? {
-            Some(batch) => PaginationResponse::More(Some(batch), reads),
-            None => PaginationResponse::Done(None),
+            Some(batch) => (Some(batch), Some(reads)),
+            None => (None, None),
         })
     })
 }

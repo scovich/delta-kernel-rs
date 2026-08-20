@@ -31,7 +31,10 @@ use url::Url;
 
 use crate::coroutine::engine::{EngineConnector, EngineRequest};
 use crate::coroutine::listing::{forward_listing_bounds, ForwardListing};
-use crate::coroutine::{self, coroutine_capabilities, CanRequestPaginated, Channel, Pagination};
+use crate::coroutine::{
+    self, coroutine_capabilities, CanRequestPaginated, Channel, PaginatedOperationRequestExt as _,
+    Pagination,
+};
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::{parse_delta_log_listing, should_process_log_file};
 use crate::path::{LogPathFileType, ParsedLogPath};
@@ -750,7 +753,7 @@ fn get_earliest_published_commit_version(
         loop {
             let (page, next_cursor) = coroutine::offload_paginated(
                 &mut channel,
-                <Q as CanRequestPaginated<Option<Version>, ForwardListing>>::request,
+                ForwardListing::paginated_request,
                 pagination,
             )
             .await?;
@@ -881,7 +884,7 @@ fn get_earliest_recreatable_commit(
         loop {
             let (page, next_cursor) = coroutine::offload_paginated(
                 &mut channel,
-                <Q as CanRequestPaginated<Output, ForwardListing>>::request,
+                ForwardListing::paginated_request,
                 pagination,
             )
             .await?;

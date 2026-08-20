@@ -6,7 +6,7 @@
 
 use bytes::Bytes;
 
-use super::{Pagination, PaginationResponse, Resume};
+use super::{Pagination, Resume};
 use crate::engine_data::EngineData;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::Operation;
@@ -17,7 +17,7 @@ use crate::{FileMeta, FileSlice, PredicateRef};
 pub type ReadFiles = Vec<FileSlice>;
 
 /// Continuation accepting one connector-sized raw file-read page, or `None` at exhaustion.
-pub type ReadFilesResume<O, Q, S> = Resume<O, Q, PaginationResponse<Option<Vec<Bytes>>, S>>;
+pub(crate) type ReadFilesResume<O, Q, S> = Resume<O, Q, (Option<Vec<Bytes>>, Option<S>)>;
 
 /// Constructor for a workflow request variant that delegates a raw file read.
 pub(crate) type ReadFilesConstructor<O, Q, S> =
@@ -38,8 +38,8 @@ pub struct ReadFileFormatStart {
 pub type ReadJsonFiles = ReadFileFormatStart;
 
 /// Continuation accepting one JSON batch, or `None` at exhaustion.
-pub type ReadJsonFilesResume<O, Q, S> =
-    Resume<O, Q, PaginationResponse<Option<Box<dyn EngineData>>, S>>;
+pub(crate) type ReadJsonFilesResume<O, Q, S> =
+    Resume<O, Q, (Option<Box<dyn EngineData>>, Option<S>)>;
 
 /// Constructor for a workflow request variant that delegates a JSON file read.
 pub(crate) type ReadJsonFilesConstructor<O, Q, S> =
@@ -49,8 +49,8 @@ pub(crate) type ReadJsonFilesConstructor<O, Q, S> =
 pub type ReadParquetFiles = ReadFileFormatStart;
 
 /// Continuation accepting one Parquet batch, or `None` at exhaustion.
-pub type ReadParquetFilesResume<O, Q, S> =
-    Resume<O, Q, PaginationResponse<Option<Box<dyn EngineData>>, S>>;
+pub(crate) type ReadParquetFilesResume<O, Q, S> =
+    Resume<O, Q, (Option<Box<dyn EngineData>>, Option<S>)>;
 
 /// Constructor for a workflow request variant that delegates a Parquet file read.
 pub(crate) type ReadParquetFilesConstructor<O, Q, S> =
@@ -62,8 +62,7 @@ pub type ExecutePlan = Operation;
 
 /// Continuation accepting one plan-output batch, or `None` at exhaustion.
 #[cfg(feature = "declarative-plans")]
-pub type ExecutePlanResume<O, Q, S> =
-    Resume<O, Q, PaginationResponse<Option<Box<dyn EngineData>>, S>>;
+pub(crate) type ExecutePlanResume<O, Q, S> = Resume<O, Q, (Option<Box<dyn EngineData>>, Option<S>)>;
 
 /// Constructor for a workflow request variant that delegates plan execution.
 #[cfg(feature = "declarative-plans")]

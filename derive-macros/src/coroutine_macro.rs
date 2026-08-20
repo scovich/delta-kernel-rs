@@ -48,10 +48,10 @@ pub(crate) fn expand_request(attr: TokenStream, item: TokenStream) -> syn::Resul
                     ::delta_kernel::coroutine::Resume<
                         #output,
                         #enum_ident #type_generics,
-                        ::delta_kernel::coroutine::PaginationResponse<
+                        (
                             <#operation as ::delta_kernel::coroutine::Operation>::Response,
-                            #state,
-                        >,
+                            ::std::option::Option<#state>,
+                        ),
                     >,
                 )
             },
@@ -59,10 +59,10 @@ pub(crate) fn expand_request(attr: TokenStream, item: TokenStream) -> syn::Resul
                 #(#attrs)*
                 #ident(
                     <#operation as ::delta_kernel::coroutine::Operation>::Work,
-                    ::delta_kernel::coroutine::Resume<
+                    ::delta_kernel::coroutine::OperationResume<
                         #output,
                         #enum_ident #type_generics,
-                        <#operation as ::delta_kernel::coroutine::Operation>::Response,
+                        #operation,
                     >,
                 )
             },
@@ -95,10 +95,10 @@ pub(crate) fn expand_request(attr: TokenStream, item: TokenStream) -> syn::Resul
                         resume: ::delta_kernel::coroutine::Resume<
                             #output,
                             Self,
-                            ::delta_kernel::coroutine::PaginationResponse<
+                            (
                                 <#operation as ::delta_kernel::coroutine::Operation>::Response,
-                                Self::State,
-                            >,
+                                ::std::option::Option<Self::State>,
+                            ),
                         >,
                     ) -> Self {
                         Self::#ident(pagination, resume)
@@ -113,10 +113,10 @@ pub(crate) fn expand_request(attr: TokenStream, item: TokenStream) -> syn::Resul
                 {
                     fn request(
                         work: <#operation as ::delta_kernel::coroutine::Operation>::Work,
-                        resume: ::delta_kernel::coroutine::Resume<
+                        resume: ::delta_kernel::coroutine::OperationResume<
                             #output,
                             Self,
-                            <#operation as ::delta_kernel::coroutine::Operation>::Response,
+                            #operation,
                         >,
                     ) -> Self {
                         Self::#ident(work, resume)
@@ -193,9 +193,15 @@ pub(crate) fn expand_request(attr: TokenStream, item: TokenStream) -> syn::Resul
                 Self::#ident(pagination, resume) => resume.resume_with(|| {
                     match pagination {
                         ::delta_kernel::coroutine::Pagination::Start(work) =>
+                        {
+                            let state =
+                                <#connector_ident as ::delta_kernel::coroutine::SupportsPaginated<
+                                    #operation,
+                                >>::start(connector, work)?;
                             <#connector_ident as ::delta_kernel::coroutine::SupportsPaginated<
                                 #operation,
-                            >>::start(connector, work),
+                            >>::next(connector, state)
+                        },
                         ::delta_kernel::coroutine::Pagination::Continue(state) =>
                             <#connector_ident as ::delta_kernel::coroutine::SupportsPaginated<
                                 #operation,

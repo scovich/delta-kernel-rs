@@ -11,12 +11,11 @@
 //!   produces another [`ControlFlow`] of the same type as before, allowing the kernel to delegate
 //!   additional work items back to the connector as needed.
 //!
-//! The work item's type is specific to each kernel workflow, an enum whose two-field tuple variants
-//! document the work items kernel might delegate to the connector. The first field describes the
-//! actual work to be done, and the second field is a [`Resume`] instance matched to the responses
-//! kernel expects back. The [`drive_to_completion!`] macro simplifies the `ControlFlow` loop by
-//! repeatedly dispatching `Continue` cases as needed, and returning the content of the final
-//! `Break`.
+//! Connectors define request enums from kernel-provided [`Operation`] descriptors. Kernel workflows
+//! declare the exact request capabilities they require, while a connector enum may contain a
+//! superset. Each request variant carries typed work plus a matching [`Resume`]. The
+//! [`drive_to_completion!`] macro repeatedly dispatches `Continue` cases and returns the final
+//! `Break` output.
 //!
 //! Meanwhile, kernel workflows are implemented as `async` functions that [`offload`] work items to
 //! the connector and `await` responses on the resulting futures. The coroutine infrastructure is a
@@ -45,160 +44,99 @@
 //!
 //! # Example
 //!
-//! Consider a hypothetical kernel workflow that delegates division and formatting, then returns the
-//! quotient as a string. We can define a workflow-specific [`Resume`] alias, request enum, and
-//! coroutine:
-//!
 //! ```
-//! use std::ops::ControlFlow;
+//! use std::ops::Range;
 //!
-//! use delta_kernel::coroutine::{self, Channel, Resume};
-//! use delta_kernel::DeltaResult;
-//!
-//! /// The kernel-provided workflow-specific `Resume` type for `QuotientAsStringRequest`.
-//! pub type QuotientAsStringResume<R> = Resume<String, QuotientAsStringRequest, R>;
-//!
-//! /// The kernel-provided workflow-specific request enum for `quotient_as_string`.
-//! pub enum QuotientAsStringRequest {
-//!     Divide((u32, u32), QuotientAsStringResume<f64>),
-//!     ToString(f64, QuotientAsStringResume<String>),
-//! }
-//!
-//! // The public connector entry point for a kernel workflow is a normal function that
-//! // returns a `ControlFlow` which communicates the next step to the connector.
-//! pub fn quotient_as_string(
-//!     dividend: u32,
-//!     divisor: u32,
-//! ) -> DeltaResult<ControlFlow<String, QuotientAsStringRequest>> {
-//!     coroutine::start(move |channel| {
-//!         quotient_as_string_impl(channel, dividend, divisor)
-//!     })
-//! }
-//!
-//! // Kernel workflows are implemented internally as async functions that `offload` work items to
-//! // the connector and `await` responses on the resulting coroutine-backed futures.
-//! async fn quotient_as_string_impl(
-//!     mut channel: Channel<String, QuotientAsStringRequest>,
-//!     dividend: u32,
-//!     divisor: u32,
-//! ) -> DeltaResult<String> {
-//!     let quotient = coroutine::offload(
-//!         &mut channel,
-//!         QuotientAsStringRequest::Divide,
-//!         (dividend, divisor),
-//!     )
-//!     .await?;
-//!     coroutine::offload(
-//!         &mut channel,
-//!         QuotientAsStringRequest::ToString,
-//!         quotient,
-//!     )
-//!     .await
-//! }
-//!
-//! // The connector performs delegated work however it likes.
-//! fn connector_divide((dividend, divisor): (u32, u32)) -> DeltaResult<f64> {
-//!     Ok(dividend as f64 / divisor as f64)
-//! }
-//!
-//! fn connector_to_string(value: f64) -> DeltaResult<String> {
-//!     Ok(value.to_string())
-//! }
-//!
-//! // The connector drives the kernel workflow by looping on `ControlFlow::Continue`: performing
-//! // each work item kernel requests and resuming the workflow with the response.
-//! //
-//! // NOTE: Connectors should prefer the `drive_to_completion!` macro instead of a manual loop.
-//! fn connector_quotient_as_string(dividend: u32, divisor: u32) -> DeltaResult<String> {
-//!     let mut next = quotient_as_string(dividend, divisor)?;
-//!     loop {
-//!         next = match next {
-//!             ControlFlow::Continue(QuotientAsStringRequest::Divide(work, resume)) => {
-//!                 resume.resume(connector_divide(work))?
-//!             }
-//!             ControlFlow::Continue(QuotientAsStringRequest::ToString(value, resume)) => {
-//!                 resume.resume(connector_to_string(value))?
-//!             }
-//!             ControlFlow::Break(output) => return Ok(output),
-//!         };
-//!     }
-//! }
-//!
-//! assert_eq!("0.25", connector_quotient_as_string(1, 4)?);
-//! # Ok::<(), delta_kernel::Error>(())
-//! ```
-//!
-//! # Pagination
-//!
-//! [`Pagination::Start`] carries initial work; [`Pagination::Continue`] carries connector state
-//! from the preceding response. Kernel retains only an opaque [`PaginationCursor`] between
-//! requests, so unrelated work can be interleaved without losing connector state.
-//!
-//! ```
 //! use delta_kernel::coroutine::{
-//!     self, Channel, Pagination, PaginationResponse, Resume,
+//!     self, coroutine_request, Operation, PaginatedOperation, Pagination, Supports,
+//!     SupportsPaginated,
 //! };
 //! use delta_kernel::DeltaResult;
 //!
-//! type Numbers = (usize, std::vec::IntoIter<u32>);
-//! type NumbersResume = Resume<Vec<u32>, Request, PaginationResponse<Vec<u32>, Numbers>>;
-//! type DoubleResume = Resume<Vec<u32>, Request, u32>;
+//! enum Length {}
 //!
-//! enum Request {
-//!     Numbers(Pagination<usize, Numbers>, NumbersResume),
-//!     Double(u32, DoubleResume),
+//! impl Operation for Length {
+//!     type Work = String;
+//!     type Response = usize;
 //! }
 //!
-//! async fn kernel_workflow(mut channel: Channel<Vec<u32>, Request>) -> DeltaResult<Vec<u32>> {
-//!     let mut pagination = Pagination::Start(2);
-//!     let mut output = Vec::new();
+//! enum Numbers {}
+//!
+//! impl Operation for Numbers {
+//!     type Work = Range<u32>;
+//!     type Response = Vec<u32>;
+//! }
+//!
+//! impl PaginatedOperation for Numbers {}
+//!
+//! #[coroutine_request(output = (usize, Vec<u32>))]
+//! enum Request {
+//!     Length(Length),
+//!
+//!     #[paginated(state = Range<u32>)]
+//!     Numbers(Numbers),
+//! }
+//!
+//! #[derive(Default)]
+//! struct Connector {
+//!     length_calls: usize,
+//! }
+//!
+//! impl Supports<Length> for Connector {
+//!     fn execute(&mut self, work: String) -> DeltaResult<usize> {
+//!         self.length_calls += 1;
+//!         Ok(work.len())
+//!     }
+//! }
+//!
+//! impl SupportsPaginated<Numbers> for Connector {
+//!     type State = Range<u32>;
+//!
+//!     fn start(&mut self, work: Range<u32>) -> DeltaResult<Self::State> {
+//!         Ok(work)
+//!     }
+//!
+//!     fn next(
+//!         &mut self,
+//!         mut state: Self::State,
+//!     ) -> DeltaResult<(Vec<u32>, Option<Self::State>)> {
+//!         let page = state.by_ref().take(2).collect();
+//!         let state = (!state.is_empty()).then_some(state);
+//!         Ok((page, state))
+//!     }
+//! }
+//!
+//! async fn kernel_workflow(
+//!     mut channel: coroutine::Channel<(usize, Vec<u32>), Request>,
+//! ) -> DeltaResult<(usize, Vec<u32>)> {
+//!     let length = coroutine::offload(
+//!         &mut channel,
+//!         Request::Length,
+//!         "kernel".to_string(),
+//!     )
+//!     .await?;
+//!
+//!     let mut numbers = Vec::new();
+//!     let mut pagination = Pagination::Start(1..4);
 //!     loop {
-//!         let (numbers, next_cursor) = coroutine::offload_paginated(
-//!             &mut channel,
-//!             Request::Numbers,
-//!             pagination,
-//!         )
-//!         .await?;
-//!
-//!         // This unrelated request runs while connector state is held in `next_cursor`.
-//!         for number in numbers {
-//!             output.push(
-//!                 coroutine::offload(&mut channel, Request::Double, number).await?,
-//!             );
-//!         }
-//!
-//!         pagination = match next_cursor {
+//!         let (page, cursor) =
+//!             coroutine::offload_paginated(&mut channel, Request::Numbers, pagination).await?;
+//!         numbers.extend(page);
+//!         pagination = match cursor {
 //!             Some(cursor) => Pagination::Continue(cursor),
-//!             None => return Ok(output),
+//!             None => return Ok((length, numbers)),
 //!         };
 //!     }
 //! }
 //!
-//! fn connector_workflow() -> DeltaResult<Vec<u32>> {
-//!     coroutine::drive_to_completion!(
-//!         coroutine::start(kernel_workflow),
-//!         |request| match request {
-//!             Request::Numbers(pagination, resume) => {
-//!                 let (limit, mut numbers) = match pagination {
-//!                     Pagination::Start(limit) => (limit, vec![1, 2, 3].into_iter()),
-//!                     Pagination::Continue(state) => state,
-//!                 };
-//!                 let response = numbers.by_ref().take(limit).collect();
-//!                 if numbers.len() == 0 {
-//!                     resume.resume(Ok(PaginationResponse::Done(response)))
-//!                 } else {
-//!                     resume.resume(Ok(PaginationResponse::More(
-//!                         response,
-//!                         (limit, numbers),
-//!                     )))
-//!                 }
-//!             }
-//!             Request::Double(number, resume) => resume.resume(Ok(number * 2)),
-//!         }
-//!     )
-//! }
+//! let mut connector = Connector::default();
+//! let result = coroutine::drive_to_completion!(
+//!     coroutine::start(kernel_workflow),
+//!     |request| request.resume(&mut connector),
+//! )?;
 //!
-//! assert_eq!(connector_workflow()?, vec![2, 4, 6]);
+//! assert_eq!(result, (6, vec![1, 2, 3]));
+//! assert_eq!(connector.length_calls, 1);
 //! # Ok::<(), delta_kernel::Error>(())
 //! ```
 pub(crate) mod engine;
@@ -253,7 +191,7 @@ pub use delta_kernel_derive::coroutine_capabilities;
 /// Each source variant must contain exactly one operation tag. Ordinary variants become
 /// one-shot `(Work, Resume)` variants. Mark a paginated variant with
 /// `#[paginated(state = ConnectorState)]`; it becomes a
-/// `(Pagination<Work, ConnectorState>, Resume<PaginationResponse<...>>)` variant.
+/// `(Pagination<Work, ConnectorState>, Resume<(Response, Option<ConnectorState>)>)` variant.
 ///
 /// The macro also implements [`CanRequest`] or [`CanRequestPaginated`] for each operation and
 /// generates a `resume(&mut connector)` method that dispatches through [`Supports`] or
@@ -266,6 +204,8 @@ pub use delta_kernel_derive::coroutine_capabilities;
 /// # Example
 ///
 /// ```
+/// use std::ops::Range;
+///
 /// use delta_kernel::coroutine::{
 ///     coroutine_request, Operation, PaginatedOperation,
 /// };
@@ -280,7 +220,7 @@ pub use delta_kernel_derive::coroutine_capabilities;
 /// enum Numbers {}
 ///
 /// impl Operation for Numbers {
-///     type Work = Vec<u32>;
+///     type Work = Range<u32>;
 ///     type Response = Vec<u32>;
 /// }
 ///
@@ -290,7 +230,7 @@ pub use delta_kernel_derive::coroutine_capabilities;
 /// enum Requests {
 ///     Head(Head),
 ///
-///     #[paginated(state = std::vec::IntoIter<u32>)]
+///     #[paginated(state = Range<u32>)]
 ///     Numbers(Numbers),
 /// }
 /// ```
@@ -396,8 +336,8 @@ pub use crate::__drive_to_completion as drive_to_completion;
 //
 // A workflow-specific request enum `Q` (defined by kernel) serves as the shared contract between
 // kernel and connector. A one-shot variant pairs concrete work `W` with a `Resume<R>`. A paginated
-// variant instead pairs `Pagination<W, S>` with `Resume<PaginationResponse<R, S>>`, preserving the
-// ordinary one-shot resume mechanism while distinguishing initial work from continuation state.
+// variant instead pairs `Pagination<W, S>` with `Resume<(R, Option<S>)>`, preserving the ordinary
+// one-shot resume mechanism while distinguishing initial work from continuation state.
 //
 // Around that shared contract, this module deliberately presents different strongly typed APIs to
 // kernel and connector authors. Kernel calls `offload(&mut channel, Q::Variant, work: W).await?`
@@ -507,84 +447,95 @@ pub enum Pagination<W, S> {
     Continue(S),
 }
 
-/// Connector response to one pagination request.
-#[derive(Debug)]
-pub enum PaginationResponse<R, S> {
-    /// Returns a response and connector state for another pagination request.
-    More(R, S),
-    /// Returns the final response and completes this pagination sequence.
-    Done(R),
-}
-
 /// Describes one low-level operation that kernel may delegate to a connector.
-pub trait Operation: Send + 'static {
+pub trait Operation: Send + Sized + 'static {
     /// Work supplied by kernel.
     type Work: Send + 'static;
     /// Successful response returned by the connector.
     type Response: Send + 'static;
 }
 
+/// Resume handle for a one-shot operation.
+pub type OperationResume<O, Q, Op> = Resume<O, Q, <Op as Operation>::Response>;
+
+/// Kernel-side request construction for one-shot operations.
+#[allow(dead_code)]
+pub(crate) trait OperationRequestExt: Operation {
+    /// Construct a request enum variant for this one-shot operation.
+    fn request<O, Q>(work: Self::Work, resume: OperationResume<O, Q, Self>) -> Q
+    where
+        O: Send + 'static,
+        Q: CanRequest<O, Self>,
+    {
+        <Q as CanRequest<O, Self>>::request(work, resume)
+    }
+}
+
+impl<T: Operation> OperationRequestExt for T {}
+
 /// Marks an [`Operation`] as supporting pagination.
 pub trait PaginatedOperation: Operation {}
 
+/// Pagination request for an operation using connector state `S`.
+pub(crate) type PaginatedOperationRequest<Op, S> = Pagination<<Op as Operation>::Work, S>;
+
+/// Resume handle for a paginated operation using connector state `S`.
+pub(crate) type PaginatedOperationResume<O, Q, Op, S> =
+    Resume<O, Q, (<Op as Operation>::Response, Option<S>)>;
+
+/// Kernel-side request construction for paginated operations.
+pub(crate) trait PaginatedOperationRequestExt: PaginatedOperation {
+    /// Construct a request enum variant for this paginated operation.
+    fn paginated_request<O: Send + 'static, Q: CanRequestPaginated<O, Self>>(
+        pagination: PaginatedOperationRequest<Self, <Q as CanRequestPaginated<O, Self>>::State>,
+        resume: PaginatedOperationResume<O, Q, Self, <Q as CanRequestPaginated<O, Self>>::State>,
+    ) -> Q {
+        <Q as CanRequestPaginated<O, Self>>::request(pagination, resume)
+    }
+}
+
+impl<T: PaginatedOperation> PaginatedOperationRequestExt for T {}
+
 /// Allows a request enum to represent a one-shot operation.
-pub trait CanRequest<O, Op>: Send + Sized + 'static
-where
-    O: Send + 'static,
-    Op: Operation,
-{
+pub trait CanRequest<O: Send + 'static, Op: Operation>: Send + Sized + 'static {
     /// Construct the request enum variant for `Op`.
-    fn request(work: Op::Work, resume: Resume<O, Self, Op::Response>) -> Self;
+    fn request(work: Op::Work, resume: OperationResume<O, Self, Op>) -> Self;
 }
 
 /// Allows a request enum to represent a paginated operation.
-pub trait CanRequestPaginated<O, Op>: Send + Sized + 'static
-where
-    O: Send + 'static,
-    Op: PaginatedOperation,
+pub trait CanRequestPaginated<O: Send + 'static, Op: PaginatedOperation>:
+    Send + Sized + 'static
 {
     /// Connector state retained between pages.
     type State: Send + 'static;
 
     /// Construct the request enum variant for `Op`.
+    #[allow(clippy::type_complexity)]
     fn request(
         pagination: Pagination<Op::Work, Self::State>,
-        resume: Resume<O, Self, PaginationResponse<Op::Response, Self::State>>,
+        resume: Resume<O, Self, (Op::Response, Option<Self::State>)>,
     ) -> Self;
 }
 
 /// Executes a one-shot operation for a connector.
-pub trait Supports<Op>: Send + 'static
-where
-    Op: Operation,
-{
+pub trait Supports<Op: Operation>: Send + 'static {
     /// Execute `work`.
     fn execute(&mut self, work: Op::Work) -> DeltaResult<Op::Response>;
 }
 
 /// Executes a paginated operation for a connector.
-pub trait SupportsPaginated<Op>: Send + 'static
-where
-    Op: PaginatedOperation,
-{
+pub trait SupportsPaginated<Op: PaginatedOperation>: Send + 'static {
     /// Connector state retained between pages.
     type State: Send + 'static;
 
     /// Start pagination from `work`.
-    fn start(
-        &mut self,
-        work: Op::Work,
-    ) -> DeltaResult<PaginationResponse<Op::Response, Self::State>>;
+    fn start(&mut self, work: Op::Work) -> DeltaResult<Self::State>;
 
     /// Continue pagination from `state`.
-    fn next(
-        &mut self,
-        state: Self::State,
-    ) -> DeltaResult<PaginationResponse<Op::Response, Self::State>>;
+    fn next(&mut self, state: Self::State) -> DeltaResult<(Op::Response, Option<Self::State>)>;
 }
 
-type PaginationConstructor<O, Q, W, R, S> =
-    fn(Pagination<W, S>, Resume<O, Q, PaginationResponse<R, S>>) -> Q;
+type PaginationConstructor<O, Q, W, R, S> = fn(Pagination<W, S>, Resume<O, Q, (R, Option<S>)>) -> Q;
 
 /// One-shot continuation accepting the response type required by its request.
 #[must_use = "the kernel workflow remains suspended until this continuation is resumed"]
@@ -733,11 +684,8 @@ where
         request,
         constructor,
     });
-    let response: PaginationResponse<R, S> = suspend(channel, pending).await?;
-    match response {
-        PaginationResponse::More(response, state) => Ok((response, Some(PaginationCursor(state)))),
-        PaginationResponse::Done(response) => Ok((response, None)),
-    }
+    let (response, state): (R, Option<S>) = suspend(channel, pending).await?;
+    Ok((response, state.map(PaginationCursor)))
 }
 
 async fn suspend<O, Q, R>(channel: &mut Channel<O, Q>, pending: Pending<O, Q>) -> DeltaResult<R>
@@ -765,6 +713,8 @@ fn advance<O: Send + 'static, Q: Send + 'static>(
 
 #[cfg(test)]
 mod capability_tests {
+    use std::ops::Range;
+
     use super::*;
 
     enum Echo {}
@@ -777,15 +727,16 @@ mod capability_tests {
     enum Numbers {}
 
     impl Operation for Numbers {
-        type Work = Vec<u32>;
+        type Work = Range<u32>;
         type Response = Vec<u32>;
     }
 
     impl PaginatedOperation for Numbers {}
 
-    #[allow(dead_code)]
+    #[cfg(any())]
     enum Disabled {}
 
+    #[cfg(any())]
     impl Operation for Disabled {
         type Work = ();
         type Response = ();
@@ -796,7 +747,7 @@ mod capability_tests {
         Echo(Echo),
 
         #[cfg(test)]
-        #[paginated(state = std::vec::IntoIter<u32>)]
+        #[paginated(state = Range<u32>)]
         Numbers(Numbers),
 
         #[cfg(any())]
@@ -823,25 +774,16 @@ mod capability_tests {
     }
 
     impl SupportsPaginated<Numbers> for TestConnector {
-        type State = std::vec::IntoIter<u32>;
+        type State = Range<u32>;
 
-        fn start(
-            &mut self,
-            work: Vec<u32>,
-        ) -> DeltaResult<PaginationResponse<Vec<u32>, Self::State>> {
-            self.next(work.into_iter())
+        fn start(&mut self, work: Range<u32>) -> DeltaResult<Self::State> {
+            Ok(work)
         }
 
-        fn next(
-            &mut self,
-            mut state: Self::State,
-        ) -> DeltaResult<PaginationResponse<Vec<u32>, Self::State>> {
+        fn next(&mut self, mut state: Self::State) -> DeltaResult<(Vec<u32>, Option<Self::State>)> {
             let page = state.by_ref().take(2).collect();
-            if state.len() == 0 {
-                Ok(PaginationResponse::Done(page))
-            } else {
-                Ok(PaginationResponse::More(page, state))
-            }
+            let state = (!state.is_empty()).then_some(state);
+            Ok((page, state))
         }
     }
 
@@ -851,22 +793,13 @@ mod capability_tests {
     where
         Q: TestCapabilities<Output>,
     {
-        let length = offload(
-            &mut channel,
-            <Q as CanRequest<Output, Echo>>::request,
-            "kernel".to_string(),
-        )
-        .await?;
+        let length = offload(&mut channel, Echo::request, "kernel".to_string()).await?;
 
         let mut numbers = Vec::new();
-        let mut pagination = Pagination::Start(vec![1, 2, 3]);
+        let mut pagination = Pagination::Start(1..4);
         loop {
-            let (page, cursor) = offload_paginated(
-                &mut channel,
-                <Q as CanRequestPaginated<Output, Numbers>>::request,
-                pagination,
-            )
-            .await?;
+            let (page, cursor) =
+                offload_paginated(&mut channel, Numbers::paginated_request, pagination).await?;
             numbers.extend(page);
             pagination = match cursor {
                 Some(cursor) => Pagination::Continue(cursor),
