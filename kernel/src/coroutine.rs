@@ -204,13 +204,97 @@
 pub(crate) mod engine;
 pub mod listing;
 pub mod read;
-
 use std::any::Any;
 use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::ops::ControlFlow;
 
+/// Add a blanket implementation to a workflow capability trait.
+///
+/// Apply this attribute to an empty trait whose supertraits are the exact [`CanRequest`] and
+/// [`CanRequestPaginated`] capabilities required by a kernel workflow. The macro preserves the
+/// trait and implements it for every request enum satisfying those bounds.
+///
+/// # Example
+///
+/// ```
+/// use delta_kernel::coroutine::{
+///     coroutine_capabilities, CanRequest, CanRequestPaginated, Operation, PaginatedOperation,
+/// };
+///
+/// enum Head {}
+///
+/// impl Operation for Head {
+///     type Work = String;
+///     type Response = usize;
+/// }
+///
+/// enum Numbers {}
+///
+/// impl Operation for Numbers {
+///     type Work = Vec<u32>;
+///     type Response = Vec<u32>;
+/// }
+///
+/// impl PaginatedOperation for Numbers {}
+///
+/// #[coroutine_capabilities]
+/// trait InspectCapabilities<O>:
+///     CanRequest<O, Head> + CanRequestPaginated<O, Numbers>
+/// where
+///     O: Send + 'static,
+/// {
+/// }
+/// ```
+pub use delta_kernel_derive::coroutine_capabilities;
+/// Expand a connector-defined request enum from kernel [`Operation`] descriptors.
+///
+/// Each source variant must contain exactly one operation tag. Ordinary variants become
+/// one-shot `(Work, Resume)` variants. Mark a paginated variant with
+/// `#[paginated(state = ConnectorState)]`; it becomes a
+/// `(Pagination<Work, ConnectorState>, Resume<PaginationResponse<...>>)` variant.
+///
+/// The macro also implements [`CanRequest`] or [`CanRequestPaginated`] for each operation and
+/// generates a `resume(&mut connector)` method that dispatches through [`Supports`] or
+/// [`SupportsPaginated`].
+///
+/// The required `output` argument is the final output type of the kernel workflow. Direct
+/// `#[cfg(...)]` attributes on variants are supported. `#[cfg_attr(...)]` is not yet
+/// supported.
+///
+/// # Example
+///
+/// ```
+/// use delta_kernel::coroutine::{
+///     coroutine_request, Operation, PaginatedOperation,
+/// };
+///
+/// enum Head {}
+///
+/// impl Operation for Head {
+///     type Work = String;
+///     type Response = usize;
+/// }
+///
+/// enum Numbers {}
+///
+/// impl Operation for Numbers {
+///     type Work = Vec<u32>;
+///     type Response = Vec<u32>;
+/// }
+///
+/// impl PaginatedOperation for Numbers {}
+///
+/// #[coroutine_request(output = (usize, Vec<u32>))]
+/// enum Requests {
+///     Head(Head),
+///
+///     #[paginated(state = std::vec::IntoIter<u32>)]
+///     Numbers(Numbers),
+/// }
+/// ```
+pub use delta_kernel_derive::coroutine_request;
 use delta_kernel_derive::internal_api;
 use genawaiter2::sync::{Co, Gen, GenBoxed};
 use genawaiter2::GeneratorState;
@@ -432,6 +516,73 @@ pub enum PaginationResponse<R, S> {
     Done(R),
 }
 
+/// Describes one low-level operation that kernel may delegate to a connector.
+pub trait Operation: Send + 'static {
+    /// Work supplied by kernel.
+    type Work: Send + 'static;
+    /// Successful response returned by the connector.
+    type Response: Send + 'static;
+}
+
+/// Marks an [`Operation`] as supporting pagination.
+pub trait PaginatedOperation: Operation {}
+
+/// Allows a request enum to represent a one-shot operation.
+pub trait CanRequest<O, Op>: Send + Sized + 'static
+where
+    O: Send + 'static,
+    Op: Operation,
+{
+    /// Construct the request enum variant for `Op`.
+    fn request(work: Op::Work, resume: Resume<O, Self, Op::Response>) -> Self;
+}
+
+/// Allows a request enum to represent a paginated operation.
+pub trait CanRequestPaginated<O, Op>: Send + Sized + 'static
+where
+    O: Send + 'static,
+    Op: PaginatedOperation,
+{
+    /// Connector state retained between pages.
+    type State: Send + 'static;
+
+    /// Construct the request enum variant for `Op`.
+    fn request(
+        pagination: Pagination<Op::Work, Self::State>,
+        resume: Resume<O, Self, PaginationResponse<Op::Response, Self::State>>,
+    ) -> Self;
+}
+
+/// Executes a one-shot operation for a connector.
+pub trait Supports<Op>: Send + 'static
+where
+    Op: Operation,
+{
+    /// Execute `work`.
+    fn execute(&mut self, work: Op::Work) -> DeltaResult<Op::Response>;
+}
+
+/// Executes a paginated operation for a connector.
+pub trait SupportsPaginated<Op>: Send + 'static
+where
+    Op: PaginatedOperation,
+{
+    /// Connector state retained between pages.
+    type State: Send + 'static;
+
+    /// Start pagination from `work`.
+    fn start(
+        &mut self,
+        work: Op::Work,
+    ) -> DeltaResult<PaginationResponse<Op::Response, Self::State>>;
+
+    /// Continue pagination from `state`.
+    fn next(
+        &mut self,
+        state: Self::State,
+    ) -> DeltaResult<PaginationResponse<Op::Response, Self::State>>;
+}
+
 type PaginationConstructor<O, Q, W, R, S> =
     fn(Pagination<W, S>, Resume<O, Q, PaginationResponse<R, S>>) -> Q;
 
@@ -609,5 +760,131 @@ fn advance<O: Send + 'static, Q: Send + 'static>(
     match generator.resume_with(response) {
         GeneratorState::Yielded(pending) => Ok(ControlFlow::Continue(pending.attach(generator))),
         GeneratorState::Complete(result) => result.map(ControlFlow::Break),
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    enum Echo {}
+
+    impl Operation for Echo {
+        type Work = String;
+        type Response = usize;
+    }
+
+    enum Numbers {}
+
+    impl Operation for Numbers {
+        type Work = Vec<u32>;
+        type Response = Vec<u32>;
+    }
+
+    impl PaginatedOperation for Numbers {}
+
+    #[allow(dead_code)]
+    enum Disabled {}
+
+    impl Operation for Disabled {
+        type Work = ();
+        type Response = ();
+    }
+
+    #[coroutine_request(output = O)]
+    enum TestRequest<O: Send + 'static> {
+        Echo(Echo),
+
+        #[cfg(test)]
+        #[paginated(state = std::vec::IntoIter<u32>)]
+        Numbers(Numbers),
+
+        #[cfg(any())]
+        Disabled(Disabled),
+    }
+
+    #[coroutine_capabilities]
+    trait TestCapabilities<O>: CanRequest<O, Echo> + CanRequestPaginated<O, Numbers>
+    where
+        O: Send + 'static,
+    {
+    }
+
+    #[derive(Default)]
+    struct TestConnector {
+        echo_calls: usize,
+    }
+
+    impl Supports<Echo> for TestConnector {
+        fn execute(&mut self, work: String) -> DeltaResult<usize> {
+            self.echo_calls += 1;
+            Ok(work.len())
+        }
+    }
+
+    impl SupportsPaginated<Numbers> for TestConnector {
+        type State = std::vec::IntoIter<u32>;
+
+        fn start(
+            &mut self,
+            work: Vec<u32>,
+        ) -> DeltaResult<PaginationResponse<Vec<u32>, Self::State>> {
+            self.next(work.into_iter())
+        }
+
+        fn next(
+            &mut self,
+            mut state: Self::State,
+        ) -> DeltaResult<PaginationResponse<Vec<u32>, Self::State>> {
+            let page = state.by_ref().take(2).collect();
+            if state.len() == 0 {
+                Ok(PaginationResponse::Done(page))
+            } else {
+                Ok(PaginationResponse::More(page, state))
+            }
+        }
+    }
+
+    type Output = (usize, Vec<u32>);
+
+    async fn workflow<Q>(mut channel: Channel<Output, Q>) -> DeltaResult<Output>
+    where
+        Q: TestCapabilities<Output>,
+    {
+        let length = offload(
+            &mut channel,
+            <Q as CanRequest<Output, Echo>>::request,
+            "kernel".to_string(),
+        )
+        .await?;
+
+        let mut numbers = Vec::new();
+        let mut pagination = Pagination::Start(vec![1, 2, 3]);
+        loop {
+            let (page, cursor) = offload_paginated(
+                &mut channel,
+                <Q as CanRequestPaginated<Output, Numbers>>::request,
+                pagination,
+            )
+            .await?;
+            numbers.extend(page);
+            pagination = match cursor {
+                Some(cursor) => Pagination::Continue(cursor),
+                None => break,
+            };
+        }
+        Ok((length, numbers))
+    }
+
+    #[test]
+    fn generated_request_bundle_drives_stateful_connector() {
+        let mut connector = TestConnector::default();
+        let result =
+            drive_to_completion!(start(workflow::<TestRequest<Output>>), |request| request
+                .resume(&mut connector),)
+            .unwrap();
+
+        assert_eq!(result, (6, vec![1, 2, 3]));
+        assert_eq!(connector.echo_calls, 1);
     }
 }

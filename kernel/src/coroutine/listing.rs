@@ -6,7 +6,7 @@
 
 use url::Url;
 
-use super::{Pagination, PaginationResponse, Resume};
+use super::{Operation, PaginatedOperation, Pagination, PaginationResponse, Resume};
 use crate::{DeltaResult, FileMeta, Version};
 
 /// Exclusive lexicographic bounds shared by every page of one listing.
@@ -18,6 +18,22 @@ pub struct ListingBounds {
     pub low: Url,
     /// Exclusive lexicographic upper bound of the interval.
     pub high: Url,
+}
+
+/// Forward file-listing operation.
+pub enum ForwardListing {}
+
+impl Operation for ForwardListing {
+    type Work = ListingBounds;
+    type Response = ForwardListingResult;
+}
+
+impl PaginatedOperation for ForwardListing {}
+
+/// One page returned by [`ForwardListing`].
+pub struct ForwardListingResult {
+    /// Files and per-entry errors in this page, in ascending lexicographic order.
+    pub entries: Vec<DeltaResult<FileMeta>>,
 }
 
 /// Initial work for a paginated file listing.
@@ -63,6 +79,15 @@ pub(crate) fn forward_log_listing_request(
         start_version,
         end_version,
     )?))
+}
+
+/// Builds bounds for a forward listing over the inclusive version range.
+pub(crate) fn forward_listing_bounds(
+    log_root: &Url,
+    start_version: Version,
+    end_version: Version,
+) -> DeltaResult<ListingBounds> {
+    log_listing_bounds(log_root, start_version, end_version)
 }
 
 /// Builds a backward listing over the inclusive version range.

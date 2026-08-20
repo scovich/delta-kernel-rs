@@ -8,7 +8,34 @@ use syn::{
     Fields, Item, Lit, Meta, PathArguments, Token, Type, Visibility,
 };
 
+mod coroutine_macro;
 mod schema_macro;
+
+/// Implementation of `delta_kernel::coroutine::coroutine_request`.
+///
+/// User-facing documentation and examples live on the `delta_kernel` re-export.
+#[proc_macro_attribute]
+pub fn coroutine_request(
+    attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    coroutine_macro::expand_request(attr.into(), item.into())
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+/// Implementation of `delta_kernel::coroutine::coroutine_capabilities`.
+///
+/// User-facing documentation and examples live on the `delta_kernel` re-export.
+#[proc_macro_attribute]
+pub fn coroutine_capabilities(
+    attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    coroutine_macro::expand_capabilities(attr.into(), item.into())
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
 
 // Builds a `StructType`; see `delta_kernel::schema::schema` re-export for details.
 #[doc(hidden)]

@@ -1,15 +1,19 @@
 //! Compatibility drivers for serving coroutine requests through an [`Engine`](crate::Engine).
 
 use std::ops::ControlFlow;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use url::Url;
 
-use super::listing::{bare_version_path, ListFiles, ListFilesResult, ListingBounds};
+use super::listing::{
+    bare_version_path, ForwardListing, ForwardListingResult, ListFiles, ListFilesResult,
+    ListingBounds,
+};
 #[cfg(feature = "declarative-plans")]
 use super::read::ExecutePlan;
 use super::read::{ReadFiles, ReadJsonFiles, ReadParquetFiles};
-use super::{Pagination, PaginationResponse, Resume};
+use super::{coroutine_request, Pagination, PaginationResponse, Resume, SupportsPaginated};
 use crate::engine_data::EngineData;
 use crate::path::may_begin_listable_log_path;
 use crate::{
@@ -52,6 +56,45 @@ pub(crate) type EngineDataResume<O, Q> =
     Resume<O, Q, PaginationResponse<Option<Box<dyn EngineData>>, EngineDataIterator>>;
 pub(crate) type EngineDataPagination<W> = Pagination<W, EngineDataIterator>;
 
+/// Owned compatibility adapter for serving coroutine requests through an [`Engine`].
+pub(crate) struct EngineConnector {
+    storage: Arc<dyn StorageHandler>,
+}
+
+#[coroutine_request(output = O)]
+pub(crate) enum EngineRequest<O: Send + 'static> {
+    #[paginated(state = ListingIterator)]
+    ListForward(ForwardListing),
+}
+
+impl EngineConnector {
+    /// Create an adapter by cloning the engine's handlers.
+    pub(crate) fn new(engine: &dyn Engine) -> Self {
+        Self {
+            storage: engine.storage_handler(),
+        }
+    }
+}
+
+impl SupportsPaginated<ForwardListing> for EngineConnector {
+    type State = ListingIterator;
+
+    fn start(
+        &mut self,
+        bounds: ListingBounds,
+    ) -> DeltaResult<PaginationResponse<ForwardListingResult, Self::State>> {
+        let listing = start_forward_listing(self.storage.as_ref(), bounds)?;
+        Ok(next_forward_listing(listing))
+    }
+
+    fn next(
+        &mut self,
+        listing: Self::State,
+    ) -> DeltaResult<PaginationResponse<ForwardListingResult, Self::State>> {
+        Ok(next_forward_listing(listing))
+    }
+}
+
 /// Serves one paginated listing request through a legacy [`StorageHandler`].
 pub(crate) fn resume_list_files<O: Send + 'static, Q: Send + 'static>(
     storage: &dyn StorageHandler,
@@ -59,18 +102,18 @@ pub(crate) fn resume_list_files<O: Send + 'static, Q: Send + 'static>(
     resume: ListingResume<O, Q>,
 ) -> DeltaResult<ControlFlow<O, Q>> {
     resume.resume_with(|| {
-        let forward_page = |mut listing: ListingIterator| {
-            let entries = Vec::from_iter(listing.by_ref().take(FORWARD_LISTING_PAGE_SIZE));
-            let may_have_more = entries.len() == FORWARD_LISTING_PAGE_SIZE;
-            let result = ListFilesResult {
-                entries,
-                known_version_boundary: !may_have_more,
-            };
-            if may_have_more {
-                PaginationResponse::More(result, ListingState::Forward(listing))
-            } else {
-                PaginationResponse::Done(result)
-            }
+        let forward_page = |listing: ListingIterator| match next_forward_listing(listing) {
+            PaginationResponse::More(result, listing) => PaginationResponse::More(
+                ListFilesResult {
+                    entries: result.entries,
+                    known_version_boundary: false,
+                },
+                ListingState::Forward(listing),
+            ),
+            PaginationResponse::Done(result) => PaginationResponse::Done(ListFilesResult {
+                entries: result.entries,
+                known_version_boundary: true,
+            }),
         };
         let backward_page = |bounds: Box<ListingBounds>, high: Version| -> DeltaResult<_> {
             let start = version_bound(&bounds.low)?;
@@ -101,13 +144,7 @@ pub(crate) fn resume_list_files<O: Send + 'static, Q: Send + 'static>(
 
         match pagination {
             Pagination::Start(ListFiles::Forward(bounds)) => {
-                let prefix = bounds.prefix.to_string();
-                let high = bounds.high.to_string();
-                let listing = Box::new(
-                    storage
-                        .list_from(&bounds.low)?
-                        .take_while(move |entry| within_log_listing_bounds(entry, &prefix, &high)),
-                ) as ListingIterator;
+                let listing = start_forward_listing(storage, bounds)?;
                 Ok(forward_page(listing))
             }
             Pagination::Continue(ListingState::Forward(listing)) => Ok(forward_page(listing)),
@@ -213,6 +250,30 @@ fn within_log_listing_bounds(entry: &DeltaResult<FileMeta>, prefix: &str, high: 
         && path
             .strip_prefix(prefix)
             .is_none_or(may_begin_listable_log_path)
+}
+
+fn start_forward_listing(
+    storage: &dyn StorageHandler,
+    bounds: ListingBounds,
+) -> DeltaResult<ListingIterator> {
+    let prefix = bounds.prefix.to_string();
+    let high = bounds.high.to_string();
+    Ok(Box::new(storage.list_from(&bounds.low)?.take_while(
+        move |entry| within_log_listing_bounds(entry, &prefix, &high),
+    )))
+}
+
+fn next_forward_listing(
+    mut listing: ListingIterator,
+) -> PaginationResponse<ForwardListingResult, ListingIterator> {
+    let entries = Vec::from_iter(listing.by_ref().take(FORWARD_LISTING_PAGE_SIZE));
+    let may_have_more = entries.len() == FORWARD_LISTING_PAGE_SIZE;
+    let result = ForwardListingResult { entries };
+    if may_have_more {
+        PaginationResponse::More(result, listing)
+    } else {
+        PaginationResponse::Done(result)
+    }
 }
 
 fn resume_engine_data<O, Q>(

@@ -146,15 +146,6 @@ impl LastCheckpointHint {
         Ok(hint.drop_oversized_fields())
     }
 
-    /// Parses raw `_last_checkpoint` bytes, returning `None` for invalid JSON.
-    pub(crate) fn try_from_bytes(bytes: &[u8]) -> Option<Self> {
-        let result = Self::from_bytes_with_oversized_fields_dropped(bytes)
-            .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
-            .ok();
-        info!(hint = result.as_ref().map(|h| h.summary()));
-        result
-    }
-
     /// Drops `sidecarFiles` / `nonFileActions` over the threshold. Drops the whole field, never
     /// truncates. Absent means info missing, so this only loses an optimization.
     fn drop_oversized_fields(mut self) -> Self {
@@ -208,20 +199,25 @@ impl LastCheckpointHint {
     ) -> DeltaResult<Option<LastCheckpointHint>> {
         let file_path = Self::path(log_root)?;
         let request = Pagination::Start(vec![(file_path, None)]);
-        match coroutine::offload_paginated(channel, read_files, request).await {
-            Ok((Some(data), _)) => {
-                let Some(data) = data.first() else {
-                    warn!("empty _last_checkpoint file");
-                    return Ok(None);
-                };
-                Ok(Self::try_from_bytes(data))
+        match coroutine::offload_paginated(channel, read_files, request)
+            .await
+            .map(|(data, _)| data.and_then(|data| data.into_iter().next()))
+            .transpose()
+        {
+            Some(Ok(data)) => {
+                let result: Option<LastCheckpointHint> =
+                    Self::from_bytes_with_oversized_fields_dropped(&data)
+                        .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
+                        .ok();
+                info!(hint = result.as_ref().map(|h| h.summary()));
+                Ok(result)
             }
-            Err(Error::FileNotFound(_)) => {
+            Some(Err(Error::FileNotFound(_))) => {
                 info!("_last_checkpoint file not found");
                 Ok(None)
             }
-            Err(err) => Err(err),
-            Ok((None, _)) => {
+            Some(Err(err)) => Err(err),
+            None => {
                 warn!("empty _last_checkpoint file");
                 Ok(None)
             }

@@ -14,7 +14,7 @@ use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path as ObjectPath;
 use crate::object_store::ObjectStoreExt as _;
 use crate::path::tests::multipart_checkpoint_name;
-use crate::{Engine as _, FileMeta, StorageHandler};
+use crate::{DeltaResultIteratorStatic, Engine as _, FileMeta, StorageHandler};
 
 // size markers used to identify commit sources in tests
 const FILESYSTEM_SIZE_MARKER: u64 = 10;
@@ -167,10 +167,7 @@ impl CountingStorageHandler {
 }
 
 impl StorageHandler for CountingStorageHandler {
-    fn list_from(
-        &self,
-        path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>> + Send>> {
+    fn list_from(&self, path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
         self.list_from_count.fetch_add(1, Ordering::Relaxed);
         let items_listed = self.items_listed.clone();
         let iter = self.inner.list_from(path)?;
@@ -182,7 +179,7 @@ impl StorageHandler for CountingStorageHandler {
     fn read_files(
         &self,
         _files: Vec<crate::FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>> + Send>> {
+    ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
         panic!("read_files should not be called during listing");
     }
 
@@ -461,16 +458,13 @@ fn test_log_tail_covers_entire_range_empty_filesystem() {
     // have nothing — e.g. a purely catalog-managed table.
     struct EmptyStorageHandler;
     impl StorageHandler for EmptyStorageHandler {
-        fn list_from(
-            &self,
-            _path: &Url,
-        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>> + Send>> {
+        fn list_from(&self, _path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
             Ok(Box::new(std::iter::empty()))
         }
         fn read_files(
             &self,
             _files: Vec<crate::FileSlice>,
-        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>> + Send>> {
+        ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
             panic!("read_files should not be called during listing");
         }
         fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {

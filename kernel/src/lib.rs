@@ -624,16 +624,10 @@ pub trait StorageHandler: AsAny {
     ///   contains all files at or below that directory.
     /// - Otherwise, the parent is the directory containing `path`, and only files (at any depth
     ///   under that parent) whose full path sorts strictly greater than `path` are returned.
-    fn list_from(
-        &self,
-        path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>> + Send>>;
+    fn list_from(&self, path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>>;
 
     /// Read data specified by the start and end offset from the file.
-    fn read_files(
-        &self,
-        files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>> + Send>>;
+    fn read_files(&self, files: Vec<FileSlice>) -> DeltaResult<DeltaResultIteratorStatic<Bytes>>;
 
     /// Copy a file atomically from source to destination. If the destination file already exists,
     /// it must return Err(Error::FileAlreadyExists).

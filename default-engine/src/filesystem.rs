@@ -3,7 +3,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
-use delta_kernel::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
+use delta_kernel::{
+    DeltaResult, DeltaResultIteratorStatic, Error, FileMeta, FileSlice, StorageHandler,
+};
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use url::Url;
@@ -188,13 +190,10 @@ async fn head_impl(store: Arc<DynObjectStore>, url: Url) -> DeltaResult<FileMeta
 }
 
 impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
-    fn list_from(
-        &self,
-        path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>> + Send>> {
+    fn list_from(&self, path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
         let future = list_from_impl(self.inner.clone(), path.clone());
         let iter = super::stream_future_to_iter(self.task_executor.clone(), future)?;
-        Ok(iter) // type coercion drops the unneeded Send bound
+        Ok(iter)
     }
 
     /// Read data specified by the start and end offset from the file.
@@ -203,10 +202,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
     ///
     /// Multiple reads may occur in parallel, depending on the configured readahead.
     /// See [`Self::with_readahead`].
-    fn read_files(
-        &self,
-        files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>> + Send>> {
+    fn read_files(&self, files: Vec<FileSlice>) -> DeltaResult<DeltaResultIteratorStatic<Bytes>> {
         let future = read_files_impl(self.inner.clone(), files, self.readahead);
         let iter = super::stream_future_to_iter(self.task_executor.clone(), future)?;
         Ok(iter)

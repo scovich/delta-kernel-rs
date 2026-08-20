@@ -21,7 +21,6 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
 use std::num::NonZero;
 
 use error::{LogHistoryError, NearestTimestamp};
@@ -30,9 +29,9 @@ use search::{binary_search_by_key_with_bounds, Bound, SearchError};
 use tracing::{info, trace, warn};
 use url::Url;
 
-use crate::coroutine::engine::{self as engine_coroutine, ListingPagination, ListingResume};
-use crate::coroutine::listing::forward_log_listing_request;
-use crate::coroutine::{self, Channel, Pagination};
+use crate::coroutine::engine::{EngineConnector, EngineRequest};
+use crate::coroutine::listing::{forward_listing_bounds, ForwardListing};
+use crate::coroutine::{self, coroutine_capabilities, CanRequestPaginated, Channel, Pagination};
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::{parse_delta_log_listing, should_process_log_file};
 use crate::path::{LogPathFileType, ParsedLogPath};
@@ -90,12 +89,12 @@ enum TimestampSearchBounds {
     },
 }
 
-type HistoryListingChannel<O> = Channel<O, HistoryListingRequest<O>>;
-
-struct HistoryListingRequest<O>(
-    ListingPagination,
-    ListingResume<O, HistoryListingRequest<O>>,
-);
+#[coroutine_capabilities]
+trait HistoryListingCapabilities<O>: CanRequestPaginated<O, ForwardListing>
+where
+    O: Send + 'static,
+{
+}
 
 /// Determines the search strategy for timestamp-to-version conversion based on ICT enablement.
 ///
@@ -703,20 +702,6 @@ pub fn timestamp_range_to_versions(
     Ok((start_version, end_version))
 }
 
-fn drive_history_listing<O, F, Fut>(engine: &dyn Engine, workflow: F) -> DeltaResult<O>
-where
-    O: Send + 'static,
-    F: FnOnce(HistoryListingChannel<O>) -> Fut + Send + 'static,
-    Fut: Future<Output = DeltaResult<O>> + Send + 'static,
-{
-    let storage = engine.storage_handler();
-    coroutine::drive_to_completion!(coroutine::start(workflow), |request| match request {
-        HistoryListingRequest(pagination, resume) => {
-            engine_coroutine::resume_list_files(storage.as_ref(), pagination, resume)
-        }
-    })
-}
-
 /// Returns the earliest commit version available on the file system for this table.
 ///
 /// The returned version is the version of the lowest-numbered `*.json` commit file present in
@@ -753,27 +738,42 @@ fn get_earliest_published_commit_version(
             .map(|f| f.version))
     }
 
-    let listing_root = log_root.clone();
-    drive_history_listing(engine, async move |mut channel| {
-        let request = forward_log_listing_request(&listing_root, 0, Version::MAX)?;
-        let mut pagination = Pagination::Start(request);
+    async fn find_earliest<Q>(
+        mut channel: Channel<Option<Version>, Q>,
+        listing_root: Url,
+    ) -> DeltaResult<Option<Version>>
+    where
+        Q: HistoryListingCapabilities<Option<Version>>,
+    {
+        let bounds = forward_listing_bounds(&listing_root, 0, Version::MAX)?;
+        let mut pagination = Pagination::Start(bounds);
         loop {
-            let (page, next_cursor) =
-                coroutine::offload_paginated(&mut channel, HistoryListingRequest, pagination)
-                    .await?;
+            let (page, next_cursor) = coroutine::offload_paginated(
+                &mut channel,
+                <Q as CanRequestPaginated<Option<Version>, ForwardListing>>::request,
+                pagination,
+            )
+            .await?;
             let files =
                 parse_delta_log_listing(page.entries.into_iter(), &listing_root, Version::MAX);
-            let version = first_published_commit_version(files)?;
-            if let Some(version) = version {
+            if let Some(version) = first_published_commit_version(files)? {
                 return Ok(Some(version));
             }
             pagination = match next_cursor {
                 Some(cursor) => Pagination::Continue(cursor),
-                None => break,
+                None => return Ok(None),
             };
         }
-        Ok(None)
-    })?
+    }
+
+    let listing_root = log_root.clone();
+    let mut connector = EngineConnector::new(engine);
+    coroutine::drive_to_completion!(
+        coroutine::start(move |channel| {
+            find_earliest::<EngineRequest<Option<Version>>>(channel, listing_root)
+        }),
+        |request| request.resume(&mut connector),
+    )?
     .ok_or_else(|| {
         if earliest_ratified_commit_version == Some(0) {
             return DeltaError::generic(format!(
@@ -813,11 +813,20 @@ fn get_earliest_recreatable_commit(
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
 ) -> DeltaResult<Version> {
-    let listing_root = log_root.clone();
-    let mut last_complete_checkpoint = None;
-    let mut multi_part_checkpoint_progress = HashMap::<(Version, u32), HashSet<u32>>::new();
-    let mut observe_files =
-        move |listing, earliest_commit_version: &mut Option<_>| -> DeltaResult<_> {
+    type Output = (Option<Version>, Option<Version>);
+
+    async fn find_earliest<Q>(
+        mut channel: Channel<Output, Q>,
+        listing_root: Url,
+    ) -> DeltaResult<Output>
+    where
+        Q: HistoryListingCapabilities<Output>,
+    {
+        let mut last_complete_checkpoint = None;
+        let mut multi_part_checkpoint_progress = HashMap::<(Version, u32), HashSet<u32>>::new();
+        let mut observe_files = move |listing,
+                                      earliest_commit_version: &mut Option<_>|
+              -> DeltaResult<_> {
             for parsed_result in listing {
                 let parsed_log_path = parsed_result?;
                 if !should_process_log_file(&parsed_log_path) {
@@ -866,28 +875,36 @@ fn get_earliest_recreatable_commit(
             Ok(None)
         };
 
-    let (recreatable_version, earliest_commit_version) =
-        drive_history_listing(engine, async move |mut channel| {
-            let mut earliest_commit_version = None;
-
-            let request = forward_log_listing_request(&listing_root, 0, Version::MAX)?;
-            let mut pagination = Pagination::Start(request);
-            loop {
-                let (page, next_cursor) =
-                    coroutine::offload_paginated(&mut channel, HistoryListingRequest, pagination)
-                        .await?;
-                let files =
-                    parse_delta_log_listing(page.entries.into_iter(), &listing_root, Version::MAX);
-                if let Some(version) = observe_files(files, &mut earliest_commit_version)? {
-                    return Ok((Some(version), earliest_commit_version));
-                }
-                pagination = match next_cursor {
-                    Some(cursor) => Pagination::Continue(cursor),
-                    None => break,
-                };
+        let mut earliest_commit_version = None;
+        let bounds = forward_listing_bounds(&listing_root, 0, Version::MAX)?;
+        let mut pagination = Pagination::Start(bounds);
+        loop {
+            let (page, next_cursor) = coroutine::offload_paginated(
+                &mut channel,
+                <Q as CanRequestPaginated<Output, ForwardListing>>::request,
+                pagination,
+            )
+            .await?;
+            let files =
+                parse_delta_log_listing(page.entries.into_iter(), &listing_root, Version::MAX);
+            if let Some(version) = observe_files(files, &mut earliest_commit_version)? {
+                return Ok((Some(version), earliest_commit_version));
             }
-            Ok((None, earliest_commit_version))
-        })?;
+            pagination = match next_cursor {
+                Some(cursor) => Pagination::Continue(cursor),
+                None => return Ok((None, earliest_commit_version)),
+            };
+        }
+    }
+
+    let listing_root = log_root.clone();
+    let mut connector = EngineConnector::new(engine);
+    let (recreatable_version, earliest_commit_version) = coroutine::drive_to_completion!(
+        coroutine::start(move |channel| {
+            find_earliest::<EngineRequest<Output>>(channel, listing_root)
+        }),
+        |request| request.resume(&mut connector),
+    )?;
 
     if let Some(version) = recreatable_version {
         return Ok(version);
