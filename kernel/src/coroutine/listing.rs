@@ -6,7 +6,7 @@
 
 use url::Url;
 
-use super::{Operation, PaginatedOperation, Pagination, Resume};
+use super::{Operation, PaginatedOperation};
 use crate::{DeltaResult, FileMeta, Version};
 
 /// Exclusive lexicographic bounds shared by every page of one listing.
@@ -21,45 +21,42 @@ pub struct ListingBounds {
 }
 
 /// Forward file-listing operation.
-pub enum ForwardListing {}
+pub struct ForwardListing(
+    /// Exclusive listing bounds.
+    pub ListingBounds,
+);
 
 impl Operation for ForwardListing {
-    type Work = ListingBounds;
     type Response = ForwardListingResult;
 }
 
 impl PaginatedOperation for ForwardListing {}
 
 /// One page returned by [`ForwardListing`].
-pub struct ForwardListingResult {
+pub struct ForwardListingResult(
     /// Files and per-entry errors in this page, in ascending lexicographic order.
-    pub entries: Vec<DeltaResult<FileMeta>>,
+    pub Vec<DeltaResult<FileMeta>>,
+);
+
+/// Backward file-listing operation.
+pub struct BackwardListing(
+    /// Exclusive listing bounds.
+    pub ListingBounds,
+);
+
+impl Operation for BackwardListing {
+    type Response = BackwardListingResult;
 }
 
-/// Initial work for a paginated file listing.
-#[derive(Debug, PartialEq, Eq)]
-pub enum ListFiles {
-    /// List from the lower bound toward the upper bound.
-    Forward(ListingBounds),
-    /// List from the upper bound toward the lower bound.
-    ///
-    /// Entries remain ascending within every page.
-    Backward(ListingBounds),
-}
+impl PaginatedOperation for BackwardListing {}
 
-/// Result of one [`ListFiles`] page.
-#[derive(Debug)]
-pub struct ListFilesResult {
+/// One page returned by [`BackwardListing`].
+pub struct BackwardListingResult {
     /// Files and per-entry errors in this page, in ascending lexicographic order.
     pub entries: Vec<DeltaResult<FileMeta>>,
-    /// Whether the page ends at a known version boundary. The boundary is after the highest
-    /// version in a forward page and before the lowest version in a backward page.
+    /// True if the page is known to end at the boundary between two versions
     pub known_version_boundary: bool,
 }
-
-/// Constructor for a workflow request variant that delegates paginated file listing.
-pub(crate) type ListFilesConstructor<O, Q, S> =
-    fn(Pagination<ListFiles, S>, Resume<O, Q, (ListFilesResult, Option<S>)>) -> Q;
 
 /// Builds the bare version path used as an exclusive lexicographic listing bound.
 ///
@@ -73,8 +70,8 @@ pub(crate) fn forward_log_listing_request(
     log_root: &Url,
     start_version: Version,
     end_version: Version,
-) -> DeltaResult<ListFiles> {
-    Ok(ListFiles::Forward(log_listing_bounds(
+) -> DeltaResult<ForwardListing> {
+    Ok(ForwardListing(log_listing_bounds(
         log_root,
         start_version,
         end_version,
@@ -95,8 +92,8 @@ pub(crate) fn backward_log_listing_request(
     log_root: &Url,
     start_version: Version,
     end_version: Version,
-) -> DeltaResult<ListFiles> {
-    Ok(ListFiles::Backward(log_listing_bounds(
+) -> DeltaResult<BackwardListing> {
+    Ok(BackwardListing(log_listing_bounds(
         log_root,
         start_version,
         end_version,
@@ -123,18 +120,12 @@ mod tests {
     fn listing_bounds_are_exclusive_and_max_saturates() {
         let log_root = Url::parse("memory:///_delta_log/").unwrap();
 
-        let ListFiles::Forward(bounded) = forward_log_listing_request(&log_root, 3, 7).unwrap()
-        else {
-            unreachable!()
-        };
+        let ForwardListing(bounded) = forward_log_listing_request(&log_root, 3, 7).unwrap();
         assert_eq!(bounded.low, bare_version_path(&log_root, 3).unwrap());
         assert_eq!(bounded.high, bare_version_path(&log_root, 8).unwrap());
 
-        let ListFiles::Forward(unbounded) =
-            forward_log_listing_request(&log_root, 3, Version::MAX).unwrap()
-        else {
-            unreachable!()
-        };
+        let ForwardListing(unbounded) =
+            forward_log_listing_request(&log_root, 3, Version::MAX).unwrap();
         assert_eq!(
             unbounded.high,
             bare_version_path(&log_root, Version::MAX).unwrap()

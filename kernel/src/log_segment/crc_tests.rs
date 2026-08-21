@@ -14,11 +14,9 @@ use url::Url;
 
 use super::for_snapshot_from_storage;
 use crate::actions::{DomainMetadata, Format, Metadata, Protocol, SetTransaction};
-use crate::coroutine::engine::{
-    self as engine_coroutine, EngineDataPagination, EngineDataResume, ReadPagination, ReadResume,
-};
-use crate::coroutine::read::ReadJsonFiles;
-use crate::coroutine::{self, Channel};
+use crate::coroutine::engine::{self as engine_coroutine, EngineDataIterator};
+use crate::coroutine::read::{ReadJsonFiles, SmallFileRead};
+use crate::coroutine::{self, coroutine_workflow, Channel};
 use crate::crc::{
     try_read_crc_file_with_engine, Crc, DomainMetadataState, FileSizeHistogram, SetTransactionState,
 };
@@ -30,34 +28,31 @@ use crate::snapshot::{IncrementalReplay, SnapshotBuilder, SnapshotRef};
 use crate::utils::FoldWithOption as _;
 use crate::{DeltaResult, Engine, Snapshot, Version};
 
-struct ReadFilesRequest<T>(ReadPagination, ReadResume<T, ReadFilesRequest<T>>);
-struct ReadJsonRequest<T>(
-    EngineDataPagination<ReadJsonFiles>,
-    EngineDataResume<T, ReadJsonRequest<T>>,
-);
+#[coroutine_workflow]
+enum ReadWorkflow<T: Send + 'static> {
+    #[output]
+    Done(T),
+    ReadFile(SmallFileRead),
+    #[paginated]
+    ReadJson(ReadJsonFiles, EngineDataIterator),
+}
 
-fn drive_read_files<T, F, Fut>(engine: &dyn Engine, workflow: F) -> DeltaResult<T>
+fn drive_read<T, F, Fut>(engine: &dyn Engine, workflow: F) -> DeltaResult<T>
 where
     T: Send + 'static,
-    F: FnOnce(Channel<T, ReadFilesRequest<T>>) -> Fut + Send + 'static,
+    F: FnOnce(Channel<ReadWorkflow<T>>) -> Fut + Send + 'static,
     Fut: Future<Output = DeltaResult<T>> + Send + 'static,
 {
     let storage = engine.storage_handler();
-    coroutine::drive_to_completion!(coroutine::start(workflow), |request| {
-        let ReadFilesRequest(pagination, resume) = request;
-        engine_coroutine::resume_read_files(storage.as_ref(), pagination, resume)
-    },)
-}
-
-fn drive_read_json<T, F, Fut>(engine: &dyn Engine, workflow: F) -> DeltaResult<T>
-where
-    T: Send + 'static,
-    F: FnOnce(Channel<T, ReadJsonRequest<T>>) -> Fut + Send + 'static,
-    Fut: Future<Output = DeltaResult<T>> + Send + 'static,
-{
-    coroutine::drive_to_completion!(coroutine::start(workflow), |request| {
-        let ReadJsonRequest(pagination, resume) = request;
-        engine_coroutine::resume_read_json_files(engine.json_handler().as_ref(), pagination, resume)
+    let json_handler = engine.json_handler();
+    coroutine::drive_workflow!(coroutine::start(workflow), |workflow| match workflow {
+        ReadWorkflow::Done(output) => break output,
+        ReadWorkflow::ReadFile(operation, resume) => {
+            engine_coroutine::resume_read_file(storage.as_ref(), operation, resume)
+        }
+        ReadWorkflow::ReadJson(pagination, resume) => {
+            engine_coroutine::resume_read_json_files(json_handler.as_ref(), pagination, resume)
+        }
     },)
 }
 
@@ -434,10 +429,8 @@ impl BuiltCrcTest {
         let log_segment =
             for_snapshot_from_storage(storage.as_ref(), log_root, vec![], None, None)?;
         let base = base.clone();
-        drive_read_json(&self.engine, async move |mut channel| {
-            log_segment
-                .build_crc_from_base(&mut channel, ReadJsonRequest, &base)
-                .await
+        drive_read(&self.engine, async move |mut channel| {
+            log_segment.build_crc_from_base(&mut channel, &base).await
         })
     }
 
@@ -451,9 +444,9 @@ impl BuiltCrcTest {
         let log_segment =
             for_snapshot_from_storage(storage.as_ref(), log_root, vec![], None, None)?;
         let in_memory_base = in_memory_base.cloned();
-        drive_read_files(&self.engine, async move |mut channel| {
+        drive_read(&self.engine, async move |mut channel| {
             Ok(log_segment
-                .pick_latest_base_crc(&mut channel, ReadFilesRequest, in_memory_base.as_ref())
+                .pick_latest_base_crc(&mut channel, in_memory_base.as_ref())
                 .await
                 .map(|c| c.version))
         })

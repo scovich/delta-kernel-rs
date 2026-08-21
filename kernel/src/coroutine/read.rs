@@ -1,27 +1,30 @@
 //! Handler-shaped work items for storage and file-format reads.
 //!
-//! Raw file reads resume with `Option<Vec<bytes::Bytes>>`. JSON and Parquet reads resume with
-//! `Option<Box<dyn EngineData>>`. In every case `Some` is one connector-sized page and `None`
-//! marks the active read exhausted.
+//! Raw file reads materialize one [`FileSlice`] as [`bytes::Bytes`]. JSON, Parquet, and plan
+//! execution return `Vec<Box<dyn EngineData>>` pages. Paginated exhaustion is signalled by absence
+//! of a continuation state.
 
 use bytes::Bytes;
 
-use super::{Pagination, Resume};
+use super::{Operation as CoroutineOperation, PaginatedOperation};
 use crate::engine_data::EngineData;
 #[cfg(feature = "declarative-plans")]
-use crate::plans::Operation;
+use crate::plans::Operation as PlanOperation;
 use crate::schema::SchemaRef;
 use crate::{FileMeta, FileSlice, PredicateRef};
 
-/// File slices supplied when starting a paginated raw read.
-pub type ReadFiles = Vec<FileSlice>;
+/// Read one complete file slice into memory.
+///
+/// Intended for reading small metadata files smaller than perhaps 10MB. Connectors may reject reads
+/// exceeding their configured resource limits.
+pub struct SmallFileRead(
+    /// File URL and optional byte range to read.
+    pub FileSlice,
+);
 
-/// Continuation accepting one connector-sized raw file-read page, or `None` at exhaustion.
-pub(crate) type ReadFilesResume<O, Q, S> = Resume<O, Q, (Option<Vec<Bytes>>, Option<S>)>;
-
-/// Constructor for a workflow request variant that delegates a raw file read.
-pub(crate) type ReadFilesConstructor<O, Q, S> =
-    fn(Pagination<ReadFiles, S>, ReadFilesResume<O, Q, S>) -> Q;
+impl CoroutineOperation for SmallFileRead {
+    type Response = Bytes;
+}
 
 /// Arguments that start a JSON or Parquet file read.
 #[derive(Debug, Clone)]
@@ -34,37 +37,41 @@ pub struct ReadFileFormatStart {
     pub predicate: Option<PredicateRef>,
 }
 
-/// Arguments supplied when starting a paginated JSON read.
-pub type ReadJsonFiles = ReadFileFormatStart;
+/// Paginated JSON file-read operation.
+pub struct ReadJsonFiles(
+    /// JSON read parameters.
+    pub ReadFileFormatStart,
+);
 
-/// Continuation accepting one JSON batch, or `None` at exhaustion.
-pub(crate) type ReadJsonFilesResume<O, Q, S> =
-    Resume<O, Q, (Option<Box<dyn EngineData>>, Option<S>)>;
+impl CoroutineOperation for ReadJsonFiles {
+    type Response = Vec<Box<dyn EngineData>>;
+}
 
-/// Constructor for a workflow request variant that delegates a JSON file read.
-pub(crate) type ReadJsonFilesConstructor<O, Q, S> =
-    fn(Pagination<ReadJsonFiles, S>, ReadJsonFilesResume<O, Q, S>) -> Q;
+impl PaginatedOperation for ReadJsonFiles {}
 
-/// Arguments supplied when starting a paginated Parquet read.
-pub type ReadParquetFiles = ReadFileFormatStart;
+/// Paginated Parquet file-read operation.
+pub struct ReadParquetFiles(
+    /// Parquet read parameters.
+    pub ReadFileFormatStart,
+);
 
-/// Continuation accepting one Parquet batch, or `None` at exhaustion.
-pub(crate) type ReadParquetFilesResume<O, Q, S> =
-    Resume<O, Q, (Option<Box<dyn EngineData>>, Option<S>)>;
+impl CoroutineOperation for ReadParquetFiles {
+    type Response = Vec<Box<dyn EngineData>>;
+}
 
-/// Constructor for a workflow request variant that delegates a Parquet file read.
-pub(crate) type ReadParquetFilesConstructor<O, Q, S> =
-    fn(Pagination<ReadParquetFiles, S>, ReadParquetFilesResume<O, Q, S>) -> Q;
+impl PaginatedOperation for ReadParquetFiles {}
 
 /// Operation supplied when starting paginated declarative-plan execution.
 #[cfg(feature = "declarative-plans")]
-pub type ExecutePlan = Operation;
+pub struct ExecutePlan(
+    /// Declarative plan operation to execute.
+    pub PlanOperation,
+);
 
-/// Continuation accepting one plan-output batch, or `None` at exhaustion.
 #[cfg(feature = "declarative-plans")]
-pub(crate) type ExecutePlanResume<O, Q, S> = Resume<O, Q, (Option<Box<dyn EngineData>>, Option<S>)>;
+impl CoroutineOperation for ExecutePlan {
+    type Response = Vec<Box<dyn EngineData>>;
+}
 
-/// Constructor for a workflow request variant that delegates plan execution.
 #[cfg(feature = "declarative-plans")]
-pub(crate) type ExecutePlanConstructor<O, Q, S> =
-    fn(Pagination<ExecutePlan, S>, ExecutePlanResume<O, Q, S>) -> Q;
+impl PaginatedOperation for ExecutePlan {}

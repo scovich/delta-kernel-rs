@@ -11,16 +11,20 @@ use super::{checkpoint_action_projection_predicate, LogSegment};
 use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
 #[cfg(feature = "declarative-plans")]
 use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
-#[cfg(feature = "declarative-plans")]
-use crate::coroutine::read::ExecutePlanConstructor;
-use crate::coroutine::read::{
-    ReadFileFormatStart, ReadJsonFilesConstructor, ReadParquetFilesConstructor,
+#[cfg(test)]
+use crate::coroutine::coroutine_workflow;
+#[cfg(test)]
+use crate::coroutine::engine::{
+    resume_read_json_files, resume_read_parquet_files, EngineDataIterator,
 };
-use crate::coroutine::{self, Channel, Pagination, Resume};
+#[cfg(feature = "declarative-plans")]
+use crate::coroutine::read::ExecutePlan;
+use crate::coroutine::read::{ReadFileFormatStart, ReadJsonFiles, ReadParquetFiles};
+use crate::coroutine::{
+    coroutine_capabilities, CanRequestPaginated, Channel, PaginatedOperation, Pagination,
+};
 use crate::crc::Crc;
 use crate::engine_data::EngineData;
-#[cfg(test)]
-use crate::log_replay::ActionsBatch;
 use crate::metrics::ProtocolMetadataSource;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::FileType;
@@ -33,6 +37,22 @@ use crate::schema::schema_ref;
 use crate::Engine;
 use crate::{DeltaResult, Error};
 
+#[cfg(feature = "declarative-plans")]
+#[coroutine_capabilities]
+pub(crate) trait ProtocolMetadataCapabilities:
+    CanRequestPaginated<ReadJsonFiles>
+    + CanRequestPaginated<ReadParquetFiles>
+    + CanRequestPaginated<ExecutePlan>
+{
+}
+
+#[cfg(not(feature = "declarative-plans"))]
+#[coroutine_capabilities]
+pub(crate) trait ProtocolMetadataCapabilities:
+    CanRequestPaginated<ReadJsonFiles> + CanRequestPaginated<ReadParquetFiles>
+{
+}
+
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
     /// Returns an error if either is missing, and the [`ProtocolMetadataSource`] describing how
@@ -40,31 +60,12 @@ impl LogSegment {
     ///
     /// This is the checked variant of [`Self::read_protocol_metadata_opt`], used for fresh
     /// snapshot creation where both Protocol and Metadata must exist.
-    pub(crate) async fn read_protocol_metadata<
-        O: Send + 'static,
-        Q: Send + 'static,
-        S: Send + 'static,
-    >(
+    pub(crate) async fn read_protocol_metadata<W: ProtocolMetadataCapabilities>(
         &self,
-        channel: &mut Channel<O, Q>,
-        read_json: ReadJsonFilesConstructor<O, Q, S>,
-        read_parquet: ReadParquetFilesConstructor<O, Q, S>,
+        channel: &mut Channel<W>,
         crc: Option<&Arc<Crc>>,
-        use_plans: bool,
-        #[cfg(feature = "declarative-plans")] execute_plan: ExecutePlanConstructor<O, Q, S>,
     ) -> DeltaResult<(Metadata, Protocol, ProtocolMetadataSource)> {
-        match self
-            .read_protocol_metadata_opt(
-                channel,
-                read_json,
-                read_parquet,
-                crc,
-                use_plans,
-                #[cfg(feature = "declarative-plans")]
-                execute_plan,
-            )
-            .await?
-        {
+        match self.read_protocol_metadata_opt(channel, crc).await? {
             (Some(m), Some(p), source) => Ok((m, p, source)),
             (None, Some(_), _) => Err(Error::MissingMetadata),
             (Some(_), None, _) => Err(Error::MissingProtocol),
@@ -82,18 +83,10 @@ impl LogSegment {
     /// The `crc` parameter is the CRC eagerly resolved by the caller; it is used to
     /// short-circuit or seed the replay.
     #[instrument(name = "log_seg.load_p_m", skip_all, err)]
-    pub(crate) async fn read_protocol_metadata_opt<
-        O: Send + 'static,
-        Q: Send + 'static,
-        S: Send + 'static,
-    >(
+    pub(crate) async fn read_protocol_metadata_opt<W: ProtocolMetadataCapabilities>(
         &self,
-        channel: &mut Channel<O, Q>,
-        read_json: ReadJsonFilesConstructor<O, Q, S>,
-        read_parquet: ReadParquetFilesConstructor<O, Q, S>,
+        channel: &mut Channel<W>,
         crc: Option<&Arc<Crc>>,
-        use_plans: bool,
-        #[cfg(feature = "declarative-plans")] execute_plan: ExecutePlanConstructor<O, Q, S>,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>, ProtocolMetadataSource)> {
         // Case 1: If CRC at target version, use it directly and exit early.
         if let Some(crc) = crc.filter(|c| c.version == self.end_version) {
@@ -121,16 +114,7 @@ impl LogSegment {
                 crc.version
             );
             let pruned = self.segment_after_version(crc.version);
-            let (metadata_opt, protocol_opt) = pruned
-                .replay_for_pm(
-                    channel,
-                    read_json,
-                    read_parquet,
-                    use_plans,
-                    #[cfg(feature = "declarative-plans")]
-                    execute_plan,
-                )
-                .await?;
+            let (metadata_opt, protocol_opt) = pruned.replay_for_pm(channel).await?;
 
             if metadata_opt.is_some() && protocol_opt.is_some() {
                 info!("Found P&M from pruned log replay");
@@ -153,16 +137,7 @@ impl LogSegment {
         }
 
         // Case 3: Full P&M log replay.
-        let (metadata_opt, protocol_opt) = self
-            .replay_for_pm(
-                channel,
-                read_json,
-                read_parquet,
-                use_plans,
-                #[cfg(feature = "declarative-plans")]
-                execute_plan,
-            )
-            .await?;
+        let (metadata_opt, protocol_opt) = self.replay_for_pm(channel).await?;
         Ok((
             metadata_opt,
             protocol_opt,
@@ -171,93 +146,99 @@ impl LogSegment {
     }
 
     /// Replays the log segment for Protocol and Metadata, stopping early once both are found.
-    async fn replay_for_pm<O: Send + 'static, Q: Send + 'static, S: Send + 'static>(
+    async fn replay_for_pm<W: ProtocolMetadataCapabilities>(
         &self,
-        channel: &mut Channel<O, Q>,
-        read_json: ReadJsonFilesConstructor<O, Q, S>,
-        read_parquet: ReadParquetFilesConstructor<O, Q, S>,
-        use_plans: bool,
-        #[cfg(feature = "declarative-plans")] execute_plan: ExecutePlanConstructor<O, Q, S>,
+        channel: &mut Channel<W>,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
-        // Providing a plan executor opts the engine into declarative P&M replay.
+        let mut metadata_opt = None;
+        let mut protocol_opt = None;
+        self.read_pm_batches(channel, |batch| {
+            if metadata_opt.is_none() {
+                metadata_opt = Metadata::try_new_from_data(batch.as_ref())?;
+            }
+            if protocol_opt.is_none() {
+                protocol_opt = Protocol::try_new_from_data(batch.as_ref())?;
+            }
+            Ok(metadata_opt.is_some() && protocol_opt.is_some())
+        })
+        .await?;
+        Ok((metadata_opt, protocol_opt))
+    }
+
+    /// Read projected P&M batches in replay order, stopping when `visit` returns true.
+    async fn read_pm_batches<W, F>(&self, channel: &mut Channel<W>, mut visit: F) -> DeltaResult<()>
+    where
+        W: ProtocolMetadataCapabilities,
+        F: FnMut(Box<dyn EngineData>) -> DeltaResult<bool> + Send,
+    {
         #[cfg(feature = "declarative-plans")]
-        if use_plans {
-            return self.replay_for_pm_via_plan(channel, execute_plan).await;
+        let mut visited_plan_batch = false;
+        #[cfg(feature = "declarative-plans")]
+        match visit_operation_pages(
+            channel,
+            ExecutePlan(self.protocol_metadata_plan()?),
+            &mut |batch| {
+                visited_plan_batch = true;
+                visit(batch)
+            },
+        )
+        .await
+        {
+            Ok(_) => return Ok(()),
+            Err(error @ Error::Unsupported(_)) if visited_plan_batch => return Err(error),
+            Err(Error::Unsupported(reason)) => {
+                info!(
+                    reason,
+                    "plan execution unsupported; falling back to handlers"
+                );
+            }
+            Err(error) => return Err(error),
         }
-        #[cfg(not(feature = "declarative-plans"))]
-        let _ = use_plans;
 
         let schema = schema_ref! {
             (&PROTOCOL_FIELD),
             (&METADATA_FIELD),
         };
-        let mut metadata_opt = None;
-        let mut protocol_opt = None;
-
         let commit_files = self.find_commit_cover();
         if !commit_files.is_empty()
-            && consume_pm_batches(
+            && visit_operation_pages(
                 channel,
-                read_json,
-                ReadFileFormatStart {
+                ReadJsonFiles(ReadFileFormatStart {
                     files: commit_files,
                     physical_schema: schema.clone(),
                     predicate: None,
-                },
-                &mut metadata_opt,
-                &mut protocol_opt,
+                }),
+                &mut visit,
             )
             .await?
         {
-            return Ok((metadata_opt, protocol_opt));
+            return Ok(());
         }
 
         let Some(first) = self.listed.checkpoint_parts.first() else {
-            return Ok((metadata_opt, protocol_opt));
+            return Ok(());
         };
-        let checkpoint_files: Vec<_> = self
+        let checkpoint_files = self
             .listed
             .checkpoint_parts
             .iter()
             .map(|f| f.location.clone())
             .collect();
-        let checkpoint_predicate = checkpoint_action_projection_predicate(&schema);
+        let start = ReadFileFormatStart {
+            files: checkpoint_files,
+            physical_schema: schema.clone(),
+            predicate: checkpoint_action_projection_predicate(&schema),
+        };
         if first.is_json() {
-            consume_pm_batches(
-                channel,
-                read_json,
-                ReadFileFormatStart {
-                    files: checkpoint_files,
-                    physical_schema: schema,
-                    predicate: checkpoint_predicate,
-                },
-                &mut metadata_opt,
-                &mut protocol_opt,
-            )
-            .await?;
+            visit_operation_pages(channel, ReadJsonFiles(start), &mut visit).await?;
         } else {
-            consume_pm_batches(
-                channel,
-                read_parquet,
-                ReadFileFormatStart {
-                    files: checkpoint_files,
-                    physical_schema: schema,
-                    predicate: checkpoint_predicate,
-                },
-                &mut metadata_opt,
-                &mut protocol_opt,
-            )
-            .await?;
+            visit_operation_pages(channel, ReadParquetFiles(start), &mut visit).await?;
         }
-        Ok((metadata_opt, protocol_opt))
+        Ok(())
     }
 
     #[cfg(feature = "declarative-plans")]
-    async fn replay_for_pm_via_plan<O: Send + 'static, Q: Send + 'static, S: Send + 'static>(
-        &self,
-        channel: &mut Channel<O, Q>,
-        execute_plan: ExecutePlanConstructor<O, Q, S>,
-    ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
+    fn protocol_metadata_plan(&self) -> DeltaResult<Operation> {
         let versioned_schema = schema_ref! {
             (&PROTOCOL_FIELD),
             (&METADATA_FIELD),
@@ -293,65 +274,73 @@ impl LogSegment {
                 )
             })?
             .build()?;
-
-        let mut metadata_opt = None;
-        let mut protocol_opt = None;
-        consume_pm_batches(
-            channel,
-            execute_plan,
-            Operation::QueryPlan(plan),
-            &mut metadata_opt,
-            &mut protocol_opt,
-        )
-        .await?;
-        Ok((metadata_opt, protocol_opt))
+        Ok(Operation::QueryPlan(plan))
     }
 
-    // Replay the commit log, projecting rows to only contain Protocol and Metadata action columns.
     #[cfg(test)]
-    fn read_pm_batches(
+    fn read_pm_batches_with_engine(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        let schema = schema_ref! {
-            (&PROTOCOL_FIELD),
-            (&METADATA_FIELD),
-        };
-        self.read_actions(engine, schema)
+    ) -> DeltaResult<Vec<Box<dyn EngineData>>> {
+        #[coroutine_workflow]
+        enum ReadPmWorkflow {
+            #[output]
+            Done(Vec<Box<dyn EngineData>>),
+            #[paginated]
+            ReadJson(ReadJsonFiles, EngineDataIterator),
+            #[paginated]
+            ReadParquet(ReadParquetFiles, EngineDataIterator),
+            #[cfg(feature = "declarative-plans")]
+            #[paginated]
+            ExecutePlan(ExecutePlan, EngineDataIterator),
+        }
+
+        let log_segment = self.clone();
+        crate::coroutine::drive_workflow!(
+            crate::coroutine::start(async move |mut channel| {
+                let mut batches = Vec::new();
+                log_segment
+                    .read_pm_batches(&mut channel, |batch| {
+                        batches.push(batch);
+                        Ok(false)
+                    })
+                    .await?;
+                Ok(batches)
+            }),
+            |workflow| match workflow {
+                ReadPmWorkflow::Done(batches) => break batches,
+                ReadPmWorkflow::ReadJson(pagination, resume) => {
+                    resume_read_json_files(engine.json_handler().as_ref(), pagination, resume)
+                }
+                ReadPmWorkflow::ReadParquet(pagination, resume) => {
+                    resume_read_parquet_files(engine.parquet_handler().as_ref(), pagination, resume)
+                }
+                #[cfg(feature = "declarative-plans")]
+                ReadPmWorkflow::ExecutePlan(_, resume) => resume.resume(Err(Error::unsupported(
+                    "plan execution disabled for handler-path test",
+                ))),
+            },
+        )
     }
 }
 
-#[allow(clippy::type_complexity)]
-async fn consume_pm_batches<O, Q, W, S>(
-    channel: &mut Channel<O, Q>,
-    constructor: fn(Pagination<W, S>, Resume<O, Q, (Option<Box<dyn EngineData>>, Option<S>)>) -> Q,
-    work: W,
-    metadata_opt: &mut Option<Metadata>,
-    protocol_opt: &mut Option<Protocol>,
+async fn visit_operation_pages<W, Op, F>(
+    channel: &mut Channel<W>,
+    operation: Op,
+    visit: &mut F,
 ) -> DeltaResult<bool>
 where
-    O: Send + 'static,
-    Q: Send + 'static,
-    W: Send + 'static,
-    S: Send + 'static,
+    W: CanRequestPaginated<Op>,
+    Op: PaginatedOperation<Response = Vec<Box<dyn EngineData>>>,
+    F: FnMut(Box<dyn EngineData>) -> DeltaResult<bool> + Send,
 {
-    let mut pagination = Pagination::Start(work);
+    let mut pagination = Pagination::Start(operation);
     loop {
-        let (batch, next_cursor) =
-            coroutine::offload_paginated(channel, constructor, pagination).await?;
-        match batch {
-            Some(batch) => {
-                if metadata_opt.is_none() {
-                    *metadata_opt = Metadata::try_new_from_data(batch.as_ref())?;
-                }
-                if protocol_opt.is_none() {
-                    *protocol_opt = Protocol::try_new_from_data(batch.as_ref())?;
-                }
-                if metadata_opt.is_some() && protocol_opt.is_some() {
-                    return Ok(true);
-                }
+        let (batches, next_cursor) = channel.offload_paginated(pagination).await?;
+        for batch in batches {
+            if visit(batch)? {
+                return Ok(true);
             }
-            None => return Ok(false),
         }
         pagination = match next_cursor {
             Some(cursor) => Pagination::Continue(cursor),
@@ -366,7 +355,6 @@ mod tests {
     #[cfg(feature = "declarative-plans")]
     use std::sync::Arc;
 
-    use itertools::Itertools;
     use test_log::test;
 
     use crate::engine::sync::SyncEngine;
@@ -407,11 +395,9 @@ mod tests {
         let engine = SyncEngine::new();
 
         let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
-        let data: Vec<_> = snapshot
+        let data = snapshot
             .log_segment()
-            .read_pm_batches(&engine)
-            .unwrap()
-            .try_collect()
+            .read_pm_batches_with_engine(&engine)
             .unwrap();
 
         // The checkpoint has five parts, each containing one action:
@@ -473,6 +459,20 @@ mod tests {
 
     #[cfg(feature = "declarative-plans")]
     #[test]
+    fn test_snapshot_build_without_plan_executor_falls_back_to_handlers() {
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let engine = DelegatingEngine::new(Arc::new(SyncEngine::new())).without_plan_executor();
+
+        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+
+        assert_eq!(snapshot.version(), 1);
+        assert_eq!(snapshot.schema().fields().count(), 3);
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    #[test]
     fn test_snapshot_build_via_failing_plan_executor_surfaces_error_without_fallback() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();
@@ -484,7 +484,7 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "plan failure must surface, not fall back to legacy replay"
+            "plan failure must surface, not fall back to handler replay"
         );
     }
 }

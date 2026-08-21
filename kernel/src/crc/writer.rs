@@ -3,11 +3,13 @@
 use url::Url;
 
 use super::Crc;
+use crate::coroutine::write::WriteBytes;
+use crate::coroutine::{CanRequest, Channel};
 use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error};
+use crate::{DeltaResult, Error};
 
-/// Serialize and write a CRC file to storage.
+/// Serialize a CRC and offload its storage write.
 ///
 /// Serializes the [`Crc`] to JSON via serde and writes the raw bytes using the storage
 /// handler. Returns [`Error::ChecksumWriteUnsupported`] if:
@@ -18,7 +20,11 @@ use crate::{DeltaResult, Engine, Error};
 /// Per the Delta protocol, writers MUST NOT overwrite existing CRC files, so this always
 /// writes with `overwrite = false`. If the file already exists, returns
 /// `Err(Error::FileAlreadyExists)`.
-pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> DeltaResult<()> {
+pub(crate) async fn try_write_crc_file<W: CanRequest<WriteBytes>>(
+    channel: &mut Channel<W>,
+    path: &Url,
+    crc: &Crc,
+) -> DeltaResult<()> {
     require!(
         crc.file_stats_state.is_complete(),
         Error::ChecksumWriteUnsupported(format!(
@@ -41,9 +47,13 @@ pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> 
         )
     );
     let data = serde_json::to_vec(crc)?;
-    engine
-        .storage_handler()
-        .put(path, data.into(), false /* overwrite */)
+    channel
+        .offload(WriteBytes {
+            url: path.clone(),
+            data: data.into(),
+            overwrite: false,
+        })
+        .await
 }
 
 #[cfg(test)]
@@ -55,6 +65,8 @@ mod tests {
 
     use super::*;
     use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
+    use crate::coroutine::engine::resume_write_bytes;
+    use crate::coroutine::{self, coroutine_workflow};
     use crate::crc::{
         try_read_crc_file_with_engine, DomainMetadataState, FileSizeHistogram, FileStats,
         FileStatsState, SetTransactionState,
@@ -63,12 +75,39 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::path::{AsUrl, ParsedLogPath};
     use crate::table_features::TableFeature;
+    use crate::Engine;
 
     fn writer_test_env(version: u64) -> (SyncEngine, ParsedLogPath) {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
         let table_root = Url::parse("memory:///test_table/").unwrap();
         let crc_path = ParsedLogPath::create_parsed_crc(&table_root, version);
         (engine, crc_path)
+    }
+
+    fn try_write_crc_file_with_engine(
+        engine: &dyn Engine,
+        path: &Url,
+        crc: &Crc,
+    ) -> DeltaResult<()> {
+        #[coroutine_workflow]
+        enum WriteWorkflow {
+            #[output]
+            Done(()),
+            Write(WriteBytes),
+        }
+
+        let path = path.clone();
+        let crc = crc.clone();
+        let storage = engine.storage_handler();
+        let workflow = coroutine::start(async move |mut channel| {
+            try_write_crc_file(&mut channel, &path, &crc).await
+        });
+        coroutine::drive_workflow!(workflow, |request| match request {
+            WriteWorkflow::Done(()) => break,
+            WriteWorkflow::Write(operation, resume) => {
+                resume_write_bytes(storage.as_ref(), operation, resume)
+            }
+        },)
     }
 
     fn test_crc(ict_supported: bool, ict_enabled: bool) -> Crc {
@@ -141,7 +180,7 @@ mod tests {
         let mut crc = test_crc(/* ict_supported */ true, /* ict_enabled */ true);
         crc.version = version;
 
-        try_write_crc_file(&engine, crc_path.location.as_url(), &crc).unwrap();
+        try_write_crc_file_with_engine(&engine, crc_path.location.as_url(), &crc).unwrap();
 
         let read_back = try_read_crc_file_with_engine(&engine, &crc_path).unwrap();
         assert_eq!(read_back, crc);
@@ -229,10 +268,10 @@ mod tests {
         let (engine, crc_path) = writer_test_env(0);
         let crc = test_crc(/* ict_supported */ true, /* ict_enabled */ true);
 
-        try_write_crc_file(&engine, crc_path.location.as_url(), &crc).unwrap();
+        try_write_crc_file_with_engine(&engine, crc_path.location.as_url(), &crc).unwrap();
 
         // Second write should fail (never overwrites)
-        let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
+        let result = try_write_crc_file_with_engine(&engine, crc_path.location.as_url(), &crc);
         assert!(matches!(result, Err(Error::FileAlreadyExists(_))));
     }
 
@@ -241,7 +280,7 @@ mod tests {
         let (engine, crc_path) = writer_test_env(0);
         let mut crc = test_crc(/* ict_supported */ true, /* ict_enabled */ true);
         crc.file_stats_state = FileStatsState::Indeterminate;
-        let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
+        let result = try_write_crc_file_with_engine(&engine, crc_path.location.as_url(), &crc);
         assert!(matches!(result, Err(Error::ChecksumWriteUnsupported(_))));
     }
 
@@ -263,7 +302,7 @@ mod tests {
 
         // If ICT is enabled, then the ICT value must be present.
         let should_succeed = !ict_enabled || ict_value_present;
-        let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
+        let result = try_write_crc_file_with_engine(&engine, crc_path.location.as_url(), &crc);
         if should_succeed {
             result.unwrap();
         } else {

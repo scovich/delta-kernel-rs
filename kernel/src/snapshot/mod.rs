@@ -2,7 +2,6 @@
 //! has schema etc.)
 
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
@@ -11,15 +10,20 @@ use url::Url;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::set_transaction::SetTransactionScanner;
+use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::{
     CheckpointSpec, CheckpointWriter, V2CheckpointConfig, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
 };
 use crate::clustering::{parse_clustering_columns, ClusteringColumnInfo, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
-use crate::coroutine::engine::{self as engine_coroutine, EngineDataPagination, EngineDataResume};
-use crate::coroutine::read::ReadJsonFiles;
-use crate::coroutine::{self, Channel};
+use crate::coroutine::engine::{self as engine_coroutine, EngineDataIterator};
+use crate::coroutine::read::{ReadFileFormatStart, ReadJsonFiles, ReadParquetFiles};
+use crate::coroutine::write::WriteBytes;
+use crate::coroutine::{
+    self, coroutine_capabilities, coroutine_workflow, CanRequest, CanRequestPaginated, Channel,
+    Pagination, Workflow,
+};
 use crate::crc::{
     try_write_crc_file, Crc, CrcDelta, DomainMetadataState, FileSizeHistogram, FileStats,
     SetTransactionState,
@@ -40,13 +44,12 @@ use crate::table_properties::TableProperties;
 use crate::transaction::builder::alter_table::AlterTableTransactionBuilder;
 use crate::transaction::Transaction;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, LogCompactionWriter, Version};
+use crate::{DeltaResult, Engine, Error, LogCompactionWriter, RowVisitor, Version};
 
 mod builder;
 mod incremental;
 mod snapshot_crc;
-use builder::SnapshotBuildRequest;
-pub use builder::{IncrementalReplay, SnapshotBuilder};
+pub use builder::{IncrementalReplay, SnapshotBuilder, SnapshotCapabilities};
 use snapshot_crc::SnapshotCrc;
 
 /// A shared, thread-safe reference to a [`Snapshot`].
@@ -60,6 +63,49 @@ pub enum ChecksumWriteResult {
     AlreadyExists,
     /// The CRC file was successfully written to storage.
     Written,
+}
+
+/// Operations required to resolve and write a version checksum.
+#[coroutine_capabilities]
+pub trait WriteChecksumCapabilities:
+    CanRequestPaginated<ReadJsonFiles> + CanRequestPaginated<ReadParquetFiles> + CanRequest<WriteBytes>
+{
+}
+
+#[coroutine_workflow]
+enum WriteChecksumWorkflow {
+    #[output]
+    Done((ChecksumWriteResult, SnapshotRef)),
+    #[paginated]
+    ReadJson(ReadJsonFiles, EngineDataIterator),
+    #[paginated]
+    ReadParquet(ReadParquetFiles, EngineDataIterator),
+    Write(WriteBytes),
+}
+
+impl WriteChecksumWorkflow {
+    fn resume(self, engine: &dyn Engine) -> DeltaResult<Self> {
+        match self {
+            Self::Done(_) => Err(Error::internal_error(
+                "completed checksum workflow cannot be resumed",
+            )),
+            Self::ReadJson(pagination, resume) => engine_coroutine::resume_read_json_files(
+                engine.json_handler().as_ref(),
+                pagination,
+                resume,
+            ),
+            Self::ReadParquet(pagination, resume) => engine_coroutine::resume_read_parquet_files(
+                engine.parquet_handler().as_ref(),
+                pagination,
+                resume,
+            ),
+            Self::Write(operation, resume) => engine_coroutine::resume_write_bytes(
+                engine.storage_handler().as_ref(),
+                operation,
+                resume,
+            ),
+        }
+    }
 }
 
 /// Result of attempting to write a checkpoint file.
@@ -86,6 +132,11 @@ pub struct Snapshot {
     crc: SnapshotCrc,
     /// Best-effort "confirmed latest at build time" flag. See [`Snapshot::built_as_latest`].
     built_as_latest: bool,
+}
+
+enum InCommitTimestampSource<'a> {
+    Resolved(Option<i64>),
+    Commit(&'a ParsedLogPath),
 }
 
 impl PartialEq for Snapshot {
@@ -197,29 +248,21 @@ impl Snapshot {
     /// permits, or used to root Protocol and Metadata log replay otherwise. Falls back to full log
     /// replay when no CRC is present.
     #[instrument(err, fields(version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(channel))]
-    async fn try_new_from_log_segment(
+    async fn try_new_from_log_segment<W: SnapshotCapabilities>(
+        channel: &mut Channel<W>,
         location: Url,
         log_segment: LogSegment,
-        channel: &mut Channel<SnapshotRef, SnapshotBuildRequest>,
         metric_context: SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
-        use_plans: bool,
     ) -> DeltaResult<Self> {
         let pm_start = std::time::Instant::now();
 
         // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
         //         (or use it as-is when already there) per `incremental_replay`.
-        let base_crc = log_segment
-            .read_latest_crc(channel, SnapshotBuildRequest::ReadBytes)
-            .await;
+        let base_crc = log_segment.read_latest_crc(channel).await;
         let crc_at_version = log_segment
-            .try_build_crc_within_budget(
-                channel,
-                SnapshotBuildRequest::ReadJson,
-                base_crc.as_ref(),
-                incremental_replay,
-            )
+            .try_build_crc_within_budget(channel, base_crc.as_ref(), incremental_replay)
             .await
             .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?;
 
@@ -228,15 +271,7 @@ impl Snapshot {
         let (metadata, protocol, source) = match &crc_at_version {
             Some((crc, source)) => (crc.metadata.clone(), crc.protocol.clone(), *source),
             None => log_segment
-                .read_protocol_metadata(
-                    channel,
-                    SnapshotBuildRequest::ReadJson,
-                    SnapshotBuildRequest::ReadParquet,
-                    base_crc.as_ref(),
-                    use_plans,
-                    #[cfg(feature = "declarative-plans")]
-                    SnapshotBuildRequest::ExecutePlan,
-                )
+                .read_protocol_metadata(channel, base_crc.as_ref())
                 .await
                 .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?,
         };
@@ -788,18 +823,52 @@ impl Snapshot {
     #[instrument(parent = &self.span, name = "snap.get_ict", skip_all, err)]
     #[internal_api]
     pub(crate) fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
-        // Get ICT enablement info and check if we should read ICT for this version
+        match self.in_commit_timestamp_source()? {
+            InCommitTimestampSource::Resolved(timestamp) => Ok(timestamp),
+            InCommitTimestampSource::Commit(commit) => {
+                Ok(Some(commit.read_in_commit_timestamp(engine)?))
+            }
+        }
+    }
+
+    async fn get_in_commit_timestamp_with_channel<W>(
+        &self,
+        channel: &mut Channel<W>,
+    ) -> DeltaResult<Option<i64>>
+    where
+        W: CanRequestPaginated<ReadJsonFiles>,
+    {
+        let commit = match self.in_commit_timestamp_source()? {
+            InCommitTimestampSource::Resolved(timestamp) => return Ok(timestamp),
+            InCommitTimestampSource::Commit(commit) => commit,
+        };
+        let request = Pagination::Start(ReadJsonFiles(ReadFileFormatStart {
+            files: vec![commit.location.clone()],
+            physical_schema: InCommitTimestampVisitor::schema(),
+            predicate: None,
+        }));
+        let (batches, _) = channel.offload_paginated(request).await?;
+        let batch = batches
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::generic("Commit file contains no actions"))?;
+        let mut visitor = InCommitTimestampVisitor::default();
+        visitor.visit_rows_of(batch.as_ref())?;
+        visitor
+            .in_commit_timestamp
+            .map(Some)
+            .ok_or_else(|| Error::generic("In-Commit Timestamp not found in commit file"))
+    }
+
+    fn in_commit_timestamp_source(&self) -> DeltaResult<InCommitTimestampSource<'_>> {
         let enablement = self
             .table_configuration()
             .in_commit_timestamp_enablement()?;
 
-        // Return None if ICT is not enabled at all
         if matches!(enablement, InCommitTimestampEnablement::NotEnabled) {
-            return Ok(None);
+            return Ok(InCommitTimestampSource::Resolved(None));
         }
 
-        // If ICT is enabled with an enablement version, verify the enablement version is not in the
-        // future
         if let InCommitTimestampEnablement::Enabled {
             enablement: Some((enablement_version, _)),
         } = enablement
@@ -813,10 +882,9 @@ impl Snapshot {
             }
         }
 
-        // Fast path: serve ICT from CRC if available at this version.
         if let Some(crc) = self.crc_at_version() {
             match crc.in_commit_timestamp_opt {
-                Some(ict) => return Ok(Some(ict)),
+                Some(ict) => return Ok(InCommitTimestampSource::Resolved(Some(ict))),
                 None => {
                     return Err(Error::generic(format!(
                         "In-Commit Timestamp not found in CRC file at version {}",
@@ -826,12 +894,8 @@ impl Snapshot {
             }
         }
 
-        // Fallback: read the ICT from latest_commit_file
         match &self.log_segment.listed.latest_commit_file {
-            Some(commit_file_meta) => {
-                let ict = commit_file_meta.read_in_commit_timestamp(engine)?;
-                Ok(Some(ict))
-            }
+            Some(commit) => Ok(InCommitTimestampSource::Commit(commit)),
             None => Err(Error::generic("Last commit file not found in log segment")),
         }
     }
@@ -986,11 +1050,44 @@ impl Snapshot {
     /// - The underlying read error if in-commit timestamps are enabled but the timestamp cannot be
     ///   read from the commit file.
     /// - I/O errors from the engine's storage handler if the write fails.
-    #[instrument(parent = &self.span, name = "snap.write_checksum", skip_all, err)]
     pub fn write_checksum(
         self: &SnapshotRef,
         engine: &dyn Engine,
     ) -> DeltaResult<(ChecksumWriteResult, SnapshotRef)> {
+        coroutine::drive_workflow!(
+            self.start_write_checksum::<WriteChecksumWorkflow>(),
+            |workflow| match workflow {
+                WriteChecksumWorkflow::Done(output) => break output,
+                request => request.resume(engine),
+            },
+        )
+    }
+
+    /// Start a connector-driven workflow that writes this snapshot's version checksum.
+    ///
+    /// Returns the first workflow state; connectors resume read and write operations until the
+    /// workflow produces `(ChecksumWriteResult, SnapshotRef)`.
+    ///
+    /// Errors if kernel cannot resolve a writable CRC before the first connector operation.
+    /// Errors encountered later surface from the corresponding resume handle.
+    #[instrument(parent = &self.span, name = "snap.write_checksum", skip_all, err)]
+    pub fn start_write_checksum<W>(self: &SnapshotRef) -> DeltaResult<W>
+    where
+        W: Workflow<Output = (ChecksumWriteResult, SnapshotRef)> + WriteChecksumCapabilities,
+    {
+        let snapshot = Arc::clone(self);
+        coroutine::start(async move |mut channel| {
+            snapshot.write_checksum_with_channel(&mut channel).await
+        })
+    }
+
+    async fn write_checksum_with_channel<W>(
+        self: &SnapshotRef,
+        channel: &mut Channel<W>,
+    ) -> DeltaResult<(ChecksumWriteResult, SnapshotRef)>
+    where
+        W: WriteChecksumCapabilities,
+    {
         let has_crc_on_disk = self
             .log_segment
             .listed
@@ -1006,11 +1103,11 @@ impl Snapshot {
             return Ok((ChecksumWriteResult::AlreadyExists, Arc::clone(self)));
         }
 
-        let crc = self.resolve_crc_for_write(engine)?;
+        let crc = self.resolve_crc_for_write(channel).await?;
 
         let crc_path = ParsedLogPath::new_crc(self.table_root(), self.version())?;
 
-        match try_write_crc_file(engine, &crc_path.location, &crc) {
+        match try_write_crc_file(channel, &crc_path.location, &crc).await {
             Ok(()) => {
                 info!("Wrote CRC file at {}", crc_path.location);
                 let new_log_segment = self.log_segment.try_new_with_crc_file(crc_path)?;
@@ -1049,28 +1146,10 @@ impl Snapshot {
     ///
     /// The `root` span field records which root resolved the CRC.
     #[instrument(parent = &self.span, name = "snap.resolve_crc_for_write", skip_all, err, fields(root))]
-    fn resolve_crc_for_write(&self, engine: &dyn Engine) -> DeltaResult<Arc<Crc>> {
-        struct ReadJsonRequest<T>(
-            EngineDataPagination<ReadJsonFiles>,
-            EngineDataResume<T, ReadJsonRequest<T>>,
-        );
-
-        fn drive_json<T, F, Fut>(engine: &dyn Engine, workflow: F) -> DeltaResult<T>
-        where
-            T: Send + 'static,
-            F: FnOnce(Channel<T, ReadJsonRequest<T>>) -> Fut + Send + 'static,
-            Fut: Future<Output = DeltaResult<T>> + Send + 'static,
-        {
-            coroutine::drive_to_completion!(coroutine::start(workflow), |request| {
-                let ReadJsonRequest(pagination, resume) = request;
-                engine_coroutine::resume_read_json_files(
-                    engine.json_handler().as_ref(),
-                    pagination,
-                    resume,
-                )
-            },)
-        }
-
+    async fn resolve_crc_for_write<W>(&self, channel: &mut Channel<W>) -> DeltaResult<Arc<Crc>>
+    where
+        W: WriteChecksumCapabilities,
+    {
         let span = tracing::Span::current();
         // Case 1: an in-memory CRC at this version is ready to write as-is.
         if let Some(crc) = self.crc_at_version() {
@@ -1085,13 +1164,7 @@ impl Snapshot {
         // tail commits (a held base is always at or above the checkpoint, so a tail exists).
         if let Some(base) = self.base_crc() {
             span.record("root", "stale_crc");
-            let log_segment = log_segment.clone();
-            let base = base.clone();
-            let crc = drive_json(engine, async move |mut channel| {
-                log_segment
-                    .build_crc_from_base(&mut channel, ReadJsonRequest, &base)
-                    .await
-            })?;
+            let crc = log_segment.build_crc_from_base(channel, base).await?;
             return Ok(Arc::new(crc));
         }
 
@@ -1104,30 +1177,29 @@ impl Snapshot {
                 // at the checkpoint version and returns None when ICT is disabled, or errors when
                 // it is enabled but unreadable.
                 let mut crc = log_segment
-                    .build_crc_from_checkpoint(engine)?
+                    .build_crc_from_checkpoint(channel)
+                    .await?
                     .ok_or_else(|| unresolved_crc("checkpoint is missing protocol or metadata"))?;
-                crc.in_commit_timestamp_opt = self.get_in_commit_timestamp(engine)?;
+                crc.in_commit_timestamp_opt =
+                    self.get_in_commit_timestamp_with_channel(channel).await?;
                 return Ok(Arc::new(crc));
             }
             // Replay the tail commits first: a non-incremental tail dooms file stats no matter
             // what the checkpoint holds, so skip the larger checkpoint read in that case.
-            let log_segment_for_delta = log_segment.clone();
-            let delta = drive_json(engine, async move |mut channel| {
-                log_segment_for_delta
-                    .build_crc_delta_from_base(
-                        &mut channel,
-                        ReadJsonRequest,
-                        checkpoint_version,
-                        Some(FileSizeHistogram::create_default()),
-                    )
-                    .await
-            })?;
+            let delta = log_segment
+                .build_crc_delta_from_base(
+                    channel,
+                    checkpoint_version,
+                    Some(FileSizeHistogram::create_default()),
+                )
+                .await?;
             require!(
                 delta.is_incremental_safe,
                 unresolved_crc("commits after the checkpoint are not incremental-safe")
             );
             let base = log_segment
-                .build_crc_from_checkpoint(engine)?
+                .build_crc_from_checkpoint(channel)
+                .await?
                 .ok_or_else(|| unresolved_crc("checkpoint is missing protocol or metadata"))?;
             // The tail delta carries v_end's ICT, which `apply` sets on the result.
             return Ok(Arc::new(base.apply(delta, end)));
@@ -1135,13 +1207,10 @@ impl Snapshot {
 
         // Case 4: neither CRC nor checkpoint, so reverse-replay the full commit history.
         span.record("root", "version_zero");
-        let log_segment = log_segment.clone();
-        let crc = drive_json(engine, async move |mut channel| {
-            log_segment
-                .build_crc_from_version_zero(&mut channel, ReadJsonRequest)
-                .await
-        })?
-        .ok_or_else(|| unresolved_crc("commit history is missing protocol or metadata"))?;
+        let crc = log_segment
+            .build_crc_from_version_zero(channel)
+            .await?
+            .ok_or_else(|| unresolved_crc("commit history is missing protocol or metadata"))?;
         Ok(Arc::new(crc))
     }
 
@@ -1386,7 +1455,8 @@ mod tests {
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::FileSystemCommitter;
     use crate::coroutine;
-    use crate::coroutine::engine::{self as engine_coroutine, ReadPagination, ReadResume};
+    use crate::coroutine::engine as engine_coroutine;
+    use crate::coroutine::read::SmallFileRead;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -1560,21 +1630,25 @@ mod tests {
         storage: &dyn crate::StorageHandler,
         log_root: &Url,
     ) -> DeltaResult<Option<LastCheckpointHint>> {
-        struct ReadFilesRequest(
-            ReadPagination,
-            ReadResume<Option<LastCheckpointHint>, ReadFilesRequest>,
-        );
+        #[coroutine_workflow]
+        enum ReadFileWorkflow {
+            #[output]
+            Done(Option<LastCheckpointHint>),
+            Read(SmallFileRead),
+        }
 
         let log_root = log_root.clone();
-        let next = coroutine::start(async move |mut channel| {
-            LastCheckpointHint::try_read(&mut channel, ReadFilesRequest, &log_root).await
-        });
-
-        coroutine::drive_to_completion!(next, |request| match request {
-            ReadFilesRequest(pagination, resume) => {
-                engine_coroutine::resume_read_files(storage, pagination, resume)
-            }
-        })
+        coroutine::drive_workflow!(
+            coroutine::start(async move |mut channel| {
+                LastCheckpointHint::try_read(&mut channel, &log_root).await
+            }),
+            |workflow| match workflow {
+                ReadFileWorkflow::Done(output) => break output,
+                ReadFileWorkflow::Read(operation, resume) => {
+                    engine_coroutine::resume_read_file(storage, operation, resume)
+                }
+            },
+        )
     }
 
     #[test]

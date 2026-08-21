@@ -29,11 +29,10 @@ use search::{binary_search_by_key_with_bounds, Bound, SearchError};
 use tracing::{info, trace, warn};
 use url::Url;
 
-use crate::coroutine::engine::{EngineConnector, EngineRequest};
+use crate::coroutine::engine::{EngineConnector, ListingWorkflow};
 use crate::coroutine::listing::{forward_listing_bounds, ForwardListing};
 use crate::coroutine::{
-    self, coroutine_capabilities, CanRequestPaginated, Channel, PaginatedOperationRequestExt as _,
-    Pagination,
+    self, coroutine_capabilities, CanRequestPaginated, Channel, Pagination, Workflow,
 };
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::{parse_delta_log_listing, should_process_log_file};
@@ -92,12 +91,9 @@ enum TimestampSearchBounds {
     },
 }
 
+/// Operations required to locate the earliest available table commit.
 #[coroutine_capabilities]
-trait HistoryListingCapabilities<O>: CanRequestPaginated<O, ForwardListing>
-where
-    O: Send + 'static,
-{
-}
+pub trait EarliestCommitCapabilities: CanRequestPaginated<ForwardListing> {}
 
 /// Determines the search strategy for timestamp-to-version conversion based on ICT enablement.
 ///
@@ -725,9 +721,9 @@ pub fn timestamp_range_to_versions(
 ///   before the catalog exposes the table. Otherwise a filesystem-only client could list an empty
 ///   `_delta_log/` and "create" a table at the same location. An empty listing here therefore
 ///   indicates a broken invariant rather than a normal missing version.
-#[tracing::instrument(skip(engine), ret, err)]
-fn get_earliest_published_commit_version(
-    engine: &dyn Engine,
+#[tracing::instrument(skip(channel), ret, err)]
+async fn get_earliest_published_commit_version<W: EarliestCommitCapabilities>(
+    channel: &mut Channel<W>,
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
 ) -> DeltaResult<Version> {
@@ -741,43 +737,20 @@ fn get_earliest_published_commit_version(
             .map(|f| f.version))
     }
 
-    async fn find_earliest<Q>(
-        mut channel: Channel<Option<Version>, Q>,
-        listing_root: Url,
-    ) -> DeltaResult<Option<Version>>
-    where
-        Q: HistoryListingCapabilities<Option<Version>>,
-    {
-        let bounds = forward_listing_bounds(&listing_root, 0, Version::MAX)?;
-        let mut pagination = Pagination::Start(bounds);
-        loop {
-            let (page, next_cursor) = coroutine::offload_paginated(
-                &mut channel,
-                ForwardListing::paginated_request,
-                pagination,
-            )
-            .await?;
-            let files =
-                parse_delta_log_listing(page.entries.into_iter(), &listing_root, Version::MAX);
-            if let Some(version) = first_published_commit_version(files)? {
-                return Ok(Some(version));
-            }
-            pagination = match next_cursor {
-                Some(cursor) => Pagination::Continue(cursor),
-                None => return Ok(None),
-            };
+    let bounds = forward_listing_bounds(log_root, 0, Version::MAX)?;
+    let mut pagination = Pagination::Start(ForwardListing(bounds));
+    let output = loop {
+        let (page, next_cursor) = channel.offload_paginated(pagination).await?;
+        let files = parse_delta_log_listing(page.0.into_iter(), log_root, Version::MAX);
+        if let Some(version) = first_published_commit_version(files)? {
+            break Some(version);
         }
-    }
-
-    let listing_root = log_root.clone();
-    let mut connector = EngineConnector::new(engine);
-    coroutine::drive_to_completion!(
-        coroutine::start(move |channel| {
-            find_earliest::<EngineRequest<Option<Version>>>(channel, listing_root)
-        }),
-        |request| request.resume(&mut connector),
-    )?
-    .ok_or_else(|| {
+        pagination = match next_cursor {
+            Some(cursor) => Pagination::Continue(cursor),
+            None => break None,
+        };
+    };
+    output.ok_or_else(|| {
         if earliest_ratified_commit_version == Some(0) {
             return DeltaError::generic(format!(
                 "expected a published v0 commit for catalog-managed table {log_root}, \
@@ -810,26 +783,16 @@ fn get_earliest_published_commit_version(
 /// broken CCv2 invariant (ratified commit 0 with no published filesystem commit).
 /// - [`LogHistoryError::NoRecreatableCommit`] if commits exist but neither
 /// `00...00.json` nor a complete checkpoint that anchors the smallest commit is present.
-#[tracing::instrument(skip(engine), err, ret)]
-fn get_earliest_recreatable_commit(
-    engine: &dyn Engine,
+#[tracing::instrument(skip(channel), err, ret)]
+async fn get_earliest_recreatable_commit<W: EarliestCommitCapabilities>(
+    channel: &mut Channel<W>,
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
 ) -> DeltaResult<Version> {
-    type Output = (Option<Version>, Option<Version>);
-
-    async fn find_earliest<Q>(
-        mut channel: Channel<Output, Q>,
-        listing_root: Url,
-    ) -> DeltaResult<Output>
-    where
-        Q: HistoryListingCapabilities<Output>,
-    {
-        let mut last_complete_checkpoint = None;
-        let mut multi_part_checkpoint_progress = HashMap::<(Version, u32), HashSet<u32>>::new();
-        let mut observe_files = move |listing,
-                                      earliest_commit_version: &mut Option<_>|
-              -> DeltaResult<_> {
+    let mut last_complete_checkpoint = None;
+    let mut multi_part_checkpoint_progress = HashMap::<(Version, u32), HashSet<u32>>::new();
+    let mut observe_files =
+        move |listing, earliest_commit_version: &mut Option<_>| -> DeltaResult<_> {
             for parsed_result in listing {
                 let parsed_log_path = parsed_result?;
                 if !should_process_log_file(&parsed_log_path) {
@@ -878,36 +841,20 @@ fn get_earliest_recreatable_commit(
             Ok(None)
         };
 
-        let mut earliest_commit_version = None;
-        let bounds = forward_listing_bounds(&listing_root, 0, Version::MAX)?;
-        let mut pagination = Pagination::Start(bounds);
-        loop {
-            let (page, next_cursor) = coroutine::offload_paginated(
-                &mut channel,
-                ForwardListing::paginated_request,
-                pagination,
-            )
-            .await?;
-            let files =
-                parse_delta_log_listing(page.entries.into_iter(), &listing_root, Version::MAX);
-            if let Some(version) = observe_files(files, &mut earliest_commit_version)? {
-                return Ok((Some(version), earliest_commit_version));
-            }
-            pagination = match next_cursor {
-                Some(cursor) => Pagination::Continue(cursor),
-                None => return Ok((None, earliest_commit_version)),
-            };
+    let mut earliest_commit_version = None;
+    let bounds = forward_listing_bounds(log_root, 0, Version::MAX)?;
+    let mut pagination = Pagination::Start(ForwardListing(bounds));
+    let recreatable_version = loop {
+        let (page, next_cursor) = channel.offload_paginated(pagination).await?;
+        let files = parse_delta_log_listing(page.0.into_iter(), log_root, Version::MAX);
+        if let Some(version) = observe_files(files, &mut earliest_commit_version)? {
+            break Some(version);
         }
-    }
-
-    let listing_root = log_root.clone();
-    let mut connector = EngineConnector::new(engine);
-    let (recreatable_version, earliest_commit_version) = coroutine::drive_to_completion!(
-        coroutine::start(move |channel| {
-            find_earliest::<EngineRequest<Output>>(channel, listing_root)
-        }),
-        |request| request.resume(&mut connector),
-    )?;
+        pagination = match next_cursor {
+            Some(cursor) => Pagination::Continue(cursor),
+            None => break None,
+        };
+    };
 
     if let Some(version) = recreatable_version {
         return Ok(version);
@@ -945,12 +892,12 @@ pub enum HistoryCommitType {
     Recreatable,
 }
 
-/// Returns the earliest table version available on the file system at `log_root`. The returned
-/// version is not guaranteed to exist by the time the caller acts on it: a concurrent log-cleanup
-/// operation may delete the underlying file.
+/// Start a connector-driven workflow that locates the earliest table version at `log_root`.
+///
+/// The resulting version is not guaranteed to exist by the time the caller acts on it: a
+/// concurrent log-cleanup operation may delete the underlying file.
 ///
 /// # Parameters
-/// - `engine`: kernel engine used to list `log_root`.
 /// - `log_root`: URL of the table's `_delta_log/` directory (must end with `/`).
 /// - `earliest_ratified_commit_version`: For catalog-managed tables, the earliest version the
 ///   catalog has ratified a commit at. Pass `None` for filesystem-only tables.
@@ -968,24 +915,57 @@ pub enum HistoryCommitType {
 /// - [`DeltaError::Generic`] when the listing yields no commits and
 ///   `earliest_ratified_commit_version` is `Some(0)`, flagging a broken catalog-managed invariant
 ///   (ratified commit 0 with no published filesystem commit).
-#[tracing::instrument(skip(engine), err, ret)]
+#[tracing::instrument(name = "history.get_earliest_commit", skip_all, err)]
+pub fn start_earliest_commit<W: Workflow<Output = Version> + EarliestCommitCapabilities>(
+    log_root: Url,
+    earliest_ratified_commit_version: Option<Version>,
+    commit_type: HistoryCommitType,
+) -> DeltaResult<W> {
+    coroutine::start(async move |mut channel| match commit_type {
+        HistoryCommitType::Published => {
+            get_earliest_published_commit_version(
+                &mut channel,
+                &log_root,
+                earliest_ratified_commit_version,
+            )
+            .await
+        }
+        HistoryCommitType::Recreatable => {
+            get_earliest_recreatable_commit(
+                &mut channel,
+                &log_root,
+                earliest_ratified_commit_version,
+            )
+            .await
+        }
+    })
+}
+
+/// Return the earliest table version by driving [`start_earliest_commit`] through `engine`.
+///
+/// # Parameters
+/// - `engine`: kernel engine used to list `log_root`.
+/// - Other parameters have the same meaning as [`start_earliest_commit`].
+///
+/// Errors from kernel or the Engine storage handler abort the workflow.
 pub fn get_earliest_commit(
     engine: &dyn Engine,
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
     commit_type: HistoryCommitType,
 ) -> DeltaResult<Version> {
-    match commit_type {
-        HistoryCommitType::Published => get_earliest_published_commit_version(
-            engine,
-            log_root,
+    let mut connector = EngineConnector::new(engine);
+    coroutine::drive_workflow!(
+        start_earliest_commit::<ListingWorkflow<Version>>(
+            log_root.clone(),
             earliest_ratified_commit_version,
+            commit_type,
         ),
-
-        HistoryCommitType::Recreatable => {
-            get_earliest_recreatable_commit(engine, log_root, earliest_ratified_commit_version)
-        }
-    }
+        |workflow| match workflow {
+            ListingWorkflow::Done(version) => break version,
+            request => connector.dispatch(request),
+        },
+    )
 }
 
 #[cfg(test)]
@@ -2283,7 +2263,7 @@ mod tests {
         #[case] expected: Expected,
     ) {
         let (engine, log_root) = engine_with_log_files(&paths, &HashSet::new());
-        let res = get_earliest_recreatable_commit(&engine, &log_root, ratified);
+        let res = get_earliest_commit(&engine, &log_root, ratified, HistoryCommitType::Recreatable);
         match expected {
             Expected::Version(v) => assert_eq!(res.unwrap(), v),
             Expected::NoCommitsFound => assert!(
@@ -2317,7 +2297,8 @@ mod tests {
         empty_paths.insert(single_part_checkpoint_path(5));
 
         let (engine, log_root) = engine_with_log_files(&paths, &empty_paths);
-        let version = get_earliest_recreatable_commit(&engine, &log_root, None).unwrap();
+        let version =
+            get_earliest_commit(&engine, &log_root, None, HistoryCommitType::Recreatable).unwrap();
         assert_eq!(version, 8);
     }
 
@@ -2354,10 +2335,11 @@ mod tests {
             }
         }
 
-        let res = get_earliest_published_commit_version(
+        let res = get_earliest_commit(
             &engine,
             &log_root,
             earliest_ratified_commit_version,
+            HistoryCommitType::Published,
         );
         match expected {
             Expected::Version(v) => assert_eq!(res.unwrap(), v),
@@ -2392,7 +2374,7 @@ mod tests {
             staged_dir.join("00000000000000000001.01234567-89ab-cdef-0123-456789abcdef.json");
         std::fs::write(&staged_file, "{}").unwrap();
 
-        let res = get_earliest_published_commit_version(&engine, &log_root, None);
+        let res = get_earliest_commit(&engine, &log_root, None, HistoryCommitType::Published);
         assert_eq!(res.unwrap(), 0);
     }
 }

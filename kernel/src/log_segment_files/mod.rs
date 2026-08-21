@@ -19,9 +19,9 @@ use tracing::{debug, info, instrument, warn};
 use url::Url;
 
 use crate::coroutine::listing::{
-    backward_log_listing_request, forward_log_listing_request, ListFilesConstructor,
+    backward_log_listing_request, forward_log_listing_request, BackwardListing, ForwardListing,
 };
-use crate::coroutine::{self, Channel, Pagination};
+use crate::coroutine::{CanRequestPaginated, Channel, Pagination};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
 use crate::path::{
@@ -528,9 +528,8 @@ impl LogSegmentFiles {
     /// `log_tail` is a contiguous run of commits ending at the table's latest version. It takes
     /// precedence over the filesystem listing, and is required for catalog-managed tables, whose
     /// unbackfilled staged commits exist only here.
-    pub(crate) async fn list_commits<O: Send + 'static, Q: Send + 'static, S: Send + 'static>(
-        channel: &mut Channel<O, Q>,
-        list_files: ListFilesConstructor<O, Q, S>,
+    pub(crate) async fn list_commits<W: CanRequestPaginated<ForwardListing>>(
+        channel: &mut Channel<W>,
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         start_version: Option<Version>,
@@ -549,10 +548,9 @@ impl LogSegmentFiles {
         let mut max_published_version: Option<Version> = None;
 
         loop {
-            let (page, next_cursor) =
-                coroutine::offload_paginated(channel, list_files, pagination).await?;
+            let (page, next_cursor) = channel.offload_paginated(pagination).await?;
             // Filesystem commits, skipping any covered by the log_tail.
-            for file_result in parse_delta_log_listing(page.entries.into_iter(), log_root, end) {
+            for file_result in parse_delta_log_listing(page.0.into_iter(), log_root, end) {
                 let file = file_result?;
                 if file.file_type != LogPathFileType::Commit {
                     continue;
@@ -604,9 +602,8 @@ impl LogSegmentFiles {
     // - CheckpointParts: Vec<ParsedLogPath>, checkpoint_version: Version (guarantee all same
     //   version)
     #[instrument(name = "log.list", skip_all, fields(start = ?start_version, end = ?end_version), err)]
-    pub(crate) async fn list<O: Send + 'static, Q: Send + 'static, S: Send + 'static>(
-        channel: &mut Channel<O, Q>,
-        list_files: ListFilesConstructor<O, Q, S>,
+    pub(crate) async fn list<W: CanRequestPaginated<ForwardListing>>(
+        channel: &mut Channel<W>,
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         start_version: Option<Version>,
@@ -619,9 +616,8 @@ impl LogSegmentFiles {
         let mut builder = LogListingBuilder::new(log_tail, start, end_version);
 
         loop {
-            let (page, next_cursor) =
-                coroutine::offload_paginated(channel, list_files, pagination).await?;
-            let files = parse_delta_log_listing(page.entries.into_iter(), log_root, end);
+            let (page, next_cursor) = channel.offload_paginated(pagination).await?;
+            let files = parse_delta_log_listing(page.0.into_iter(), log_root, end);
             builder.extend_filesystem_files(files)?;
 
             pagination = match next_cursor {
@@ -640,21 +636,15 @@ impl LogSegmentFiles {
     /// The hint only tells us where to start listing; it never influences which checkpoint is
     /// selected at a version. A hint that turns out to describe a different checkpoint than the one
     /// selected is logged and ignored, not an error.
-    pub(crate) async fn list_with_checkpoint_hint<
-        O: Send + 'static,
-        Q: Send + 'static,
-        S: Send + 'static,
-    >(
+    pub(crate) async fn list_with_checkpoint_hint<W: CanRequestPaginated<ForwardListing>>(
         checkpoint_metadata: &LastCheckpointHint,
-        channel: &mut Channel<O, Q>,
-        list_files: ListFilesConstructor<O, Q, S>,
+        channel: &mut Channel<W>,
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
         Self::list(
             channel,
-            list_files,
             log_root,
             log_tail,
             Some(checkpoint_metadata.version),
@@ -738,24 +728,21 @@ impl LogSegmentFiles {
     /// Files from these pages are combined with `log_tail`, producing a log segment rooted at v8900
     /// with commits v8901 through v12500.
     #[instrument(name = "log.list_with_backward_checkpoint_scan", skip_all, fields(end = end_version), err)]
-    pub(crate) async fn list_with_backward_checkpoint_scan<
-        O: Send + 'static,
-        Q: Send + 'static,
-        S: Send + 'static,
-    >(
-        channel: &mut Channel<O, Q>,
-        list_files: ListFilesConstructor<O, Q, S>,
+    pub(crate) async fn list_with_backward_checkpoint_scan<W>(
+        channel: &mut Channel<W>,
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         end_version: Version,
-    ) -> DeltaResult<Self> {
+    ) -> DeltaResult<Self>
+    where
+        W: CanRequestPaginated<BackwardListing>,
+    {
         let request = backward_log_listing_request(log_root, 0, end_version)?;
         let mut pagination = Pagination::Start(request);
         let mut checkpoint_search = BackwardCheckpointSearch::default();
 
         loop {
-            let (page, next_cursor) =
-                coroutine::offload_paginated(channel, list_files, pagination).await?;
+            let (page, next_cursor) = channel.offload_paginated(pagination).await?;
             let files = parse_delta_log_listing(page.entries.into_iter(), log_root, end_version)
                 .try_collect()?;
             if checkpoint_search.push_page(files, page.known_version_boundary) {

@@ -1,17 +1,19 @@
 //! Builder for creating [`Snapshot`] instances.
 
-use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use tracing::{info, instrument};
 
 use crate::coroutine::engine::{
-    self as engine_coroutine, EngineDataPagination, EngineDataResume, ListingPagination,
-    ListingResume, ReadPagination, ReadResume,
+    self as engine_coroutine, BackwardListingState, EngineDataIterator, ListingIterator,
 };
+use crate::coroutine::listing::{BackwardListing, ForwardListing};
 #[cfg(feature = "declarative-plans")]
 use crate::coroutine::read::ExecutePlan;
-use crate::coroutine::read::{ReadJsonFiles, ReadParquetFiles};
+use crate::coroutine::read::{ReadJsonFiles, ReadParquetFiles, SmallFileRead};
+use crate::coroutine::{
+    coroutine_capabilities, coroutine_workflow, CanRequest, CanRequestPaginated, Workflow,
+};
 use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
 use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
@@ -21,51 +23,73 @@ use crate::snapshot::SnapshotRef;
 use crate::utils::{require, try_parse_uri};
 use crate::{coroutine, DeltaResult, Engine, Error, Snapshot, Version};
 
-/// Work items delegated while constructing a snapshot.
-pub(super) enum SnapshotBuildRequest {
-    List(
-        ListingPagination,
-        ListingResume<SnapshotRef, SnapshotBuildRequest>,
-    ),
-    ReadBytes(
-        ReadPagination,
-        ReadResume<SnapshotRef, SnapshotBuildRequest>,
-    ),
-    ReadJson(
-        EngineDataPagination<ReadJsonFiles>,
-        EngineDataResume<SnapshotRef, SnapshotBuildRequest>,
-    ),
-    ReadParquet(
-        EngineDataPagination<ReadParquetFiles>,
-        EngineDataResume<SnapshotRef, SnapshotBuildRequest>,
-    ),
+/// Current state of a snapshot construction workflow.
+#[coroutine_workflow]
+pub(super) enum SnapshotWorkflow {
+    #[output]
+    Loaded(SnapshotRef),
+    #[paginated]
+    ListForward(ForwardListing, ListingIterator),
+    #[paginated]
+    ListBackward(BackwardListing, BackwardListingState),
+    ReadBytes(SmallFileRead),
+    #[paginated]
+    ReadJson(ReadJsonFiles, EngineDataIterator),
+    #[paginated]
+    ReadParquet(ReadParquetFiles, EngineDataIterator),
     #[cfg(feature = "declarative-plans")]
-    ExecutePlan(
-        EngineDataPagination<ExecutePlan>,
-        EngineDataResume<SnapshotRef, SnapshotBuildRequest>,
-    ),
+    #[paginated]
+    ExecutePlan(ExecutePlan, EngineDataIterator),
 }
 
-impl SnapshotBuildRequest {
-    pub(super) fn resume(
-        self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<ControlFlow<SnapshotRef, SnapshotBuildRequest>> {
+/// Operations required to load fresh or incremental snapshots.
+#[cfg(feature = "declarative-plans")]
+#[coroutine_capabilities]
+pub trait SnapshotCapabilities:
+    CanRequestPaginated<ForwardListing>
+    + CanRequestPaginated<BackwardListing>
+    + CanRequest<SmallFileRead>
+    + CanRequestPaginated<ReadJsonFiles>
+    + CanRequestPaginated<ReadParquetFiles>
+    + CanRequestPaginated<ExecutePlan>
+{
+}
+
+/// Operations required to load fresh or incremental snapshots.
+#[cfg(not(feature = "declarative-plans"))]
+#[coroutine_capabilities]
+pub trait SnapshotCapabilities:
+    CanRequestPaginated<ForwardListing>
+    + CanRequestPaginated<BackwardListing>
+    + CanRequest<SmallFileRead>
+    + CanRequestPaginated<ReadJsonFiles>
+    + CanRequestPaginated<ReadParquetFiles>
+{
+}
+
+impl SnapshotWorkflow {
+    pub(super) fn resume(self, engine: &dyn Engine) -> DeltaResult<Self> {
         let storage = engine.storage_handler();
+        let parquet_handler = engine.parquet_handler();
+        let json_handler = engine.json_handler();
         match self {
-            Self::List(pagination, resume) => {
-                engine_coroutine::resume_list_files(storage.as_ref(), pagination, resume)
+            Self::Loaded(_) => Err(Error::internal_error(
+                "completed snapshot workflow cannot be resumed",
+            )),
+            Self::ListForward(pagination, resume) => {
+                engine_coroutine::resume_forward_listing(storage.as_ref(), pagination, resume)
             }
-            Self::ReadBytes(pagination, resume) => {
-                engine_coroutine::resume_read_files(storage.as_ref(), pagination, resume)
+            Self::ListBackward(pagination, resume) => {
+                engine_coroutine::resume_backward_listing(storage.as_ref(), pagination, resume)
             }
-            Self::ReadJson(pagination, resume) => engine_coroutine::resume_read_json_files(
-                engine.json_handler().as_ref(),
-                pagination,
-                resume,
-            ),
+            Self::ReadBytes(operation, resume) => {
+                engine_coroutine::resume_read_file(storage.as_ref(), operation, resume)
+            }
+            Self::ReadJson(pagination, resume) => {
+                engine_coroutine::resume_read_json_files(json_handler.as_ref(), pagination, resume)
+            }
             Self::ReadParquet(pagination, resume) => engine_coroutine::resume_read_parquet_files(
-                engine.parquet_handler().as_ref(),
+                parquet_handler.as_ref(),
                 pagination,
                 resume,
             ),
@@ -260,16 +284,27 @@ impl SnapshotBuilder {
     // Terminal: build the Snapshot
     // ============================================================================
 
-    /// Create a new [`Snapshot`]. This returns a [`SnapshotRef`] (`Arc<Snapshot>`), perhaps
-    /// returning a reference to an existing snapshot if the request to build a new snapshot
-    /// matches the version of an existing snapshot.
+    /// Build a [`Snapshot`] by driving [`start`](Self::start) through `engine`.
+    ///
+    /// Returns a shared reference to the loaded snapshot. Errors from kernel or Engine handlers
+    /// abort the workflow.
+    pub fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
+        coroutine::drive_workflow!(
+            self.start::<SnapshotWorkflow>(),
+            |workflow| match workflow {
+                SnapshotWorkflow::Loaded(snapshot) => break snapshot,
+                request => request.resume(engine),
+            },
+        )
+    }
+
+    /// Start a connector-driven workflow that produces a [`SnapshotRef`].
+    ///
+    /// `W` chooses the connector's workflow enum and pagination state types. The workflow may
+    /// complete immediately or return an operation variant for the connector to execute and resume.
     ///
     /// Reports metrics: [`MetricEvent::SnapshotBuildSuccess`] or
     /// [`MetricEvent::SnapshotBuildFailure`].
-    ///
-    /// # Parameters
-    ///
-    /// - `engine`: Implementation of [`Engine`] apis.
     ///
     /// [`MetricEvent::SnapshotBuildSuccess`]: crate::metrics::MetricEvent::SnapshotBuildSuccess
     /// [`MetricEvent::SnapshotBuildFailure`]: crate::metrics::MetricEvent::SnapshotBuildFailure
@@ -281,7 +316,10 @@ impl SnapshotBuilder {
         fields(path = %self.table_path(), report, version = tracing::field::Empty, operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some(), correlation_id = self.correlation_id.as_deref().unwrap_or(""), load_type = self.load_type().as_ref()),
         err
     )]
-    pub fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
+    pub fn start<W>(self) -> DeltaResult<W>
+    where
+        W: Workflow<Output = SnapshotRef> + SnapshotCapabilities,
+    {
         // Fold the context into the message string rather than passing structured fields: this
         // `info!` fires inside the `snap.build` metrics span, where any field the
         // `SnapshotBuildSuccess` event doesn't recognize would trip a spurious "Invalid field"
@@ -330,68 +368,56 @@ impl SnapshotBuilder {
         // requested version is exactly the max_catalog_version.
         let built_as_latest = version.is_none() || version == max_catalog_version;
 
-        #[cfg(feature = "declarative-plans")]
-        let use_plans = engine.plan_executor().is_some();
-        #[cfg(not(feature = "declarative-plans"))]
-        let use_plans = false;
+        coroutine::start(async move |mut channel| {
+            let result = if let Some(table_root) = table_root {
+                let table_url = try_parse_uri(table_root)?;
+                let log_segment = LogSegment::for_snapshot(
+                    &mut channel,
+                    table_url.join("_delta_log/")?,
+                    log_tail,
+                    effective_version,
+                    metric_context.clone(),
+                )
+                .await?;
 
-        let result = coroutine::drive_to_completion!(
-            coroutine::start(async move |mut channel| {
-                if let Some(table_root) = table_root {
-                    let table_url = try_parse_uri(table_root)?;
-                    let log_segment = LogSegment::for_snapshot(
-                        &mut channel,
-                        SnapshotBuildRequest::List,
-                        SnapshotBuildRequest::ReadBytes,
-                        table_url.join("_delta_log/")?,
-                        log_tail,
-                        effective_version,
-                        metric_context.clone(),
+                Snapshot::try_new_from_log_segment(
+                    &mut channel,
+                    table_url,
+                    log_segment,
+                    metric_context,
+                    incremental_replay,
+                    built_as_latest,
+                )
+                .await
+                .map(Into::into)
+            } else {
+                let existing_snapshot = existing_snapshot.ok_or_else(|| {
+                    Error::internal_error(
+                        "SnapshotBuilder should have either table_root or existing_snapshot",
                     )
-                    .await?;
+                })?;
+                Snapshot::try_new_from(
+                    &mut channel,
+                    existing_snapshot,
+                    log_tail,
+                    effective_version,
+                    metric_context,
+                    incremental_replay,
+                    built_as_latest,
+                )
+                .await
+            };
 
-                    Snapshot::try_new_from_log_segment(
-                        table_url,
-                        log_segment,
-                        &mut channel,
-                        metric_context,
-                        incremental_replay,
-                        built_as_latest,
-                        use_plans,
-                    )
-                    .await
-                    .map(Arc::new)
-                } else {
-                    let existing_snapshot = existing_snapshot.ok_or_else(|| {
-                        Error::internal_error(
-                            "SnapshotBuilder should have either table_root or existing_snapshot",
-                        )
-                    })?;
-                    Snapshot::try_new_from(
-                        &mut channel,
-                        existing_snapshot,
-                        log_tail,
-                        effective_version,
-                        metric_context,
-                        incremental_replay,
-                        built_as_latest,
-                        use_plans,
-                    )
-                    .await
-                }
-            }),
-            |request| request.resume(engine),
-        );
-
-        // Post-build validations for catalog-managed tables
-        let result = result.and_then(|snapshot| {
-            Self::validate_catalog_managed_build_result(&snapshot, max_catalog_version)?;
-            Ok(snapshot)
-        });
-        if let Ok(ref snapshot) = result {
-            tracing::Span::current().record("version", snapshot.version());
-        }
-        result
+            // Post-build validations for catalog-managed tables
+            let result = result.and_then(|snapshot| {
+                Self::validate_catalog_managed_build_result(&snapshot, max_catalog_version)?;
+                Ok(snapshot)
+            });
+            if let Ok(ref snapshot) = result {
+                tracing::Span::current().record("version", snapshot.version());
+            }
+            result
+        })
     }
 
     // ============================================================================

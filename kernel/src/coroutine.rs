@@ -1,46 +1,62 @@
 //! Connector-driven coroutines for kernel workflows.
 //!
 //! By design, kernel maintains a strict separation of concerns, delegating I/O and dataflow
-//! operations to the connector. Connector-initiated kernel workflows that delegate work back to
-//! the connector are designed as coroutines. The initial call returns a [`ControlFlow`] that
-//! communicates the next step to connector:
-//! * `Break` indicates the requested workflow completed without delegation, and yields the
-//!   workflow's final result.
-//! * `Continue` indicates that kernel delegated a work item for the connector to execute on its
-//!   behalf, along with a [`Resume`] that routes the connector's response back to kernel. Resuming
-//!   produces another [`ControlFlow`] of the same type as before, allowing the kernel to delegate
-//!   additional work items back to the connector as needed.
+//! operations to the connector. Connector-initiated kernel workflows that delegate work back to the
+//! connector are designed as coroutines. Invoking a kernel workflow returns an enum implementing
+//! [`Workflow`], with one output variant carrying the completed result and one or more operation
+//! variants. Each operation variant carries an [`Operation`] for the connector to perform and a
+//! [`Resume`] that connector uses to reply back to kernel. Resuming produces another value of the
+//! same workflow type. Connectors drive the workflow in a loop until it produces either an error or
+//! an output.
 //!
-//! Connectors define request enums from kernel-provided [`Operation`] descriptors. Kernel workflows
-//! declare the exact request capabilities they require, while a connector enum may contain a
-//! superset. Each request variant carries typed work plus a matching [`Resume`]. The
-//! [`drive_to_completion!`] macro repeatedly dispatches `Continue` cases and returns the final
-//! `Break` output.
+//! Connectors define the [`Workflow`] enums they use, with variants using kernel-provided
+//! [`Operation`] descriptors. Kernel workflows accept any workflow that has the correct output type
+//! and that provides all operations the workflow requires. Alternatively, kernel provides legacy
+//! entry points that accept an [`Engine`](crate::Engine) instead of a [`Workflow`], and which
+//! drive the workflow to completion by dispatching operations to the `Engine`.
 //!
-//! Meanwhile, kernel workflows are implemented as `async` functions that [`offload`] work items to
-//! the connector and `await` responses on the resulting futures. The coroutine infrastructure is a
-//! trivial, no-concurrency async executor used only for the stack ripping that coroutines require.
-//! Starting or resuming a workflow runs kernel synchronously on the calling thread until the next
-//! delegated work item or completion; delegated work itself runs only after kernel returns. The
-//! connector remains free to use its own async runtime and scheduling strategy. Work items are
-//! [`Send`] and can be resumed from different threads or async tasks than they were delivered to.
+//! Meanwhile, kernel workflows are implemented as `async` functions that call [`Channel::offload`]
+//! or [`Channel::offload_paginated`] and `await` the connector's response. The coroutine
+//! infrastructure is a fully internal, trivial, no-concurrency async executor; used only for the
+//! stack ripping that coroutines require. Starting or resuming a workflow runs kernel synchronously
+//! on the calling thread until the next delegated work item or completion, at which point the
+//! method call returns the delegated work to the connector. The connector remains free to use its
+//! own async runtime and scheduling strategy on top. In particular, work items are [`Send`] and
+//! the workflow can migrate between threads and/or async tasks as it progresses.
+//!
+//! # Pagination
+//!
+//! Some operations that kernel delegates, such as file listing, technically has unbounded response
+//! sizes even tho the responses are usually small. These operations are paginated, in order to give
+//! engines full visibility and control over potentially unbounded work. The workflow enum defines a
+//! paginated variant that includes a second field for connector-defined and managed pagination
+//! state, and returns that state to kernel along with its initial response when resuming. Connector
+//! decides the page size; if kernel needs more data than was supplied, it returns the connector's
+//! state in a new operation request, which connector can use to resume the operation where it left
+//! off. If the operation is still not complete, connector can resume kernel by passing an updated
+//! state to kernel along with the next page.
+//!
+//! NOTE: Kernel may interleave requests for other operations while consuming the output of a
+//! paginated operation (e.g. read a file whose status the listing returned). Connectors must ensure
+//! that the state variable they pass to kernel contains all information necessary to resume the
+//! operation, even if kernel requests other work between pages.
 //!
 //! # Error handling
 //!
 //! All calls are fallible:
-//! * The initial workflow call returns `DeltaResult<ControlFlow>`, where `Err` indicates that
-//!   kernel determined up front that the workflow cannot succeed (e.g. invalid inputs). Connector
-//!   decides whether the failure is user-facing or not.
+//! * The initial workflow call returns `DeltaResult<Workflow>`, where `Err` indicates that kernel
+//!   was unable to start the workflow (e.g. invalid inputs). Connector decides whether the failure
+//!   is user-facing or not.
 //! * The connector passes `DeltaResult<R>` to [`Resume::resume`] when resuming kernel, where `Err`
 //!   indicates that the connector encountered an error executing the work item. Kernel decides
 //!   whether/how that failure influences the workflow.
-//! * The return value of [`Resume::resume`] is again `DeltaResult<ControlFlow>`, where `Err`
-//!   indicates that kernel encountered an error while processing the connector's response or
-//!   advancing the workflow. Connector decides whether the failure is user-facing or not.
+//! * The return value of [`Resume::resume`] is again `DeltaResult<Workflow>`, where `Err` indicates
+//!   that kernel encountered an error while processing the connector's response or advancing the
+//!   workflow. Connector again decides whether such failures are user-facing or not.
 //!
-//! Additionally, the connector can always choose to abandon a request by dropping the `Resume`
-//! instead of invoking it. In particular, connector decides whether to forward a work item error
-//! back to kernel, or just fail directly without further kernel involvement.
+//! Additionally, the connector can always choose to abandon a workflow by dropping the `Resume`
+//! instead of invoking it. In particular, connector decides whether to resume kernel when a work
+//! item fails, or just fail directly without further kernel involvement.
 //!
 //! # Example
 //!
@@ -48,508 +64,461 @@
 //! use std::ops::Range;
 //!
 //! use delta_kernel::coroutine::{
-//!     self, coroutine_request, Operation, PaginatedOperation, Pagination, Supports,
-//!     SupportsPaginated,
+//!     self, coroutine_workflow, drive_workflow, Operation, PaginatedOperation, Pagination,
 //! };
 //! use delta_kernel::DeltaResult;
 //!
-//! enum Length {}
+//! struct Double(u32);
 //!
-//! impl Operation for Length {
-//!     type Work = String;
-//!     type Response = usize;
+//! impl Operation for Double {
+//!     type Response = u32;
 //! }
 //!
-//! enum Numbers {}
+//! struct Numbers(Range<u32>);
 //!
 //! impl Operation for Numbers {
-//!     type Work = Range<u32>;
 //!     type Response = Vec<u32>;
 //! }
 //!
 //! impl PaginatedOperation for Numbers {}
 //!
-//! #[coroutine_request(output = (usize, Vec<u32>))]
-//! enum Request {
-//!     Length(Length),
+//! #[coroutine_workflow]
+//! enum ExampleWorkflow {
+//!     #[output]
+//!     Done(Vec<u32>),
 //!
-//!     #[paginated(state = Range<u32>)]
-//!     Numbers(Numbers),
-//! }
+//!     Double(Double),
 //!
-//! #[derive(Default)]
-//! struct Connector {
-//!     length_calls: usize,
-//! }
-//!
-//! impl Supports<Length> for Connector {
-//!     fn execute(&mut self, work: String) -> DeltaResult<usize> {
-//!         self.length_calls += 1;
-//!         Ok(work.len())
-//!     }
-//! }
-//!
-//! impl SupportsPaginated<Numbers> for Connector {
-//!     type State = Range<u32>;
-//!
-//!     fn start(&mut self, work: Range<u32>) -> DeltaResult<Self::State> {
-//!         Ok(work)
-//!     }
-//!
-//!     fn next(
-//!         &mut self,
-//!         mut state: Self::State,
-//!     ) -> DeltaResult<(Vec<u32>, Option<Self::State>)> {
-//!         let page = state.by_ref().take(2).collect();
-//!         let state = (!state.is_empty()).then_some(state);
-//!         Ok((page, state))
-//!     }
+//!     #[paginated]
+//!     Numbers(Numbers, Range<u32>),
 //! }
 //!
 //! async fn kernel_workflow(
-//!     mut channel: coroutine::Channel<(usize, Vec<u32>), Request>,
-//! ) -> DeltaResult<(usize, Vec<u32>)> {
-//!     let length = coroutine::offload(
-//!         &mut channel,
-//!         Request::Length,
-//!         "kernel".to_string(),
-//!     )
-//!     .await?;
-//!
-//!     let mut numbers = Vec::new();
-//!     let mut pagination = Pagination::Start(1..4);
+//!     mut channel: coroutine::Channel<ExampleWorkflow>,
+//! ) -> DeltaResult<Vec<u32>> {
+//!     let mut output = Vec::new();
+//!     let mut pagination = Pagination::Start(Numbers(1..4));
 //!     loop {
-//!         let (page, cursor) =
-//!             coroutine::offload_paginated(&mut channel, Request::Numbers, pagination).await?;
-//!         numbers.extend(page);
+//!         let (page, cursor) = channel.offload_paginated(pagination).await?;
+//!         for number in page {
+//!             output.push(channel.offload(Double(number)).await?);
+//!         }
 //!         pagination = match cursor {
 //!             Some(cursor) => Pagination::Continue(cursor),
-//!             None => return Ok((length, numbers)),
+//!             None => return Ok(output),
 //!         };
 //!     }
 //! }
 //!
-//! let mut connector = Connector::default();
-//! let result = coroutine::drive_to_completion!(
+//! let result = drive_workflow!(
 //!     coroutine::start(kernel_workflow),
-//!     |request| request.resume(&mut connector),
+//!     |workflow| match workflow {
+//!         ExampleWorkflow::Done(output) => break output,
+//!         ExampleWorkflow::Double(Double(number), resume) => resume.resume(Ok(number * 2)),
+//!         ExampleWorkflow::Numbers(pagination, resume) => resume.resume_with(|| {
+//!             let mut state = match pagination {
+//!                 Pagination::Start(Numbers(work)) => work,
+//!                 Pagination::Continue(state) => state,
+//!             };
+//!             let page = state.by_ref().take(2).collect();
+//!             let state = (!state.is_empty()).then_some(state);
+//!             Ok((page, state))
+//!         }),
+//!     },
 //! )?;
 //!
-//! assert_eq!(result, (6, vec![1, 2, 3]));
-//! assert_eq!(connector.length_calls, 1);
+//! assert_eq!(result, vec![2, 4, 6]);
 //! # Ok::<(), delta_kernel::Error>(())
 //! ```
 pub(crate) mod engine;
 pub mod listing;
 pub mod read;
+pub mod write;
 use std::any::Any;
 use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
-use std::ops::ControlFlow;
 
-/// Add a blanket implementation to a workflow capability trait.
+/// Generate the blanket implementation for an empty workflow capability trait.
 ///
-/// Apply this attribute to an empty trait whose supertraits are the exact [`CanRequest`] and
-/// [`CanRequestPaginated`] capabilities required by a kernel workflow. The macro preserves the
-/// trait and implements it for every request enum satisfying those bounds.
+/// The annotated trait's supertraits are the required operation capabilities.
 ///
-/// # Example
+/// With the macro:
 ///
 /// ```
-/// use delta_kernel::coroutine::{
-///     coroutine_capabilities, CanRequest, CanRequestPaginated, Operation, PaginatedOperation,
-/// };
+/// use delta_kernel::coroutine::{coroutine_capabilities, CanRequest, Operation};
 ///
-/// enum Head {}
+/// struct Read;
 ///
-/// impl Operation for Head {
-///     type Work = String;
-///     type Response = usize;
+/// impl Operation for Read {
+///     type Response = ();
 /// }
 ///
-/// enum Numbers {}
-///
-/// impl Operation for Numbers {
-///     type Work = Vec<u32>;
-///     type Response = Vec<u32>;
+/// impl Operation for Write {
+///     type Response = ();
 /// }
-///
-/// impl PaginatedOperation for Numbers {}
 ///
 /// #[coroutine_capabilities]
-/// trait InspectCapabilities<O>:
-///     CanRequest<O, Head> + CanRequestPaginated<O, Numbers>
-/// where
-///     O: Send + 'static,
-/// {
-/// }
+/// trait WorkflowCapabilities: CanRequest<Read> + CanRequest<Write> {}
+/// ```
+///
+/// The equivalent manual definition would be:
+///
+/// ```
+/// # use delta_kernel::coroutine::{CanRequest, Operation};
+/// #
+/// # struct Read;
+/// #
+/// # impl Operation for Read {
+/// #     type Response = ();
+/// # }
+/// #
+/// # trait WorkflowCapabilities: CanRequest<Read> + CanRequest<Write> {}
+/// #
+/// impl<W> WorkflowCapabilities for W where W: CanRequest<Read> + CanRequest<Write> {}
 /// ```
 pub use delta_kernel_derive::coroutine_capabilities;
-/// Expand a connector-defined request enum from kernel [`Operation`] descriptors.
+/// Expands a connector-defined workflow enum from kernel [`Operation`] descriptors, and derive
+/// appropriate implementations of [`Workflow`] [`CanRequest`] and [`CanRequestPaginated`] for
+/// its variants.
 ///
-/// Each source variant must contain exactly one operation tag. Ordinary variants become
-/// one-shot `(Work, Resume)` variants. Mark a paginated variant with
-/// `#[paginated(state = ConnectorState)]`; it becomes a
-/// `(Pagination<Work, ConnectorState>, Resume<(Response, Option<ConnectorState>)>)` variant.
+/// Exactly one single-field variant must be marked `#[output]`; it supplies
+/// [`Workflow::Output`] in the derived [`Workflow`].
 ///
-/// The macro also implements [`CanRequest`] or [`CanRequestPaginated`] for each operation and
-/// generates a `resume(&mut connector)` method that dispatches through [`Supports`] or
-/// [`SupportsPaginated`].
+/// To express a one-shot operation, define a tuple variant containing the operation type. The
+/// macro adds the corresponding [`Resume`] field and derives a matching impl [`CanRequest`].
 ///
-/// The required `output` argument is the final output type of the kernel workflow. Direct
-/// `#[cfg(...)]` attributes on variants are supported. `#[cfg_attr(...)]` is not yet
-/// supported.
+/// To express a paginated operation, mark a tuple variant `#[paginated]` and give it the
+/// operation type followed by the connector state type. The macro adds the corresponding
+/// [`PaginatedResume`] field, wraps the operation in [`Pagination`], and derives a matching
+/// impl [`CanRequestPaginated`].
 ///
 /// # Example
+///
+/// With the macro:
 ///
 /// ```
 /// use std::ops::Range;
 ///
 /// use delta_kernel::coroutine::{
-///     coroutine_request, Operation, PaginatedOperation,
+///     coroutine_workflow, Operation, PaginatedOperation,
 /// };
 ///
-/// enum Head {}
+/// struct Double(u32);
 ///
-/// impl Operation for Head {
-///     type Work = String;
-///     type Response = usize;
+/// impl Operation for Double {
+///     type Response = u32;
 /// }
 ///
-/// enum Numbers {}
+/// struct Numbers(Range<u32>);
 ///
 /// impl Operation for Numbers {
-///     type Work = Range<u32>;
 ///     type Response = Vec<u32>;
 /// }
 ///
 /// impl PaginatedOperation for Numbers {}
 ///
-/// #[coroutine_request(output = (usize, Vec<u32>))]
-/// enum Requests {
-///     Head(Head),
+/// #[coroutine_workflow]
+/// enum ExampleWorkflow {
+///     #[output]
+///     Done(Vec<u32>),
 ///
-///     #[paginated(state = Range<u32>)]
-///     Numbers(Numbers),
+///     Double(Double),
+///
+///     #[paginated]
+///     Numbers(Numbers, Range<u32>),
 /// }
 /// ```
-pub use delta_kernel_derive::coroutine_request;
-use delta_kernel_derive::internal_api;
-use genawaiter2::sync::{Co, Gen, GenBoxed};
-use genawaiter2::GeneratorState;
-
-use crate::{DeltaResult, Error};
-
-/// Drives a kernel coroutine through zero or more work items until it returns its final output.
 ///
-/// The first argument produces the initial `DeltaResult<ControlFlow>`, which immediately terminates
-/// the loop with a `DeltaResult` on `Err` or `Ok(ControlFlow::Break)`. Otherwise, the provided
-/// handler code receives the delegated work item from `Ok(ControlFlow::Continue)`. The handler
-/// returns the `DeltaResult<ControlFlow>` produced by that work item's [`Resume::resume`], which
-/// becomes the input of the next loop iteration.
-///
-/// # Example
+/// Equivalent manual definitions:
 ///
 /// ```
-/// # use std::ops::ControlFlow;
-/// # use delta_kernel::coroutine::{self, Channel};
-/// # use delta_kernel::DeltaResult;
-/// use delta_kernel::coroutine::Resume;
+/// # use std::ops::Range;
+/// #
+/// # use delta_kernel::coroutine::{Operation, PaginatedOperation};
+/// # struct Double(u32);
+/// #
+/// # impl Operation for Double {
+/// #     type Response = u32;
+/// # }
+/// #
+/// # struct Numbers(Range<u32>);
+/// #
+/// # impl Operation for Numbers {
+/// #     type Response = Vec<u32>;
+/// # }
+/// #
+/// # impl PaginatedOperation for Numbers {}
+/// #
+/// use delta_kernel::coroutine::{
+///     CanRequest, CanRequestPaginated, PaginatedResume, Pagination, Resume, Workflow,
+/// };
 ///
-/// /// The kernel-provided workflow-specific `Resume` type for `QuotientAsStringRequest`.
-/// pub type QuotientAsStringResume<R> = Resume<String, QuotientAsStringRequest, R>;
-///
-/// /// The kernel-provided workflow-specific request enum for `kernel_quotient_as_string`.
-/// pub enum QuotientAsStringRequest {
-///     Divide((u32, u32), QuotientAsStringResume<f64>),
-///     ToString(f64, QuotientAsStringResume<String>),
+/// enum ExampleWorkflow {
+///     Done(Vec<u32>),
+///     Double(Double, Resume<ExampleWorkflow, Double>),
+///     Numbers(
+///         Pagination<Numbers, Range<u32>>,
+///         PaginatedResume<ExampleWorkflow, Numbers, Range<u32>>,
+///     ),
 /// }
-/// # async fn kernel_quotient_as_string_impl(
-/// #     mut channel: Channel<String, QuotientAsStringRequest>,
-/// #     dividend: u32,
-/// #     divisor: u32,
-/// # ) -> DeltaResult<String> {
-/// #     let quotient = coroutine::offload(
-/// #         &mut channel,
-/// #         QuotientAsStringRequest::Divide,
-/// #         (dividend, divisor),
-/// #     )
-/// #     .await?;
-/// #     coroutine::offload(
-/// #         &mut channel,
-/// #         QuotientAsStringRequest::ToString,
-/// #         quotient,
-/// #     )
-/// #     .await
-/// # }
-/// # fn kernel_quotient_as_string(
-/// #     dividend: u32,
-/// #     divisor: u32,
-/// # ) -> DeltaResult<ControlFlow<String, QuotientAsStringRequest>> {
-/// #     coroutine::start(move |channel| {
-/// #         kernel_quotient_as_string_impl(channel, dividend, divisor)
-/// #     })
-/// # }
 ///
-/// // Use the macro to drive the `kernel_quotient_as_string` workflow.
-/// let output = coroutine::drive_to_completion!(
-///     kernel_quotient_as_string(1, 4),
-///     |request| match request {
-///     QuotientAsStringRequest::Divide((dividend, divisor), resume) => {
-///         resume.resume(Ok(dividend as f64 / divisor as f64))
+/// impl Workflow for ExampleWorkflow {
+///     type Output = Vec<u32>;
+///
+///     fn finish(output: Self::Output) -> Self {
+///         Self::Done(output)
 ///     }
-///     QuotientAsStringRequest::ToString(value, resume) => {
-///         resume.resume(Ok(value.to_string()))
+/// }
+///
+/// impl CanRequest<Double> for ExampleWorkflow {
+///     fn request(operation: Double, resume: Resume<Self, Double>) -> Self {
+///         Self::Double(operation, resume)
 ///     }
-/// })?;
-/// assert_eq!(output, "0.25");
-/// # Ok::<(), delta_kernel::Error>(())
+/// }
+///
+/// impl CanRequestPaginated<Numbers> for ExampleWorkflow {
+///     type State = Range<u32>;
+///
+///     fn request(
+///         pagination: Pagination<Numbers, Self::State>,
+///         resume: PaginatedResume<Self, Numbers, Self::State>,
+///     ) -> Self {
+///         Self::Numbers(pagination, resume)
+///     }
+/// }
+/// ```
+pub use delta_kernel_derive::coroutine_workflow;
+
+/// Drives a kernel workflow to its output state.
+///
+/// `start` and every non-output arm in `body` must return [`DeltaResult`] containing the next
+/// workflow state. An output arm completes the generated loop with `break output`.
+///
+/// The invocation
+///
+/// ```text
+/// drive_workflow!(start, |workflow| match workflow {
+///     Workflow::Done(output) => break output,
+///     Workflow::Read(operation, resume) => resume.resume(read(operation)),
+/// })
+/// ```
+///
+/// expands to the equivalent of:
+///
+/// ```text
+/// (|| -> DeltaResult<_> {
+///     let mut workflow = start?;
+///     Ok(loop {
+///         workflow = (match workflow {
+///             Workflow::Done(output) => break output,
+///             Workflow::Read(operation, resume) => resume.resume(read(operation)),
+///         })?;
+///     })
+/// })()
 /// ```
 #[macro_export]
 #[doc(hidden)]
-macro_rules! __drive_to_completion {
-    ($step:expr, |$request:ident| $handler:expr $(,)?) => {{
-        let mut next = $step;
-        loop {
-            match next {
-                ::std::result::Result::Ok(::std::ops::ControlFlow::Continue($request)) => {
-                    next = $handler;
-                }
-                ::std::result::Result::Ok(::std::ops::ControlFlow::Break(output)) => {
-                    break ::std::result::Result::Ok(output);
-                }
-                ::std::result::Result::Err(error) => {
-                    break ::std::result::Result::Err(error);
-                }
-            }
-        }
+macro_rules! __drive_workflow {
+    ($start:expr, |$workflow:ident| $body:expr $(,)?) => {{
+        (|| -> $crate::DeltaResult<_> {
+            let mut $workflow = $start?;
+            Ok(loop {
+                $workflow = ($body)?;
+            })
+        })()
     }};
 }
 
+use delta_kernel_derive::internal_api;
+use genawaiter2::sync::{Co, Gen, GenBoxed};
+use genawaiter2::GeneratorState;
+use tracing::Instrument as _;
+
 #[doc(inline)]
-pub use crate::__drive_to_completion as drive_to_completion;
+pub use crate::__drive_workflow as drive_workflow;
+use crate::{DeltaResult, Error};
 
 // === Implementation ===
 //
 // See module-level documentation for an overview of kernel/connector communication via coroutines.
 //
-// A workflow-specific request enum `Q` (defined by kernel) serves as the shared contract between
-// kernel and connector. A one-shot variant pairs concrete work `W` with a `Resume<R>`. A paginated
-// variant instead pairs `Pagination<W, S>` with `Resume<(R, Option<S>)>`, preserving the ordinary
-// one-shot resume mechanism while distinguishing initial work from continuation state.
+// Rust compiles kernel's async workflow function into a `Future` that stores kernel's locals and
+// control flow across each `.await` call; `genawaiter2` wraps and polls that future in a
+// `Generator`, an object that can suspend by yielding a value and later resumed with a
+// connector-provide value. Its yield and resume types are fixed for the lifetime of the
+// generator. When the workflow suspends, the generator owns the future and all state required to
+// continue it; in that state, the generator is the continuation. While kernel runs, `advance` owns
+// it. While the connector performs work, the request's `Resume` owns it. No hidden kernel-owned
+// state connects the two calls.
 //
-// Around that shared contract, this module deliberately presents different strongly typed APIs to
-// kernel and connector authors. Kernel calls `offload(&mut channel, Q::Variant, work: W).await?`
-// and receives a concrete response of type `R`. Because it is a tuple variant, the variant's name
-// is also a constructor of type `fn(W, Resume<O, Q, R>) -> Q`, where `O` is the final output type
-// of the workflow, `Q` is the workflow request enum, and `R` is the successful response type of the
-// selected work item. Kernel supplies both the variant name/constructor and the work `W` that
-// initializes its first field, while this module supplies the second field `Resume`. The latter
-// encapsulates a continuation that resumes kernel at its `await` point, so the kernel-side workflow
-// implementation reads as ordinary sequential async code.
+// Each offload selects one physical operation variant and its typed contract. To fit heterogeneous
+// contracts through the generator's fixed transport types, each pending operation is boxed behind
+// `Box<dyn PendingRequest>` and each inbound response behind `Box<dyn Any>`. The concrete pending
+// type and its `CanRequest` implementation preserve those relationships.
 //
-// Meanwhile, connector code sees `DeltaResult<ControlFlow<O, Q>>`. Matching a `Q` variant tells the
-// connector both what to do and what response type kernel expects. Its `Resume<R>` accepts the
-// typed response, consumes itself, resumes kernel, and returns kernel's next step. For pagination,
-// connector additionally receives `Option<S>` and returns either `More(R, S)` or `Done(R)`.
+// From `offload` to the next operation state:
 //
-// Rust compiles the async workflow into a `Future` that stores kernel's locals and control flow
-// across each `.await`. `genawaiter2` wraps and polls that future in a `Generator`, an object that
-// can suspend by yielding a value and later continue with a resumed value. Its yield and resume
-// types are fixed for the lifetime of the generator. When the workflow suspends, the generator owns
-// the future and all state required to continue it; in that state, the generator is the
-// continuation. While kernel runs, `advance` owns it. While the connector performs work, the
-// request's `Resume` owns it. No additional kernel-owned state table connects the two calls.
-//
-// Each offload selects one variant of `Q` and its corresponding typed contract. Multiple variants
-// could have the same signature while still representing logically distinct work items. To fit
-// heterogeneous contracts through the generator's fixed transport types, this module erases each
-// outbound request behind `dyn PendingRequest` and each inbound response behind `Any`. Typed
-// constructors preserve the relationships so concrete types are restored before kernel or
-// connector handles them.
-//
-// From `offload` to `Continue`:
-//
-// - `offload<W, R>` packages `work: W` with the request variant constructor `fn(W, Resume<O, Q, R>)
-//   -> Q`. The constructor's signature preserves the relationship between this work and its
-//   expected response.
-// - The package is a concrete `TypedPending<W, R>` instance, erased as `dyn PendingRequest` so it
+// - `offload` packages `Op` in a concrete `TypedPending<Op>`, erased as `dyn PendingRequest` so it
 //   can travel through the generator's single yield type. `yield_(...).await` then suspends the
 //   workflow and returns that pending request to `advance`.
 // - `advance` still owns the now-suspended generator. Calling `PendingRequest::attach` dispatches
-//   back to the concrete `TypedPending<W, R>`, moves the generator into a typed `Resume<R>`, and
-//   invokes the stored constructor to produce `Q`.
-// - `advance` returns `Continue(Q)`, giving the connector both its concrete work and exclusive
-//   ownership of the continuation that accepts the matching response.
+//   back to `TypedPending<Op>`, moves the generator into a typed `Resume<W, Op>`, and invokes `W`'s
+//   `CanRequest<Op>` implementation to produce the operation variant.
+// - `advance` returns `W`, giving the connector both its concrete work and exclusive ownership of
+//   the continuation that accepts the matching response.
 //
 // From `Resume::resume` to the return from `.await`:
 //
-// - The connector matches the request variant and passes `DeltaResult<R>` to its `Resume<R>`.
+// - The connector matches the operation variant and passes `DeltaResult<Op::Response>` to its
+//   `Resume<W, Op>`.
 // - `Resume::resume` consumes the continuation. It erases a successful `R` behind `Any`, the
 //   generator's single resume type, and gives both generator and response back to `advance`.
 // - Resuming the generator delivers the erased response to the suspended `yield_(...).await`.
-//   `offload` propagates a connector error or downcasts the success value to `R`, then returns it
-//   to the ordinary async workflow.
-// - Kernel runs until the workflow yields again or completes, which `advance` translates into
-//   `Continue(next_request)` or `Break(final_output)`, respectively.
+//   `Channel::offload` propagates a connector error or downcasts the success value to `R`, then
+//   returns it to the ordinary async workflow.
+// - Kernel runs until the workflow yields again or completes. On completion, `start` has already
+//   mapped the producer's output through `Workflow::finish`.
 //
-// The downcast is structurally guaranteed: `TypedPending<W, R>` can construct only a `Resume<R>`,
-// and that `Resume<R>` can accept only an `R` before resuming the exact generator suspended by the
-// matching `offload<W, R>`.
+// The downcast is structurally guaranteed: `TypedPending<Op>` constructs only a `Resume<W, Op>`,
+// which accepts only `Op::Response` before resuming the exact generator suspended by the matching
+// `offload`.
 //
-// Pagination applies the same pattern to `(W, R, S)`. `PaginationCursor<S>` retains typed connector
-// state in the async workflow, while `PaginatedPending<W, R, S>` restores it to `Pagination`.
+// Pagination applies the same pattern to `(Op, Op::Response, S)`;
+// `TypedPaginatedPending<Op, S>` preserves that relationship while suspended.
 
 /// Erases a typed request contract only while the generator is suspended.
-trait PendingRequest<O, Q>: Send {
-    fn attach(self: Box<Self>, generator: Generator<O, Q>) -> Q;
+trait PendingRequest<W>: Send {
+    fn attach(self: Box<Self>, generator: Generator<W>) -> W;
 }
 
 /// Erases heterogeneous request contracts into the generator's single yield type.
-type Pending<O, Q> = Box<dyn PendingRequest<O, Q>>;
+type Pending<W> = Box<dyn PendingRequest<W>>;
 
 /// Erases successful connector responses into the generator's single resume type.
 type ErasedResponse = DeltaResult<Box<dyn Any + Send>>;
 
 /// Boxes workflow futures so every continuation can store the same concrete generator type.
-type Generator<O, Q> = GenBoxed<Pending<O, Q>, ErasedResponse, DeltaResult<O>>;
-
-/// The Generator API starts a new coroutine by "resuming" it with a dummy initial "response" that
-/// is unobservable to the coroutine itself (because it did not actually resume from a yield).
-#[allow(dead_code)]
-const UNOBSERVABLE_INITIAL_RESPONSE: ErasedResponse = Err(Error::InternalError(String::new()));
+type Generator<W> = GenBoxed<Pending<W>, ErasedResponse, DeltaResult<W>>;
 
 /// Kernel-side channel used by a coroutine workflow to yield connector requests.
-#[allow(dead_code)]
 #[internal_api]
-pub(crate) struct Channel<O, Q>(Co<Pending<O, Q>, ErasedResponse>);
+pub(crate) struct Channel<W>(Co<Pending<W>, ErasedResponse>);
 
-/// Connector state retained by kernel between pagination requests.
-///
-/// The state field is private, so kernel can only move or drop a cursor. Pagination machinery
-/// returns the state to the connector with its original type.
-#[must_use = "dropping the cursor abandons the connector's pagination state"]
-pub struct PaginationCursor<S>(S);
+impl<W> Channel<W>
+where
+    W: Send + 'static,
+{
+    /// Yield one `Op` request carrying `work`.
+    ///
+    /// Returns the connector's successful response after the workflow is resumed.
+    ///
+    /// Errors if the connector resumes the workflow with an error. An internal error is returned
+    /// if the resumed value does not have `Op::Response`'s type.
+    pub async fn offload<Op>(&mut self, operation: Op) -> DeltaResult<Op::Response>
+    where
+        Op: Operation,
+        W: CanRequest<Op>,
+    {
+        let pending: Pending<W> = Box::new(TypedPending { operation });
+        suspend(self, pending).await
+    }
 
-impl<S> fmt::Debug for PaginationCursor<S> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("PaginationCursor")
+    /// Yield one page request for `Op`.
+    ///
+    /// `request` starts pagination with [`Pagination::Start`] or continues it with connector state
+    /// from a preceding response. Returns one page and optional state for another request (None if
+    /// exhausted, Some if more pages remain).
+    ///
+    /// Errors if the connector resumes the workflow with an error. An internal error is returned
+    /// if the resumed value does not have the expected response-and-state type.
+    pub async fn offload_paginated<Op>(
+        &mut self,
+        request: Pagination<Op, <W as CanRequestPaginated<Op>>::State>,
+    ) -> DeltaResult<(Op::Response, Option<<W as CanRequestPaginated<Op>>::State>)>
+    where
+        Op: PaginatedOperation,
+        W: CanRequestPaginated<Op>,
+    {
+        let pending: Pending<W> =
+            Box::new(
+                TypedPaginatedPending::<Op, <W as CanRequestPaginated<Op>>::State> { request },
+            );
+        suspend(self, pending).await
     }
 }
 
-/// Work or connector state for one pagination request.
+/// Initial operation or connector state for one pagination request.
 #[derive(Debug)]
-pub enum Pagination<W, S> {
-    /// Starts pagination with the initial work.
-    Start(W),
+pub enum Pagination<Op, S> {
+    /// Starts pagination with the operation request.
+    Start(Op),
     /// Continues pagination with connector state returned by the preceding response.
     Continue(S),
 }
 
 /// Describes one low-level operation that kernel may delegate to a connector.
 pub trait Operation: Send + Sized + 'static {
-    /// Work supplied by kernel.
-    type Work: Send + 'static;
     /// Successful response returned by the connector.
     type Response: Send + 'static;
 }
 
-/// Resume handle for a one-shot operation.
-pub type OperationResume<O, Q, Op> = Resume<O, Q, <Op as Operation>::Response>;
+/// A top-level kernel workflow represented by its current state.
+pub trait Workflow: Send + Sized + 'static {
+    /// Value produced when the workflow completes.
+    type Output: Send + 'static;
 
-/// Kernel-side request construction for one-shot operations.
-#[allow(dead_code)]
-pub(crate) trait OperationRequestExt: Operation {
-    /// Construct a request enum variant for this one-shot operation.
-    fn request<O, Q>(work: Self::Work, resume: OperationResume<O, Q, Self>) -> Q
-    where
-        O: Send + 'static,
-        Q: CanRequest<O, Self>,
-    {
-        <Q as CanRequest<O, Self>>::request(work, resume)
-    }
+    /// Construct the workflow's output state.
+    fn finish(output: Self::Output) -> Self;
 }
 
-impl<T: Operation> OperationRequestExt for T {}
+/// Resume handle for a one-shot operation.
+pub type Resume<W, Op> = TypedResume<W, <Op as Operation>::Response>;
+
+/// Resume handle for a paginated operation using connector state `S`.
+pub type PaginatedResume<W, Op, S> = TypedResume<W, (<Op as Operation>::Response, Option<S>)>;
 
 /// Marks an [`Operation`] as supporting pagination.
 pub trait PaginatedOperation: Operation {}
 
-/// Pagination request for an operation using connector state `S`.
-pub(crate) type PaginatedOperationRequest<Op, S> = Pagination<<Op as Operation>::Work, S>;
-
-/// Resume handle for a paginated operation using connector state `S`.
-pub(crate) type PaginatedOperationResume<O, Q, Op, S> =
-    Resume<O, Q, (<Op as Operation>::Response, Option<S>)>;
-
-/// Kernel-side request construction for paginated operations.
-pub(crate) trait PaginatedOperationRequestExt: PaginatedOperation {
-    /// Construct a request enum variant for this paginated operation.
-    fn paginated_request<O: Send + 'static, Q: CanRequestPaginated<O, Self>>(
-        pagination: PaginatedOperationRequest<Self, <Q as CanRequestPaginated<O, Self>>::State>,
-        resume: PaginatedOperationResume<O, Q, Self, <Q as CanRequestPaginated<O, Self>>::State>,
-    ) -> Q {
-        <Q as CanRequestPaginated<O, Self>>::request(pagination, resume)
-    }
+/// Allows a workflow enum to represent a one-shot operation.
+///
+/// [`Channel::offload`] uses this trait only to inject typed work and its [`Resume`] into the
+/// connector's workflow enum. Connectors may implement it directly or use [`coroutine_workflow`].
+pub trait CanRequest<Op: Operation>: Send + Sized + 'static {
+    /// Construct the workflow variant carrying `operation` and `resume`.
+    fn request(operation: Op, resume: Resume<Self, Op>) -> Self;
 }
 
-impl<T: PaginatedOperation> PaginatedOperationRequestExt for T {}
-
-/// Allows a request enum to represent a one-shot operation.
-pub trait CanRequest<O: Send + 'static, Op: Operation>: Send + Sized + 'static {
-    /// Construct the request enum variant for `Op`.
-    fn request(work: Op::Work, resume: OperationResume<O, Self, Op>) -> Self;
-}
-
-/// Allows a request enum to represent a paginated operation.
-pub trait CanRequestPaginated<O: Send + 'static, Op: PaginatedOperation>:
-    Send + Sized + 'static
-{
+/// Allows a workflow enum to represent a paginated operation.
+///
+/// [`Channel::offload_paginated`] uses this trait only to inject one typed page request and its
+/// [`Resume`] into the connector's workflow enum.
+pub trait CanRequestPaginated<Op: PaginatedOperation>: Send + Sized + 'static {
     /// Connector state retained between pages.
     type State: Send + 'static;
 
-    /// Construct the request enum variant for `Op`.
-    #[allow(clippy::type_complexity)]
+    /// Construct the workflow variant carrying `pagination` and `resume`.
     fn request(
-        pagination: Pagination<Op::Work, Self::State>,
-        resume: Resume<O, Self, (Op::Response, Option<Self::State>)>,
+        pagination: Pagination<Op, Self::State>,
+        resume: PaginatedResume<Self, Op, Self::State>,
     ) -> Self;
 }
 
-/// Executes a one-shot operation for a connector.
-pub trait Supports<Op: Operation>: Send + 'static {
-    /// Execute `work`.
-    fn execute(&mut self, work: Op::Work) -> DeltaResult<Op::Response>;
-}
-
-/// Executes a paginated operation for a connector.
-pub trait SupportsPaginated<Op: PaginatedOperation>: Send + 'static {
-    /// Connector state retained between pages.
-    type State: Send + 'static;
-
-    /// Start pagination from `work`.
-    fn start(&mut self, work: Op::Work) -> DeltaResult<Self::State>;
-
-    /// Continue pagination from `state`.
-    fn next(&mut self, state: Self::State) -> DeltaResult<(Op::Response, Option<Self::State>)>;
-}
-
-type PaginationConstructor<O, Q, W, R, S> = fn(Pagination<W, S>, Resume<O, Q, (R, Option<S>)>) -> Q;
-
-/// One-shot continuation accepting the response type required by its request.
-#[must_use = "the kernel workflow remains suspended until this continuation is resumed"]
-pub struct Resume<O, Q, R> {
-    generator: Generator<O, Q>,
+/// Continuation typed to accept a response of type `R` for workflow `W`.
+///
+/// Connector-facing workflow variants normally use [`Resume`] or [`PaginatedResume`], which derive
+/// `R` from an [`Operation`].
+pub struct TypedResume<W, R> {
+    generator: Generator<W>,
     response_type: PhantomData<R>,
 }
 
-impl<O: Send + 'static, Q: Send + 'static, R: Send + 'static> Resume<O, Q, R> {
-    /// Submit `response` and run kernel until its next request or completion.
+impl<W: Send + 'static, R: Send + 'static> TypedResume<W, R> {
+    /// Submit `response` and run kernel until its next workflow state.
     ///
-    /// Returns [`ControlFlow::Continue`] with the next connector request, or
-    /// [`ControlFlow::Break`] with the completed workflow's output.
-    pub fn resume(self, response: DeltaResult<R>) -> DeltaResult<ControlFlow<O, Q>> {
+    /// Returns the next operation state or the workflow's output state.
+    pub fn resume(self, response: DeltaResult<R>) -> DeltaResult<W> {
         let response = response.map(|response| Box::new(response) as _);
         advance(self.generator, response)
     }
@@ -557,141 +526,81 @@ impl<O: Send + 'static, Q: Send + 'static, R: Send + 'static> Resume<O, Q, R> {
     /// Produce a response and submit its result to the suspended kernel workflow.
     ///
     /// Errors produced by `response` are delivered to kernel rather than returned directly by the
-    /// connector driver.
-    pub fn resume_with(
-        self,
-        response: impl FnOnce() -> DeltaResult<R>,
-    ) -> DeltaResult<ControlFlow<O, Q>> {
+    /// connector driver; this method's return value comes directly from the resumed kernel.
+    pub fn resume_with(self, response: impl FnOnce() -> DeltaResult<R>) -> DeltaResult<W> {
         self.resume(response())
     }
 }
 
-impl<O, Q, R> fmt::Debug for Resume<O, Q, R> {
+impl<W, R> fmt::Debug for TypedResume<W, R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Resume")
     }
 }
 
-/// Start `producer` and run it until its first request or completion.
-#[allow(dead_code)]
+/// Start `workflow` and run it until its first operation or completion.
 #[internal_api]
-pub(crate) fn start<O, Q, F, Fut>(producer: F) -> DeltaResult<ControlFlow<O, Q>>
+pub(crate) fn start<W, F, Fut>(workflow: F) -> DeltaResult<W>
 where
-    O: Send + 'static,
-    Q: Send + 'static,
-    F: FnOnce(Channel<O, Q>) -> Fut + Send + 'static,
-    Fut: Future<Output = DeltaResult<O>> + Send + 'static,
+    W: Workflow,
+    F: FnOnce(Channel<W>) -> Fut + Send + 'static,
+    Fut: Future<Output = DeltaResult<W::Output>> + Send + 'static,
 {
-    let generator = Gen::new_boxed(move |channel| producer(Channel(channel)));
-    advance(generator, UNOBSERVABLE_INITIAL_RESPONSE)
+    let span = tracing::Span::current();
+    let generator = Gen::new_boxed(async move |channel| {
+        async move {
+            workflow(Channel(channel))
+                .await
+                .inspect_err(|err| tracing::error!(error = %err, "kernel workflow failed"))
+                .map(W::finish)
+        }
+        .instrument(span)
+        .await
+    });
+
+    // The Generator API starts a new coroutine by "resuming" it from a fake internal "yield" with
+    // a dummy initial "response" that is silently dropped before the coroutine starts running.
+    advance(generator, Err(Error::InternalError(String::new())))
 }
 
-/// Preserves a typed work/response pair until it can attach the generator and construct `Q`.
-#[allow(dead_code)]
-struct TypedPending<O, Q, W, R> {
-    work: W,
-    constructor: fn(W, Resume<O, Q, R>) -> Q,
+/// Preserves a typed one-shot operation until it can attach the generator and construct `W`.
+struct TypedPending<Op: Operation> {
+    operation: Op,
 }
 
-impl<O, Q, W, R> PendingRequest<O, Q> for TypedPending<O, Q, W, R>
-where
-    O: Send + 'static,
-    Q: Send + 'static,
-    W: Send + 'static,
-    R: Send + 'static,
-{
-    fn attach(self: Box<Self>, generator: Generator<O, Q>) -> Q {
-        let resume = Resume {
+impl<Op: Operation, W: CanRequest<Op>> PendingRequest<W> for TypedPending<Op> {
+    fn attach(self: Box<Self>, generator: Generator<W>) -> W {
+        let resume = TypedResume {
             generator,
             response_type: PhantomData,
         };
-        (self.constructor)(self.work, resume)
+        W::request(self.operation, resume)
     }
 }
 
 /// Preserves a typed paginated work/response/state relationship while suspended.
-struct PaginatedPending<O, Q, W, R, S> {
-    request: Pagination<W, PaginationCursor<S>>,
-    constructor: PaginationConstructor<O, Q, W, R, S>,
+struct TypedPaginatedPending<Op: PaginatedOperation, S> {
+    request: Pagination<Op, S>,
 }
 
-impl<O, Q, W, R, S> PendingRequest<O, Q> for PaginatedPending<O, Q, W, R, S>
+impl<W, Op, S> PendingRequest<W> for TypedPaginatedPending<Op, S>
 where
-    O: Send + 'static,
-    Q: Send + 'static,
-    W: Send + 'static,
-    R: Send + 'static,
+    W: CanRequestPaginated<Op, State = S>,
+    Op: PaginatedOperation,
     S: Send + 'static,
 {
-    fn attach(self: Box<Self>, generator: Generator<O, Q>) -> Q {
-        let request = match self.request {
-            Pagination::Start(work) => Pagination::Start(work),
-            Pagination::Continue(cursor) => Pagination::Continue(cursor.0),
-        };
-        let resume = Resume {
+    fn attach(self: Box<Self>, generator: Generator<W>) -> W {
+        let resume = TypedResume {
             generator,
             response_type: PhantomData,
         };
-        (self.constructor)(request, resume)
+        <W as CanRequestPaginated<Op>>::request(self.request, resume)
     }
 }
 
-/// Yield `work` and resume with the response type encoded by `constructor`.
-#[allow(dead_code)]
-#[internal_api]
-pub(crate) async fn offload<O, Q, W, R>(
-    channel: &mut Channel<O, Q>,
-    constructor: fn(W, Resume<O, Q, R>) -> Q,
-    work: W,
-) -> DeltaResult<R>
+async fn suspend<W, R>(channel: &mut Channel<W>, pending: Pending<W>) -> DeltaResult<R>
 where
-    O: Send + 'static,
-    Q: Send + 'static,
     W: Send + 'static,
-    R: Send + 'static,
-{
-    // The generator has one yield type, so erase this work/response pair while suspended.
-    // `TypedPending` preserves `R` until it can attach the generator to a typed `Resume<R>`.
-    let pending: Pending<O, Q> = Box::new(TypedPending { work, constructor });
-    suspend(channel, pending).await
-}
-
-/// Yield a pagination request and resume with its typed response and optional continuation state.
-///
-/// Start with [`Pagination::Start`]. A cursor returned by this function may be retained across
-/// unrelated offloads and supplied through [`Pagination::Continue`] using the same request
-/// constructor and connector state type `S`.
-///
-/// Returns the connector response and `Some` cursor when more pagination work remains, or `None`
-/// when the connector completed the sequence.
-///
-/// Errors if the connector reports an error.
-#[allow(dead_code)]
-#[internal_api]
-pub(crate) async fn offload_paginated<O, Q, W, R, S>(
-    channel: &mut Channel<O, Q>,
-    constructor: PaginationConstructor<O, Q, W, R, S>,
-    request: Pagination<W, PaginationCursor<S>>,
-) -> DeltaResult<(R, Option<PaginationCursor<S>>)>
-where
-    O: Send + 'static,
-    Q: Send + 'static,
-    W: Send + 'static,
-    R: Send + 'static,
-    S: Send + 'static,
-{
-    let pending: Pending<O, Q> = Box::new(PaginatedPending {
-        request,
-        constructor,
-    });
-    let (response, state): (R, Option<S>) = suspend(channel, pending).await?;
-    Ok((response, state.map(PaginationCursor)))
-}
-
-async fn suspend<O, Q, R>(channel: &mut Channel<O, Q>, pending: Pending<O, Q>) -> DeltaResult<R>
-where
-    O: Send + 'static,
-    Q: Send + 'static,
     R: Send + 'static,
 {
     let response = channel.0.yield_(pending).await?;
@@ -700,14 +609,14 @@ where
     })
 }
 
-// Advances the generator by `response` and translates the result to `ControlFlow`.
-fn advance<O: Send + 'static, Q: Send + 'static>(
-    mut generator: Generator<O, Q>,
+// Advances the generator by `response` to its next workflow state.
+fn advance<W: Send + 'static>(
+    mut generator: Generator<W>,
     response: ErasedResponse,
-) -> DeltaResult<ControlFlow<O, Q>> {
+) -> DeltaResult<W> {
     match generator.resume_with(response) {
-        GeneratorState::Yielded(pending) => Ok(ControlFlow::Continue(pending.attach(generator))),
-        GeneratorState::Complete(result) => result.map(ControlFlow::Break),
+        GeneratorState::Yielded(pending) => Ok(pending.attach(generator)),
+        GeneratorState::Complete(result) => result,
     }
 }
 
@@ -717,17 +626,15 @@ mod capability_tests {
 
     use super::*;
 
-    enum Echo {}
+    struct Echo(String);
 
     impl Operation for Echo {
-        type Work = String;
         type Response = usize;
     }
 
-    enum Numbers {}
+    struct Numbers(Range<u32>);
 
     impl Operation for Numbers {
-        type Work = Range<u32>;
         type Response = Vec<u32>;
     }
 
@@ -738,68 +645,67 @@ mod capability_tests {
 
     #[cfg(any())]
     impl Operation for Disabled {
-        type Work = ();
         type Response = ();
     }
 
-    #[coroutine_request(output = O)]
-    enum TestRequest<O: Send + 'static> {
+    type Output = (usize, Vec<u32>);
+
+    #[coroutine_workflow]
+    enum TestWorkflow {
+        #[output]
+        Done(Output),
+
         Echo(Echo),
 
         #[cfg(test)]
-        #[paginated(state = Range<u32>)]
-        Numbers(Numbers),
+        #[paginated]
+        Numbers(Numbers, Range<u32>),
 
         #[cfg(any())]
         Disabled(Disabled),
     }
 
     #[coroutine_capabilities]
-    trait TestCapabilities<O>: CanRequest<O, Echo> + CanRequestPaginated<O, Numbers>
-    where
-        O: Send + 'static,
-    {
-    }
+    trait TestCapabilities: CanRequest<Echo> + CanRequestPaginated<Numbers> {}
 
     #[derive(Default)]
     struct TestConnector {
         echo_calls: usize,
     }
 
-    impl Supports<Echo> for TestConnector {
-        fn execute(&mut self, work: String) -> DeltaResult<usize> {
-            self.echo_calls += 1;
-            Ok(work.len())
+    impl TestConnector {
+        fn dispatch(&mut self, workflow: TestWorkflow) -> DeltaResult<TestWorkflow> {
+            match workflow {
+                TestWorkflow::Done(_) => Err(Error::internal_error(
+                    "completed workflow cannot be dispatched",
+                )),
+                TestWorkflow::Echo(Echo(work), resume) => resume.resume_with(|| {
+                    self.echo_calls += 1;
+                    Ok(work.len())
+                }),
+                TestWorkflow::Numbers(pagination, resume) => resume.resume_with(|| {
+                    let mut state = match pagination {
+                        Pagination::Start(Numbers(work)) => work,
+                        Pagination::Continue(state) => state,
+                    };
+                    let page = state.by_ref().take(2).collect();
+                    let state = (!state.is_empty()).then_some(state);
+                    Ok((page, state))
+                }),
+            }
         }
     }
 
-    impl SupportsPaginated<Numbers> for TestConnector {
-        type State = Range<u32>;
-
-        fn start(&mut self, work: Range<u32>) -> DeltaResult<Self::State> {
-            Ok(work)
-        }
-
-        fn next(&mut self, mut state: Self::State) -> DeltaResult<(Vec<u32>, Option<Self::State>)> {
-            let page = state.by_ref().take(2).collect();
-            let state = (!state.is_empty()).then_some(state);
-            Ok((page, state))
-        }
-    }
-
-    type Output = (usize, Vec<u32>);
-
-    async fn workflow<Q>(mut channel: Channel<Output, Q>) -> DeltaResult<Output>
+    async fn workflow<W>(mut channel: Channel<W>) -> DeltaResult<Output>
     where
-        Q: TestCapabilities<Output>,
+        W: TestCapabilities,
     {
-        let length = offload(&mut channel, Echo::request, "kernel".to_string()).await?;
+        let length = channel.offload(Echo("kernel".to_string())).await?;
 
         let mut numbers = Vec::new();
-        let mut pagination = Pagination::Start(1..4);
+        let mut pagination = Pagination::Start(Numbers(1..4));
         loop {
-            let (page, cursor) =
-                offload_paginated(&mut channel, Numbers::paginated_request, pagination).await?;
+            let (page, cursor) = channel.offload_paginated(pagination).await?;
             numbers.extend(page);
             pagination = match cursor {
                 Some(cursor) => Pagination::Continue(cursor),
@@ -812,12 +718,19 @@ mod capability_tests {
     #[test]
     fn generated_request_bundle_drives_stateful_connector() {
         let mut connector = TestConnector::default();
-        let result =
-            drive_to_completion!(start(workflow::<TestRequest<Output>>), |request| request
-                .resume(&mut connector),)
-            .unwrap();
+        let result = drive_workflow!(start(workflow), |workflow| match workflow {
+            TestWorkflow::Done(output) => break output,
+            request => connector.dispatch(request),
+        },)
+        .unwrap();
 
         assert_eq!(result, (6, vec![1, 2, 3]));
         assert_eq!(connector.echo_calls, 1);
+        assert!(
+            connector
+                .dispatch(TestWorkflow::Done((0, Vec::new())))
+                .is_err(),
+            "completed workflows cannot be dispatched"
+        );
     }
 }

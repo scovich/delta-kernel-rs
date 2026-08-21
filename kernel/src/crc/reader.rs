@@ -6,14 +6,16 @@ use tracing::instrument;
 
 use super::Crc;
 #[cfg(test)]
-use crate::coroutine::engine::{self as engine_coroutine, ReadPagination, ReadResume};
-use crate::coroutine::read::ReadFilesConstructor;
-use crate::coroutine::{self, Channel, Pagination};
+use crate::coroutine;
+#[cfg(test)]
+use crate::coroutine::engine as engine_coroutine;
+use crate::coroutine::read::SmallFileRead;
+use crate::coroutine::{CanRequest, Channel};
 use crate::metrics::events::CRC_READ_COMPLETED_SPAN;
 use crate::path::{AsUrl as _, ParsedLogPath};
+use crate::DeltaResult;
 #[cfg(test)]
 use crate::Engine;
-use crate::{DeltaResult, Error};
 
 /// Attempt to read and parse a CRC file.
 ///
@@ -25,18 +27,12 @@ use crate::{DeltaResult, Error};
 ///
 /// Reports metrics: `CrcReadSuccess` or `CrcReadFailure`.
 #[instrument(name = CRC_READ_COMPLETED_SPAN, err(level = "warn"), skip_all, fields(report, bytes_read, path = ?crc_path.location.location))]
-pub(crate) async fn try_read_crc_file<O: Send + 'static, Q: Send + 'static, S: Send + 'static>(
-    channel: &mut Channel<O, Q>,
-    read_files: ReadFilesConstructor<O, Q, S>,
+pub(crate) async fn try_read_crc_file<W: CanRequest<SmallFileRead>>(
+    channel: &mut Channel<W>,
     crc_path: &ParsedLogPath,
 ) -> DeltaResult<Crc> {
     let url = crc_path.location.as_url().clone();
-    let request = Pagination::Start(vec![(url, None)]);
-    let data = coroutine::offload_paginated(channel, read_files, request)
-        .await?
-        .0
-        .and_then(|page| page.into_iter().next())
-        .ok_or_else(|| Error::generic("CRC file read returned no data"))?;
+    let data = channel.offload(SmallFileRead((url, None))).await?;
     tracing::Span::current().record("bytes_read", data.len() as u64);
     Crc::try_from_json_bytes(&data, crc_path.version)
 }
@@ -45,16 +41,11 @@ pub(crate) async fn try_read_crc_file<O: Send + 'static, Q: Send + 'static, S: S
 ///
 /// CRC files are optional, so an unreadable one is not an error: the caller proceeds without
 /// it. The failure is logged and metered by [`try_read_crc_file`]'s instrumentation.
-pub(crate) async fn read_crc_file_or_none<
-    O: Send + 'static,
-    Q: Send + 'static,
-    S: Send + 'static,
->(
-    channel: &mut Channel<O, Q>,
-    read_files: ReadFilesConstructor<O, Q, S>,
+pub(crate) async fn read_crc_file_or_none<W: CanRequest<SmallFileRead>>(
+    channel: &mut Channel<W>,
     crc_file: &ParsedLogPath,
 ) -> Option<Arc<Crc>> {
-    try_read_crc_file(channel, read_files, crc_file)
+    try_read_crc_file(channel, crc_file)
         .await
         .ok()
         .map(Arc::new)
@@ -66,19 +57,23 @@ pub(crate) fn try_read_crc_file_with_engine(
     engine: &dyn Engine,
     crc_path: &ParsedLogPath,
 ) -> DeltaResult<Crc> {
-    struct CrcReadRequest(ReadPagination, ReadResume<Crc, CrcReadRequest>);
+    #[coroutine::coroutine_workflow]
+    enum CrcReadWorkflow {
+        #[output]
+        Done(Crc),
+        Read(SmallFileRead),
+    }
 
     let crc_path = crc_path.clone();
     let storage = engine.storage_handler();
-    coroutine::drive_to_completion!(
-        coroutine::start(async move |mut channel| {
-            try_read_crc_file(&mut channel, CrcReadRequest, &crc_path).await
-        }),
-        |request| {
-            let CrcReadRequest(pagination, resume) = request;
-            engine_coroutine::resume_read_files(storage.as_ref(), pagination, resume)
-        },
-    )
+    let workflow =
+        coroutine::start(async move |mut channel| try_read_crc_file(&mut channel, &crc_path).await);
+    coroutine::drive_workflow!(workflow, |request| match request {
+        CrcReadWorkflow::Done(crc) => break crc,
+        CrcReadWorkflow::Read(operation, resume) => {
+            engine_coroutine::resume_read_file(storage.as_ref(), operation, resume)
+        }
+    })
 }
 
 #[cfg(test)]

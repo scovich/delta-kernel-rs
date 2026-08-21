@@ -11,22 +11,22 @@ use syn::{
 mod coroutine_macro;
 mod schema_macro;
 
-/// Implementation of `delta_kernel::coroutine::coroutine_request`.
+/// Implementation of `delta_kernel::coroutine::coroutine_workflow`.
 ///
 /// User-facing documentation and examples live on the `delta_kernel` re-export.
 #[proc_macro_attribute]
-pub fn coroutine_request(
+pub fn coroutine_workflow(
     attr: proc_macro::TokenStream,
     item: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
-    coroutine_macro::expand_request(attr.into(), item.into())
+    coroutine_macro::expand_workflow(attr.into(), item.into())
         .unwrap_or_else(Error::into_compile_error)
         .into()
 }
 
 /// Implementation of `delta_kernel::coroutine::coroutine_capabilities`.
 ///
-/// User-facing documentation and examples live on the `delta_kernel` re-export.
+/// User-facing documentation lives on the `delta_kernel` re-export.
 #[proc_macro_attribute]
 pub fn coroutine_capabilities(
     attr: proc_macro::TokenStream,

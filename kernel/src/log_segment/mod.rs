@@ -1,6 +1,5 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of checkpoint and commit
 //! files.
-use std::future::Future;
 use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
 
@@ -15,10 +14,9 @@ use crate::actions::{
 };
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 use crate::committer::CatalogCommit;
-use crate::coroutine::engine::{self as engine_coroutine, ListingPagination, ListingResume};
-use crate::coroutine::listing::ListFilesConstructor;
-use crate::coroutine::read::ReadFilesConstructor;
-use crate::coroutine::{self, Channel};
+use crate::coroutine::listing::{BackwardListing, ForwardListing};
+use crate::coroutine::read::SmallFileRead;
+use crate::coroutine::{engine as engine_coroutine, CanRequest, CanRequestPaginated, Channel};
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_reader::commit::CommitReader;
@@ -53,25 +51,6 @@ mod crc_tests;
 #[cfg(test)]
 mod tests;
 
-enum LogSegmentRequest {
-    ListFiles(
-        ListingPagination,
-        ListingResume<LogSegment, LogSegmentRequest>,
-    ),
-}
-
-fn drive_log_segment<F, Fut>(storage: &dyn StorageHandler, workflow: F) -> DeltaResult<LogSegment>
-where
-    F: FnOnce(Channel<LogSegment, LogSegmentRequest>) -> Fut + Send + 'static,
-    Fut: Future<Output = DeltaResult<LogSegment>> + Send + 'static,
-{
-    coroutine::drive_to_completion!(coroutine::start(workflow), |request| match request {
-        LogSegmentRequest::ListFiles(pagination, resume) => {
-            engine_coroutine::resume_list_files(storage, pagination, resume)
-        }
-    })
-}
-
 #[cfg(test)]
 fn for_snapshot_from_storage(
     storage: &dyn StorageHandler,
@@ -80,10 +59,9 @@ fn for_snapshot_from_storage(
     checkpoint_hint: Option<LastCheckpointHint>,
     time_travel_version: Option<Version>,
 ) -> DeltaResult<LogSegment> {
-    drive_log_segment(storage, async move |mut channel| {
+    engine_coroutine::drive_listing(storage, async move |mut channel| {
         LogSegment::for_snapshot_impl(
             &mut channel,
-            LogSegmentRequest::ListFiles,
             log_root,
             log_tail,
             checkpoint_hint,
@@ -363,29 +341,24 @@ impl LogSegment {
     ///
     /// Reports metrics: `LogSegmentLoadSuccess` or `LogSegmentLoadFailure`.
     #[internal_api]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn for_snapshot<
-        O: Send + 'static,
-        Q: Send + 'static,
-        LS: Send + 'static,
-        RS: Send + 'static,
-    >(
-        channel: &mut Channel<O, Q>,
-        list_files: ListFilesConstructor<O, Q, LS>,
-        read_files: ReadFilesConstructor<O, Q, RS>,
+    pub(crate) async fn for_snapshot<W>(
+        channel: &mut Channel<W>,
         log_root: Url,
         log_tail: Vec<ParsedLogPath>,
         time_travel_version: impl Into<Option<Version>>,
         metric_context: SnapshotLoadMetricContext,
-    ) -> DeltaResult<Self> {
+    ) -> DeltaResult<Self>
+    where
+        W: CanRequestPaginated<ForwardListing>
+            + CanRequestPaginated<BackwardListing>
+            + CanRequest<SmallFileRead>,
+    {
         let time_travel_version = time_travel_version.into();
         let start = std::time::Instant::now();
         let log_segment = async {
-            let checkpoint_hint =
-                LastCheckpointHint::try_read(channel, read_files, &log_root).await?;
+            let checkpoint_hint = LastCheckpointHint::try_read(channel, &log_root).await?;
             Self::for_snapshot_impl(
                 channel,
-                list_files,
                 log_root,
                 log_tail,
                 checkpoint_hint,
@@ -412,14 +385,16 @@ impl LogSegment {
     }
 
     // factored out for testing
-    async fn for_snapshot_impl<O: Send + 'static, Q: Send + 'static, S: Send + 'static>(
-        channel: &mut Channel<O, Q>,
-        list_files: ListFilesConstructor<O, Q, S>,
+    async fn for_snapshot_impl<W>(
+        channel: &mut Channel<W>,
         log_root: Url,
         log_tail: Vec<ParsedLogPath>,
         checkpoint_hint: Option<LastCheckpointHint>,
         time_travel_version: Option<Version>,
-    ) -> DeltaResult<Self> {
+    ) -> DeltaResult<Self>
+    where
+        W: CanRequestPaginated<ForwardListing> + CanRequestPaginated<BackwardListing>,
+    {
         // The end_version is the time_travel_version, if present
         // TODO: When max catalog version is implemented, we would use that as end_version if
         // time_travel_version is not present
@@ -448,7 +423,6 @@ impl LogSegment {
                 LogSegmentFiles::list_with_checkpoint_hint(
                     cp,
                     channel,
-                    list_files,
                     &log_root,
                     log_tail,
                     end_version,
@@ -458,14 +432,12 @@ impl LogSegment {
             // Case 3
             (None, Some(end)) => {
                 LogSegmentFiles::list_with_backward_checkpoint_scan(
-                    channel, list_files, &log_root, log_tail, end,
+                    channel, &log_root, log_tail, end,
                 )
                 .await?
             }
             // Case 4
-            (None, None) => {
-                LogSegmentFiles::list(channel, list_files, &log_root, log_tail, None, None).await?
-            }
+            (None, None) => LogSegmentFiles::list(channel, &log_root, log_tail, None, None).await?,
         };
 
         LogSegment::try_new(listed_files, log_root, time_travel_version, checkpoint_hint)
@@ -484,29 +456,21 @@ impl LogSegment {
         end_version: impl Into<Option<Version>>,
     ) -> DeltaResult<Self> {
         let end_version = end_version.into();
-        drive_log_segment(storage, async move |mut channel| {
-            Self::construct_for_table_changes(
-                &mut channel,
-                LogSegmentRequest::ListFiles,
-                log_root,
-                start_version,
-                end_version,
-            )
-            .await
+        engine_coroutine::drive_listing(storage, async move |mut channel| {
+            Self::construct_for_table_changes(&mut channel, log_root, start_version, end_version)
+                .await
         })
     }
 
-    async fn construct_for_table_changes<
-        O: Send + 'static,
-        Q: Send + 'static,
-        S: Send + 'static,
-    >(
-        channel: &mut Channel<O, Q>,
-        list_files: ListFilesConstructor<O, Q, S>,
+    async fn construct_for_table_changes<W>(
+        channel: &mut Channel<W>,
         log_root: Url,
         start_version: Version,
         end_version: Option<Version>,
-    ) -> DeltaResult<Self> {
+    ) -> DeltaResult<Self>
+    where
+        W: CanRequestPaginated<ForwardListing>,
+    {
         if let Some(end_version) = end_version {
             if start_version > end_version {
                 return Err(Error::generic(
@@ -520,7 +484,6 @@ impl LogSegment {
         // table will need the catalog's commits passed here to see unbackfilled staged commits.
         let listed_files = LogSegmentFiles::list_commits(
             channel,
-            list_files,
             &log_root,
             vec![], // log-tail
             Some(start_version),
@@ -563,10 +526,9 @@ impl LogSegment {
         limit: Option<NonZero<usize>>,
         log_tail: Vec<ParsedLogPath>,
     ) -> DeltaResult<Self> {
-        drive_log_segment(storage, async move |mut channel| {
+        engine_coroutine::drive_listing(storage, async move |mut channel| {
             Self::construct_for_timestamp_conversion(
                 &mut channel,
-                LogSegmentRequest::ListFiles,
                 log_root,
                 end_version,
                 limit,
@@ -576,18 +538,16 @@ impl LogSegment {
         })
     }
 
-    async fn construct_for_timestamp_conversion<
-        O: Send + 'static,
-        Q: Send + 'static,
-        S: Send + 'static,
-    >(
-        channel: &mut Channel<O, Q>,
-        list_files: ListFilesConstructor<O, Q, S>,
+    async fn construct_for_timestamp_conversion<W>(
+        channel: &mut Channel<W>,
         log_root: Url,
         end_version: Version,
         limit: Option<NonZero<usize>>,
         log_tail: Vec<ParsedLogPath>,
-    ) -> DeltaResult<Self> {
+    ) -> DeltaResult<Self>
+    where
+        W: CanRequestPaginated<ForwardListing>,
+    {
         // Compute the version to start listing from.
         let start_from = limit
             .map(|limit| match NonZero::<Version>::try_from(limit) {
@@ -602,7 +562,6 @@ impl LogSegment {
         // chunk of commits
         let mut listed_commits = LogSegmentFiles::list_commits(
             channel,
-            list_files,
             &log_root,
             log_tail,
             start_from,

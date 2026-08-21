@@ -1,4 +1,3 @@
-use std::future::Future;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -6,8 +5,7 @@ use rstest::rstest;
 use url::Url;
 
 use super::*;
-use crate::coroutine::engine::{self as engine_coroutine, ListingPagination, ListingResume};
-use crate::coroutine::{self, Channel};
+use crate::coroutine::engine as engine_coroutine;
 use crate::engine::sync::SyncEngine;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::object_store::memory::InMemory;
@@ -200,23 +198,6 @@ impl StorageHandler for CountingStorageHandler {
     }
 }
 
-struct ListingRequest(
-    ListingPagination,
-    ListingResume<LogSegmentFiles, ListingRequest>,
-);
-
-fn drive_listing<F, Fut>(storage: &dyn StorageHandler, workflow: F) -> DeltaResult<LogSegmentFiles>
-where
-    F: FnOnce(Channel<LogSegmentFiles, ListingRequest>) -> Fut + Send + 'static,
-    Fut: Future<Output = DeltaResult<LogSegmentFiles>> + Send + 'static,
-{
-    coroutine::drive_to_completion!(coroutine::start(workflow), |request| match request {
-        ListingRequest(pagination, resume) => {
-            engine_coroutine::resume_list_files(storage, pagination, resume)
-        }
-    })
-}
-
 fn list(
     storage: &dyn StorageHandler,
     log_root: &Url,
@@ -225,10 +206,9 @@ fn list(
     end_version: Option<Version>,
 ) -> DeltaResult<LogSegmentFiles> {
     let log_root = log_root.clone();
-    drive_listing(storage, async move |mut channel| {
+    engine_coroutine::drive_listing(storage, async move |mut channel| {
         LogSegmentFiles::list(
             &mut channel,
-            ListingRequest,
             &log_root,
             log_tail,
             start_version,
@@ -246,10 +226,9 @@ fn list_commits(
     end_version: Option<Version>,
 ) -> DeltaResult<LogSegmentFiles> {
     let log_root = log_root.clone();
-    drive_listing(storage, async move |mut channel| {
+    engine_coroutine::drive_listing(storage, async move |mut channel| {
         LogSegmentFiles::list_commits(
             &mut channel,
-            ListingRequest,
             &log_root,
             log_tail,
             start_version,
@@ -268,11 +247,10 @@ fn list_with_checkpoint_hint(
 ) -> DeltaResult<LogSegmentFiles> {
     let checkpoint_hint = checkpoint_hint.clone();
     let log_root = log_root.clone();
-    drive_listing(storage, async move |mut channel| {
+    engine_coroutine::drive_listing(storage, async move |mut channel| {
         LogSegmentFiles::list_with_checkpoint_hint(
             &checkpoint_hint,
             &mut channel,
-            ListingRequest,
             &log_root,
             log_tail,
             end_version,
@@ -288,10 +266,9 @@ fn list_with_backward_checkpoint_scan(
     end_version: Version,
 ) -> DeltaResult<LogSegmentFiles> {
     let log_root = log_root.clone();
-    drive_listing(storage, async move |mut channel| {
+    engine_coroutine::drive_listing(storage, async move |mut channel| {
         LogSegmentFiles::list_with_backward_checkpoint_scan(
             &mut channel,
-            ListingRequest,
             &log_root,
             log_tail,
             end_version,

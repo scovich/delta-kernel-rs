@@ -11,8 +11,8 @@ use url::Url;
 use crate::actions::{
     CheckpointMetadata, DomainMetadata, Metadata, Protocol, SetTransaction, Sidecar,
 };
-use crate::coroutine::read::ReadFilesConstructor;
-use crate::coroutine::{self, Channel, Pagination};
+use crate::coroutine::read::SmallFileRead;
+use crate::coroutine::{CanRequest, Channel};
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Error, FileMeta, Version};
@@ -192,16 +192,15 @@ impl LastCheckpointHint {
     /// not found or is invalid JSON. Unexpected/unrecoverable errors are returned as `Err` case and
     /// are assumed to cause failure.
     #[instrument(name = "last_checkpoint.read", skip_all, err)]
-    pub(crate) async fn try_read<O: Send + 'static, Q: Send + 'static, S: Send + 'static>(
-        channel: &mut Channel<O, Q>,
-        read_files: ReadFilesConstructor<O, Q, S>,
+    pub(crate) async fn try_read<W: CanRequest<SmallFileRead>>(
+        channel: &mut Channel<W>,
         log_root: &Url,
     ) -> DeltaResult<Option<LastCheckpointHint>> {
         let file_path = Self::path(log_root)?;
-        let request = Pagination::Start(vec![(file_path, None)]);
-        match coroutine::offload_paginated(channel, read_files, request)
+        match channel
+            .offload(SmallFileRead((file_path, None)))
             .await
-            .map(|(data, _)| data.and_then(|data| data.into_iter().next()))
+            .map(|data| (!data.is_empty()).then_some(data))
             .transpose()
         {
             Some(Ok(data)) => {
