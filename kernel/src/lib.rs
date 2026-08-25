@@ -207,10 +207,17 @@ pub use snapshot::{Snapshot, SnapshotRef};
 ))]
 pub mod engine;
 
-/// Delta table version is 8 byte unsigned int
+/// Delta table version represented as an 8-byte unsigned integer.
+///
+/// NOTE: In practice, versions are 63-bit unsigned values (`0..=i64::MAX`) because The Java
+/// ecosystem lacks an unsigned 64-bit int type. In bounds and searches, `Version::MAX` is the
+/// sentinel value for a missing/open upper bound, and code using versions MUST treat
+/// `v..Version::MAX` as equivalent to `v..`. Use saturating adds when increasing a version number
+/// to preserve the sentinel while avoiding overflow panics.
 pub type Version = u64;
 
 /// Converts a [`Version`] to `i64`, returning an error if the version exceeds `i64::MAX`.
+// See `Version` above for the sentinel semantics that callers must preserve before conversion.
 pub(crate) fn version_as_i64(version: Version) -> DeltaResult<i64> {
     version
         .try_into()
@@ -626,8 +633,7 @@ pub trait StorageHandler: AsAny {
     ///   contains all files at or below that directory.
     /// - Otherwise, the parent is the directory containing `path`, and only files (at any depth
     ///   under that parent) whose full path sorts strictly greater than `path` are returned.
-    fn list_from(&self, path: &Url)
-        -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>>;
+    fn list_from(&self, path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>>;
 
     /// Cancellation-aware variant of [`list_from`](Self::list_from).
     ///
@@ -648,17 +654,14 @@ pub trait StorageHandler: AsAny {
         &self,
         path: &Url,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    ) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
         check_cancelled(cancellation_token.as_ref())?;
         let iter = self.list_from(path)?;
         Ok(Box::new(CancellableIterator::new(iter, cancellation_token)))
     }
 
     /// Read data specified by the start and end offset from the file.
-    fn read_files(
-        &self,
-        files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>>;
+    fn read_files(&self, files: Vec<FileSlice>) -> DeltaResult<DeltaResultIteratorStatic<Bytes>>;
 
     /// Cancellation-aware variant of [`read_files`](Self::read_files).
     ///
@@ -678,7 +681,7 @@ pub trait StorageHandler: AsAny {
         &self,
         files: Vec<FileSlice>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+    ) -> DeltaResult<DeltaResultIteratorStatic<Bytes>> {
         check_cancelled(cancellation_token.as_ref())?;
         let iter = self.read_files(files)?;
         Ok(Box::new(CancellableIterator::new(iter, cancellation_token)))

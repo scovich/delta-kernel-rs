@@ -1503,6 +1503,14 @@ mod tests {
         assert_eq!(snapshot.schema(), expected);
     }
 
+    /// Test helper: drive [`LastCheckpointHint::try_read`] through a [`StorageHandler`].
+    fn read_last_checkpoint(
+        storage: &dyn crate::StorageHandler,
+        log_root: &Url,
+    ) -> DeltaResult<Option<LastCheckpointHint>> {
+        LastCheckpointHint::try_read(storage, log_root, None)
+    }
+
     #[test]
     fn test_read_table_with_missing_last_checkpoint() {
         // this table doesn't have a _last_checkpoint file
@@ -1514,7 +1522,7 @@ mod tests {
 
         let engine = SyncEngine::new();
         let storage = engine.storage_handler();
-        let cp = LastCheckpointHint::try_read(storage.as_ref(), &url, None).unwrap();
+        let cp = read_last_checkpoint(storage.as_ref(), &url).unwrap();
         assert!(cp.is_none());
     }
 
@@ -1573,8 +1581,7 @@ mod tests {
         let engine = SyncEngine::new_with_store(store);
         let storage = engine.storage_handler();
         let url = Url::parse("memory:///invalid/").expect("valid url");
-        let invalid = LastCheckpointHint::try_read(storage.as_ref(), &url, None)
-            .expect("read last checkpoint");
+        let invalid = read_last_checkpoint(storage.as_ref(), &url).expect("read last checkpoint");
         assert!(invalid.is_none())
     }
 
@@ -1608,8 +1615,8 @@ mod tests {
         // valid, invalid and valid with tags.
         for (path_prefix, _, expected_result) in test_cases {
             let url = Url::parse(&format!("memory:///{path_prefix}/")).expect("valid url");
-            let result = LastCheckpointHint::try_read(storage.as_ref(), &url, None)
-                .expect("read last checkpoint");
+            let result =
+                read_last_checkpoint(storage.as_ref(), &url).expect("read last checkpoint");
             assert_eq!(result, expected_result);
         }
     }

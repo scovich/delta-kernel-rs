@@ -371,32 +371,6 @@ impl ListingAccumulator {
 /// `LogSegmentFiles::list_with_backward_checkpoint_scan`
 const BACKWARD_SCAN_WINDOW_SIZE: u64 = 1000;
 
-impl LogSegmentFiles {
-    /// Assembles a `LogSegmentFiles` from `fs_files` (an iterator of files
-    /// listed from storage) and `log_tail` (catalog-provided commits).
-    ///
-    /// - `fs_files`: files listed from storage in ascending version order
-    /// - `log_tail`: list of commits that takes precedence over the filesystem ones
-    /// - `start_version`: start version of the entire listing range provided; in practice, this is
-    ///   the lower bound (inclusive) for log_tail entries included in the result
-    /// - `end_version`: upper bound (inclusive) on versions to include, `None` means no bound
-    pub(crate) fn build_log_segment_files(
-        fs_files: impl Iterator<Item = DeltaResult<ParsedLogPath>>,
-        log_tail: Vec<ParsedLogPath>,
-        start_version: Version,
-        end_version: Option<Version>,
-    ) -> DeltaResult<Self> {
-        let mut builder = LogListingBuilder::new(log_tail, start_version, end_version);
-
-        // Phase 1: Stream filesystem files lazily (no collect).
-        // We always list from the filesystem even when the log_tail covers the entire commit
-        // range, because non-commit files (CRC, checkpoints, compactions) only exist on the
-        // filesystem — the log_tail only provides commit files.
-        builder.extend_filesystem_files(fs_files)?;
-        Ok(builder.finish())
-    }
-}
-
 /// Incrementally builds [`LogSegmentFiles`] from an ascending filesystem listing.
 ///
 /// Files may be supplied in any batch sizes. Checkpoint groups remain pending until a later version
@@ -635,7 +609,9 @@ impl LogSegmentFiles {
         let end = end_version.unwrap_or(Version::MAX);
         let fs_iter =
             list_delta_log_from_storage(storage, log_root, start, end, cancellation_token)?;
-        Self::build_log_segment_files(fs_iter, log_tail, start, end_version)
+        let mut builder = LogListingBuilder::new(log_tail, start, end_version);
+        builder.extend_filesystem_files(fs_iter)?;
+        Ok(builder.finish())
     }
 
     /// List all commit and checkpoint files after the provided checkpoint. It is guaranteed that
@@ -774,7 +750,9 @@ impl LogSegmentFiles {
         let (windows, found_checkpoint_version) = checkpoint_search.finish();
         let fs_iter = windows.into_iter().rev().flatten().map(Ok);
         let start = found_checkpoint_version.unwrap_or(0);
-        Self::build_log_segment_files(fs_iter, log_tail, start, Some(end_version))
+        let mut builder = LogListingBuilder::new(log_tail, start, Some(end_version));
+        builder.extend_filesystem_files(fs_iter)?;
+        Ok(builder.finish())
     }
 }
 

@@ -503,10 +503,33 @@ mod tests {
     use crate::unit_test_utils::{
         install_thread_local_metrics_reporter, string_array_to_engine_data, CapturingReporter,
     };
+    use crate::SnapshotRef;
 
     // ============================================================================
     // Helpers
     // ============================================================================
+
+    /// Test helper: drive [`Snapshot::try_new_from`] through a legacy [`Engine`].
+    fn try_new_from_with_engine(
+        existing_snapshot: Arc<Snapshot>,
+        log_tail: Vec<ParsedLogPath>,
+        engine: &dyn Engine,
+        target_version: Option<Version>,
+        metric_context: SnapshotLoadMetricContext,
+        incremental_replay: IncrementalReplay,
+        built_as_latest: bool,
+    ) -> DeltaResult<SnapshotRef> {
+        Snapshot::try_new_from(
+            existing_snapshot,
+            log_tail,
+            engine,
+            target_version,
+            metric_context,
+            incremental_replay,
+            built_as_latest,
+            None,
+        )
+    }
 
     // Action builders for incremental-snapshot tests. Centralized so commit setup stays
     // consistent across tests (e.g. the schema matches `make_test_crc_json`).
@@ -638,7 +661,7 @@ mod tests {
             .at_version(0)
             .build(&engine)?;
 
-        let result = Snapshot::try_new_from(
+        let result = try_new_from_with_engine(
             base_snapshot.clone(),
             vec![],
             &engine,
@@ -646,7 +669,6 @@ mod tests {
             SnapshotLoadMetricContext::for_test(),
             IncrementalReplay::Disabled,
             true, /* built_as_latest */
-            None, /* cancellation_token */
         )?;
         assert_eq!(result, base_snapshot);
         // `PartialEq` ignores `built_as_latest`, so assert it explicitly.
@@ -719,7 +741,7 @@ mod tests {
         let log_tail = vec![parsed_path];
 
         // Create new snapshot from base to version 2 using try_new_from directly
-        let new_snapshot = Snapshot::try_new_from(
+        let new_snapshot = try_new_from_with_engine(
             base_snapshot.clone(),
             log_tail,
             &engine,
@@ -727,7 +749,6 @@ mod tests {
             SnapshotLoadMetricContext::for_test(),
             IncrementalReplay::Disabled,
             false, /* built_as_latest */
-            None,  /* cancellation_token */
         )?;
 
         // Latest commit should now be version 2
@@ -779,7 +800,7 @@ mod tests {
             .build(&engine)?;
 
         // Test requesting same version - should return same snapshot
-        let same_version = Snapshot::try_new_from(
+        let same_version = try_new_from_with_engine(
             base_snapshot.clone(),
             vec![],
             &engine,
@@ -787,12 +808,11 @@ mod tests {
             SnapshotLoadMetricContext::for_test(),
             IncrementalReplay::Disabled,
             false, /* built_as_latest */
-            None,  /* cancellation_token */
         )?;
         assert!(Arc::ptr_eq(&same_version, &base_snapshot));
 
         // Test requesting older version - should error
-        let older_version = Snapshot::try_new_from(
+        let older_version = try_new_from_with_engine(
             base_snapshot.clone(),
             vec![],
             &engine,
@@ -800,7 +820,6 @@ mod tests {
             SnapshotLoadMetricContext::for_test(),
             IncrementalReplay::Disabled,
             false, /* built_as_latest */
-            None,  /* cancellation_token */
         );
         assert!(matches!(
             older_version,

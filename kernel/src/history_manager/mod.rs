@@ -2200,7 +2200,7 @@ mod tests {
         #[case] expected: Expected,
     ) {
         let (engine, log_root) = engine_with_log_files(&paths, &HashSet::new());
-        let res = get_earliest_recreatable_commit(&engine, &log_root, ratified);
+        let res = get_earliest_commit(&engine, &log_root, ratified, HistoryCommitType::Recreatable);
         match expected {
             Expected::Version(v) => assert_eq!(res.unwrap(), v),
             Expected::NoCommitsFound => assert!(
@@ -2234,7 +2234,8 @@ mod tests {
         empty_paths.insert(single_part_checkpoint_path(5));
 
         let (engine, log_root) = engine_with_log_files(&paths, &empty_paths);
-        let version = get_earliest_recreatable_commit(&engine, &log_root, None).unwrap();
+        let version =
+            get_earliest_commit(&engine, &log_root, None, HistoryCommitType::Recreatable).unwrap();
         assert_eq!(version, 8);
     }
 
@@ -2271,10 +2272,11 @@ mod tests {
             }
         }
 
-        let res = get_earliest_published_commit_version(
+        let res = get_earliest_commit(
             &engine,
             &log_root,
             earliest_ratified_commit_version,
+            HistoryCommitType::Published,
         );
         match expected {
             Expected::Version(v) => assert_eq!(res.unwrap(), v),
@@ -2309,7 +2311,7 @@ mod tests {
             staged_dir.join("00000000000000000001.01234567-89ab-cdef-0123-456789abcdef.json");
         std::fs::write(&staged_file, "{}").unwrap();
 
-        let res = get_earliest_published_commit_version(&engine, &log_root, None);
+        let res = get_earliest_commit(&engine, &log_root, None, HistoryCommitType::Published);
         assert_eq!(res.unwrap(), 0);
     }
 }

@@ -88,13 +88,16 @@ impl CheckpointReadInfo {
 ///
 /// This struct provides named access to the return values instead of tuple indexing.
 #[internal_api]
-pub(crate) struct ActionsWithCheckpointInfo<A: Iterator<Item = DeltaResult<ActionsBatch>>> {
+pub(crate) struct EngineActionsWithCheckpointInfo<A: Iterator<Item = DeltaResult<ActionsBatch>>> {
     /// Iterator over action batches read from the log segment.
     pub actions: A,
     /// Metadata about checkpoint reading, including the schema used.
     #[allow(unused)]
     pub checkpoint_info: CheckpointReadInfo,
 }
+
+#[internal_api]
+pub(crate) type ActionsWithCheckpointInfo<A> = EngineActionsWithCheckpointInfo<A>;
 
 /// A [`LogSegment`] represents a contiguous section of the log and is made of checkpoint files
 /// and commit files and guarantees the following:
@@ -731,7 +734,6 @@ impl LogSegment {
             partition_schema,
             cancellation_token,
         )?;
-
         Ok(ActionsWithCheckpointInfo {
             actions: commit_stream.chain(checkpoint_result.actions),
             checkpoint_info: checkpoint_result.checkpoint_info,
@@ -1196,6 +1198,28 @@ impl LogSegment {
         })
     }
 
+    #[cfg(test)]
+    fn create_checkpoint_stream_with_engine(
+        &self,
+        engine: &dyn Engine,
+        action_schema: SchemaRef,
+        meta_predicate: Option<PredicateRef>,
+        stats_schema: Option<&StructType>,
+        partition_schema: Option<&StructType>,
+        cancellation_token: Option<&CancellationTokenRef>,
+    ) -> DeltaResult<
+        ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
+    > {
+        self.create_checkpoint_stream(
+            engine,
+            action_schema,
+            meta_predicate,
+            stats_schema,
+            partition_schema,
+            cancellation_token,
+        )
+    }
+
     /// Extracts sidecar file references from a checkpoint file.
     fn extract_sidecar_refs(
         &self,
@@ -1497,6 +1521,17 @@ impl LogSegment {
         debug!("Checkpoint schema has compatible partitionValues_parsed for partition pruning");
         true
     }
+
+    /// Test helper: drive [`Self::get_file_actions_schema_and_sidecars`] through a legacy
+    /// [`Engine`].
+    #[cfg(test)]
+    fn get_file_actions_schema_and_sidecars_with_engine(
+        &self,
+        engine: &dyn Engine,
+        cancellation_token: Option<&CancellationTokenRef>,
+    ) -> DeltaResult<(Option<SchemaRef>, Vec<FileMeta>)> {
+        self.get_file_actions_schema_and_sidecars(engine, cancellation_token)
+    }
 }
 
 fn validate_compaction_files(compactions: &[ParsedLogPath]) -> DeltaResult<()> {
@@ -1686,4 +1721,23 @@ fn validate_crc(
         ))
     );
     Ok(())
+}
+
+/// Test helper: drive [`LogSegment::for_snapshot_impl`] through a [`StorageHandler`].
+#[cfg(test)]
+fn for_snapshot_from_storage(
+    storage: &dyn StorageHandler,
+    log_root: Url,
+    log_tail: Vec<ParsedLogPath>,
+    checkpoint_hint: Option<LastCheckpointHint>,
+    time_travel_version: Option<Version>,
+) -> DeltaResult<LogSegment> {
+    LogSegment::for_snapshot_impl(
+        storage,
+        log_root,
+        log_tail,
+        checkpoint_hint,
+        time_travel_version,
+        None,
+    )
 }

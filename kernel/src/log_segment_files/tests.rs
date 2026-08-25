@@ -12,7 +12,7 @@ use crate::object_store::path::Path as ObjectPath;
 use crate::object_store::ObjectStoreExt as _;
 use crate::path::tests::multipart_checkpoint_name;
 use crate::unit_test_utils::TestCancellationToken;
-use crate::{Engine as _, FileMeta, StorageHandler};
+use crate::{DeltaResultIteratorStatic, Engine as _, FileMeta, StorageHandler};
 
 // size markers used to identify commit sources in tests
 const FILESYSTEM_SIZE_MARKER: u64 = 10;
@@ -165,10 +165,7 @@ impl CountingStorageHandler {
 }
 
 impl StorageHandler for CountingStorageHandler {
-    fn list_from(
-        &self,
-        path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    fn list_from(&self, path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
         self.list_from_count.fetch_add(1, Ordering::Relaxed);
         let items_listed = self.items_listed.clone();
         let iter = self.inner.list_from(path)?;
@@ -180,7 +177,7 @@ impl StorageHandler for CountingStorageHandler {
     fn read_files(
         &self,
         _files: Vec<crate::FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+    ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
         panic!("read_files should not be called during listing");
     }
 
@@ -201,6 +198,72 @@ impl StorageHandler for CountingStorageHandler {
     }
 }
 
+fn list(
+    storage: &dyn StorageHandler,
+    log_root: &Url,
+    log_tail: Vec<ParsedLogPath>,
+    start_version: Option<Version>,
+    end_version: Option<Version>,
+) -> DeltaResult<LogSegmentFiles> {
+    LogSegmentFiles::list(
+        storage,
+        log_root,
+        log_tail,
+        start_version,
+        end_version,
+        None,
+    )
+}
+
+fn list_commits(
+    storage: &dyn StorageHandler,
+    log_root: &Url,
+    log_tail: Vec<ParsedLogPath>,
+    start_version: Option<Version>,
+    end_version: Option<Version>,
+) -> DeltaResult<LogSegmentFiles> {
+    LogSegmentFiles::list_commits(
+        storage,
+        log_root,
+        log_tail,
+        start_version,
+        end_version,
+        None,
+    )
+}
+
+fn list_with_checkpoint_hint(
+    checkpoint_hint: &LastCheckpointHint,
+    storage: &dyn StorageHandler,
+    log_root: &Url,
+    log_tail: Vec<ParsedLogPath>,
+    end_version: Option<Version>,
+) -> DeltaResult<LogSegmentFiles> {
+    LogSegmentFiles::list_with_checkpoint_hint(
+        checkpoint_hint,
+        storage,
+        log_root,
+        log_tail,
+        end_version,
+        None,
+    )
+}
+
+fn list_with_backward_checkpoint_scan(
+    storage: &dyn StorageHandler,
+    log_root: &Url,
+    log_tail: Vec<ParsedLogPath>,
+    end_version: Version,
+) -> DeltaResult<LogSegmentFiles> {
+    LogSegmentFiles::list_with_backward_checkpoint_scan(
+        storage,
+        log_root,
+        log_tail,
+        end_version,
+        None,
+    )
+}
+
 /// Helper to call `LogSegmentFiles::list()` and destructure the result for assertions.
 /// Returns (ascending_commit_files, ascending_compaction_files, checkpoint_parts,
 ///          latest_crc_file, latest_commit_file, max_published_version).
@@ -219,15 +282,7 @@ fn list_and_destructure(
     Option<ParsedLogPath>,
     Option<Version>,
 ) {
-    let r = LogSegmentFiles::list(
-        storage,
-        log_root,
-        log_tail,
-        start_version,
-        end_version,
-        None,
-    )
-    .unwrap();
+    let r = list(storage, log_root, log_tail, start_version, end_version).unwrap();
     (
         r.ascending_commit_files,
         r.ascending_compaction_files,
@@ -367,16 +422,13 @@ fn test_log_tail_covers_entire_range_empty_filesystem() {
     // have nothing — e.g. a purely catalog-managed table.
     struct EmptyStorageHandler;
     impl StorageHandler for EmptyStorageHandler {
-        fn list_from(
-            &self,
-            _path: &Url,
-        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+        fn list_from(&self, _path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
             Ok(Box::new(std::iter::empty()))
         }
         fn read_files(
             &self,
             _files: Vec<crate::FileSlice>,
-        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+        ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
             panic!("read_files should not be called during listing");
         }
         fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
@@ -746,14 +798,7 @@ async fn backward_scan_single_checkpoint_cases(
     let (storage, log_root) = create_storage(log_files).await;
     let counter = CountingStorageHandler::new(storage);
 
-    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
-        &counter,
-        &log_root,
-        vec![],
-        1005,
-        None,
-    )
-    .unwrap();
+    let result = list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 1005).unwrap();
 
     assert_eq!(counter.call_count(), expected_listings);
 
@@ -875,14 +920,8 @@ async fn backward_scan_multipart_checkpoint_cases(
     let (storage, log_root) = create_storage(log_files).await;
     let counter = CountingStorageHandler::new(storage);
 
-    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
-        &counter,
-        &log_root,
-        vec![],
-        end_version,
-        None,
-    )
-    .unwrap();
+    let result =
+        list_with_backward_checkpoint_scan(&counter, &log_root, vec![], end_version).unwrap();
 
     assert_eq!(counter.call_count(), expected_listings);
     assert_eq!(result.checkpoint_parts.len(), expected_checkpoint_parts);
@@ -926,14 +965,8 @@ async fn backward_scan_with_log_tail_derives_lower_bound_from_checkpoint() {
         })
         .collect();
 
-    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
-        storage.as_ref(),
-        &log_root,
-        log_tail,
-        10,
-        None,
-    )
-    .unwrap();
+    let result =
+        list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, log_tail, 10).unwrap();
 
     assert_eq!(result.checkpoint_parts.len(), 1);
     assert_eq!(result.checkpoint_parts[0].version, 5);
@@ -977,14 +1010,8 @@ async fn backward_scan_with_log_tail_starting_before_checkpoint() {
         })
         .collect();
 
-    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
-        storage.as_ref(),
-        &log_root,
-        log_tail,
-        8,
-        None,
-    )
-    .unwrap();
+    let result =
+        list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, log_tail, 8).unwrap();
 
     assert_eq!(result.checkpoint_parts.len(), 1);
     assert_eq!(result.checkpoint_parts[0].version, 5);
@@ -1020,14 +1047,8 @@ async fn backward_scan_log_tail_defines_latest_version() {
         CommitSource::Catalog,
     )];
 
-    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
-        storage.as_ref(),
-        &log_root,
-        log_tail,
-        5,
-        None,
-    )
-    .unwrap();
+    let result =
+        list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, log_tail, 5).unwrap();
 
     let expected = [
         (0, CommitSource::Filesystem),
@@ -1082,8 +1103,7 @@ async fn test_zero_byte_commit_kept_in_listing() {
     ];
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
-    let result =
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2), None).unwrap();
+    let result = list(storage.as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
     assert_eq!(result.ascending_commit_files.len(), 3);
     assert_eq!(result.ascending_commit_files[0].version, 0);
     assert_eq!(result.ascending_commit_files[1].version, 1);
@@ -1112,16 +1132,9 @@ async fn test_zero_byte_compaction_skipped_commits_used(#[case] use_backward_sca
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result = if use_backward_scan {
-        LogSegmentFiles::list_with_backward_checkpoint_scan(
-            storage.as_ref(),
-            &log_root,
-            vec![],
-            4,
-            None,
-        )
-        .unwrap()
+        list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, vec![], 4).unwrap()
     } else {
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(4), None).unwrap()
+        list(storage.as_ref(), &log_root, vec![], Some(0), Some(4)).unwrap()
     };
 
     assert!(
@@ -1158,16 +1171,9 @@ async fn test_zero_byte_checkpoint_skipped_older_used(#[case] use_backward_scan:
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result = if use_backward_scan {
-        LogSegmentFiles::list_with_backward_checkpoint_scan(
-            storage.as_ref(),
-            &log_root,
-            vec![],
-            10,
-            None,
-        )
-        .unwrap()
+        list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, vec![], 10).unwrap()
     } else {
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(10), None).unwrap()
+        list(storage.as_ref(), &log_root, vec![], Some(0), Some(10)).unwrap()
     };
 
     // Should fall back to checkpoint at v5 (the empty v10 checkpoint is skipped)
@@ -1192,8 +1198,7 @@ async fn test_zero_byte_crc_kept() {
     ];
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
-    let result =
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2), None).unwrap();
+    let result = list(storage.as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
 
     // The 0-byte CRC at v2 is kept (latest_crc_file tracks the highest version)
     let crc = result.latest_crc_file.unwrap();
@@ -1216,14 +1221,7 @@ async fn test_zero_byte_checkpoint_backward_scan_crosses_windows() {
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
     let counter = CountingStorageHandler::new(storage);
 
-    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
-        &counter,
-        &log_root,
-        vec![],
-        1005,
-        None,
-    )
-    .unwrap();
+    let result = list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 1005).unwrap();
 
     // Needed 2 windows because the 0-byte checkpoint at v1005 was skipped
     assert_eq!(counter.call_count(), 2);
@@ -1245,9 +1243,7 @@ async fn test_list_commits_zero_byte_commit_kept() {
     ];
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
-    let result =
-        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, vec![], Some(0), Some(2), None)
-            .unwrap();
+    let result = list_commits(storage.as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
     assert_eq!(result.ascending_commit_files.len(), 3);
     assert_eq!(result.ascending_commit_files[2].version, 2);
     assert_eq!(result.ascending_commit_files[2].location.size, 0);
@@ -1317,9 +1313,7 @@ async fn list_commits_merges_log_tail(
         })
         .collect();
 
-    let result =
-        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, log_tail, start, end, None)
-            .unwrap();
+    let result = list_commits(storage.as_ref(), &log_root, log_tail, start, end).unwrap();
 
     let commits = &result.ascending_commit_files;
     assert_eq!(commits.len(), expected.len());
@@ -1345,9 +1339,7 @@ async fn test_list_commits_keeps_commits_across_checkpoint() {
     ));
     let (storage, log_root) = create_storage(files).await;
 
-    let result =
-        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, vec![], Some(0), Some(5), None)
-            .unwrap();
+    let result = list_commits(storage.as_ref(), &log_root, vec![], Some(0), Some(5)).unwrap();
     let versions: Vec<_> = result
         .ascending_commit_files
         .iter()
@@ -1673,15 +1665,8 @@ async fn last_checkpoint_hint_applies_iff_it_names_the_selected_checkpoint(
     )
     .await;
 
-    let listed = LogSegmentFiles::list_with_checkpoint_hint(
-        &hint,
-        storage.as_ref(),
-        &log_root,
-        vec![],
-        None,
-        None,
-    )
-    .unwrap();
+    let listed =
+        list_with_checkpoint_hint(&hint, storage.as_ref(), &log_root, vec![], None).unwrap();
 
     // The winner is the same no matter what the hint names.
     assert_eq!(listed.checkpoint_parts.len(), 1);
@@ -1826,10 +1811,7 @@ struct FiniteListingHandler {
 }
 
 impl StorageHandler for FiniteListingHandler {
-    fn list_from(
-        &self,
-        _path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    fn list_from(&self, _path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
         let log_root = self.log_root.clone();
         let pulled = self.items_pulled.clone();
         let iter = (0..self.count as u64).map(move |version| {
@@ -1846,7 +1828,7 @@ impl StorageHandler for FiniteListingHandler {
     fn read_files(
         &self,
         _files: Vec<crate::FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+    ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
         panic!("read_files should not be called during listing");
     }
 
@@ -1958,10 +1940,7 @@ struct CancelAfterListingHandler {
 }
 
 impl StorageHandler for CancelAfterListingHandler {
-    fn list_from(
-        &self,
-        _path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    fn list_from(&self, _path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
         self.list_calls.fetch_add(1, Ordering::Relaxed);
         Ok(Box::new(CancelOnExhaustion {
             token: self.token.clone(),
@@ -1972,7 +1951,7 @@ impl StorageHandler for CancelAfterListingHandler {
     fn read_files(
         &self,
         _files: Vec<crate::FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+    ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
         panic!("read_files should not be called during listing");
     }
 
