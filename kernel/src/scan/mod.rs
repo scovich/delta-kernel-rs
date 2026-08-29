@@ -944,8 +944,14 @@ impl Scan {
         // Since we're only processing existing data (no checkpoint), we use the base schema
         // and no stats_parsed optimization.
         if existing_version == self.snapshot.version() {
+            // Cached metadata bypasses engine handlers, so kernel must poll cancellation while
+            // consuming it.
+            let actions = CancellableIterator::new(
+                existing_data.into_iter().map(apply_transform),
+                self.cancellation_token.clone(),
+            );
             let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
-                actions: existing_data.into_iter().map(apply_transform),
+                actions,
                 checkpoint_info: CheckpointReadInfo {
                     has_stats_parsed: false,
                     has_partition_values_parsed: false,
@@ -992,15 +998,16 @@ impl Scan {
             meta_predicate,
             physical_stats_schema,
             None,
-            // The incremental path relies on the batch-boundary poll in `scan_metadata_inner`
-            // for cancellation; it does not thread the token into the engine reads here, so a
-            // read already in flight is not interrupted mid-I/O.
-            None,
+            self.cancellation_token.as_ref(),
         )?;
+        // Only the cached suffix needs a kernel-side check. The engine owns cancellation for the
+        // newly read action prefix.
+        let existing_actions = CancellableIterator::new(
+            existing_data.into_iter().map(apply_transform),
+            self.cancellation_token.clone(),
+        );
         let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
-            actions: result
-                .actions
-                .chain(existing_data.into_iter().map(apply_transform)),
+            actions: result.actions.chain(existing_actions),
             checkpoint_info: result.checkpoint_info,
         };
 
@@ -1028,15 +1035,9 @@ impl Scan {
                 (None, Arc::new(ScanMetrics::default()))
             }
             _ => {
-                // Wrap the input iterator (not the shared `process_actions_iter`) so token
-                // polling stays scoped to scans.
-                let actions = CancellableIterator::new(
-                    actions_with_checkpoint_info.actions,
-                    self.cancellation_token.clone(),
-                );
                 let (it, m) = scan_action_iter(
                     engine,
-                    actions,
+                    actions_with_checkpoint_info.actions,
                     self.state_info.clone(),
                     actions_with_checkpoint_info.checkpoint_info,
                     self.stats_options(),
