@@ -12,7 +12,7 @@ use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
     action_presence_leaf, schema_contains_file_actions, Sidecar, LOG_ADD_SCHEMA, SIDECAR_NAME,
 };
-use crate::cancellation::{CancellableIterator, CancellationTokenRef};
+use crate::cancellation::CancellationTokenRef;
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -1221,11 +1221,6 @@ impl LogSegment {
                 )?,
             _ => return Ok(vec![]),
         };
-
-        // Unlike the checkpoint/commit reads that feed the wrapped scan-action stream, this loop
-        // consumes batches locally, so wrap it to poll the token between batches even against an
-        // engine whose reader ignores it.
-        let batches = CancellableIterator::new(batches, cancellation_token.cloned());
 
         // Extract sidecar file references
         let mut visitor = SidecarVisitor::default();

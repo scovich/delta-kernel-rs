@@ -18,7 +18,7 @@ use itertools::Itertools;
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 
-use crate::cancellation::{check_cancelled, CancellableIterator, CancellationTokenRef};
+use crate::cancellation::{check_cancelled, CancellationTokenRef};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
 use crate::path::{
@@ -107,11 +107,7 @@ pub(crate) fn list_delta_log_from_storage(
             Ok(path) => path.version <= end_version,
             Err(_) => true,
         });
-    // Wrap the filtered pipeline so cancellation is checked as the iterator is consumed, outside
-    // the version `take_while` above. Checked inside, a cancelled listing would end with `None` and
-    // be indistinguishable from a complete one; outside, it surfaces as a terminal
-    // `Error::Cancelled`.
-    Ok(CancellableIterator::new(files, cancellation_token.cloned()))
+    Ok(files)
 }
 
 /// Groups all checkpoint parts according to the checkpoint they belong to.
