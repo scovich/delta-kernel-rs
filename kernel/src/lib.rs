@@ -91,7 +91,6 @@ pub mod commit_range;
 pub mod committer;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 mod content_tree;
-#[allow(unused)]
 pub mod coroutine;
 #[cfg(feature = "internal-api")]
 pub mod crc;
@@ -667,9 +666,10 @@ pub trait StorageHandler: AsAny {
 
     /// Cancellation-aware variant of [`read_files`](Self::read_files).
     ///
-    /// When `cancellation_token` is `Some`, an engine may race its I/O against the token and
-    /// terminate the returned iterator with [`Error::Cancelled`] once cancellation is observed,
-    /// rather than reading every file slice to completion.
+    /// When `cancellation_token` is `Some`, the returned iterator must remain cancellation-aware:
+    /// once cancellation is observed, it must yield [`Error::Cancelled`] and then end rather than
+    /// continuing or reporting normal exhaustion. An engine may also race in-flight I/O against
+    /// the token.
     ///
     /// Kernel is responsible to propagate connector-provided cancellation tokens from public entry
     /// points to calls of this function. Engines are responsible to honor a cancellation promptly;
@@ -762,9 +762,10 @@ pub trait JsonHandler: AsAny {
 
     /// Cancellation-aware variant of [`read_json_files`](Self::read_json_files).
     ///
-    /// When `cancellation_token` is `Some`, an engine may race its I/O against the token and
-    /// terminate the returned iterator with [`Error::Cancelled`] once cancellation is observed,
-    /// rather than reading every file to completion.
+    /// When `cancellation_token` is `Some`, the returned iterator must remain cancellation-aware:
+    /// once cancellation is observed, it must yield [`Error::Cancelled`] and then end rather than
+    /// continuing or reporting normal exhaustion. An engine may also race in-flight I/O against
+    /// the token.
     ///
     /// Kernel is responsible to propagate connector-provided cancellation tokens from public entry
     /// points to calls of this function. Engines are responsible to honor a cancellation promptly;
@@ -1011,9 +1012,10 @@ pub trait ParquetHandler: AsAny {
 
     /// Cancellation-aware variant of [`read_parquet_files`](Self::read_parquet_files).
     ///
-    /// When `cancellation_token` is `Some`, an engine may race its I/O against the token and
-    /// terminate the returned iterator with [`Error::Cancelled`] once cancellation is observed,
-    /// rather than reading every file to completion.
+    /// When `cancellation_token` is `Some`, the returned iterator must remain cancellation-aware:
+    /// once cancellation is observed, it must yield [`Error::Cancelled`] and then end rather than
+    /// continuing or reporting normal exhaustion. An engine may also race in-flight I/O against
+    /// the token.
     ///
     /// Kernel is responsible to propagate connector-provided cancellation tokens from public entry
     /// points to calls of this function. Engines are responsible to honor a cancellation promptly;

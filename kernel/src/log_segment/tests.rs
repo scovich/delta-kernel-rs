@@ -210,7 +210,7 @@ fn collect_projected_adds(
     engine: &dyn Engine,
 ) -> DeltaResult<(usize, Vec<String>)> {
     let actions = log_segment
-        .read_actions_with_projected_checkpoint_actions(
+        .read_actions_with_projected_checkpoint_actions_with_engine(
             engine,
             COMMIT_READ_SCHEMA.clone(),
             CHECKPOINT_READ_SCHEMA.clone(),
@@ -4916,7 +4916,7 @@ async fn read_actions_with_null_map_values(
     // Use all_actions_schema to cover sidecar and checkpointMetadata (checkpoint-only actions).
     let action_schema = get_all_actions_schema().clone();
     let action_batches = log_segment
-        .read_actions(&engine, action_schema)
+        .read_actions_with_engine(&engine, action_schema)
         .expect("read_actions should succeed");
 
     // Iterate batches and verify the map value field is nullable.
@@ -4995,7 +4995,8 @@ fn test_commit_phase_processes_commits() -> Result<(), Box<dyn std::error::Error
     let log_segment = snapshot.log_segment();
 
     let schema = COMMIT_READ_SCHEMA.clone();
-    let commit_actions = log_segment.read_commit_actions(engine.as_ref(), schema, None)?;
+    let commit_actions =
+        log_segment.read_commit_actions_with_engine(engine.as_ref(), schema, None)?;
 
     let mut file_paths = vec![];
     for result in commit_actions {

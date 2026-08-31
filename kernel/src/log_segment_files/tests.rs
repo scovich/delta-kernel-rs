@@ -5,14 +5,18 @@ use rstest::rstest;
 use url::Url;
 
 use super::*;
+use crate::coroutine::engine::{drive_storage, EngineConnector};
 use crate::engine::sync::SyncEngine;
+use crate::engine::test_delegating::DelegatingEngine;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path as ObjectPath;
 use crate::object_store::ObjectStoreExt as _;
 use crate::path::tests::multipart_checkpoint_name;
 use crate::unit_test_utils::TestCancellationToken;
-use crate::{DeltaResultIteratorStatic, Engine as _, FileMeta, StorageHandler};
+use crate::{
+    CancellationTokenRef, DeltaResultIteratorStatic, Engine as _, FileMeta, StorageHandler,
+};
 
 // size markers used to identify commit sources in tests
 const FILESYSTEM_SIZE_MARKER: u64 = 10;
@@ -205,14 +209,10 @@ fn list(
     start_version: Option<Version>,
     end_version: Option<Version>,
 ) -> DeltaResult<LogSegmentFiles> {
-    LogSegmentFiles::list(
-        storage,
-        log_root,
-        log_tail,
-        start_version,
-        end_version,
-        None,
-    )
+    let log_root = log_root.clone();
+    drive_storage(storage, None, async move |channel| {
+        LogSegmentFiles::list(&channel, &log_root, log_tail, start_version, end_version).await
+    })
 }
 
 fn list_commits(
@@ -222,14 +222,11 @@ fn list_commits(
     start_version: Option<Version>,
     end_version: Option<Version>,
 ) -> DeltaResult<LogSegmentFiles> {
-    LogSegmentFiles::list_commits(
-        storage,
-        log_root,
-        log_tail,
-        start_version,
-        end_version,
-        None,
-    )
+    let log_root = log_root.clone();
+    drive_storage(storage, None, async move |channel| {
+        LogSegmentFiles::list_commits(&channel, &log_root, log_tail, start_version, end_version)
+            .await
+    })
 }
 
 fn list_with_checkpoint_hint(
@@ -239,14 +236,18 @@ fn list_with_checkpoint_hint(
     log_tail: Vec<ParsedLogPath>,
     end_version: Option<Version>,
 ) -> DeltaResult<LogSegmentFiles> {
-    LogSegmentFiles::list_with_checkpoint_hint(
-        checkpoint_hint,
-        storage,
-        log_root,
-        log_tail,
-        end_version,
-        None,
-    )
+    let checkpoint_hint = checkpoint_hint.clone();
+    let log_root = log_root.clone();
+    drive_storage(storage, None, async move |channel| {
+        LogSegmentFiles::list_with_checkpoint_hint(
+            &checkpoint_hint,
+            &channel,
+            &log_root,
+            log_tail,
+            end_version,
+        )
+        .await
+    })
 }
 
 fn list_with_backward_checkpoint_scan(
@@ -255,13 +256,16 @@ fn list_with_backward_checkpoint_scan(
     log_tail: Vec<ParsedLogPath>,
     end_version: Version,
 ) -> DeltaResult<LogSegmentFiles> {
-    LogSegmentFiles::list_with_backward_checkpoint_scan(
-        storage,
-        log_root,
-        log_tail,
-        end_version,
-        None,
-    )
+    let log_root = log_root.clone();
+    drive_storage(storage, None, async move |channel| {
+        LogSegmentFiles::list_with_backward_checkpoint_scan(
+            &channel,
+            &log_root,
+            log_tail,
+            end_version,
+        )
+        .await
+    })
 }
 
 /// Helper to call `LogSegmentFiles::list()` and destructure the result for assertions.
@@ -1869,8 +1873,9 @@ fn precancelled_token_stops_listing_before_any_storage_call() {
     let (log_root, pulled, storage) = finite_listing_handler(100);
 
     let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
-
-    let result = list_delta_log_from_storage(&storage, &log_root, 0, Version::MAX, Some(&token));
+    let result = drive_storage(&storage, Some(token), async move |channel| {
+        LogSegmentFiles::list(&channel, &log_root, vec![], Some(0), Some(Version::MAX)).await
+    });
     assert!(matches!(result, Err(Error::Cancelled)));
     assert_eq!(pulled.load(Ordering::Relaxed), 0);
 }
@@ -1884,9 +1889,12 @@ fn mid_listing_cancellation_yields_terminal_error_not_silent_truncation() {
 
     let token = Arc::new(TestCancellationToken::default());
     let token_ref: CancellationTokenRef = token.clone();
-    let mut iter =
-        list_delta_log_from_storage(&storage, &log_root, 0, Version::MAX, Some(&token_ref))
-            .unwrap();
+    let mut iter = EngineConnector::new(
+        &DelegatingEngine::new(Arc::new(SyncEngine::new())).with_storage_handler(Arc::new(storage)),
+    )
+    .with_cancellation_token(Some(token_ref))
+    .iterate_generator(list_delta_log_from_storage(&log_root, 0, Version::MAX))
+    .unwrap();
 
     assert!(matches!(iter.next(), Some(Ok(p)) if p.version == 0));
     assert!(matches!(iter.next(), Some(Ok(p)) if p.version == 1));
@@ -1906,11 +1914,8 @@ fn mid_listing_cancellation_yields_terminal_error_not_silent_truncation() {
 fn listing_without_token_is_unchanged() {
     let (log_root, _pulled, storage) = finite_listing_handler(5);
 
-    let listed: Vec<_> = list_delta_log_from_storage(&storage, &log_root, 0, Version::MAX, None)
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
-    assert_eq!(listed.len(), 5);
+    let listed = list(&storage, &log_root, vec![], Some(0), Some(Version::MAX)).unwrap();
+    assert_eq!(listed.ascending_commit_files.len(), 5);
 }
 
 /// An iterator that yields nothing but cancels `token` the instant it is polled (i.e. as the
@@ -1986,14 +1991,10 @@ fn backward_scan_checks_cancellation_between_windows() {
         list_calls: list_calls.clone(),
     };
     let token_ref: CancellationTokenRef = token;
-
-    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
-        &storage,
-        &log_root,
-        vec![],
-        5_000,
-        Some(&token_ref),
-    );
+    let result = drive_storage(&storage, Some(token_ref), async move |channel| {
+        LogSegmentFiles::list_with_backward_checkpoint_scan(&channel, &log_root, vec![], 5_000)
+            .await
+    });
     assert!(matches!(result, Err(Error::Cancelled)));
     assert_eq!(list_calls.load(Ordering::Relaxed), 1);
 }

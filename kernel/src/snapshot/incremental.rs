@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tracing::instrument;
 
 use super::{IncrementalReplay, Snapshot};
-use crate::cancellation::CancellationTokenRef;
+use crate::coroutine::Channel;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::{
@@ -17,7 +17,7 @@ use crate::metrics::{
 };
 use crate::path::ParsedLogPath;
 use crate::table_configuration::TableConfiguration;
-use crate::{DeltaResult, Engine, Error, Version};
+use crate::{DeltaResult, Error, Version};
 
 /// The assembled outcome of the listing phase of an incremental update. Listing/assembly
 /// failures surface as `Err` from [`Snapshot::build_new_segment`], not a variant here.
@@ -100,20 +100,18 @@ impl Snapshot {
     /// [`SnapshotBuilder::at_version`]: crate::snapshot::SnapshotBuilder::at_version
     /// [`SnapshotBuilder::with_max_catalog_version`]: crate::snapshot::SnapshotBuilder::with_max_catalog_version
     #[allow(clippy::too_many_arguments)]
-    #[instrument(err, fields(version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(engine, target_version, cancellation_token))]
-    pub(super) fn try_new_from(
+    #[instrument(err, fields(version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(channel, target_version))]
+    pub(super) async fn try_new_from(
+        channel: &Channel,
         existing_snapshot: Arc<Snapshot>,
         log_tail: Vec<ParsedLogPath>,
-        engine: &dyn Engine,
-        target_version: impl Into<Option<Version>>,
+        target_version: Option<Version>,
         metric_context: SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
-        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Arc<Self>> {
-        let existing_log_segment = &existing_snapshot.log_segment;
         let existing_snapshot_version = existing_snapshot.version();
-        let requested_version = target_version.into();
+        let requested_version = target_version;
         if let Some(requested_version) = requested_version {
             tracing::Span::current().record("version", requested_version);
             // Case A: re-requesting the same version.
@@ -134,55 +132,56 @@ impl Snapshot {
         // Assemble the new segment as one fallible unit so a load failure emits exactly once, via
         // the `inspect_err` below.
         let segment_load_start = std::time::Instant::now();
-        let (combined_log_segment, new_end_version) = match Self::build_new_segment(
-            engine,
-            existing_log_segment,
-            existing_snapshot_version,
-            log_tail,
-            requested_version,
-            cancellation_token,
-        )
-        .inspect_err(|_| emit_log_segment_load_failure(&metric_context))?
-        {
-            NewSegment::Unchanged => {
-                return Self::reuse_promoting_built_as_latest(&existing_snapshot, built_as_latest);
-            }
-            NewSegment::Rebuild(new_log_segment) => {
-                emit_log_segment_load(
-                    &metric_context,
-                    &new_log_segment,
-                    segment_load_start.elapsed(),
-                );
-                let snapshot = Self::try_new_from_log_segment(
-                    existing_snapshot.table_root().clone(),
-                    new_log_segment,
-                    engine,
-                    metric_context,
-                    incremental_replay,
-                    built_as_latest,
-                );
-                return Ok(Arc::new(snapshot?));
-            }
-            NewSegment::Combined(combined_log_segment) => {
-                emit_log_segment_load(
-                    &metric_context,
-                    &combined_log_segment,
-                    segment_load_start.elapsed(),
-                );
-                let new_end_version = combined_log_segment.end_version;
-                (combined_log_segment, new_end_version)
-            }
-        };
+        let (combined_log_segment, new_end_version) =
+            match Self::build_new_segment(channel, &existing_snapshot, log_tail, requested_version)
+                .await
+                .inspect_err(|_| emit_log_segment_load_failure(&metric_context))?
+            {
+                NewSegment::Unchanged => {
+                    return Self::reuse_promoting_built_as_latest(
+                        &existing_snapshot,
+                        built_as_latest,
+                    );
+                }
+                NewSegment::Rebuild(new_log_segment) => {
+                    emit_log_segment_load(
+                        &metric_context,
+                        &new_log_segment,
+                        segment_load_start.elapsed(),
+                    );
+                    let snapshot = Self::try_new_from_log_segment(
+                        channel,
+                        existing_snapshot.table_root().clone(),
+                        new_log_segment,
+                        metric_context,
+                        incremental_replay,
+                        built_as_latest,
+                    )
+                    .await;
+                    return Ok(Arc::new(snapshot?));
+                }
+                NewSegment::Combined(combined_log_segment) => {
+                    emit_log_segment_load(
+                        &metric_context,
+                        &combined_log_segment,
+                        segment_load_start.elapsed(),
+                    );
+                    let new_end_version = combined_log_segment.end_version;
+                    (combined_log_segment, new_end_version)
+                }
+            };
 
         // Advance the latest available base (the existing snapshot's in-memory CRC, or a newer
         // on-disk CRC the combined segment carries) to the new end version, subject to
         // `incremental_replay`. Time from here so the CRC-advance cost lands in the P&M duration,
         // matching the fresh path.
         let pm_start = std::time::Instant::now();
-        let base_crc =
-            combined_log_segment.pick_latest_base_crc(engine, existing_snapshot.base_crc());
+        let base_crc = combined_log_segment
+            .pick_latest_base_crc(channel, existing_snapshot.base_crc())
+            .await;
         let crc_at_version = combined_log_segment
-            .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
+            .try_build_crc_within_budget(channel, base_crc.as_ref(), incremental_replay)
+            .await
             .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?;
 
         let existing_table_config = existing_snapshot.table_configuration();
@@ -206,7 +205,8 @@ impl Snapshot {
                     .filter(|c| c.version > existing_snapshot_version);
                 combined_log_segment
                     .segment_after_version(existing_snapshot_version)
-                    .read_protocol_metadata_opt(engine, newer_base)
+                    .read_protocol_metadata_opt(channel, newer_base)
+                    .await
                     .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?
             }
         };
@@ -235,28 +235,27 @@ impl Snapshot {
     /// List the log after the existing snapshot and assemble the new [`NewSegment`] for this
     /// incremental update. Returns a non-failure [`NewSegment`] on the C/D.1/E/F cases; a
     /// propagated `Err` is a genuine listing/assembly failure.
-    fn build_new_segment(
-        engine: &dyn Engine,
-        existing_log_segment: &LogSegment,
-        existing_snapshot_version: Version,
+    async fn build_new_segment(
+        channel: &Channel,
+        existing_snapshot: &Snapshot,
         log_tail: Vec<ParsedLogPath>,
         requested_version: Option<Version>,
-        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<NewSegment> {
+        let existing_log_segment = &existing_snapshot.log_segment;
+        let existing_snapshot_version = existing_snapshot.version();
         let log_root = existing_log_segment.log_root.clone();
-        let storage = engine.storage_handler();
 
         // Start listing just after the previous segment's checkpoint, if any.
         let listing_start = existing_log_segment.checkpoint_version.unwrap_or(0) + 1;
 
         let new_listed_files = LogSegmentFiles::list(
-            storage.as_ref(),
+            channel,
             &log_root,
             log_tail,
             Some(listing_start),
             requested_version,
-            cancellation_token,
-        )?;
+        )
+        .await?;
 
         // NB: we need to check both checkpoints and commits since we filter commits at and below
         // the checkpoint version. Example: if we have a checkpoint + commit at version 1, the log
@@ -489,6 +488,7 @@ mod tests {
     use super::*;
     use crate::arrow::array::StringArray;
     use crate::arrow::record_batch::RecordBatch;
+    use crate::coroutine::engine::EngineConnector;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::metrics::{
@@ -503,7 +503,7 @@ mod tests {
     use crate::unit_test_utils::{
         install_thread_local_metrics_reporter, string_array_to_engine_data, CapturingReporter,
     };
-    use crate::SnapshotRef;
+    use crate::{Engine, SnapshotRef};
 
     // ============================================================================
     // Helpers
@@ -519,16 +519,18 @@ mod tests {
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
     ) -> DeltaResult<SnapshotRef> {
-        Snapshot::try_new_from(
-            existing_snapshot,
-            log_tail,
-            engine,
-            target_version,
-            metric_context,
-            incremental_replay,
-            built_as_latest,
-            None,
-        )
+        EngineConnector::run_with(engine, async move |channel| {
+            Snapshot::try_new_from(
+                &channel,
+                existing_snapshot,
+                log_tail,
+                target_version,
+                metric_context,
+                incremental_replay,
+                built_as_latest,
+            )
+            .await
+        })
     }
 
     // Action builders for incremental-snapshot tests. Centralized so commit setup stays

@@ -11,12 +11,13 @@ use serde_json::{json, Value};
 use test_utils::{assert_result_error_with_message, delta_path_for_version};
 use url::Url;
 
+use super::for_snapshot_from_storage;
 use crate::actions::{DomainMetadata, Format, Metadata, Protocol, SetTransaction};
+use crate::coroutine::engine::EngineConnector;
 use crate::crc::{
-    try_read_crc_file, Crc, DomainMetadataState, FileSizeHistogram, SetTransactionState,
+    try_read_crc_file_with_engine, Crc, DomainMetadataState, FileSizeHistogram, SetTransactionState,
 };
 use crate::engine::sync::SyncEngine;
-use crate::log_segment::for_snapshot_from_storage;
 use crate::object_store::memory::InMemory;
 use crate::object_store::ObjectStoreExt as _;
 use crate::path::ParsedLogPath;
@@ -435,7 +436,10 @@ impl BuiltCrcTest {
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
             for_snapshot_from_storage(storage.as_ref(), log_root, vec![], None, None)?;
-        log_segment.build_crc_from_base(&self.engine, base)
+        let base = base.clone();
+        EngineConnector::run_with(&self.engine, async move |channel| {
+            log_segment.build_crc_from_base(&channel, &base).await
+        })
     }
 
     /// Run `pick_latest_base_crc` against a directly-listed `LogSegment`, using `in_memory_base`.
@@ -447,14 +451,18 @@ impl BuiltCrcTest {
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
             for_snapshot_from_storage(storage.as_ref(), log_root, vec![], None, None)?;
-        Ok(log_segment
-            .pick_latest_base_crc(&self.engine, in_memory_base)
-            .map(|c| c.version))
+        let in_memory_base = in_memory_base.cloned();
+        EngineConnector::run_with(&self.engine, async move |channel| {
+            Ok(log_segment
+                .pick_latest_base_crc(&channel, in_memory_base.as_ref())
+                .await
+                .map(|c| c.version))
+        })
     }
 
     /// Read the on-disk CRC at `version` from this test's log.
     fn read_crc_at(&self, version: u64) -> DeltaResult<Crc> {
-        try_read_crc_file(
+        try_read_crc_file_with_engine(
             &self.engine,
             &ParsedLogPath::create_parsed_crc(&self.url, version),
         )
