@@ -1,11 +1,25 @@
 //! Paginated file-listing requests.
 
+use delta_kernel_derive::internal_api;
 use url::Url;
 
 use super::core::{PendingPageRequest, PendingRequest};
 use super::{Channel, Cursor, Page, PageRequest, PagedOperation};
+use crate::path::may_begin_listable_log_path;
 use crate::{DeltaResult, FileMeta, Version};
 
+/// Default number of listing entries in one forward-listing page.
+#[internal_api]
+pub(crate) const DEFAULT_FORWARD_LISTING_PAGE_SIZE: usize = 1024;
+
+/// Default number of Delta versions covered by one backward-listing request.
+#[internal_api]
+pub(crate) const DEFAULT_BACKWARD_LISTING_WINDOW_SIZE: Version = 1000;
+
+/// Selects descendants of `prefix` whose full URLs are in the exclusive range `(low, high)`.
+///
+/// Comparisons use UTF-8 byte order. A bare-version bound sorts before files carrying that version
+/// prefix.
 pub struct ListingBounds {
     pub prefix: Url,
     pub low: Url,
@@ -35,6 +49,75 @@ pub struct BackwardListingResult {
     pub known_version_boundary: bool,
 }
 
+/// URL bounds and continuation state for one backward-listing window.
+#[internal_api]
+pub(crate) struct BackwardListingWindow {
+    pub low: Url,
+    pub high: Url,
+    /// Upper version for the next lower window, or `None` when this window reaches the range
+    /// start.
+    pub next_high: Option<Version>,
+}
+
+/// Select the next descending version window within `bounds`.
+///
+/// `high` is the current exclusive upper version. `window_size` controls how many versions the
+/// returned window spans.
+///
+/// Returns an error if a bound does not end in a version or `window_size` is zero.
+#[internal_api]
+pub(crate) fn backward_listing_window(
+    bounds: &ListingBounds,
+    high: Version,
+    window_size: Version,
+) -> DeltaResult<BackwardListingWindow> {
+    if window_size == 0 {
+        return Err(crate::Error::generic(
+            "backward listing window size must be greater than zero",
+        ));
+    }
+    let start = version_from_listing_bound(&bounds.low)?;
+    let lower = high.saturating_sub(window_size).max(start);
+    Ok(BackwardListingWindow {
+        low: bare_version_path(&bounds.prefix, lower)?,
+        high: bare_version_path(&bounds.prefix, high)?,
+        next_high: (lower > start).then_some(lower),
+    })
+}
+
+/// Return whether `entry` remains within a bounded, version-named log listing.
+///
+/// Errors remain within bounds so the listing consumer can observe them.
+#[internal_api]
+pub(crate) fn is_within_listing_bounds(
+    entry: &DeltaResult<FileMeta>,
+    prefix: &Url,
+    high: &Url,
+) -> bool {
+    let Ok(entry) = entry else {
+        return true;
+    };
+    let path = entry.location.as_str();
+    path < high.as_str()
+        && path
+            .strip_prefix(prefix.as_str())
+            .is_none_or(may_begin_listable_log_path)
+}
+
+/// Parse the final path segment of a listing bound as a Delta version.
+///
+/// Returns an error if the URL has no final segment or that segment is not a version.
+#[internal_api]
+pub(crate) fn version_from_listing_bound(bound: &Url) -> DeltaResult<Version> {
+    bound
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .ok_or_else(|| crate::Error::internal_error("listing bound has no path segment"))?
+        .parse()
+        .map_err(|_| crate::Error::internal_error("listing bound is not a version"))
+}
+
+/// Map an inclusive version range to exclusive bare-version URL bounds.
 pub(crate) fn log_listing_bounds(
     log_root: &Url,
     start_version: Version,
@@ -143,5 +226,60 @@ impl<N: Send + 'static> PageRequest<N, BackwardListing> {
                 resume.resume(parent.continue_backward_listing(cursor).await)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Error;
+
+    fn bounds(start: Version, end: Version) -> ListingBounds {
+        log_listing_bounds(&Url::parse("memory:///_delta_log/").unwrap(), start, end).unwrap()
+    }
+
+    #[test]
+    fn backward_windows_descend_without_overlapping_versions() {
+        let bounds = bounds(10, 3010);
+        let first = backward_listing_window(
+            &bounds,
+            version_from_listing_bound(&bounds.high).unwrap(),
+            DEFAULT_BACKWARD_LISTING_WINDOW_SIZE,
+        )
+        .unwrap();
+        assert_eq!(first.low.path(), "/_delta_log/00000000000000002011");
+        assert_eq!(first.high.path(), "/_delta_log/00000000000000003011");
+        assert_eq!(first.next_high, Some(2011));
+
+        let last = backward_listing_window(
+            &bounds,
+            first.next_high.unwrap(),
+            DEFAULT_BACKWARD_LISTING_WINDOW_SIZE * 3,
+        )
+        .unwrap();
+        assert_eq!(last.low.path(), "/_delta_log/00000000000000000010");
+        assert_eq!(last.next_high, None);
+    }
+
+    #[test]
+    fn listing_bounds_keep_errors_and_stop_after_version_named_paths() {
+        let bounds = bounds(0, 10);
+        let error = Err(Error::generic("listing failed"));
+        assert!(is_within_listing_bounds(
+            &error,
+            &bounds.prefix,
+            &bounds.high
+        ));
+
+        let sidecar = Ok(FileMeta::new(
+            Url::parse("memory:///_delta_log/_sidecars/part.parquet").unwrap(),
+            0,
+            0,
+        ));
+        assert!(!is_within_listing_bounds(
+            &sidecar,
+            &bounds.prefix,
+            &bounds.high
+        ));
     }
 }

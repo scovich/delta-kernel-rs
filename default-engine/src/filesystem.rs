@@ -44,7 +44,7 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
 /// returns the raw stream.
 ///
 /// [`MeteredStorageHandler`]: delta_kernel::metrics::MeteredStorageHandler
-async fn list_from_impl(
+pub(crate) async fn list_from_impl(
     store: Arc<DynObjectStore>,
     path: Url,
 ) -> DeltaResult<BoxStream<'static, DeltaResult<FileMeta>>> {
@@ -93,7 +93,7 @@ async fn list_from_impl(
 }
 
 /// Native async implementation for read_files
-async fn read_files_impl(
+pub(crate) async fn read_files_impl(
     store: Arc<DynObjectStore>,
     files: Vec<FileSlice>,
     readahead: usize,
@@ -152,7 +152,7 @@ async fn copy_atomic_impl(
 }
 
 /// Native async implementation for put
-async fn put_impl(
+pub(crate) async fn put_impl(
     store: Arc<DynObjectStore>,
     path: Path,
     data: Bytes,

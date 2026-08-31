@@ -1,10 +1,19 @@
+//! Reference connector that serves coroutine requests through [`Engine`] handlers.
+//!
+//! Engine iterators travel in boxed cursors. [`drive_storage`] serves only listing and small-file
+//! requests.
+
 use std::any::Any;
 use std::sync::Arc;
 
 use bytes::Bytes;
+#[cfg(test)]
 use url::Url;
 
-use super::listing::bare_version_path;
+use super::listing::{
+    backward_listing_window, is_within_listing_bounds, version_from_listing_bound,
+    DEFAULT_BACKWARD_LISTING_WINDOW_SIZE, DEFAULT_FORWARD_LISTING_PAGE_SIZE,
+};
 #[cfg(feature = "declarative-plans")]
 use super::ExecutePlan;
 use super::{
@@ -14,7 +23,6 @@ use super::{
 };
 use crate::cancellation::{check_cancelled, CancellationTokenRef};
 use crate::engine_data::EngineData;
-use crate::path::may_begin_listable_log_path;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::PlanExecutor;
 use crate::{
@@ -22,11 +30,11 @@ use crate::{
     FileSlice, JsonHandler, ParquetHandler, StorageHandler, Version,
 };
 
-#[cfg(test)]
-const FORWARD_LISTING_PAGE_SIZE: usize = 2;
-#[cfg(not(test))]
-const FORWARD_LISTING_PAGE_SIZE: usize = 1024;
-const BACKWARD_LISTING_WINDOW_SIZE: Version = 1000;
+const FORWARD_LISTING_PAGE_SIZE: usize = if cfg!(test) {
+    2
+} else {
+    DEFAULT_FORWARD_LISTING_PAGE_SIZE
+};
 
 type ListingIterator = DeltaResultIteratorStatic<FileMeta>;
 type EngineDataIterator = FileDataReadResultIterator;
@@ -275,12 +283,10 @@ impl EnginePagination<ForwardListing> for StorageConnector<'_> {
     const DESCRIPTION: &'static str = "forward listing";
 
     fn initialize(&self, ForwardListing(bounds): ForwardListing) -> DeltaResult<Self::State> {
-        let prefix = bounds.prefix.to_string();
-        let high = bounds.high.to_string();
         let listing = self
             .storage
             .list_from_with_cancellation(&bounds.low, self.cancellation_token.clone())?
-            .take_while(move |entry| within_listing_bounds(entry, &prefix, &high));
+            .take_while(move |entry| is_within_listing_bounds(entry, &bounds.prefix, &bounds.high));
         Ok(Box::new(listing))
     }
 
@@ -304,28 +310,21 @@ impl EnginePagination<BackwardListing> for StorageConnector<'_> {
 
     fn initialize(&self, BackwardListing(bounds): BackwardListing) -> DeltaResult<Self::State> {
         Ok(BackwardListingState {
-            high: version_bound(&bounds.high)?,
+            high: version_from_listing_bound(&bounds.high)?,
             bounds: Box::new(*bounds),
         })
     }
 
     fn next_page(&self, state: Self::State) -> DeltaResult<Page<BackwardListing>> {
         let BackwardListingState { bounds, high } = state;
-        let start = version_bound(&bounds.low)?;
-        let lower = high.saturating_sub(BACKWARD_LISTING_WINDOW_SIZE).max(start);
-        let lower_url = bare_version_path(&bounds.prefix, lower)?;
-        let upper_url = bare_version_path(&bounds.prefix, high)?;
-        let prefix = bounds.prefix.as_str();
+        let window = backward_listing_window(&bounds, high, DEFAULT_BACKWARD_LISTING_WINDOW_SIZE)?;
         let entries = self
             .storage
-            .list_from_with_cancellation(&lower_url, self.cancellation_token.clone())?
-            .take_while(|entry| within_listing_bounds(entry, prefix, upper_url.as_str()))
+            .list_from_with_cancellation(&window.low, self.cancellation_token.clone())?
+            .take_while(|entry| is_within_listing_bounds(entry, &bounds.prefix, &window.high))
             .collect();
-        let next = if lower > start {
-            Cursor::boxed(BackwardListingState {
-                bounds,
-                high: lower,
-            })
+        let next = if let Some(high) = window.next_high {
+            Cursor::boxed(BackwardListingState { bounds, high })
         } else {
             Cursor::exhausted()
         };
@@ -435,26 +434,6 @@ where
         None => (Vec::new(), Cursor::exhausted()),
     };
     Ok(Page { data, next })
-}
-
-fn within_listing_bounds(entry: &DeltaResult<FileMeta>, prefix: &str, high: &str) -> bool {
-    let Ok(entry) = entry else {
-        return true;
-    };
-    let path = entry.location.as_str();
-    path < high
-        && path
-            .strip_prefix(prefix)
-            .is_none_or(may_begin_listable_log_path)
-}
-
-fn version_bound(bound: &Url) -> DeltaResult<Version> {
-    bound
-        .path_segments()
-        .and_then(|mut segments| segments.next_back())
-        .ok_or_else(|| Error::internal_error("listing bound has no path segment"))?
-        .parse()
-        .map_err(|_| Error::internal_error("listing bound is not a version"))
 }
 
 #[cfg(test)]
