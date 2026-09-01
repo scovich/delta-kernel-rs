@@ -43,7 +43,8 @@ impl PagedOperation for BackwardListing {
 /// One backward-listing page with entries in ascending lexicographic order.
 pub struct BackwardListingResult {
     pub entries: Vec<DeltaResult<FileMeta>>,
-    /// True only if no later, lower page can contain another file for any Delta log version here.
+    /// True if all file version numbers in all future pages will be strictly lower than the lowest
+    /// file version seen so far.
     ///
     /// False is conservative and always valid.
     pub known_version_boundary: bool,
