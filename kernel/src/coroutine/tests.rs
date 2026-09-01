@@ -1,6 +1,69 @@
 use std::future::pending;
+use std::sync::Arc;
+
+use rstest::rstest;
+use tracing::field::Empty;
+use tracing::info_span;
 
 use super::*;
+use crate::metrics::MetricEvent;
+use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+
+/// Connector action after the toy workflow's single `ReadSmallFile` request.
+#[derive(Clone, Copy)]
+enum ResumeOutcome {
+    Ok,
+    Err,
+    Drop,
+}
+
+#[rstest]
+#[case::ok(ResumeOutcome::Ok)]
+#[case::err(ResumeOutcome::Err)]
+#[case::drop(ResumeOutcome::Drop)]
+fn reporting_span_tracks_single_resume_outcome(#[case] outcome: ResumeOutcome) {
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    {
+        // Any lifecycle span with `report` works; this is not a CRC-read test.
+        let span = info_span!("crc_read_completed", report = Empty);
+        let _enter = span.enter();
+        let location = Url::parse("memory:///toy").unwrap();
+        let Workflow::Request(Request::ReadSmallFile(_, resume)) =
+            Workflow::start(async move |channel| channel.read_small_file(location, None).await)
+                .unwrap()
+        else {
+            panic!("toy workflow should suspend once on ReadSmallFile");
+        };
+        match outcome {
+            ResumeOutcome::Ok => {
+                resume.resume(Ok(Bytes::from_static(b"ok"))).unwrap();
+            }
+            ResumeOutcome::Err => {
+                let _ = resume.resume(Err(Error::generic("connector failed the read")));
+            }
+            ResumeOutcome::Drop => drop(resume),
+        }
+    }
+
+    let events = reporter.events();
+    let success = events
+        .iter()
+        .any(|e| matches!(e, MetricEvent::CrcReadSuccess(_)));
+    let failure = events
+        .iter()
+        .any(|e| matches!(e, MetricEvent::CrcReadFailure));
+    match outcome {
+        ResumeOutcome::Ok => {
+            assert!(success, "expected CrcReadSuccess; got: {events:?}");
+            assert!(!failure, "did not expect CrcReadFailure; got: {events:?}");
+        }
+        ResumeOutcome::Err | ResumeOutcome::Drop => {
+            assert!(failure, "expected CrcReadFailure; got: {events:?}");
+            assert!(!success, "did not expect CrcReadSuccess; got: {events:?}");
+        }
+    }
+}
 
 #[test]
 fn workflow_output_is_independent_of_request_response_type() {

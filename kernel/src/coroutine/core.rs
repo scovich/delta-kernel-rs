@@ -1,6 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::task::{Context, Poll, Waker};
 
 use bytes::Bytes;
@@ -253,11 +253,7 @@ impl<Out, In> Exchange<Out, In> {
     /// Connector-side: Claim the request kernel offered when suspending a workflow
     pub(super) fn claim(&self) -> DeltaResult<Out> {
         // WARNING: Never acquire another lock or invoke external code while holding this guard.
-        let Ok(mut state) = self.0.lock() else {
-            return Err(Error::internal_error(
-                "coroutine exchange mutex was poisoned",
-            ));
-        };
+        let mut state = self.lock()?;
         match std::mem::replace(&mut *state, ExchangeState::InFlight) {
             ExchangeState::Outbound(outbound) => Ok(outbound),
             previous => {
@@ -272,11 +268,7 @@ impl<Out, In> Exchange<Out, In> {
     /// Connector-side: Offer a response to kernel just before resuming the workflow
     pub(super) fn respond(&self, response: DeltaResult<In>) -> DeltaResult<()> {
         // WARNING: Never acquire another lock or invoke external code while holding this guard.
-        let Ok(mut state) = self.0.lock() else {
-            return Err(Error::internal_error(
-                "coroutine exchange mutex was poisoned",
-            ));
-        };
+        let mut state = self.lock()?;
         if !matches!(*state, ExchangeState::InFlight) {
             return Err(Error::internal_error(
                 "coroutine exchange was not awaiting a response",
@@ -284,6 +276,13 @@ impl<Out, In> Exchange<Out, In> {
         }
         *state = ExchangeState::Inbound(response);
         Ok(())
+    }
+
+    // WARNING: Never acquire another lock or invoke external code while holding this guard.
+    fn lock(&self) -> DeltaResult<MutexGuard<'_, ExchangeState<Out, In>>> {
+        self.0
+            .lock()
+            .map_err(|_| Error::internal_error("coroutine exchange mutex was poisoned"))
     }
 }
 
@@ -309,7 +308,8 @@ impl<Out: Send, In: Send> Future for Wait<Out, In> {
     type Output = DeltaResult<In>;
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let Ok(mut state) = self.0 .0.lock() else {
+        // WARNING: Never acquire another lock or invoke external code while holding this guard.
+        let Ok(mut state) = self.0.lock() else {
             return Poll::Ready(Err(Error::internal_error(
                 "coroutine exchange mutex was poisoned",
             )));
@@ -323,6 +323,27 @@ impl<Out: Send, In: Send> Future for Wait<Out, In> {
             ExchangeState::Complete => Poll::Ready(Err(Error::internal_error(
                 "coroutine exchange future was polled after completion",
             ))),
+        }
+    }
+}
+
+/// An instrumented `Future` enters its owning span both on `poll` and on `drop`. The former ensures
+/// that kernel's work is correctly attributed to the span that created the workflow; the latter
+/// (here) lets us mark an abandoned workflow as failed (otherwise, it defaults to success). This
+/// works because `poll` always stores `Complete` before returning `Ready`; any other state means
+/// the `Task` (which owns this `Wait`) was dropped while still suspended.
+impl<Out, In> Drop for Wait<Out, In> {
+    fn drop(&mut self) {
+        // WARNING: We must drop the lock before invoking other code.
+        let completed = self
+            .0
+            .lock()
+            .is_ok_and(|state| matches!(*state, ExchangeState::Complete));
+        if !completed {
+            tracing::error!(
+                error = "abandoned",
+                "kernel coroutine was abandoned while suspended"
+            );
         }
     }
 }
