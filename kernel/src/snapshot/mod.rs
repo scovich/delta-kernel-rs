@@ -793,18 +793,24 @@ impl Snapshot {
             InCommitTimestampSource::Resolved(timestamp) => return Ok(timestamp),
             InCommitTimestampSource::Commit(commit) => commit,
         };
-        let page = channel
+        let mut page = channel
             .start_read_json(ReadFileFormatStart {
                 files: vec![commit.location.clone()],
                 physical_schema: InCommitTimestampVisitor::schema(),
                 predicate: None,
             })
             .await?;
-        let batch = page
-            .data
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::generic("Commit file contains no actions"))?;
+        // CommitInfo is the first action, so the first batch is enough. Empty pages with a live
+        // cursor are not exhaustion and must be continued.
+        let batch = loop {
+            if let Some(batch) = page.data.into_iter().next() {
+                break batch;
+            }
+            let Some(next) = page.next else {
+                return Err(Error::generic("Commit file contains no actions"));
+            };
+            page = channel.continue_read_json(next).await?;
+        };
         let mut visitor = InCommitTimestampVisitor::default();
         visitor.visit_rows_of(batch.as_ref())?;
         visitor
@@ -1403,6 +1409,7 @@ mod tests {
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::FileSystemCommitter;
     use crate::coroutine::engine::drive_storage;
+    use crate::coroutine::{Cursor, CursorState, Page, PageRequest, Request};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -2190,6 +2197,62 @@ mod tests {
             let ict_ts = snapshot.get_in_commit_timestamp(&engine)?.unwrap();
             assert_eq!(ts, ict_ts);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn ict_channel_read_continues_past_empty_pages() -> DeltaResult<()> {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = Url::from_directory_path(temp_dir.path())
+            .unwrap()
+            .to_string();
+        let engine = SyncEngine::new();
+        let schema = schema_ref! { nullable "id": INTEGER };
+        let _ = create_table(&table_path, schema, "Test/1.0")
+            .with_table_properties(vec![(ENABLE_IN_COMMIT_TIMESTAMPS, "true")])
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?;
+        let snapshot = Snapshot::builder_for(&table_path).build(&engine)?;
+        let expected = snapshot.get_in_commit_timestamp(&engine)?.unwrap();
+
+        let json_strings: StringArray = vec![format!(
+            r#"{{"commitInfo":{{"inCommitTimestamp":{expected}}}}}"#
+        )]
+        .into();
+        let mut batch = Some(engine.json_handler().parse_json(
+            string_array_to_engine_data(json_strings),
+            InCommitTimestampVisitor::schema(),
+        )?);
+
+        let mut workflow = Workflow::start(async move |channel| {
+            snapshot
+                .get_in_commit_timestamp_with_channel(&channel)
+                .await
+        })?;
+        let timestamp = loop {
+            workflow = match workflow {
+                Workflow::Done(timestamp) => break timestamp,
+                Workflow::Request(Request::ReadJson(PageRequest::Start(_, resume))) => resume
+                    .resume(Ok(Page {
+                        data: Vec::new(),
+                        next: Some(Cursor::id(1)),
+                    }))?,
+                Workflow::Request(Request::ReadJson(PageRequest::Continue(cursor, resume))) => {
+                    assert!(matches!(cursor.into_state(), CursorState::Id(1)));
+                    resume.resume(Ok(Page {
+                        data: vec![batch.take().expect("first non-empty JSON page")],
+                        next: None,
+                    }))?
+                }
+                Workflow::Request(_) => panic!("workflow requested an unexpected operation"),
+            };
+        };
+
+        assert!(
+            batch.is_none(),
+            "empty page should have been followed by a batch"
+        );
+        assert_eq!(timestamp, Some(expected));
         Ok(())
     }
 
