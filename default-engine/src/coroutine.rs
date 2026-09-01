@@ -165,6 +165,15 @@ impl AsyncEngineConnector {
             }
             Request::ReadJson(request) => resume_paged(self, request).await,
             Request::ReadParquet(request) => resume_paged(self, request).await,
+            #[cfg(feature = "declarative-plans")]
+            Request::ExecutePlan(request) => {
+                let err = Error::unsupported("Default engine does not execute plans");
+                match request {
+                    PageRequest::Start(_, resume) => resume.resume(Err(err)),
+                    PageRequest::Prepare(_, resume) => resume.resume(Err(err)),
+                    PageRequest::Continue(_, resume) => resume.resume(Err(err)),
+                }
+            }
             Request::WriteBytes(operation, resume) => resume.resume(
                 self.write_bytes(operation.url, operation.data, operation.overwrite)
                     .await,
