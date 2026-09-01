@@ -238,9 +238,9 @@ impl LogSegment {
                         })
                         .await?;
                 }
-                if next.is_exhausted() {
+                let Some(next) = next else {
                     break;
-                }
+                };
                 page = channel.continue_plan(next).await?;
             }
             Ok(())

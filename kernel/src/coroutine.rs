@@ -65,7 +65,7 @@
 //!     // Connector resolves its cursor state and fetches the next page here.
 //!     # Ok(Page {
 //!     #     data: vec![],
-//!     #     next: Cursor::exhausted(),
+//!     #     next: None,
 //!     # })
 //! }
 //!
@@ -131,12 +131,12 @@
 //!   first page. This lets the connector begin work in the background while waiting for the first
 //!   [`PageRequest::Continue`] from kernel.
 //!
-//! Every response to a pagination request carries its data and a [`CursorState`] for
-//! continuing. Only [`CursorState::Exhausted`] ends pagination; an empty page with a live cursor
-//! does not. Connectors choose page boundaries and cursor representation; cursor payloads are
-//! opaque to kernel, forwarded blindly back to connector with each continuation request (or dropped
-//! if kernel abandoned the operation). [`CursorState::Boxed`] owns and drops in-process state while
-//! [`CursorState::Id`] is a raw (connector-managed) reference with no drop notification.
+//! Every response to a pagination request carries its data and an optional [`Cursor`] for
+//! continuing. `None` ends pagination; an empty page with a live cursor does not. Connectors choose
+//! page boundaries and cursor representation; cursor payloads are opaque to kernel, forwarded
+//! blindly back to connector with each continuation request (or dropped if kernel abandoned the
+//! operation). [`CursorState::Boxed`] owns and drops in-process state while [`CursorState::Id`] is
+//! a raw (connector-managed) reference with no drop notification.
 //!
 //! NOTE: kernel coroutines expose only one request at a time, but pagination allows kernel to
 //! expose upcoming I/O streams so connectors can begin prefetching if they want.
@@ -297,8 +297,8 @@ pub trait PagedOperation: Send + Sized + 'static {
 pub struct Page<Op: PagedOperation> {
     /// Data returned in this page.
     pub data: Op::Page,
-    /// Cursor to pass to `Continue`, or an exhausted cursor when no pages remain.
-    pub next: Cursor<Op>,
+    /// Cursor to pass to `Continue`, or `None` when no pages remain.
+    pub next: Option<Cursor<Op>>,
 }
 
 /// Opaque pagination handle typed to one operation; kernel stores it until `Continue`.
@@ -309,8 +309,6 @@ pub struct Cursor<Op: PagedOperation> {
 
 /// Type-erased connector state carried by a [`Cursor`].
 pub enum CursorState {
-    /// No pages remain.
-    Exhausted,
     /// Scalar handle, commonly for FFI; kernel is not notified when it is dropped.
     Id(i64),
     /// Owned in-process state, dropped with the cursor.
@@ -318,11 +316,6 @@ pub enum CursorState {
 }
 
 impl<Op: PagedOperation> Cursor<Op> {
-    /// Construct a cursor indicating that no pages remain.
-    pub fn exhausted() -> Self {
-        Self::from_state(CursorState::Exhausted)
-    }
-
     /// Construct a cursor from connector-defined scalar state.
     pub fn id(id: i64) -> Self {
         Self::from_state(CursorState::Id(id))
@@ -331,11 +324,6 @@ impl<Op: PagedOperation> Cursor<Op> {
     /// Construct a cursor that owns connector-defined in-process state.
     pub fn boxed(state: impl Any + Send) -> Self {
         Self::from_state(CursorState::Boxed(Box::new(state)))
-    }
-
-    /// True if this is exhausted (no pages remain).
-    pub fn is_exhausted(&self) -> bool {
-        matches!(self.state, CursorState::Exhausted)
     }
 
     /// Consume the cursor and return its connector-defined state.

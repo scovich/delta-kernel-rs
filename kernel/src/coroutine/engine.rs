@@ -292,14 +292,8 @@ impl EnginePagination<ForwardListing> for StorageConnector<'_> {
 
     fn next_page(&self, mut listing: ListingIterator) -> DeltaResult<Page<ForwardListing>> {
         let data = Vec::from_iter(listing.by_ref().take(FORWARD_LISTING_PAGE_SIZE));
-        Ok(Page {
-            next: if data.len() == FORWARD_LISTING_PAGE_SIZE {
-                Cursor::boxed(listing)
-            } else {
-                Cursor::exhausted()
-            },
-            data,
-        })
+        let next = (data.len() == FORWARD_LISTING_PAGE_SIZE).then(|| Cursor::boxed(listing));
+        Ok(Page { data, next })
     }
 }
 
@@ -323,11 +317,9 @@ impl EnginePagination<BackwardListing> for StorageConnector<'_> {
             .list_from_with_cancellation(&window.low, self.cancellation_token.clone())?
             .take_while(|entry| is_within_listing_bounds(entry, &bounds.prefix, &window.high))
             .collect();
-        let next = if let Some(high) = window.next_high {
-            Cursor::boxed(BackwardListingState { bounds, high })
-        } else {
-            Cursor::exhausted()
-        };
+        let next = window
+            .next_high
+            .map(|high| Cursor::boxed(BackwardListingState { bounds, high }));
         let data = BackwardListingResult {
             entries,
             known_version_boundary: true,
@@ -430,8 +422,8 @@ where
     Op: PagedOperation<Page = Vec<Box<dyn EngineData>>>,
 {
     let (data, next) = match reads.next().transpose()? {
-        Some(data) => (vec![data], Cursor::boxed(reads)),
-        None => (Vec::new(), Cursor::exhausted()),
+        Some(data) => (vec![data], Some(Cursor::boxed(reads))),
+        None => (Vec::new(), None),
     };
     Ok(Page { data, next })
 }

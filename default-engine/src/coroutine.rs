@@ -223,8 +223,8 @@ impl AsyncEngineConnector {
         Op: PagedOperation<Page = Vec<Box<dyn EngineData>>>,
     {
         let (data, next) = match self.next(&mut stream).await?.transpose()? {
-            Some(data) => (vec![data], Cursor::boxed(stream)),
-            None => (Vec::new(), Cursor::exhausted()),
+            Some(data) => (vec![data], Some(Cursor::boxed(stream))),
+            None => (Vec::new(), None),
         };
         Ok(Page { data, next })
     }
@@ -336,11 +336,7 @@ impl AsyncPagination<ForwardListing> for AsyncEngineConnector {
             };
             data.push(entry);
         }
-        let next = if data.len() == page_size {
-            Cursor::boxed(stream)
-        } else {
-            Cursor::exhausted()
-        };
+        let next = (data.len() == page_size).then(|| Cursor::boxed(stream));
         Ok(Page { data, next })
     }
 }
@@ -373,11 +369,9 @@ impl AsyncPagination<BackwardListing> for AsyncEngineConnector {
         while let Some(entry) = self.next(&mut stream).await? {
             entries.push(entry);
         }
-        let next = if let Some(high) = window.next_high {
-            Cursor::boxed(BackwardListingState { bounds, high })
-        } else {
-            Cursor::exhausted()
-        };
+        let next = window
+            .next_high
+            .map(|high| Cursor::boxed(BackwardListingState { bounds, high }));
         let data = BackwardListingResult {
             entries,
             known_version_boundary: true,

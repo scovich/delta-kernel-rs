@@ -1361,9 +1361,9 @@ impl LogSegment {
             for batch in batches {
                 visitor.visit_rows_of(batch.as_ref())?;
             }
-            if next.is_exhausted() {
+            let Some(next) = next else {
                 break;
-            }
+            };
             page = Op::continue_from(next, channel).await?;
         }
 
@@ -1679,9 +1679,9 @@ where
                 .yield_item(ActionsBatch::new(batch, is_log_batch))
                 .await?;
         }
-        if next.is_exhausted() {
+        let Some(next) = next else {
             break;
-        }
+        };
         page = Op::continue_from(next, channel).await?;
     }
     Ok(())

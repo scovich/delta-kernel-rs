@@ -291,9 +291,9 @@ impl LogSegment {
                 let mut visitor = CommitCrcVisitor { acc: &mut acc };
                 visitor.visit_rows_of(batch.as_ref())?;
             }
-            if next.is_exhausted() {
+            let Some(next) = next else {
                 break;
-            }
+            };
             page = channel.continue_read_json(next).await?;
         }
 

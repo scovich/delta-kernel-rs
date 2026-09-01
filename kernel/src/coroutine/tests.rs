@@ -151,7 +151,7 @@ fn prepare_threads_an_opaque_id_to_continue() {
     let mut workflow = Workflow::start(move |channel| async move {
         let cursor = channel.prepare_forward_listing(bounds).await?;
         let page = channel.continue_forward_listing(cursor).await?;
-        assert!(page.next.is_exhausted());
+        assert!(page.next.is_none());
         Ok(page.data.len())
     })
     .unwrap();
@@ -173,7 +173,7 @@ fn prepare_threads_an_opaque_id_to_continue() {
                 resume
                     .resume(Ok(Page {
                         data: Vec::new(),
-                        next: Cursor::exhausted(),
+                        next: None,
                     }))
                     .unwrap()
             }
@@ -342,9 +342,9 @@ fn engine_connector_pages_forward_listing() {
             for entry in entries {
                 channel.yield_item(entry?.location).await?;
             }
-            if next.is_exhausted() {
+            let Some(next) = next else {
                 break;
-            }
+            };
             page = channel.continue_forward_listing(next).await?;
         }
         Ok(())
@@ -401,9 +401,9 @@ fn engine_connector_pages_backward_listing() {
                 for entry in entries {
                     files.push(entry?.location);
                 }
-                if next.is_exhausted() {
+                let Some(next) = next else {
                     break;
-                }
+                };
                 page = channel.continue_backward_listing(next).await?;
             }
             Ok(files)

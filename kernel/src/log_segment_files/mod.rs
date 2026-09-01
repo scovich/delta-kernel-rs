@@ -74,9 +74,9 @@ pub(crate) fn list_delta_log_from_storage(
             for file in parse_delta_log_listing(files.into_iter(), &log_root, end_version) {
                 channel.yield_item(file?).await?;
             }
-            if next.is_exhausted() {
+            let Some(next) = next else {
                 break;
-            }
+            };
             page = channel.continue_forward_listing(next).await?;
         }
         Ok(())
@@ -729,9 +729,12 @@ impl LogSegmentFiles {
             } = page;
             let files = parse_delta_log_listing(entries.into_iter(), log_root, end_version)
                 .try_collect()?;
-            if checkpoint_search.push_page(files, known_version_boundary) || next.is_exhausted() {
+            if checkpoint_search.push_page(files, known_version_boundary) {
                 break;
             }
+            let Some(next) = next else {
+                break;
+            };
             page = channel.continue_backward_listing(next).await?;
         }
 
