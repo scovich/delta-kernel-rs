@@ -439,6 +439,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "declarative-plans")]
     use crate::engine::sync::SyncEngine;
     use crate::unit_test_utils::TestCancellationToken;
 
