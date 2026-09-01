@@ -38,12 +38,23 @@ impl PagedOperation for ReadParquetFiles {
     type Page = Vec<Box<dyn EngineData>>;
 }
 
+/// Paginated declarative-plan execution.
+#[cfg(feature = "declarative-plans")]
+pub struct ExecutePlan(pub PlanOperation);
+
+#[cfg(feature = "declarative-plans")]
+impl PagedOperation for ExecutePlan {
+    type Page = Vec<Box<dyn EngineData>>;
+}
+
 /// Generic kernel pagination driver for operations that return [`EngineData`].
 pub(crate) trait EngineDataOperation:
     PagedOperation<Page = Vec<Box<dyn EngineData>>> + Sized
 {
+    /// Initialize this operation and return its first page.
     fn start(self, channel: &Channel) -> impl DeltaFuture<Page<Self>>;
 
+    /// Continue this operation from `cursor`.
     fn continue_from(cursor: Cursor<Self>, channel: &Channel) -> impl DeltaFuture<Page<Self>>;
 }
 
@@ -68,15 +79,6 @@ impl EngineDataOperation for ReadParquetFiles {
 }
 
 #[cfg(feature = "declarative-plans")]
-/// Paginated declarative-plan execution.
-pub struct ExecutePlan(pub PlanOperation);
-
-#[cfg(feature = "declarative-plans")]
-impl PagedOperation for ExecutePlan {
-    type Page = Vec<Box<dyn EngineData>>;
-}
-
-#[cfg(feature = "declarative-plans")]
 impl EngineDataOperation for ExecutePlan {
     async fn start(self, channel: &Channel) -> DeltaResult<Page<Self>> {
         channel.start_plan(self.0).await
@@ -98,10 +100,12 @@ impl Channel {
             .await
     }
 
+    /// Read a Parquet file footer.
     pub(crate) async fn read_parquet_footer(&self, file: FileMeta) -> DeltaResult<ParquetFooter> {
         self.exchange(file, PendingRequest::ReadParquetFooter).await
     }
 
+    /// Initialize a JSON read and return its first page.
     pub(crate) async fn start_read_json(
         &self,
         read: ReadFileFormatStart,
@@ -112,6 +116,7 @@ impl Channel {
         .await
     }
 
+    /// Initialize a JSON read without fetching its first page.
     pub(crate) async fn prepare_read_json(
         &self,
         read: ReadFileFormatStart,
@@ -122,6 +127,7 @@ impl Channel {
         .await
     }
 
+    /// Continue a JSON read from `cursor`.
     pub(crate) async fn continue_read_json(
         &self,
         cursor: Cursor<ReadJsonFiles>,
@@ -132,6 +138,7 @@ impl Channel {
         .await
     }
 
+    /// Initialize a Parquet read and return its first page.
     pub(crate) async fn start_read_parquet(
         &self,
         read: ReadFileFormatStart,
@@ -142,6 +149,7 @@ impl Channel {
         .await
     }
 
+    /// Initialize a Parquet read without fetching its first page.
     pub(crate) async fn prepare_read_parquet(
         &self,
         read: ReadFileFormatStart,
@@ -152,6 +160,7 @@ impl Channel {
         .await
     }
 
+    /// Continue a Parquet read from `cursor`.
     pub(crate) async fn continue_read_parquet(
         &self,
         cursor: Cursor<ReadParquetFiles>,
@@ -162,6 +171,7 @@ impl Channel {
         .await
     }
 
+    /// Execute `plan` and return its first page.
     #[cfg(feature = "declarative-plans")]
     pub(crate) async fn start_plan(&self, plan: PlanOperation) -> DeltaResult<Page<ExecutePlan>> {
         self.exchange(ExecutePlan(plan), |request| {
@@ -170,6 +180,7 @@ impl Channel {
         .await
     }
 
+    /// Prepare `plan` without fetching its first page.
     #[cfg(feature = "declarative-plans")]
     pub(crate) async fn prepare_plan(
         &self,
@@ -181,6 +192,7 @@ impl Channel {
         .await
     }
 
+    /// Continue plan execution from `cursor`.
     #[cfg(feature = "declarative-plans")]
     pub(crate) async fn continue_plan(
         &self,
@@ -194,6 +206,7 @@ impl Channel {
 }
 
 impl<N: Send + 'static> PageRequest<N, ReadJsonFiles> {
+    /// Forward this JSON request through `parent`.
     pub(super) async fn forward_to(self, parent: &Channel) -> DeltaResult<N> {
         match self {
             Self::Start(ReadJsonFiles(read), resume) => {
@@ -210,6 +223,7 @@ impl<N: Send + 'static> PageRequest<N, ReadJsonFiles> {
 }
 
 impl<N: Send + 'static> PageRequest<N, ReadParquetFiles> {
+    /// Forward this Parquet request through `parent`.
     pub(super) async fn forward_to(self, parent: &Channel) -> DeltaResult<N> {
         match self {
             Self::Start(ReadParquetFiles(read), resume) => {
@@ -227,6 +241,7 @@ impl<N: Send + 'static> PageRequest<N, ReadParquetFiles> {
 
 #[cfg(feature = "declarative-plans")]
 impl<N: Send + 'static> PageRequest<N, ExecutePlan> {
+    /// Forward this plan request through `parent`.
     pub(super) async fn forward_to(self, parent: &Channel) -> DeltaResult<N> {
         match self {
             Self::Start(ExecutePlan(plan), resume) => resume.resume(parent.start_plan(plan).await),

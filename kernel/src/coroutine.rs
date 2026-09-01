@@ -138,8 +138,8 @@
 //! operation). [`CursorState::Boxed`] owns and drops in-process state while [`CursorState::Id`] is
 //! a raw (connector-managed) reference with no drop notification.
 //!
-//! NOTE: kernel coroutines expose only one request at a time, but pagination allows kernel to
-//! expose upcoming I/O streams so connectors can begin prefetching if they want.
+//! Kernel coroutines expose only one request at a time, but pagination allows kernel to expose
+//! upcoming I/O streams so connectors can begin prefetching.
 //!
 //! # Yielding
 //!
@@ -161,7 +161,7 @@
 //! A connector may drop any resume handle at any time. This abandons the suspended coroutine and
 //! drops all associated state. For connector-side work failures, resume with `Err` when kernel
 //! should observe the failure; otherwise drop the handle and return the error directly.
-// === KERNEL SIDE DOCS ===
+// === Kernel implementation ===
 //
 // Kernel workflows are ordinary async Rust functions, but this module allows the connector to drive
 // them directly, without runtime scheduling: Kernel futures are polled with a no-op waker and
@@ -249,22 +249,13 @@
 // it to completion using an `EngineConnector` that uses the caller-provided `Engine` instance to
 // serve requestse.
 
-mod core;
-pub(crate) mod engine;
-pub mod listing;
-pub mod read;
-pub mod write;
-
-#[cfg(test)]
-mod tests;
-
 use std::any::Any;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use tracing::Instrument as _;
+use tracing::{error, Instrument as _, Span};
 #[cfg(test)]
 use url::Url;
 
@@ -281,6 +272,15 @@ use self::write::WriteBytes;
 #[cfg(test)]
 use crate::Error;
 use crate::{DeltaResult, FileMeta, FileSlice, ParquetFooter};
+
+mod core;
+pub(crate) mod engine;
+pub mod listing;
+pub mod read;
+pub mod write;
+
+#[cfg(test)]
+mod tests;
 
 /// Resume handle for one yielded generator item.
 ///
@@ -316,17 +316,17 @@ pub enum CursorState {
 }
 
 impl<Op: PagedOperation> Cursor<Op> {
-    /// Construct a cursor from connector-defined scalar state.
+    /// Construct and return a cursor carrying connector-defined scalar `id`.
     pub fn id(id: i64) -> Self {
         Self::from_state(CursorState::Id(id))
     }
 
-    /// Construct a cursor that owns connector-defined in-process state.
+    /// Construct and return a cursor owning connector-defined in-process `state`.
     pub fn boxed(state: impl Any + Send) -> Self {
         Self::from_state(CursorState::Boxed(Box::new(state)))
     }
 
-    /// Consume the cursor and return its connector-defined state.
+    /// Consume this cursor and return its connector-defined state.
     pub fn into_state(self) -> CursorState {
         self.state
     }
@@ -356,9 +356,9 @@ impl<O: Send + 'static> Workflow<O> {
         let future = async move {
             future
                 .await
-                .inspect_err(|err| tracing::error!(error = %err, "kernel workflow failed"))
+                .inspect_err(|err| error!(error = %err, "kernel workflow failed"))
         };
-        let task = Box::pin(future.instrument(tracing::Span::current()));
+        let task = Box::pin(future.instrument(Span::current()));
         advance_workflow(task, mailbox)
     }
 }
@@ -386,42 +386,10 @@ impl<O: Send + 'static, Y: Send + 'static> Generator<O, Y> {
         let future = async move {
             future
                 .await
-                .inspect_err(|err| tracing::error!(error = %err, "kernel generator failed"))
+                .inspect_err(|err| error!(error = %err, "kernel generator failed"))
         };
-        let task = Box::pin(future.instrument(tracing::Span::current()));
+        let task = Box::pin(future.instrument(Span::current()));
         advance_generator(task, mailbox, yields)
-    }
-}
-
-/// Kernel-side state for consuming a child generator.
-pub(crate) enum GeneratorState<W> {
-    Start(W),
-    Continue(YieldResume<W>),
-    Exhausted,
-}
-
-impl<Y: Send + 'static> GeneratorState<Generator<(), Y>> {
-    /// Return the next yielded item, forwarding connector requests through `parent`.
-    ///
-    /// Returns `None` after the child generator completes.
-    pub(crate) async fn next(&mut self, parent: &Channel) -> DeltaResult<Option<Y>> {
-        let state = std::mem::replace(self, Self::Exhausted);
-        let mut generator = match state {
-            Self::Start(generator) => Ok(generator),
-            Self::Continue(resume) => resume.resume(Ok(())),
-            Self::Exhausted => return Ok(None),
-        };
-
-        loop {
-            generator = match generator? {
-                Generator::Request(request) => request.forward_to(parent).await,
-                Generator::Done(()) => return Ok(None),
-                Generator::Yield(item, resume) => {
-                    *self = Self::Continue(resume);
-                    return Ok(Some(item));
-                }
-            };
-        }
     }
 }
 
@@ -490,11 +458,10 @@ impl<N: Send + 'static> Request<N> {
 pub struct TypedResume<N, R>(Box<dyn FnOnce(DeltaResult<R>) -> DeltaResult<N> + Send>);
 
 impl<N, R> TypedResume<N, R> {
-    /// Resume a kernel workflow with a response from connector, and run kernel to its next
-    /// boundary.
+    /// Resume with connector `response` and run kernel to its next boundary.
     ///
-    /// Passing a connector error to kernel as `Err` allows kernel to respond to it (possibly
-    /// failing the workflow with an `Err` result in return).
+    /// Returns the next workflow or generator state. A connector error is delivered to kernel,
+    /// which may handle it or return it; errors while advancing kernel are also returned.
     pub fn resume(self, response: DeltaResult<R>) -> DeltaResult<N> {
         self.0(response)
     }
@@ -543,5 +510,37 @@ impl<Y> Deref for Yielder<Y> {
 
     fn deref(&self) -> &Self::Target {
         &self.channel
+    }
+}
+
+/// Kernel-side state for consuming a child generator.
+pub(crate) enum GeneratorState<W> {
+    Start(W),
+    Continue(YieldResume<W>),
+    Exhausted,
+}
+
+impl<Y: Send + 'static> GeneratorState<Generator<(), Y>> {
+    /// Return the next yielded item, forwarding connector requests through `parent`.
+    ///
+    /// Returns `None` after the child generator completes.
+    pub(crate) async fn next(&mut self, parent: &Channel) -> DeltaResult<Option<Y>> {
+        let state = std::mem::replace(self, Self::Exhausted);
+        let mut generator = match state {
+            Self::Start(generator) => Ok(generator),
+            Self::Continue(resume) => resume.resume(Ok(())),
+            Self::Exhausted => return Ok(None),
+        };
+
+        loop {
+            generator = match generator? {
+                Generator::Request(request) => request.forward_to(parent).await,
+                Generator::Done(()) => return Ok(None),
+                Generator::Yield(item, resume) => {
+                    *self = Self::Continue(resume);
+                    return Ok(Some(item));
+                }
+            };
+        }
     }
 }

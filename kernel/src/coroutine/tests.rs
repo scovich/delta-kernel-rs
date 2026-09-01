@@ -2,10 +2,13 @@ use std::future::pending;
 use std::sync::Arc;
 
 use rstest::rstest;
+use tempfile::tempdir;
 use tracing::field::Empty;
 use tracing::info_span;
 
 use super::*;
+use crate::coroutine::engine::EngineConnector;
+use crate::engine::sync::SyncEngine;
 use crate::metrics::MetricEvent;
 use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
 
@@ -69,7 +72,7 @@ fn reporting_span_tracks_single_resume_outcome(#[case] outcome: ResumeOutcome) {
 fn workflow_output_is_independent_of_request_response_type() {
     let location = Url::parse("memory:///answer").unwrap();
     let expected_location = location.clone();
-    let mut workflow = Workflow::start(move |channel| async move {
+    let mut workflow = Workflow::start(async move |channel| {
         let bytes = channel.read_small_file(location, None).await?;
         Ok(format!("read {} bytes", bytes.len()))
     })
@@ -94,7 +97,7 @@ fn workflow_output_is_independent_of_request_response_type() {
 #[test]
 fn connector_facing_generator_interleaves_requests_and_yields() {
     let location = Url::parse("memory:///item").unwrap();
-    let mut generator = Generator::start(move |channel| async move {
+    let mut generator = Generator::start(async move |channel| {
         let bytes = channel.read_small_file(location, None).await?;
         channel.yield_item(bytes.len()).await?;
         Ok("generator complete")
@@ -122,7 +125,7 @@ fn connector_facing_generator_interleaves_requests_and_yields() {
 
 #[test]
 fn yield_resume_error_is_delivered_to_generator() {
-    let generator = Generator::start(|channel| async move {
+    let generator = Generator::start(async |channel| {
         let err = channel.yield_item(1).await.unwrap_err();
         Ok(err.to_string())
     })
@@ -148,7 +151,7 @@ fn prepare_threads_an_opaque_id_to_continue() {
         low: Url::parse("memory:///00000000000000000000").unwrap(),
         high: Url::parse("memory:///00000000000000000002").unwrap(),
     };
-    let mut workflow = Workflow::start(move |channel| async move {
+    let mut workflow = Workflow::start(async move |channel| {
         let cursor = channel.prepare_forward_listing(bounds).await?;
         let page = channel.continue_forward_listing(cursor).await?;
         assert!(page.next.is_none());
@@ -249,7 +252,7 @@ fn parent_intercepts_child_items_while_child_io_reaches_connector() {
 
 #[test]
 fn pending_without_connector_work_fails_instead_of_hanging() {
-    let result = Workflow::start(|_channel| async {
+    let result = Workflow::start(async |_channel| {
         pending::<()>().await;
         Ok(())
     });
@@ -281,15 +284,15 @@ fn stale_weak_mailbox_entries_do_not_block_reuse() {
 
 #[test]
 fn engine_connector_drives_real_storage_operations() {
-    let temp_dir = tempfile::tempdir().unwrap();
+    let temp_dir = tempdir().unwrap();
     let location = Url::from_file_path(temp_dir.path().join("data.bin")).unwrap();
     let expected = Bytes::from_static(b"kernel coroutine");
     let write_data = expected.clone();
-    let sync_engine = crate::engine::sync::SyncEngine::new();
-    let connector = super::engine::EngineConnector::new(&sync_engine);
+    let sync_engine = SyncEngine::new();
+    let connector = EngineConnector::new(&sync_engine);
 
     let actual = connector
-        .run(move |channel| async move {
+        .run(async move |channel| {
             channel
                 .write_bytes(location.clone(), write_data, false)
                 .await?;
@@ -302,55 +305,43 @@ fn engine_connector_drives_real_storage_operations() {
 
 #[test]
 fn engine_connector_pages_forward_listing() {
-    let temp_dir = tempfile::tempdir().unwrap();
+    let temp_dir = tempdir().unwrap();
     let root = Url::from_directory_path(temp_dir.path()).unwrap();
     let expected: Vec<_> = (1..=3)
         .map(|version| root.join(&format!("{version:020}.json")).unwrap())
         .collect();
-    let workflow_root = root.clone();
-    let sync_engine = crate::engine::sync::SyncEngine::new();
-    let connector = super::engine::EngineConnector::new(&sync_engine).with_cancellation_token(None);
+    let sync_engine = SyncEngine::new();
+    let connector = EngineConnector::new(&sync_engine).with_cancellation_token(None);
 
-    connector
-        .run(move |channel| async move {
+    let actual = connector
+        .iterate_generator(Generator::start(async move |channel| {
             for version in 1..=3 {
                 channel
                     .write_bytes(
-                        workflow_root.join(&format!("{version:020}.json"))?,
+                        root.join(&format!("{version:020}.json"))?,
                         Bytes::new(),
                         false,
                     )
                     .await?;
             }
-            Ok(())
-        })
-        .unwrap();
-
-    let generator = Generator::start(move |channel| async move {
-        let mut page = channel
-            .start_forward_listing(ListingBounds {
-                prefix: root.clone(),
-                low: root.join("00000000000000000000")?,
-                high: root.join("00000000000000000004")?,
-            })
-            .await?;
-        loop {
-            let Page {
-                data: entries,
-                next,
-            } = page;
-            for entry in entries {
-                channel.yield_item(entry?.location).await?;
+            let mut page = channel
+                .start_forward_listing(ListingBounds {
+                    prefix: root.clone(),
+                    low: root.join("00000000000000000000")?,
+                    high: root.join("00000000000000000004")?,
+                })
+                .await?;
+            loop {
+                for entry in page.data {
+                    channel.yield_item(entry?.location).await?;
+                }
+                let Some(next) = page.next else {
+                    break;
+                };
+                page = channel.continue_forward_listing(next).await?;
             }
-            let Some(next) = next else {
-                break;
-            };
-            page = channel.continue_forward_listing(next).await?;
-        }
-        Ok(())
-    });
-    let actual = connector
-        .iterate_generator(generator)
+            Ok(())
+        }))
         .unwrap()
         .collect::<DeltaResult<Vec<_>>>()
         .unwrap();
@@ -360,21 +351,20 @@ fn engine_connector_pages_forward_listing() {
 
 #[test]
 fn engine_connector_pages_backward_listing() {
-    let temp_dir = tempfile::tempdir().unwrap();
+    let temp_dir = tempdir().unwrap();
     let root = Url::from_directory_path(temp_dir.path()).unwrap();
     let expected: Vec<_> = (1..=3)
         .map(|version| root.join(&format!("{version:020}.json")).unwrap())
         .collect();
-    let workflow_root = root.clone();
-    let sync_engine = crate::engine::sync::SyncEngine::new();
-    let connector = super::engine::EngineConnector::new(&sync_engine);
+    let sync_engine = SyncEngine::new();
+    let connector = EngineConnector::new(&sync_engine);
 
     let actual = connector
-        .run(move |channel| async move {
+        .run(async move |channel| {
             for version in 1..=3 {
                 channel
                     .write_bytes(
-                        workflow_root.join(&format!("{version:020}.json"))?,
+                        root.join(&format!("{version:020}.json"))?,
                         Bytes::new(),
                         false,
                     )
@@ -382,26 +372,18 @@ fn engine_connector_pages_backward_listing() {
             }
             let mut page = channel
                 .start_backward_listing(ListingBounds {
-                    prefix: workflow_root.clone(),
-                    low: workflow_root.join("00000000000000000000")?,
-                    high: workflow_root.join("00000000000000000004")?,
+                    prefix: root.clone(),
+                    low: root.join("00000000000000000000")?,
+                    high: root.join("00000000000000000004")?,
                 })
                 .await?;
             let mut files = Vec::new();
             loop {
-                let Page {
-                    data:
-                        BackwardListingResult {
-                            entries,
-                            known_version_boundary,
-                        },
-                    next,
-                } = page;
-                assert!(known_version_boundary);
-                for entry in entries {
+                assert!(page.data.known_version_boundary);
+                for entry in page.data.entries {
                     files.push(entry?.location);
                 }
-                let Some(next) = next else {
+                let Some(next) = page.next else {
                     break;
                 };
                 page = channel.continue_backward_listing(next).await?;

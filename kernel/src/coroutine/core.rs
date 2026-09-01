@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::task::{Context, Poll, Waker};
 
 use bytes::Bytes;
+use tracing::error;
 
 #[cfg(feature = "declarative-plans")]
 use super::ExecutePlan;
@@ -13,16 +14,19 @@ use super::{
 };
 use crate::{DeltaResult, Error, FileMeta, FileSlice, ParquetFooter};
 
+/// A sendable future that resolves to a kernel result.
 pub(crate) trait DeltaFuture<O>: Future<Output = DeltaResult<O>> + Send {}
 
 impl<O, F> DeltaFuture<O> for F where F: Future<Output = DeltaResult<O>> + Send {}
 
+/// Type-erased coroutine task.
 pub(super) type Task<O> = Pin<Box<dyn DeltaFuture<O> + 'static>>;
+/// Weak reference to an operation exchange.
 pub(super) type WeakExchange<Out, In> = Weak<Exchange<Out, In>>;
+/// Exchange used to suspend a generator at a yielded item.
 pub(super) type YieldExchange<Y> = Exchange<Y, ()>;
 
-/// Shared mailbox implementation used by Workflows and generators (for the connector's `Channel`
-/// and the generator's `Yielder`). The `is_live` method returns true if the slot contains a value.
+/// Shared mailbox entry used by workflows and generators.
 pub(super) trait MailboxEntry: Default {
     fn is_live(&self) -> bool;
 }
@@ -34,12 +38,13 @@ pub(super) trait MailboxEntry: Default {
 /// connectors, so the handles are always accessed sequentially (kernel side) and move between
 /// threads together or not at all (connector side).
 ///
-/// Unfortunately, the compiler cannot infer these invariants, so we must wrap the mailbox with
-/// `Arc` (not `Rc`) and its entry with `Mutex` (not `RefCell`) for the handles to be `Send`.
+/// The compiler cannot infer these invariants, so the mailbox uses `Arc` and `Mutex` to make its
+/// handles `Send`. Otherwise, `Rc<RefCell<T>>` would suffice.
 #[derive(Default)]
 pub(super) struct Mailbox<T: MailboxEntry>(Mutex<T>);
 
 impl<T: MailboxEntry> Mailbox<T> {
+    /// Publish an entry, returning an error if the mailbox is poisoned or already occupied.
     pub(super) fn publish(&self, pending: T) -> DeltaResult<()> {
         // WARNING: Never acquire another lock or invoke external code while holding this guard.
         let Ok(mut mailbox) = self.0.lock() else {
@@ -80,6 +85,7 @@ impl Mailbox<PendingRequest> {
     }
 }
 
+/// Type-erased requests stored while a coroutine is suspended.
 pub(super) enum PendingRequest {
     ListForward(PendingPageRequest<ForwardListing>),
     ListBackward(PendingPageRequest<BackwardListing>),
@@ -92,6 +98,7 @@ pub(super) enum PendingRequest {
     WriteBytes(WeakExchange<WriteBytes, ()>),
 }
 
+/// A suspended phase of a paginated operation.
 pub(super) enum PendingPageRequest<Op: PagedOperation> {
     Start(WeakExchange<Op, Page<Op>>),
     Prepare(WeakExchange<Op, Cursor<Op>>),
@@ -230,27 +237,28 @@ where
 /// - Dropping the resume drops both strong references.
 ///
 /// These accesses are sequential on the thread invoking `resume`. The compiler cannot infer this
-/// ownership invariant, so we must wrap the exchange in a `Mutex` so the `Arc` can be `Send`.
+/// ownership invariant, so the exchange uses a `Mutex` to make its `Arc` references `Send`.
 pub(super) struct Exchange<Out, In>(Mutex<ExchangeState<Out, In>>);
 
-/// The lifecycle steps of an exchange
+/// Lifecycle state of an exchange.
 enum ExchangeState<Out, In> {
-    /// Kernel offers a request to connector just before suspending the workflow (very short-lived)
+    /// Kernel has offered a request and is suspending the workflow.
     Outbound(Out),
-    /// Connector received the request but has not responded back yet
+    /// Connector has claimed the request but has not responded yet.
     InFlight,
-    /// Connector offers a response back to kernel just before resuming the workflow
+    /// Connector has supplied a response for the next poll.
     Inbound(DeltaResult<In>),
-    /// Kernel has claimed the response and `Wait::poll` is about to return it (very short-lived)
+    /// Kernel has consumed the response.
     Complete,
 }
 
 impl<Out, In> Exchange<Out, In> {
+    /// Create an exchange containing the outbound operation.
     pub(super) fn new(outbound: Out) -> Self {
         Self(Mutex::new(ExchangeState::Outbound(outbound)))
     }
 
-    /// Connector-side: Claim the request kernel offered when suspending a workflow
+    /// Claim the request kernel offered when suspending a workflow.
     pub(super) fn claim(&self) -> DeltaResult<Out> {
         // WARNING: Never acquire another lock or invoke external code while holding this guard.
         let mut state = self.lock()?;
@@ -265,7 +273,7 @@ impl<Out, In> Exchange<Out, In> {
         }
     }
 
-    /// Connector-side: Offer a response to kernel just before resuming the workflow
+    /// Supply a response before resuming the workflow.
     pub(super) fn respond(&self, response: DeltaResult<In>) -> DeltaResult<()> {
         // WARNING: Never acquire another lock or invoke external code while holding this guard.
         let mut state = self.lock()?;
@@ -296,12 +304,11 @@ impl<Out, In> Exchange<Out, In> {
 /// second poll. That second `poll` propagates through the suspended chain of futures until it
 /// reaches `Wait::poll`, which now returns `Ready` and physically resumes the kernel coroutine.
 ///
-/// Generator yields use the same mechanism, with the yield consumer taking the connector’s role.
+/// Generator yields use the same mechanism, with the yield consumer taking the connector's role.
 ///
-/// NOTE: All polling is strictly sequential in the connector's calling thread, using a no-op
-/// waker. No async runtime is involved in suspending and resuming coroutines. Further, the
-/// connector's own async futures are _not_ disturbed when a kernel coroutine suspends, because the
-/// kernel APIs to start and resume coroutines are normal sync methods that break the poll chain.
+/// Polling is strictly sequential in the connector's calling thread, using a no-op waker. No async
+/// runtime is involved in suspending and resuming coroutines. Suspending a kernel coroutine does
+/// not disturb the connector's async futures because start and resume are synchronous boundaries.
 pub(super) struct Wait<Out, In>(pub(super) Arc<Exchange<Out, In>>);
 
 impl<Out: Send, In: Send> Future for Wait<Out, In> {
@@ -340,7 +347,7 @@ impl<Out, In> Drop for Wait<Out, In> {
             .lock()
             .is_ok_and(|state| matches!(*state, ExchangeState::Complete));
         if !completed {
-            tracing::error!(
+            error!(
                 error = "abandoned",
                 "kernel coroutine was abandoned while suspended"
             );

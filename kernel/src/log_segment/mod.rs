@@ -18,7 +18,7 @@ use crate::coroutine::engine::{drive_storage, EngineConnector};
 use crate::coroutine::read::{
     EngineDataOperation, ReadFileFormatStart, ReadJsonFiles, ReadParquetFiles,
 };
-use crate::coroutine::{Channel, Generator, GeneratorState, Page, Yielder};
+use crate::coroutine::{Channel, Generator, GeneratorState, Yielder};
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::ActionsBatch;
@@ -758,7 +758,7 @@ impl LogSegment {
 
         // `replay` expects commit files to be sorted in descending order, so the return value here
         // is correct
-        let commit_stream = self.read_commit_actions(commit_read_schema)?;
+        let mut commits = GeneratorState::Start(self.read_commit_actions(commit_read_schema)?);
 
         let checkpoint_result = self
             .create_checkpoint_stream(
@@ -769,13 +769,11 @@ impl LogSegment {
                 partition_schema,
             )
             .await?;
-        let checkpoint_actions = checkpoint_result.actions;
-        let actions = Generator::start(move |channel| async move {
-            let mut commits = GeneratorState::Start(commit_stream);
+        let mut checkpoints = GeneratorState::Start(checkpoint_result.actions);
+        let actions = Generator::start(async move |channel| {
             while let Some(batch) = commits.next(&channel).await? {
                 channel.yield_item(batch).await?;
             }
-            let mut checkpoints = GeneratorState::Start(checkpoint_actions);
             while let Some(batch) = checkpoints.next(&channel).await? {
                 channel.yield_item(batch).await?;
             }
@@ -864,7 +862,7 @@ impl LogSegment {
 
     fn read_commit_actions(&self, schema: SchemaRef) -> DeltaResult<Generator<(), ActionsBatch>> {
         let commit_files = self.find_commit_cover();
-        Generator::start(move |channel| async move {
+        Generator::start(async move |channel| {
             // `replay` expects commit files to be sorted in descending order.
             let operation = ReadJsonFiles(ReadFileFormatStart {
                 files: commit_files,
@@ -1200,7 +1198,7 @@ impl LogSegment {
         };
         let checkpoint_read_schema = checkpoint_info.checkpoint_read_schema.clone();
         let log_segment = self.clone();
-        let actions = Generator::start(move |channel| async move {
+        let actions = Generator::start(async move |channel| {
             let checkpoint_file_meta: Vec<_> = log_segment
                 .listed
                 .checkpoint_parts
@@ -1354,14 +1352,10 @@ impl LogSegment {
         let mut visitor = SidecarVisitor::default();
         let mut page = operation.start(channel).await?;
         loop {
-            let Page {
-                data: batches,
-                next,
-            } = page;
-            for batch in batches {
+            for batch in page.data {
                 visitor.visit_rows_of(batch.as_ref())?;
             }
-            let Some(next) = next else {
+            let Some(next) = page.next else {
                 break;
             };
             page = Op::continue_from(next, channel).await?;
@@ -1670,16 +1664,12 @@ where
 {
     let mut page = operation.start(channel).await?;
     loop {
-        let Page {
-            data: batches,
-            next,
-        } = page;
-        for batch in batches {
+        for batch in page.data {
             channel
                 .yield_item(ActionsBatch::new(batch, is_log_batch))
                 .await?;
         }
-        let Some(next) = next else {
+        let Some(next) = page.next else {
             break;
         };
         page = Op::continue_from(next, channel).await?;

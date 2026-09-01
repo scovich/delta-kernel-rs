@@ -24,7 +24,7 @@ use crate::actions::{
     METADATA_FIELD, PROTOCOL_FIELD, REMOVE_NAME, SET_TRANSACTION_FIELD,
 };
 use crate::coroutine::read::ReadFileFormatStart;
-use crate::coroutine::{Channel, GeneratorState, Page};
+use crate::coroutine::{Channel, GeneratorState};
 use crate::crc::{
     is_incremental_safe_operation, read_crc_file_or_none, size_to_u64, Crc, CrcDelta,
     FileSizeHistogram, FileStatsDelta,
@@ -281,17 +281,13 @@ impl LogSegment {
             })
             .await?;
         loop {
-            let Page {
-                data: batches,
-                next,
-            } = page;
-            for batch in batches {
+            for batch in page.data {
                 // Transient visitor borrows the shared accumulator for the duration of the
                 // batch; same pattern as `ActionReconciliationVisitor`.
                 let mut visitor = CommitCrcVisitor { acc: &mut acc };
                 visitor.visit_rows_of(batch.as_ref())?;
             }
-            let Some(next) = next else {
+            let Some(next) = page.next else {
                 break;
             };
             page = channel.continue_read_json(next).await?;

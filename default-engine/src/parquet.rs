@@ -425,6 +425,9 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     }
 }
 
+/// Read and decode the Parquet footer for `file` from `store`.
+///
+/// Returns an error when the object cannot be read or its footer is invalid.
 pub(crate) async fn read_parquet_footer_impl(
     store: Arc<DynObjectStore>,
     file: FileMeta,

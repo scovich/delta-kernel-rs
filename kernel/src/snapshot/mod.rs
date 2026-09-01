@@ -1398,6 +1398,7 @@ mod tests {
 
     use rstest::rstest;
     use serde_json::json;
+    use tempfile::tempdir;
     use test_utils::table_builder::{
         checkpoint_json_stats, unpartitioned, FeatureSet, LogState, TestTableBuilder, VersionTarget,
     };
@@ -1428,6 +1429,7 @@ mod tests {
     use crate::transaction::create_table::create_table;
     use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::utils::FoldWithOption as _;
+    use crate::StorageHandler;
 
     /// Helper function to create a commitInfo action with optional ICT
     fn create_commit_info(timestamp: i64, ict: Option<i64>) -> serde_json::Value {
@@ -1579,9 +1581,9 @@ mod tests {
         assert_eq!(snapshot.schema(), expected);
     }
 
-    /// Test helper: drive [`LastCheckpointHint::try_read`] through a [`StorageHandler`].
+    /// Drive [`LastCheckpointHint::try_read`] through a [`StorageHandler`].
     fn read_last_checkpoint(
-        storage: &dyn crate::StorageHandler,
+        storage: &dyn StorageHandler,
         log_root: &Url,
     ) -> DeltaResult<Option<LastCheckpointHint>> {
         let log_root = log_root.clone();
@@ -2202,7 +2204,7 @@ mod tests {
 
     #[test]
     fn ict_channel_read_continues_past_empty_pages() -> DeltaResult<()> {
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = tempdir().unwrap();
         let table_path = Url::from_directory_path(temp_dir.path())
             .unwrap()
             .to_string();

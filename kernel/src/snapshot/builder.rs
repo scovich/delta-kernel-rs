@@ -50,7 +50,7 @@ pub struct SnapshotBuilder {
     /// Opaque, caller-supplied id recorded on this build's metric events. Not interpreted by
     /// kernel; set via [`with_correlation_id`](Self::with_correlation_id).
     correlation_id: Option<Arc<str>>,
-    /// Cancellation used only while the legacy Engine shim drives the connector workflow.
+    /// Cancellation honored while [`Self::build`] drives the workflow through an [`Engine`].
     cancellation_token: Option<CancellationTokenRef>,
 }
 
@@ -250,6 +250,9 @@ impl SnapshotBuilder {
     ///
     /// The workflow may complete immediately or return an operation for the connector to execute
     /// and resume.
+    ///
+    /// Returns an error if setup fails before the first connector operation. Errors encountered
+    /// after suspension are returned by the corresponding resume handle.
     ///
     /// Reports metrics: [`MetricEvent::SnapshotBuildSuccess`] or
     /// [`MetricEvent::SnapshotBuildFailure`].

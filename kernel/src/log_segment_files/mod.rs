@@ -18,8 +18,8 @@ use itertools::Itertools;
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 
-use crate::coroutine::listing::{log_listing_bounds, BackwardListingResult};
-use crate::coroutine::{Channel, Generator, GeneratorState, Page};
+use crate::coroutine::listing::log_listing_bounds;
+use crate::coroutine::{Channel, Generator, GeneratorState};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
 use crate::path::{
@@ -67,14 +67,13 @@ pub(crate) fn list_delta_log_from_storage(
 ) -> DeltaResult<Generator<(), ParsedLogPath>> {
     let log_root = log_root.clone();
     let bounds = log_listing_bounds(&log_root, start_version, end_version)?;
-    Generator::start(move |channel| async move {
+    Generator::start(async move |channel| {
         let mut page = channel.start_forward_listing(bounds).await?;
         loop {
-            let Page { data: files, next } = page;
-            for file in parse_delta_log_listing(files.into_iter(), &log_root, end_version) {
+            for file in parse_delta_log_listing(page.data.into_iter(), &log_root, end_version) {
                 channel.yield_item(file?).await?;
             }
-            let Some(next) = next else {
+            let Some(next) = page.next else {
                 break;
             };
             page = channel.continue_forward_listing(next).await?;
@@ -719,20 +718,13 @@ impl LogSegmentFiles {
 
         let mut page = channel.start_backward_listing(bounds).await?;
         loop {
-            let Page {
-                data:
-                    BackwardListingResult {
-                        entries,
-                        known_version_boundary,
-                    },
-                next,
-            } = page;
-            let files = parse_delta_log_listing(entries.into_iter(), log_root, end_version)
-                .try_collect()?;
-            if checkpoint_search.push_page(files, known_version_boundary) {
+            let files =
+                parse_delta_log_listing(page.data.entries.into_iter(), log_root, end_version)
+                    .try_collect()?;
+            if checkpoint_search.push_page(files, page.data.known_version_boundary) {
                 break;
             }
-            let Some(next) = next else {
+            let Some(next) = page.next else {
                 break;
             };
             page = channel.continue_backward_listing(next).await?;

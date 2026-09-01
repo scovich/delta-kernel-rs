@@ -217,15 +217,10 @@ impl LogSegment {
             })?
             .build()?;
 
-        let first_page = channel.start_plan(Operation::QueryPlan(plan)).await?;
-        Generator::start(move |channel| async move {
-            let mut page = first_page;
+        let mut page = channel.start_plan(Operation::QueryPlan(plan)).await?;
+        Generator::start(async move |channel| {
             loop {
-                let crate::coroutine::Page {
-                    data: batches,
-                    next,
-                } = page;
-                for data in batches {
+                for data in page.data {
                     // Mark as a log batch so the checkpoint action is read from it.
                     let batch = ActionsBatch::new(data, true);
                     let (protocol_version, metadata_version) =
@@ -238,7 +233,7 @@ impl LogSegment {
                         })
                         .await?;
                 }
-                let Some(next) = next else {
+                let Some(next) = page.next else {
                     break;
                 };
                 page = channel.continue_plan(next).await?;
@@ -260,8 +255,8 @@ impl LogSegment {
             commit_schema.fields().cloned().chain([file_column]),
         )?);
         let checkpoint_version = self.checkpoint_version.map(|v| v as i64);
-        let batches = self
-            .read_actions_with_projected_checkpoint_actions(
+        let mut batches = GeneratorState::Start(
+            self.read_actions_with_projected_checkpoint_actions(
                 channel,
                 commit_schema,
                 checkpoint_schema,
@@ -270,9 +265,9 @@ impl LogSegment {
                 None,
             )
             .await?
-            .actions;
-        Generator::start(move |channel| async move {
-            let mut batches = GeneratorState::Start(batches);
+            .actions,
+        );
+        Generator::start(async move |channel| {
             while let Some(batch) = batches.next(&channel).await? {
                 // A commit's version is parsed from its `_file`; a checkpoint batch uses the
                 // constant.

@@ -1,8 +1,9 @@
 //! Native async driver for Delta Kernel coroutines.
 
 use std::any::Any;
+use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::future::Future;
-use std::num::NonZero;
+use std::num::{NonZero, NonZeroU64, NonZeroUsize};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -35,19 +36,6 @@ use crate::json::read_json_files_impl;
 use crate::parquet::{read_parquet_files_impl, read_parquet_footer_impl};
 use crate::{DEFAULT_READ_BATCH_SIZE, DEFAULT_READ_BUFFER_SIZE};
 
-const STORAGE_READAHEAD: usize = 10;
-const DEFAULT_FORWARD_PAGE: NonZero<usize> = match NonZero::new(DEFAULT_FORWARD_LISTING_PAGE_SIZE) {
-    Some(size) => size,
-    None => panic!("DEFAULT_FORWARD_LISTING_PAGE_SIZE must be non-zero"),
-};
-const DEFAULT_BACKWARD_WINDOW: NonZero<Version> =
-    match NonZero::new(DEFAULT_BACKWARD_LISTING_WINDOW_SIZE) {
-        Some(size) => size,
-        None => panic!("DEFAULT_BACKWARD_LISTING_WINDOW_SIZE must be non-zero"),
-    };
-
-type ResultStream<T> = BoxStream<'static, DeltaResult<T>>;
-
 /// Drives kernel coroutines directly through the default engine's native async I/O.
 ///
 /// This connector does not use [`delta_kernel::Engine`] or a
@@ -64,8 +52,8 @@ pub struct AsyncEngineConnector {
     backward_listing_window_size: NonZero<Version>,
 }
 
-impl std::fmt::Debug for AsyncEngineConnector {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for AsyncEngineConnector {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("AsyncEngineConnector")
             .field("cancellation_token", &self.cancellation_token)
             .field("storage_readahead", &self.storage_readahead)
@@ -152,8 +140,8 @@ impl AsyncEngineConnector {
 
     /// Serve one coroutine request and resume kernel to its next suspension boundary.
     ///
-    /// This is public so connectors can intercept selected request variants and delegate the
-    /// remainder to the default implementation.
+    /// Connectors can intercept selected variants of `request` and delegate the remainder here.
+    /// Returns kernel's next state, or an error from I/O, cancellation, or advancing kernel.
     pub async fn resume<N: Send + 'static>(&self, request: Request<N>) -> DeltaResult<N> {
         #[allow(unreachable_patterns)]
         match request {
@@ -257,6 +245,19 @@ impl AsyncEngineConnector {
         }
     }
 }
+
+const STORAGE_READAHEAD: usize = 10;
+const DEFAULT_FORWARD_PAGE: NonZero<usize> = match NonZero::new(DEFAULT_FORWARD_LISTING_PAGE_SIZE) {
+    Some(size) => size,
+    None => NonZeroUsize::MIN,
+};
+const DEFAULT_BACKWARD_WINDOW: NonZero<Version> =
+    match NonZero::new(DEFAULT_BACKWARD_LISTING_WINDOW_SIZE) {
+        Some(size) => size,
+        None => NonZeroU64::MIN,
+    };
+
+type ResultStream<T> = BoxStream<'static, DeltaResult<T>>;
 
 /// Carries native async pagination state in boxed cursors.
 ///
@@ -558,7 +559,10 @@ mod tests {
         let commit = concat!(
             r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
             "\n",
-            r#"{"metaData":{"id":"test-table","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":0}}"#,
+            r#"{"metaData":{"id":"test-table","format":{"provider":"parquet","options":{}},"#,
+            r#""schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\","#,
+            r#"\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","#,
+            r#""partitionColumns":[],"configuration":{},"createdTime":0}}"#,
         );
         store
             .put(

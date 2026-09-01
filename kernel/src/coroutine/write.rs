@@ -7,9 +7,11 @@ use super::core::PendingRequest;
 use super::Channel;
 use crate::DeltaResult;
 
-/// Write the bytes of one complete storage object to the specified destination url.
+/// Write the bytes of one complete storage object to the specified destination URL.
 pub struct WriteBytes {
+    /// Destination URL.
     pub url: Url,
+    /// Complete object contents.
     pub data: Bytes,
     /// Whether to replace an existing destination.
     ///
@@ -18,6 +20,7 @@ pub struct WriteBytes {
 }
 
 impl Channel {
+    /// Write `data` to `url`, replacing an existing object only when `overwrite` is true.
     pub(crate) async fn write_bytes(
         &self,
         url: Url,

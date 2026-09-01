@@ -6,15 +6,7 @@ use url::Url;
 use super::core::{PendingPageRequest, PendingRequest};
 use super::{Channel, Cursor, Page, PageRequest, PagedOperation};
 use crate::path::may_begin_listable_log_path;
-use crate::{DeltaResult, FileMeta, Version};
-
-/// Default number of listing entries in one forward-listing page.
-#[internal_api]
-pub(crate) const DEFAULT_FORWARD_LISTING_PAGE_SIZE: usize = 1024;
-
-/// Default number of Delta versions covered by one backward-listing request.
-#[internal_api]
-pub(crate) const DEFAULT_BACKWARD_LISTING_WINDOW_SIZE: Version = 1000;
+use crate::{DeltaResult, Error, FileMeta, Version};
 
 /// Selects descendants of `prefix` whose full URLs are in the exclusive range `(low, high)`.
 ///
@@ -33,7 +25,7 @@ impl PagedOperation for ForwardListing {
     type Page = Vec<DeltaResult<FileMeta>>;
 }
 
-/// A bounded listing whose page ranges move high to low, with page entries are in ascending order.
+/// A bounded listing whose page ranges move high to low, with entries ascending within each page.
 pub struct BackwardListing(pub Box<ListingBounds>);
 
 impl PagedOperation for BackwardListing {
@@ -42,6 +34,7 @@ impl PagedOperation for BackwardListing {
 
 /// One backward-listing page with entries in ascending lexicographic order.
 pub struct BackwardListingResult {
+    /// Entries in this page.
     pub entries: Vec<DeltaResult<FileMeta>>,
     /// True if all file version numbers in all future pages will be strictly lower than the lowest
     /// file version seen so far.
@@ -50,10 +43,20 @@ pub struct BackwardListingResult {
     pub known_version_boundary: bool,
 }
 
+/// Default number of listing entries in one forward-listing page.
+#[internal_api]
+pub(crate) const DEFAULT_FORWARD_LISTING_PAGE_SIZE: usize = 1024;
+
+/// Default number of Delta versions covered by one backward-listing request.
+#[internal_api]
+pub(crate) const DEFAULT_BACKWARD_LISTING_WINDOW_SIZE: Version = 1000;
+
 /// URL bounds and continuation state for one backward-listing window.
 #[internal_api]
 pub(crate) struct BackwardListingWindow {
+    /// Inclusive lower bound for this window.
     pub low: Url,
+    /// Exclusive upper bound for this window.
     pub high: Url,
     /// Upper version for the next lower window, or `None` when this window reaches the range
     /// start.
@@ -73,7 +76,7 @@ pub(crate) fn backward_listing_window(
     window_size: Version,
 ) -> DeltaResult<BackwardListingWindow> {
     if window_size == 0 {
-        return Err(crate::Error::generic(
+        return Err(Error::generic(
             "backward listing window size must be greater than zero",
         ));
     }
@@ -113,9 +116,9 @@ pub(crate) fn version_from_listing_bound(bound: &Url) -> DeltaResult<Version> {
     bound
         .path_segments()
         .and_then(|mut segments| segments.next_back())
-        .ok_or_else(|| crate::Error::internal_error("listing bound has no path segment"))?
+        .ok_or_else(|| Error::internal_error("listing bound has no path segment"))?
         .parse()
-        .map_err(|_| crate::Error::internal_error("listing bound is not a version"))
+        .map_err(|_| Error::internal_error("listing bound is not a version"))
 }
 
 /// Map an inclusive version range to exclusive bare-version URL bounds.
@@ -137,6 +140,7 @@ pub(crate) fn bare_version_path(log_root: &Url, version: Version) -> DeltaResult
 }
 
 impl Channel {
+    /// Initialize a forward listing and return its first page.
     pub(crate) async fn start_forward_listing(
         &self,
         bounds: ListingBounds,
@@ -147,6 +151,7 @@ impl Channel {
         .await
     }
 
+    /// Initialize a forward listing without fetching its first page.
     pub(crate) async fn prepare_forward_listing(
         &self,
         bounds: ListingBounds,
@@ -157,6 +162,7 @@ impl Channel {
         .await
     }
 
+    /// Continue a forward listing from `cursor`.
     pub(crate) async fn continue_forward_listing(
         &self,
         cursor: Cursor<ForwardListing>,
@@ -167,6 +173,7 @@ impl Channel {
         .await
     }
 
+    /// Initialize a backward listing and return its first page.
     pub(crate) async fn start_backward_listing(
         &self,
         bounds: ListingBounds,
@@ -177,6 +184,7 @@ impl Channel {
         .await
     }
 
+    /// Initialize a backward listing without fetching its first page.
     pub(crate) async fn prepare_backward_listing(
         &self,
         bounds: ListingBounds,
@@ -187,6 +195,7 @@ impl Channel {
         .await
     }
 
+    /// Continue a backward listing from `cursor`.
     pub(crate) async fn continue_backward_listing(
         &self,
         cursor: Cursor<BackwardListing>,
@@ -199,6 +208,7 @@ impl Channel {
 }
 
 impl<N: Send + 'static> PageRequest<N, ForwardListing> {
+    /// Forward this listing request through `parent`.
     pub(super) async fn forward_to(self, parent: &Channel) -> DeltaResult<N> {
         match self {
             Self::Start(ForwardListing(bounds), resume) => {
@@ -215,6 +225,7 @@ impl<N: Send + 'static> PageRequest<N, ForwardListing> {
 }
 
 impl<N: Send + 'static> PageRequest<N, BackwardListing> {
+    /// Forward this listing request through `parent`.
     pub(super) async fn forward_to(self, parent: &Channel) -> DeltaResult<N> {
         match self {
             Self::Start(BackwardListing(bounds), resume) => {

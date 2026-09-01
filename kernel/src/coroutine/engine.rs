@@ -183,6 +183,7 @@ impl StorageConnector<'_> {
 }
 
 impl EngineConnector {
+    /// Create a connector from the handlers exposed by `engine`.
     pub(crate) fn new(engine: &dyn Engine) -> Self {
         Self {
             storage: engine.storage_handler(),
@@ -194,6 +195,7 @@ impl EngineConnector {
         }
     }
 
+    /// Configure the cancellation token propagated to engine handlers.
     pub(crate) fn with_cancellation_token(
         mut self,
         cancellation_token: impl Into<Option<CancellationTokenRef>>,
@@ -202,6 +204,7 @@ impl EngineConnector {
         self
     }
 
+    /// Start and drive `workflow` to completion.
     pub(crate) fn run<O: Send + 'static, F, Fut>(&self, workflow: F) -> DeltaResult<O>
     where
         F: FnOnce(Channel) -> Fut,
@@ -210,6 +213,7 @@ impl EngineConnector {
         self.drive(Workflow::start(workflow))
     }
 
+    /// Drive a started `workflow` to completion.
     pub(crate) fn drive<O: Send + 'static>(
         &self,
         mut workflow: DeltaResult<Workflow<O>>,
@@ -222,6 +226,7 @@ impl EngineConnector {
         }
     }
 
+    /// Start and drive `workflow` through `engine`.
     #[cfg(test)]
     pub(crate) fn run_with<O: Send + 'static, Fut>(
         engine: &dyn Engine,
@@ -233,6 +238,7 @@ impl EngineConnector {
         Self::new(engine).run(workflow)
     }
 
+    /// Convert a started generator into an iterator that drives connector requests.
     pub(crate) fn iterate_generator<Item: Send + 'static>(
         self,
         generator: DeltaResult<Generator<(), Item>>,
