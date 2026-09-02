@@ -869,7 +869,7 @@ pub enum HistoryCommitType {
 /// - [`DeltaError::Generic`] when the listing yields no commits and
 ///   `earliest_ratified_commit_version` is `Some(0)`, flagging a broken catalog-managed invariant
 ///   (ratified commit 0 with no published filesystem commit).
-#[tracing::instrument(name = "history.get_earliest_commit", skip_all, err)]
+#[tracing::instrument(name = "get_earliest_commit", skip_all, err)]
 pub fn start_earliest_commit(
     log_root: Url,
     earliest_ratified_commit_version: Option<Version>,
@@ -898,6 +898,7 @@ pub fn start_earliest_commit(
 /// - Other parameters have the same meaning as [`start_earliest_commit`].
 ///
 /// Errors from kernel or the Engine storage handler abort the workflow.
+#[tracing::instrument(skip(engine), err, ret)]
 pub fn get_earliest_commit(
     engine: &dyn Engine,
     log_root: &Url,

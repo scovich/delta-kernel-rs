@@ -7,10 +7,10 @@ use bytes::Bytes;
 use tracing::error;
 
 #[cfg(feature = "declarative-plans")]
-use super::ExecutePlan;
+use super::PlanOperation;
 use super::{
     BackwardListing, Cursor, ForwardListing, Generator, Page, PageRequest, PagedOperation,
-    ReadJsonFiles, ReadParquetFiles, Request, TypedResume, Workflow, WriteBytes,
+    ReadJsonFiles, ReadParquetFiles, Request, Resume, Workflow, WriteBytes,
 };
 use crate::{DeltaResult, Error, FileMeta, FileSlice, ParquetFooter};
 
@@ -94,7 +94,7 @@ pub(super) enum PendingRequest {
     ReadJson(PendingPageRequest<ReadJsonFiles>),
     ReadParquet(PendingPageRequest<ReadParquetFiles>),
     #[cfg(feature = "declarative-plans")]
-    ExecutePlan(PendingPageRequest<ExecutePlan>),
+    ExecutePlan(PendingPageRequest<PlanOperation>),
     WriteBytes(WeakExchange<WriteBytes, ()>),
 }
 
@@ -203,7 +203,7 @@ fn request_from_exchange<N, O, Out, In, T>(
     task: Task<O>,
     mailbox: Arc<RequestMailbox>,
     advance: impl FnOnce(Task<O>, Arc<RequestMailbox>) -> DeltaResult<N> + Send + 'static,
-    make_request: impl FnOnce(Out, TypedResume<N, In>) -> T,
+    make_request: impl FnOnce(Out, Resume<N, In>) -> T,
 ) -> DeltaResult<T>
 where
     N: Send + 'static,
@@ -217,10 +217,10 @@ where
         ));
     };
     let outbound = exchange.claim()?;
-    let resume = TypedResume(Box::new(move |response| {
+    let resume = Box::new(move |response| {
         exchange.respond(response)?;
         advance(task, mailbox)
-    }));
+    });
     Ok(make_request(outbound, resume))
 }
 
@@ -387,10 +387,10 @@ pub(super) fn advance_generator<O: Send + 'static, Y: Send + 'static>(
 
     if let Some(pending) = yields.take_pending()? {
         let item = pending.claim()?;
-        let resume = TypedResume(Box::new(move |response| {
+        let resume = Box::new(move |response| {
             pending.respond(response)?;
             advance_generator(task, mailbox, yields)
-        }));
+        });
         return Ok(Generator::Yield(item, resume));
     }
 

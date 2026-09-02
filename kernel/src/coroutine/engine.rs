@@ -15,7 +15,7 @@ use super::listing::{
     DEFAULT_BACKWARD_LISTING_WINDOW_SIZE, DEFAULT_FORWARD_LISTING_PAGE_SIZE,
 };
 #[cfg(feature = "declarative-plans")]
-use super::ExecutePlan;
+use super::PlanOperation;
 use super::{
     BackwardListing, BackwardListingResult, Channel, Cursor, CursorState, DeltaFuture,
     ForwardListing, Generator, ListingBounds, Page, PageRequest, PagedOperation, ReadJsonFiles,
@@ -87,13 +87,13 @@ where
 {
     match request {
         PageRequest::Start(operation, resume) => {
-            resume.resume(EnginePagination::start(connector, operation))
+            resume(EnginePagination::start(connector, operation))
         }
         PageRequest::Prepare(operation, resume) => {
-            resume.resume(EnginePagination::prepare(connector, operation))
+            resume(EnginePagination::prepare(connector, operation))
         }
         PageRequest::Continue(cursor, resume) => {
-            resume.resume(EnginePagination::continue_from(connector, cursor))
+            resume(EnginePagination::continue_from(connector, cursor))
         }
     }
 }
@@ -159,7 +159,7 @@ impl StorageConnector<'_> {
         match request {
             Request::ListForward(request) => resume_paged(self, request),
             Request::ListBackward(request) => resume_paged(self, request),
-            Request::ReadSmallFile(file, resume) => resume.resume(self.read_small_file(file)),
+            Request::ReadSmallFile(file, resume) => resume(self.read_small_file(file)),
             _ => Err(Error::internal_error(
                 "storage-only coroutine requested a non-storage operation",
             )),
@@ -261,7 +261,7 @@ impl EngineConnector {
             request @ (Request::ListForward(_)
             | Request::ListBackward(_)
             | Request::ReadSmallFile(..)) => self.storage_connector().resume(request),
-            Request::ReadParquetFooter(file, resume) => resume.resume(
+            Request::ReadParquetFooter(file, resume) => resume(
                 self.parquet
                     .read_parquet_footer_with_cancellation(&file, self.cancellation_token.clone()),
             ),
@@ -270,7 +270,7 @@ impl EngineConnector {
             #[cfg(feature = "declarative-plans")]
             Request::ExecutePlan(request) => resume_paged(self, request),
             Request::WriteBytes(operation, resume) => {
-                resume.resume(self.check_cancelled().and_then(|()| {
+                resume(self.check_cancelled().and_then(|()| {
                     self.storage
                         .put(&operation.url, operation.data, operation.overwrite)
                 }))
@@ -373,12 +373,12 @@ impl EnginePagination<ReadParquetFiles> for EngineConnector {
 }
 
 #[cfg(feature = "declarative-plans")]
-impl EnginePagination<ExecutePlan> for EngineConnector {
+impl EnginePagination<PlanOperation> for EngineConnector {
     type State = EngineDataIterator;
 
     const DESCRIPTION: &'static str = "plan execution";
 
-    fn initialize(&self, ExecutePlan(operation): ExecutePlan) -> DeltaResult<Self::State> {
+    fn initialize(&self, operation: PlanOperation) -> DeltaResult<Self::State> {
         self.check_cancelled()?;
         self.plan_executor
             .as_deref()
@@ -387,7 +387,7 @@ impl EnginePagination<ExecutePlan> for EngineConnector {
             .into_data()
     }
 
-    fn next_page(&self, state: Self::State) -> DeltaResult<Page<ExecutePlan>> {
+    fn next_page(&self, state: Self::State) -> DeltaResult<Page<PlanOperation>> {
         self.check_cancelled()?;
         next_engine_data(state)
     }
@@ -400,7 +400,7 @@ impl<Item: Send + 'static> Iterator for EngineGeneratorIterator<Item> {
         let state = std::mem::replace(&mut self.state, EngineGeneratorState::Exhausted);
         let mut generator = match state {
             EngineGeneratorState::Active(generator) => Ok(generator),
-            EngineGeneratorState::Yielded(resume) => resume.resume(Ok(())),
+            EngineGeneratorState::Yielded(resume) => resume(Ok(())),
             EngineGeneratorState::Exhausted => return None,
         };
 
@@ -503,7 +503,7 @@ mod tests {
         let reads: EngineDataIterator = Box::new(std::iter::from_fn(|| {
             panic!("cancelled plan continuation polled its iterator")
         }));
-        let cursor = Cursor::<ExecutePlan>::boxed(reads);
+        let cursor = Cursor::<PlanOperation>::boxed(reads);
 
         let result = EnginePagination::continue_from(&connector, cursor);
 

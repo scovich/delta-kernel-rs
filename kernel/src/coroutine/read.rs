@@ -40,10 +40,7 @@ impl PagedOperation for ReadParquetFiles {
 
 /// Paginated declarative-plan execution.
 #[cfg(feature = "declarative-plans")]
-pub struct ExecutePlan(pub PlanOperation);
-
-#[cfg(feature = "declarative-plans")]
-impl PagedOperation for ExecutePlan {
+impl PagedOperation for PlanOperation {
     type Page = Vec<Box<dyn EngineData>>;
 }
 
@@ -79,9 +76,9 @@ impl EngineDataOperation for ReadParquetFiles {
 }
 
 #[cfg(feature = "declarative-plans")]
-impl EngineDataOperation for ExecutePlan {
+impl EngineDataOperation for PlanOperation {
     async fn start(self, channel: &Channel) -> DeltaResult<Page<Self>> {
-        channel.start_plan(self.0).await
+        channel.start_plan(self).await
     }
 
     async fn continue_from(cursor: Cursor<Self>, channel: &Channel) -> DeltaResult<Page<Self>> {
@@ -173,8 +170,8 @@ impl Channel {
 
     /// Execute `plan` and return its first page.
     #[cfg(feature = "declarative-plans")]
-    pub(crate) async fn start_plan(&self, plan: PlanOperation) -> DeltaResult<Page<ExecutePlan>> {
-        self.exchange(ExecutePlan(plan), |request| {
+    pub(crate) async fn start_plan(&self, plan: PlanOperation) -> DeltaResult<Page<PlanOperation>> {
+        self.exchange(plan, |request| {
             PendingRequest::ExecutePlan(PendingPageRequest::Start(request))
         })
         .await
@@ -185,8 +182,8 @@ impl Channel {
     pub(crate) async fn prepare_plan(
         &self,
         plan: PlanOperation,
-    ) -> DeltaResult<Cursor<ExecutePlan>> {
-        self.exchange(ExecutePlan(plan), |request| {
+    ) -> DeltaResult<Cursor<PlanOperation>> {
+        self.exchange(plan, |request| {
             PendingRequest::ExecutePlan(PendingPageRequest::Prepare(request))
         })
         .await
@@ -196,8 +193,8 @@ impl Channel {
     #[cfg(feature = "declarative-plans")]
     pub(crate) async fn continue_plan(
         &self,
-        cursor: Cursor<ExecutePlan>,
-    ) -> DeltaResult<Page<ExecutePlan>> {
+        cursor: Cursor<PlanOperation>,
+    ) -> DeltaResult<Page<PlanOperation>> {
         self.exchange(cursor, |request| {
             PendingRequest::ExecutePlan(PendingPageRequest::Continue(request))
         })
@@ -209,15 +206,11 @@ impl<N: Send + 'static> PageRequest<N, ReadJsonFiles> {
     /// Forward this JSON request through `parent`.
     pub(super) async fn forward_to(self, parent: &Channel) -> DeltaResult<N> {
         match self {
-            Self::Start(ReadJsonFiles(read), resume) => {
-                resume.resume(parent.start_read_json(read).await)
-            }
+            Self::Start(ReadJsonFiles(read), resume) => resume(parent.start_read_json(read).await),
             Self::Prepare(ReadJsonFiles(read), resume) => {
-                resume.resume(parent.prepare_read_json(read).await)
+                resume(parent.prepare_read_json(read).await)
             }
-            Self::Continue(cursor, resume) => {
-                resume.resume(parent.continue_read_json(cursor).await)
-            }
+            Self::Continue(cursor, resume) => resume(parent.continue_read_json(cursor).await),
         }
     }
 }
@@ -227,28 +220,24 @@ impl<N: Send + 'static> PageRequest<N, ReadParquetFiles> {
     pub(super) async fn forward_to(self, parent: &Channel) -> DeltaResult<N> {
         match self {
             Self::Start(ReadParquetFiles(read), resume) => {
-                resume.resume(parent.start_read_parquet(read).await)
+                resume(parent.start_read_parquet(read).await)
             }
             Self::Prepare(ReadParquetFiles(read), resume) => {
-                resume.resume(parent.prepare_read_parquet(read).await)
+                resume(parent.prepare_read_parquet(read).await)
             }
-            Self::Continue(cursor, resume) => {
-                resume.resume(parent.continue_read_parquet(cursor).await)
-            }
+            Self::Continue(cursor, resume) => resume(parent.continue_read_parquet(cursor).await),
         }
     }
 }
 
 #[cfg(feature = "declarative-plans")]
-impl<N: Send + 'static> PageRequest<N, ExecutePlan> {
+impl<N: Send + 'static> PageRequest<N, PlanOperation> {
     /// Forward this plan request through `parent`.
     pub(super) async fn forward_to(self, parent: &Channel) -> DeltaResult<N> {
         match self {
-            Self::Start(ExecutePlan(plan), resume) => resume.resume(parent.start_plan(plan).await),
-            Self::Prepare(ExecutePlan(plan), resume) => {
-                resume.resume(parent.prepare_plan(plan).await)
-            }
-            Self::Continue(cursor, resume) => resume.resume(parent.continue_plan(cursor).await),
+            Self::Start(plan, resume) => resume(parent.start_plan(plan).await),
+            Self::Prepare(plan, resume) => resume(parent.prepare_plan(plan).await),
+            Self::Continue(cursor, resume) => resume(parent.continue_plan(cursor).await),
         }
     }
 }

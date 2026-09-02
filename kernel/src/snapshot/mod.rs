@@ -2234,14 +2234,15 @@ mod tests {
         let timestamp = loop {
             workflow = match workflow {
                 Workflow::Done(timestamp) => break timestamp,
-                Workflow::Request(Request::ReadJson(PageRequest::Start(_, resume))) => resume
-                    .resume(Ok(Page {
+                Workflow::Request(Request::ReadJson(PageRequest::Start(_, resume))) => {
+                    resume(Ok(Page {
                         data: Vec::new(),
                         next: Some(Cursor::id(1)),
-                    }))?,
+                    }))?
+                }
                 Workflow::Request(Request::ReadJson(PageRequest::Continue(cursor, resume))) => {
                     assert!(matches!(cursor.into_state(), CursorState::Id(1)));
-                    resume.resume(Ok(Page {
+                    resume(Ok(Page {
                         data: vec![batch.take().expect("first non-empty JSON page")],
                         next: None,
                     }))?

@@ -40,10 +40,10 @@ fn reporting_span_tracks_single_resume_outcome(#[case] outcome: ResumeOutcome) {
         };
         match outcome {
             ResumeOutcome::Ok => {
-                resume.resume(Ok(Bytes::from_static(b"ok"))).unwrap();
+                resume(Ok(Bytes::from_static(b"ok"))).unwrap();
             }
             ResumeOutcome::Err => {
-                let _ = resume.resume(Err(Error::generic("connector failed the read")));
+                let _ = resume(Err(Error::generic("connector failed the read")));
             }
             ResumeOutcome::Drop => drop(resume),
         }
@@ -83,7 +83,7 @@ fn workflow_output_is_independent_of_request_response_type() {
             Workflow::Request(Request::ReadSmallFile((location, range), resume)) => {
                 assert_eq!(location, expected_location);
                 assert_eq!(range, None);
-                resume.resume(Ok(Bytes::from_static(b"answer"))).unwrap()
+                resume(Ok(Bytes::from_static(b"answer"))).unwrap()
             }
             Workflow::Request(_) => {
                 panic!("workflow requested an unexpected operation")
@@ -110,11 +110,11 @@ fn connector_facing_generator_interleaves_requests_and_yields() {
             Generator::Done(output) => break output,
             Generator::Yield(item, resume) => {
                 yielded.push(item);
-                resume.resume(Ok(())).unwrap()
+                resume(Ok(())).unwrap()
             }
-            Generator::Request(Request::ReadSmallFile(_, resume)) => resume
-                .resume(Ok(Bytes::from_static(b"generated item")))
-                .unwrap(),
+            Generator::Request(Request::ReadSmallFile(_, resume)) => {
+                resume(Ok(Bytes::from_static(b"generated item"))).unwrap()
+            }
             Generator::Request(_) => panic!("generator requested an unexpected operation"),
         };
     };
@@ -134,9 +134,7 @@ fn yield_resume_error_is_delivered_to_generator() {
         panic!("generator did not yield its item");
     };
 
-    let generator = resume
-        .resume(Err(Error::generic("connector rejected yield")))
-        .unwrap();
+    let generator = resume(Err(Error::generic("connector rejected yield"))).unwrap();
     let Generator::Done(output) = generator else {
         panic!("generator did not handle the yield error");
     };
@@ -163,7 +161,7 @@ fn prepare_threads_an_opaque_id_to_continue() {
         workflow = match workflow {
             Workflow::Done(output) => break output,
             Workflow::Request(Request::ListForward(PageRequest::Prepare(_, resume))) => {
-                resume.resume(Ok(Cursor::id(7))).unwrap()
+                resume(Ok(Cursor::id(7))).unwrap()
             }
             Workflow::Request(Request::ListForward(PageRequest::Continue(
                 Cursor {
@@ -173,12 +171,11 @@ fn prepare_threads_an_opaque_id_to_continue() {
                 resume,
             ))) => {
                 assert_eq!(id, 7);
-                resume
-                    .resume(Ok(Page {
-                        data: Vec::new(),
-                        next: None,
-                    }))
-                    .unwrap()
+                resume(Ok(Page {
+                    data: Vec::new(),
+                    next: None,
+                }))
+                .unwrap()
             }
             Workflow::Request(Request::ListForward(PageRequest::Start(..))) => {
                 panic!("workflow unexpectedly started listing eagerly")
@@ -225,9 +222,7 @@ fn parent_intercepts_child_items_while_child_io_reaches_connector() {
             Workflow::Done(output) => break output,
             Workflow::Request(Request::ReadSmallFile((location, None), resume)) => {
                 connector_inputs.push(location.path().to_string());
-                resume
-                    .resume(Ok(Bytes::copy_from_slice(location.path().as_bytes())))
-                    .unwrap()
+                resume(Ok(Bytes::copy_from_slice(location.path().as_bytes()))).unwrap()
             }
             Workflow::Request(Request::ReadSmallFile(..)) => {
                 panic!("workflow unexpectedly requested a ranged read")

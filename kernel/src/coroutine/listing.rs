@@ -212,14 +212,12 @@ impl<N: Send + 'static> PageRequest<N, ForwardListing> {
     pub(super) async fn forward_to(self, parent: &Channel) -> DeltaResult<N> {
         match self {
             Self::Start(ForwardListing(bounds), resume) => {
-                resume.resume(parent.start_forward_listing(*bounds).await)
+                resume(parent.start_forward_listing(*bounds).await)
             }
             Self::Prepare(ForwardListing(bounds), resume) => {
-                resume.resume(parent.prepare_forward_listing(*bounds).await)
+                resume(parent.prepare_forward_listing(*bounds).await)
             }
-            Self::Continue(cursor, resume) => {
-                resume.resume(parent.continue_forward_listing(cursor).await)
-            }
+            Self::Continue(cursor, resume) => resume(parent.continue_forward_listing(cursor).await),
         }
     }
 }
@@ -229,13 +227,13 @@ impl<N: Send + 'static> PageRequest<N, BackwardListing> {
     pub(super) async fn forward_to(self, parent: &Channel) -> DeltaResult<N> {
         match self {
             Self::Start(BackwardListing(bounds), resume) => {
-                resume.resume(parent.start_backward_listing(*bounds).await)
+                resume(parent.start_backward_listing(*bounds).await)
             }
             Self::Prepare(BackwardListing(bounds), resume) => {
-                resume.resume(parent.prepare_backward_listing(*bounds).await)
+                resume(parent.prepare_backward_listing(*bounds).await)
             }
             Self::Continue(cursor, resume) => {
-                resume.resume(parent.continue_backward_listing(cursor).await)
+                resume(parent.continue_backward_listing(cursor).await)
             }
         }
     }

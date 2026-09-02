@@ -147,9 +147,9 @@ impl AsyncEngineConnector {
         match request {
             Request::ListForward(request) => resume_paged(self, request).await,
             Request::ListBackward(request) => resume_paged(self, request).await,
-            Request::ReadSmallFile(file, resume) => resume.resume(self.read_small_file(file).await),
+            Request::ReadSmallFile(file, resume) => resume(self.read_small_file(file).await),
             Request::ReadParquetFooter(file, resume) => {
-                resume.resume(self.read_parquet_footer(file).await)
+                resume(self.read_parquet_footer(file).await)
             }
             Request::ReadJson(request) => resume_paged(self, request).await,
             Request::ReadParquet(request) => resume_paged(self, request).await,
@@ -157,12 +157,12 @@ impl AsyncEngineConnector {
             Request::ExecutePlan(request) => {
                 let err = Error::unsupported("Default engine does not execute plans");
                 match request {
-                    PageRequest::Start(_, resume) => resume.resume(Err(err)),
-                    PageRequest::Prepare(_, resume) => resume.resume(Err(err)),
-                    PageRequest::Continue(_, resume) => resume.resume(Err(err)),
+                    PageRequest::Start(_, resume) => resume(Err(err)),
+                    PageRequest::Prepare(_, resume) => resume(Err(err)),
+                    PageRequest::Continue(_, resume) => resume(Err(err)),
                 }
             }
-            Request::WriteBytes(operation, resume) => resume.resume(
+            Request::WriteBytes(operation, resume) => resume(
                 self.write_bytes(operation.url, operation.data, operation.overwrite)
                     .await,
             ),
@@ -295,13 +295,13 @@ where
 {
     match request {
         PageRequest::Start(operation, resume) => {
-            resume.resume(AsyncPagination::start(connector, operation).await)
+            resume(AsyncPagination::start(connector, operation).await)
         }
         PageRequest::Prepare(operation, resume) => {
-            resume.resume(AsyncPagination::prepare(connector, operation).await)
+            resume(AsyncPagination::prepare(connector, operation).await)
         }
         PageRequest::Continue(cursor, resume) => {
-            resume.resume(AsyncPagination::continue_from(connector, cursor).await)
+            resume(AsyncPagination::continue_from(connector, cursor).await)
         }
     }
 }

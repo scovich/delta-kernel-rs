@@ -75,14 +75,14 @@
 //! ) -> DeltaResult<N> {
 //!     match request {
 //!         Request::ListForward(PageRequest::Prepare(args, resume)) => {
-//!             resume.resume(prepare_listing(args).await)
+//!             resume(prepare_listing(args).await)
 //!         }
 //!         Request::ListForward(PageRequest::Start(args, resume)) => {
 //!             let cursor = prepare_listing(args).await?;
-//!             resume.resume(advance_listing(cursor).await)
+//!             resume(advance_listing(cursor).await)
 //!         }
 //!         Request::ListForward(PageRequest::Continue(cursor, resume)) => {
-//!             resume.resume(advance_listing(cursor).await)
+//!             resume(advance_listing(cursor).await)
 //!         }
 //!         _ => Err(delta_kernel::Error::unsupported(
 //!             "this connector does not support the requested operation",
@@ -265,10 +265,10 @@ use self::core::{
     WeakExchange, YieldMailbox,
 };
 use self::listing::{BackwardListing, BackwardListingResult, ForwardListing, ListingBounds};
-#[cfg(feature = "declarative-plans")]
-use self::read::ExecutePlan;
 use self::read::{ReadJsonFiles, ReadParquetFiles};
 use self::write::WriteBytes;
+#[cfg(feature = "declarative-plans")]
+pub(crate) use crate::plans::Operation as PlanOperation;
 #[cfg(test)]
 use crate::Error;
 use crate::{DeltaResult, FileMeta, FileSlice, ParquetFooter};
@@ -285,7 +285,7 @@ mod tests;
 /// Resume handle for one yielded generator item.
 ///
 /// Pass `Ok(())` to continue or an error for kernel to observe at the suspended yield.
-pub type YieldResume<N> = TypedResume<N, ()>;
+pub type YieldResume<N> = Resume<N, ()>;
 
 /// Describes a connector operation that may return multiple pages.
 pub trait PagedOperation: Send + Sized + 'static {
@@ -402,9 +402,9 @@ pub enum Request<N: Send + 'static> {
     /// List page ranges from high to low, with entries ascending within each page.
     ListBackward(PageRequest<N, BackwardListing>),
     /// Read a whole file when the range is `None`, or exactly the half-open range otherwise.
-    ReadSmallFile(FileSlice, TypedResume<N, Bytes>),
+    ReadSmallFile(FileSlice, Resume<N, Bytes>),
     /// Read one Parquet footer.
-    ReadParquetFooter(FileMeta, TypedResume<N, ParquetFooter>),
+    ReadParquetFooter(FileMeta, Resume<N, ParquetFooter>),
     /// Read JSON files as ordered [`crate::EngineData`] batches: Each file may produce multiple
     /// batches, but batches may not span multiple files.
     ReadJson(PageRequest<N, ReadJsonFiles>),
@@ -413,19 +413,19 @@ pub enum Request<N: Send + 'static> {
     ReadParquet(PageRequest<N, ReadParquetFiles>),
     #[cfg(feature = "declarative-plans")]
     /// Execute a declarative plan in connector-selected pages.
-    ExecutePlan(PageRequest<N, ExecutePlan>),
+    ExecutePlan(PageRequest<N, PlanOperation>),
     /// Write one complete object.
-    WriteBytes(WriteBytes, TypedResume<N, ()>),
+    WriteBytes(WriteBytes, Resume<N, ()>),
 }
 
 /// One phase of a paginated connector operation.
 pub enum PageRequest<N: Send + 'static, Op: PagedOperation> {
     /// Initialize the operation and return its first page.
-    Start(Op, TypedResume<N, Page<Op>>),
+    Start(Op, Resume<N, Page<Op>>),
     /// Initialize the operation and return a cursor without fetching the first page.
-    Prepare(Op, TypedResume<N, Cursor<Op>>),
+    Prepare(Op, Resume<N, Cursor<Op>>),
     /// Consume a cursor and return the next page.
-    Continue(Cursor<Op>, TypedResume<N, Page<Op>>),
+    Continue(Cursor<Op>, Resume<N, Page<Op>>),
 }
 
 impl<N: Send + 'static> Request<N> {
@@ -435,16 +435,14 @@ impl<N: Send + 'static> Request<N> {
             Self::ListForward(request) => request.forward_to(parent).await,
             Self::ListBackward(request) => request.forward_to(parent).await,
             Self::ReadSmallFile(file, resume) => {
-                resume.resume(parent.read_small_file(file.0, file.1).await)
+                resume(parent.read_small_file(file.0, file.1).await)
             }
-            Self::ReadParquetFooter(file, resume) => {
-                resume.resume(parent.read_parquet_footer(file).await)
-            }
+            Self::ReadParquetFooter(file, resume) => resume(parent.read_parquet_footer(file).await),
             Self::ReadJson(request) => request.forward_to(parent).await,
             Self::ReadParquet(request) => request.forward_to(parent).await,
             #[cfg(feature = "declarative-plans")]
             Self::ExecutePlan(request) => request.forward_to(parent).await,
-            Self::WriteBytes(operation, resume) => resume.resume(
+            Self::WriteBytes(operation, resume) => resume(
                 parent
                     .write_bytes(operation.url, operation.data, operation.overwrite)
                     .await,
@@ -453,19 +451,9 @@ impl<N: Send + 'static> Request<N> {
     }
 }
 
-/// Owns a suspended continuation from an operation's response of type `R` to the next
-/// workflow/generator state `N`.
-pub struct TypedResume<N, R>(Box<dyn FnOnce(DeltaResult<R>) -> DeltaResult<N> + Send>);
-
-impl<N, R> TypedResume<N, R> {
-    /// Resume with connector `response` and run kernel to its next boundary.
-    ///
-    /// Returns the next workflow or generator state. A connector error is delivered to kernel,
-    /// which may handle it or return it; errors while advancing kernel are also returned.
-    pub fn resume(self, response: DeltaResult<R>) -> DeltaResult<N> {
-        self.0(response)
-    }
-}
+/// Resumes a suspended [`Workflow`] or [`Generator`] with connector's `response`, advancing it to
+/// the next communication point (suspend, yield, or completion).
+pub type Resume<N, R> = Box<dyn FnOnce(DeltaResult<R>) -> DeltaResult<N> + Send>;
 
 /// Kernel-side handle for typed connector operations.
 ///
@@ -528,7 +516,7 @@ impl<Y: Send + 'static> GeneratorState<Generator<(), Y>> {
         let state = std::mem::replace(self, Self::Exhausted);
         let mut generator = match state {
             Self::Start(generator) => Ok(generator),
-            Self::Continue(resume) => resume.resume(Ok(())),
+            Self::Continue(resume) => resume(Ok(())),
             Self::Exhausted => return Ok(None),
         };
 
