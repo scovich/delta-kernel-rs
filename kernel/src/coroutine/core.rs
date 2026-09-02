@@ -21,8 +21,6 @@ impl<O, F> DeltaFuture<O> for F where F: Future<Output = DeltaResult<O>> + Send 
 
 /// Type-erased coroutine task.
 pub(super) type Task<O> = Pin<Box<dyn DeltaFuture<O> + 'static>>;
-/// Weak reference to an operation exchange.
-pub(super) type WeakExchange<Out, In> = Weak<Exchange<Out, In>>;
 /// Exchange used to suspend a generator at a yielded item.
 pub(super) type YieldExchange<Y> = Exchange<Y, ()>;
 
@@ -73,9 +71,6 @@ impl<T: MailboxEntry> Mailbox<T> {
     }
 }
 
-/// Request slot shared by a coroutine task and its driver.
-pub(super) type RequestMailbox = Mailbox<PendingRequest>;
-
 impl Mailbox<PendingRequest> {
     /// Connector-side: Retrieve a pending kernel request after the coroutine suspends.
     pub(super) fn take_pending(&self) -> DeltaResult<PendingRequest> {
@@ -89,20 +84,20 @@ impl Mailbox<PendingRequest> {
 pub(super) enum PendingRequest {
     ListForward(PendingPageRequest<ForwardListing>),
     ListBackward(PendingPageRequest<BackwardListing>),
-    ReadSmallFile(WeakExchange<FileSlice, Bytes>),
-    ReadParquetFooter(WeakExchange<FileMeta, ParquetFooter>),
+    ReadSmallFile(Weak<Exchange<FileSlice, Bytes>>),
+    ReadParquetFooter(Weak<Exchange<FileMeta, ParquetFooter>>),
     ReadJson(PendingPageRequest<ReadJsonFiles>),
     ReadParquet(PendingPageRequest<ReadParquetFiles>),
     #[cfg(feature = "declarative-plans")]
     ExecutePlan(PendingPageRequest<PlanOperation>),
-    WriteBytes(WeakExchange<WriteBytes, ()>),
+    WriteBytes(Weak<Exchange<WriteBytes, ()>>),
 }
 
 /// A suspended phase of a paginated operation.
 pub(super) enum PendingPageRequest<Op: PagedOperation> {
-    Start(WeakExchange<Op, Page<Op>>),
-    Prepare(WeakExchange<Op, Cursor<Op>>),
-    Continue(WeakExchange<Cursor<Op>, Page<Op>>),
+    Start(Weak<Exchange<Op, Page<Op>>>),
+    Prepare(Weak<Exchange<Op, Cursor<Op>>>),
+    Continue(Weak<Exchange<Cursor<Op>, Page<Op>>>),
 }
 
 impl Default for PendingRequest {
@@ -133,8 +128,8 @@ impl PendingRequest {
     fn into_request<N: Send + 'static, O: Send + 'static>(
         self,
         task: Task<O>,
-        mailbox: Arc<RequestMailbox>,
-        advance: impl FnOnce(Task<O>, Arc<RequestMailbox>) -> DeltaResult<N> + Send + 'static,
+        mailbox: Arc<Mailbox<PendingRequest>>,
+        advance: impl FnOnce(Task<O>, Arc<Mailbox<PendingRequest>>) -> DeltaResult<N> + Send + 'static,
     ) -> DeltaResult<Request<N>> {
         match self {
             Self::ListForward(pending) => Ok(Request::ListForward(
@@ -179,8 +174,8 @@ impl<Op: PagedOperation> PendingPageRequest<Op> {
     fn into_request<N: Send + 'static, O: Send + 'static>(
         self,
         task: Task<O>,
-        mailbox: Arc<RequestMailbox>,
-        advance: impl FnOnce(Task<O>, Arc<RequestMailbox>) -> DeltaResult<N> + Send + 'static,
+        mailbox: Arc<Mailbox<PendingRequest>>,
+        advance: impl FnOnce(Task<O>, Arc<Mailbox<PendingRequest>>) -> DeltaResult<N> + Send + 'static,
     ) -> DeltaResult<PageRequest<N, Op>> {
         match self {
             Self::Start(exchange) => {
@@ -199,10 +194,10 @@ impl<Op: PagedOperation> PendingPageRequest<Op> {
 /// Extracts a pending kernel-side request from the exchange and converts it to a `TypedResume` the
 /// connector can consume.
 fn request_from_exchange<N, O, Out, In, T>(
-    exchange: WeakExchange<Out, In>,
+    exchange: Weak<Exchange<Out, In>>,
     task: Task<O>,
-    mailbox: Arc<RequestMailbox>,
-    advance: impl FnOnce(Task<O>, Arc<RequestMailbox>) -> DeltaResult<N> + Send + 'static,
+    mailbox: Arc<Mailbox<PendingRequest>>,
+    advance: impl FnOnce(Task<O>, Arc<Mailbox<PendingRequest>>) -> DeltaResult<N> + Send + 'static,
     make_request: impl FnOnce(Out, Resume<N, In>) -> T,
 ) -> DeltaResult<T>
 where
@@ -358,7 +353,7 @@ impl<Out, In> Drop for Wait<Out, In> {
 /// Connector-side helper that starts or resumes a kernel workflow
 pub(super) fn advance_workflow<O: Send + 'static>(
     mut task: Task<O>,
-    mailbox: Arc<RequestMailbox>,
+    mailbox: Arc<Mailbox<PendingRequest>>,
 ) -> DeltaResult<Workflow<O>> {
     let mut context = Context::from_waker(Waker::noop());
     match task.as_mut().poll(&mut context) {
@@ -368,7 +363,7 @@ pub(super) fn advance_workflow<O: Send + 'static>(
             Ok(Workflow::Request(pending.into_request(
                 task,
                 mailbox,
-                advance_workflow::<O>,
+                advance_workflow,
             )?))
         }
     }
@@ -377,8 +372,8 @@ pub(super) fn advance_workflow<O: Send + 'static>(
 /// Connector-side helper that starts or resumes a kernel generator
 pub(super) fn advance_generator<O: Send + 'static, Y: Send + 'static>(
     mut task: Task<O>,
-    mailbox: Arc<RequestMailbox>,
-    yields: Arc<YieldMailbox<Y>>,
+    mailbox: Arc<Mailbox<PendingRequest>>,
+    yields: Arc<Mailbox<Weak<YieldExchange<Y>>>>,
 ) -> DeltaResult<Generator<O, Y>> {
     let mut context = Context::from_waker(Waker::noop());
     if let Poll::Ready(output) = task.as_mut().poll(&mut context) {
@@ -402,12 +397,7 @@ pub(super) fn advance_generator<O: Send + 'static, Y: Send + 'static>(
     Ok(Generator::Request(request))
 }
 
-/// Yield slot shared by a generator task and its driver.
-///
-/// The mailbox stores only a weak reference to the pending [`YieldExchange`], to avoid retaining an
-/// exchange whose owning future was abandoned before the driver claimed it.
-pub(super) type YieldMailbox<Y> = Mailbox<Weak<YieldExchange<Y>>>;
-
+/// Yields publish a weak [`YieldExchange`] so an abandoned waiter does not occupy the slot.
 impl<Y> MailboxEntry for Weak<YieldExchange<Y>> {
     fn is_live(&self) -> bool {
         self.strong_count() > 0

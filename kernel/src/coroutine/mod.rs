@@ -172,10 +172,10 @@
 // 2. The entry point calls `Workflow::start` with a closure that, when invoked synchronously,
 //    associates the workflow's async logic with a `Channel` and returns the resulting async future.
 //
-// 3. `Workflow::start` creates an `Arc<RequestMailbox>`. It keeps one reference for itself, and
-//    shares a second reference with kernel by wrapping it in a `Channel`, which it uses to invoke
-//    the workflow-creation closure. Because that closure returns a future, invoking it creates but
-//    does not start the workflow's (compiler-generated) async state machine.
+// 3. `Workflow::start` creates an `Arc<Mailbox<PendingRequest>>`. It keeps one reference for
+//    itself, and shares a second reference with kernel by wrapping it in a `Channel`, which it uses
+//    to invoke the workflow-creation closure. Because that closure returns a future, invoking it
+//    creates but does not start the workflow's (compiler-generated) async state machine.
 //
 // 4. `Workflow::start` wraps and instruments that future, and box-pins it (type alias: `Task<O>`).
 //    This `Task` owns the complete compiler-generated state of the kernel workflow.
@@ -252,7 +252,7 @@
 use std::any::Any;
 use std::marker::PhantomData;
 use std::ops::Deref;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use bytes::Bytes;
 use tracing::{error, Instrument as _, Span};
@@ -261,8 +261,7 @@ use url::Url;
 
 pub(crate) use self::core::DeltaFuture;
 use self::core::{
-    advance_generator, advance_workflow, Exchange, PendingRequest, RequestMailbox, Wait,
-    WeakExchange, YieldMailbox,
+    advance_generator, advance_workflow, Exchange, Mailbox, PendingRequest, Wait, YieldExchange,
 };
 use self::listing::{BackwardListing, BackwardListingResult, ForwardListing, ListingBounds};
 use self::read::{ReadJsonFiles, ReadParquetFiles};
@@ -351,7 +350,7 @@ impl<O: Send + 'static> Workflow<O> {
     where
         Fut: DeltaFuture<O> + 'static,
     {
-        let mailbox = Arc::new(RequestMailbox::default());
+        let mailbox = Arc::new(Mailbox::default());
         let future = workflow(Channel(Arc::clone(&mailbox)));
         let future = async move {
             future
@@ -376,8 +375,8 @@ impl<O: Send + 'static, Y: Send + 'static> Generator<O, Y> {
     where
         Fut: DeltaFuture<O> + 'static,
     {
-        let mailbox = Arc::new(RequestMailbox::default());
-        let yields = Arc::new(YieldMailbox::default());
+        let mailbox = Arc::new(Mailbox::default());
+        let yields = Arc::new(Mailbox::default());
         let yielder = Yielder {
             channel: Channel(Arc::clone(&mailbox)),
             mailbox: Arc::clone(&yields),
@@ -458,14 +457,14 @@ pub type Resume<N, R> = Box<dyn FnOnce(DeltaResult<R>) -> DeltaResult<N> + Send>
 /// Kernel-side handle for typed connector operations.
 ///
 /// It shares a mailbox with the coroutine driver and admits one live request at a time.
-pub(crate) struct Channel(Arc<RequestMailbox>);
+pub(crate) struct Channel(Arc<Mailbox<PendingRequest>>);
 
 impl Channel {
     /// Initiate a request/response exchange with the connector
     async fn exchange<Out: Send + 'static, In: Send + 'static>(
         &self,
         outbound: Out,
-        pending: impl FnOnce(WeakExchange<Out, In>) -> PendingRequest + Send,
+        pending: impl FnOnce(Weak<Exchange<Out, In>>) -> PendingRequest + Send,
     ) -> DeltaResult<In> {
         let exchange = Arc::new(Exchange::new(outbound));
         self.0.publish(pending(Arc::downgrade(&exchange)))?;
@@ -479,7 +478,7 @@ impl Channel {
 /// delivering the input of [`Self::yield_item`] calls to the generator's immediate consumer.
 pub(crate) struct Yielder<Y> {
     channel: Channel,
-    mailbox: Arc<YieldMailbox<Y>>,
+    mailbox: Arc<Mailbox<Weak<YieldExchange<Y>>>>,
 }
 
 impl<Y: Send + 'static> Yielder<Y> {

@@ -262,7 +262,7 @@ fn pending_without_connector_work_fails_instead_of_hanging() {
 
 #[test]
 fn stale_weak_mailbox_entries_do_not_block_reuse() {
-    let core = RequestMailbox::default();
+    let core = Mailbox::default();
     let abandoned = Arc::new(Exchange::new((
         Url::parse("memory:///abandoned").unwrap(),
         None,
