@@ -631,13 +631,9 @@ pub trait StorageHandler: AsAny {
 
     /// Cancellation-aware variant of [`list_from`](Self::list_from).
     ///
-    /// When `cancellation_token` is `Some`, an engine races its listing against the token and
-    /// terminates the returned iterator with [`Error::Cancelled`] once cancellation is observed,
+    /// When `cancellation_token` is `Some`, the engine races its listing against the token and
+    /// terminates the returned iterator with [`Error::Cancelled`] if cancellation is observed,
     /// rather than paging through the whole listing. Kernel injects no additional checks.
-    ///
-    /// Kernel is responsible to propagate connector-provided cancellation tokens from public entry
-    /// points to calls of this function. Engines are responsible to honor a cancellation promptly;
-    /// kernel will not inject additional cancellation checks when consuming this iterator.
     ///
     /// The default implementation delegates to [`list_from`](Self::list_from), but checks
     /// cancellation first and wraps the iterator to also check at every `next` call. An engine with
@@ -662,13 +658,9 @@ pub trait StorageHandler: AsAny {
 
     /// Cancellation-aware variant of [`read_files`](Self::read_files).
     ///
-    /// When `cancellation_token` is `Some`, an engine may race its I/O against the token and
-    /// terminate the returned iterator with [`Error::Cancelled`] once cancellation is observed,
-    /// rather than reading every file slice to completion.
-    ///
-    /// Kernel is responsible to propagate connector-provided cancellation tokens from public entry
-    /// points to calls of this function. Engines are responsible to honor a cancellation promptly;
-    /// kernel will not inject additional cancellation checks when consuming this iterator.
+    /// When `cancellation_token` is `Some`, the engine races its I/O against the token and
+    /// terminates the returned iterator with [`Error::Cancelled`] if cancellation is observed,
+    /// rather than reading every file slice to completion. Kernel injects no additional checks.
     ///
     /// The default implementation delegates to [`read_files`](Self::read_files), but checks
     /// cancellation first and wraps the iterator to also check at every `next` call.
@@ -757,13 +749,9 @@ pub trait JsonHandler: AsAny {
 
     /// Cancellation-aware variant of [`read_json_files`](Self::read_json_files).
     ///
-    /// When `cancellation_token` is `Some`, an engine may race its I/O against the token and
-    /// terminate the returned iterator with [`Error::Cancelled`] once cancellation is observed,
-    /// rather than reading every file to completion.
-    ///
-    /// Kernel is responsible to propagate connector-provided cancellation tokens from public entry
-    /// points to calls of this function. Engines are responsible to honor a cancellation promptly;
-    /// kernel will not inject additional cancellation checks when consuming this iterator.
+    /// When `cancellation_token` is `Some`, the engine races its I/O against the token and
+    /// terminates the returned iterator with [`Error::Cancelled`] if cancellation is observed,
+    /// rather than reading every file to completion. Kernel injects no additional checks.
     ///
     /// The default implementation delegates to [`read_json_files`](Self::read_json_files), but
     /// checks cancellation first and wraps the iterator to also check at every `next` call. An
@@ -1006,13 +994,9 @@ pub trait ParquetHandler: AsAny {
 
     /// Cancellation-aware variant of [`read_parquet_files`](Self::read_parquet_files).
     ///
-    /// When `cancellation_token` is `Some`, an engine may race its I/O against the token and
-    /// terminate the returned iterator with [`Error::Cancelled`] once cancellation is observed,
-    /// rather than reading every file to completion.
-    ///
-    /// Kernel is responsible to propagate connector-provided cancellation tokens from public entry
-    /// points to calls of this function. Engines are responsible to honor a cancellation promptly;
-    /// kernel will not inject additional cancellation checks when consuming this iterator.
+    /// When `cancellation_token` is `Some`, the engine races its I/O against the token and
+    /// terminates the returned iterator with [`Error::Cancelled`] if cancellation is observed,
+    /// rather than reading every file to completion. Kernel injects no additional checks.
     ///
     /// The default implementation delegates to [`read_parquet_files`](Self::read_parquet_files),
     /// but checks cancellation first and wraps the iterator to also check at every `next` call. An
@@ -1112,11 +1096,8 @@ pub trait ParquetHandler: AsAny {
 
     /// Cancellation-aware variant of [`read_parquet_footer`](Self::read_parquet_footer).
     ///
-    /// When `cancellation_token` is `Some`, an engine may race the footer read against the token
-    /// and return [`Error::Cancelled`] once cancellation is observed.
-    ///
-    /// Kernel is responsible to propagate connector-provided cancellation tokens from public entry
-    /// points to calls of this function. Engines are responsible to honor a cancellation promptly.
+    /// When `cancellation_token` is `Some`, the engine races the footer read against the token
+    /// and returns [`Error::Cancelled`] if cancellation is observed.
     ///
     /// The default implementation returns [`Error::Cancelled`] if the token is already cancelled
     /// and otherwise delegates to [`read_parquet_footer`](Self::read_parquet_footer), ignoring the
