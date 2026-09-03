@@ -1,9 +1,13 @@
+//! Core infrastructure for kernel coroutines.
+//!
+//! The [`Wait`] future is the heart of the coroutine implementation, along with.
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::task::{Context, Poll, Waker};
 
 use bytes::Bytes;
+use delta_kernel_derive::internal_api;
 use tracing::error;
 
 #[cfg(feature = "declarative-plans")]
@@ -15,6 +19,7 @@ use super::{
 use crate::{DeltaResult, Error, FileMeta, FileSlice, ParquetFooter};
 
 /// A sendable future that resolves to a kernel result.
+#[internal_api]
 pub(crate) trait DeltaFuture<O>: Future<Output = DeltaResult<O>> + Send {}
 
 impl<O, F> DeltaFuture<O> for F where F: Future<Output = DeltaResult<O>> + Send {}
@@ -225,8 +230,8 @@ where
 ///
 /// - After publication, [`Wait`] inside the task owns the only strong reference; the corresponding
 ///   mailbox stores a weak reference.
-/// - Claiming the handoff upgrades the weak reference. The resulting [`TypedResume`] owns that
-///   strong reference directly and owns the other indirectly through the captured task's `Wait`.
+/// - Claiming the handoff upgrades the weak reference. The resulting [`Resume`] owns that strong
+///   reference directly and owns the other indirectly through the captured task's `Wait`.
 /// - Resuming writes the response through the direct reference, then polls the task, whose `Wait`
 ///   reads the response through the other reference.
 /// - Dropping the resume drops both strong references.
@@ -350,51 +355,52 @@ impl<Out, In> Drop for Wait<Out, In> {
     }
 }
 
-/// Connector-side helper that starts or resumes a kernel workflow
-pub(super) fn advance_workflow<O: Send + 'static>(
-    mut task: Task<O>,
-    mailbox: Arc<Mailbox<PendingRequest>>,
-) -> DeltaResult<Workflow<O>> {
-    let mut context = Context::from_waker(Waker::noop());
-    match task.as_mut().poll(&mut context) {
-        Poll::Ready(output) => output.map(Workflow::Done),
-        Poll::Pending => {
-            let pending = mailbox.take_pending()?;
-            Ok(Workflow::Request(pending.into_request(
-                task,
-                mailbox,
-                advance_workflow,
-            )?))
+impl<O: Send + 'static> Workflow<O> {
+    /// Connector-side helper that starts or resumes a kernel workflow
+    pub(super) fn advance(
+        mut task: Task<O>,
+        mailbox: Arc<Mailbox<PendingRequest>>,
+    ) -> DeltaResult<Workflow<O>> {
+        let mut context = Context::from_waker(Waker::noop());
+        match task.as_mut().poll(&mut context) {
+            Poll::Ready(output) => output.map(Workflow::Done),
+            Poll::Pending => {
+                let pending = mailbox.take_pending()?;
+                let request = pending.into_request(task, mailbox, Self::advance)?;
+                Ok(Workflow::Request(request))
+            }
         }
     }
 }
 
-/// Connector-side helper that starts or resumes a kernel generator
-pub(super) fn advance_generator<O: Send + 'static, Y: Send + 'static>(
-    mut task: Task<O>,
-    mailbox: Arc<Mailbox<PendingRequest>>,
-    yields: Arc<Mailbox<Weak<YieldExchange<Y>>>>,
-) -> DeltaResult<Generator<O, Y>> {
-    let mut context = Context::from_waker(Waker::noop());
-    if let Poll::Ready(output) = task.as_mut().poll(&mut context) {
-        return output.map(Generator::Done);
-    }
+impl<O: Send + 'static, Y: Send + 'static> Generator<O, Y> {
+    /// Connector-side helper that starts or resumes a kernel generator
+    pub(super) fn advance(
+        mut task: Task<O>,
+        mailbox: Arc<Mailbox<PendingRequest>>,
+        yields: Arc<Mailbox<Weak<YieldExchange<Y>>>>,
+    ) -> DeltaResult<Generator<O, Y>> {
+        let mut context = Context::from_waker(Waker::noop());
+        if let Poll::Ready(output) = task.as_mut().poll(&mut context) {
+            return output.map(Generator::Done);
+        }
 
-    if let Some(pending) = yields.take_pending()? {
-        let item = pending.claim()?;
-        let resume = Box::new(move |response| {
-            pending.respond(response)?;
-            advance_generator(task, mailbox, yields)
-        });
-        return Ok(Generator::Yield(item, resume));
-    }
+        if let Some(pending) = yields.take_pending()? {
+            let item = pending.claim()?;
+            let resume = Box::new(move |response| {
+                pending.respond(response)?;
+                Self::advance(task, mailbox, yields)
+            });
+            return Ok(Generator::Yield(item, resume));
+        }
 
-    let pending = mailbox.take_pending()?;
-    let next_yields = Arc::clone(&yields);
-    let request = pending.into_request(task, mailbox, move |task, mailbox| {
-        advance_generator(task, mailbox, next_yields)
-    })?;
-    Ok(Generator::Request(request))
+        let pending = mailbox.take_pending()?;
+        let next_yields = Arc::clone(&yields);
+        let request = pending.into_request(task, mailbox, move |task, mailbox| {
+            Self::advance(task, mailbox, next_yields)
+        })?;
+        Ok(Generator::Request(request))
+    }
 }
 
 /// Yields publish a weak [`YieldExchange`] so an abandoned waiter does not occupy the slot.

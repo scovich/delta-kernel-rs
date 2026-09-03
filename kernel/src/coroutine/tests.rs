@@ -5,12 +5,15 @@ use rstest::rstest;
 use tempfile::tempdir;
 use tracing::field::Empty;
 use tracing::info_span;
+use url::Url;
 
 use super::*;
+use crate::coroutine::core::{Exchange, Mailbox, PendingRequest};
 use crate::coroutine::engine::EngineConnector;
 use crate::engine::sync::SyncEngine;
 use crate::metrics::MetricEvent;
 use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+use crate::Error;
 
 /// Connector action after the toy workflow's single `ReadSmallFile` request.
 #[derive(Clone, Copy)]

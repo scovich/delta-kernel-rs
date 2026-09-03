@@ -7,8 +7,6 @@ use std::any::Any;
 use std::sync::Arc;
 
 use bytes::Bytes;
-#[cfg(test)]
-use url::Url;
 
 use super::listing::{
     backward_listing_window, is_within_listing_bounds, version_from_listing_bound,
@@ -436,6 +434,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use url::Url;
+
     use super::*;
     #[cfg(feature = "declarative-plans")]
     use crate::engine::sync::SyncEngine;

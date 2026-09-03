@@ -38,8 +38,6 @@ use crate::schema::{
 };
 use crate::snapshot::IncrementalReplay;
 use crate::utils::require;
-#[cfg(test)]
-use crate::Engine;
 use crate::{DeltaResult, Error, FileMeta, RowVisitor, Version};
 
 static REPLAY_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
@@ -698,6 +696,7 @@ mod tests {
     use crate::log_segment::for_snapshot_from_storage;
     use crate::object_store::memory::InMemory;
     use crate::table_features::TableFeature;
+    use crate::Engine;
 
     // ===== Unit tests on `on_*` methods =====
 
