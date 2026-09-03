@@ -629,17 +629,14 @@ pub trait StorageHandler: AsAny {
     fn list_from(&self, path: &Url)
         -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>>;
 
-    /// Cancellation-aware variant of [`list_from`](Self::list_from).
+    /// Cancellation-aware variant of [`list_from`].
     ///
-    /// When `cancellation_token` is `Some`, the engine races its listing against the token and
-    /// terminates the returned iterator with [`Error::Cancelled`] if cancellation is observed,
-    /// rather than paging through the whole listing. Kernel injects no additional checks.
+    /// Implementations must follow the [Engine operation cancellation contract]. The provided
+    /// implementation checks before delegating to [`list_from`] and before each pull of the
+    /// returned iterator. It cannot interrupt I/O initiated inside [`list_from`].
     ///
-    /// The default implementation delegates to [`list_from`](Self::list_from), but checks
-    /// cancellation first and wraps the iterator to also check at every `next` call. An engine with
-    /// cancellable I/O should override this method to use that capability.
-    ///
-    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    /// [`list_from`]: Self::list_from
+    /// [Engine operation cancellation contract]: crate::cancellation#engine-operation-contract
     fn list_from_with_cancellation(
         &self,
         path: &Url,
@@ -656,16 +653,14 @@ pub trait StorageHandler: AsAny {
         files: Vec<FileSlice>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>>;
 
-    /// Cancellation-aware variant of [`read_files`](Self::read_files).
+    /// Cancellation-aware variant of [`read_files`].
     ///
-    /// When `cancellation_token` is `Some`, the engine races its I/O against the token and
-    /// terminates the returned iterator with [`Error::Cancelled`] if cancellation is observed,
-    /// rather than reading every file slice to completion. Kernel injects no additional checks.
+    /// Implementations must follow the [Engine operation cancellation contract]. The provided
+    /// implementation checks before delegating to [`read_files`] and before each pull of the
+    /// returned iterator. It cannot interrupt I/O initiated inside [`read_files`].
     ///
-    /// The default implementation delegates to [`read_files`](Self::read_files), but checks
-    /// cancellation first and wraps the iterator to also check at every `next` call.
-    ///
-    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    /// [`read_files`]: Self::read_files
+    /// [Engine operation cancellation contract]: crate::cancellation#engine-operation-contract
     fn read_files_with_cancellation(
         &self,
         files: Vec<FileSlice>,
@@ -747,17 +742,14 @@ pub trait JsonHandler: AsAny {
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
 
-    /// Cancellation-aware variant of [`read_json_files`](Self::read_json_files).
+    /// Cancellation-aware variant of [`read_json_files`].
     ///
-    /// When `cancellation_token` is `Some`, the engine races its I/O against the token and
-    /// terminates the returned iterator with [`Error::Cancelled`] if cancellation is observed,
-    /// rather than reading every file to completion. Kernel injects no additional checks.
+    /// Implementations must follow the [Engine operation cancellation contract]. The provided
+    /// implementation checks before delegating to [`read_json_files`] and before each pull of the
+    /// returned iterator. It cannot interrupt I/O initiated inside [`read_json_files`].
     ///
-    /// The default implementation delegates to [`read_json_files`](Self::read_json_files), but
-    /// checks cancellation first and wraps the iterator to also check at every `next` call. An
-    /// engine with cancellable I/O should override this method to use that capability.
-    ///
-    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    /// [`read_json_files`]: Self::read_json_files
+    /// [Engine operation cancellation contract]: crate::cancellation#engine-operation-contract
     fn read_json_files_with_cancellation(
         &self,
         files: &[FileMeta],
@@ -992,17 +984,14 @@ pub trait ParquetHandler: AsAny {
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
 
-    /// Cancellation-aware variant of [`read_parquet_files`](Self::read_parquet_files).
+    /// Cancellation-aware variant of [`read_parquet_files`].
     ///
-    /// When `cancellation_token` is `Some`, the engine races its I/O against the token and
-    /// terminates the returned iterator with [`Error::Cancelled`] if cancellation is observed,
-    /// rather than reading every file to completion. Kernel injects no additional checks.
+    /// Implementations must follow the [Engine operation cancellation contract]. The provided
+    /// implementation checks before delegating to [`read_parquet_files`] and before each pull of
+    /// the returned iterator. It cannot interrupt I/O initiated inside [`read_parquet_files`].
     ///
-    /// The default implementation delegates to [`read_parquet_files`](Self::read_parquet_files),
-    /// but checks cancellation first and wraps the iterator to also check at every `next` call. An
-    /// engine with cancellable I/O should override this method to use that capability.
-    ///
-    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    /// [`read_parquet_files`]: Self::read_parquet_files
+    /// [Engine operation cancellation contract]: crate::cancellation#engine-operation-contract
     fn read_parquet_files_with_cancellation(
         &self,
         files: &[FileMeta],
@@ -1094,17 +1083,14 @@ pub trait ParquetHandler: AsAny {
     /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
     fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter>;
 
-    /// Cancellation-aware variant of [`read_parquet_footer`](Self::read_parquet_footer).
+    /// Cancellation-aware variant of [`read_parquet_footer`].
     ///
-    /// When `cancellation_token` is `Some`, the engine races the footer read against the token
-    /// and returns [`Error::Cancelled`] if cancellation is observed.
+    /// Implementations must follow the [Engine operation cancellation contract]. The provided
+    /// implementation checks before delegating to [`read_parquet_footer`] but cannot interrupt the
+    /// footer read after it starts.
     ///
-    /// The default implementation returns [`Error::Cancelled`] if the token is already cancelled
-    /// and otherwise delegates to [`read_parquet_footer`](Self::read_parquet_footer), ignoring the
-    /// token for the rest of the read. An engine with cancellable I/O should override this method
-    /// to use that capability.
-    ///
-    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    /// [`read_parquet_footer`]: Self::read_parquet_footer
+    /// [Engine operation cancellation contract]: crate::cancellation#engine-operation-contract
     fn read_parquet_footer_with_cancellation(
         &self,
         file: &FileMeta,

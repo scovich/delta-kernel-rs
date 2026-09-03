@@ -696,7 +696,6 @@ fn scan_metadata_from_cancels_cached_metadata_consumption() {
 
     token.cancel();
     assert!(matches!(metadata.next(), Some(Err(Error::Cancelled))));
-    assert!(metadata.next().is_none());
 }
 
 // reading v0 with 3 files.

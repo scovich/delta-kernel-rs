@@ -18,7 +18,7 @@ use itertools::Itertools;
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 
-use crate::cancellation::{check_cancelled, CancellationTokenRef};
+use crate::cancellation::CancellationTokenRef;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
 use crate::path::{
@@ -66,9 +66,8 @@ pub(crate) struct LogSegmentFiles {
 /// Delta log file discovery pipeline. Callers are responsible for handling the `log_tail`
 /// (catalog-provided commits) and tracking `max_published_version`.
 ///
-/// With a `cancellation_token`, the listing becomes cancellable: the engine may interrupt its own
-/// I/O, and the returned iterator is polled against the token so cancellation arrives as a terminal
-/// [`Error::Cancelled`] rather than an early end.
+/// With a `cancellation_token`, [`StorageHandler::list_from_with_cancellation`] owns cancellation
+/// for the underlying listing. This pipeline preserves any cancellation error through its filters.
 #[internal_api]
 pub(crate) fn list_delta_log_from_storage(
     storage: &dyn StorageHandler,
@@ -688,9 +687,6 @@ impl LogSegmentFiles {
         // [lower, upper - 1].
         let mut upper = end_version + 1;
         while upper > 0 {
-            // Each window is collected eagerly, so check between windows too: a long backward scan
-            // would otherwise keep going after cancellation.
-            check_cancelled(cancellation_token)?;
             let lower = upper.saturating_sub(BACKWARD_SCAN_WINDOW_SIZE);
             let window_files: Vec<_> = list_delta_log_from_storage(
                 storage,

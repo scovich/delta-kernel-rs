@@ -351,13 +351,10 @@ impl ScanBuilder {
     /// Provide a [`CancellationToken`] so a cancelled request can stop an in-flight
     /// [`scan_metadata`](Scan::scan_metadata) log replay instead of running to completion.
     ///
-    /// Cancellation is cooperative: kernel polls the token at each action-batch boundary, and a
-    /// cancellation-aware [`Engine`] additionally races its checkpoint/commit reads against it.
-    /// On cancellation the scan surfaces [`Error::Cancelled`] -- either returned directly from
-    /// [`scan_metadata`](Scan::scan_metadata) when the token is already cancelled before replay
-    /// begins, or as the terminal item of its iterator -- never as a silent early `None`, so a
-    /// cancelled listing cannot be mistaken for a complete one. With no token the scan is not
-    /// cancellable.
+    /// Cancellation is cooperative: Kernel forwards the token (if any) to cancellation-aware
+    /// [`Engine`] operations, which own cancellation for their I/O and iterators. Work that
+    /// completes concurrently with cancellation may still succeed. Passing `None` means the scan
+    /// is not cancellable.
     ///
     /// [`CancellationToken`]: crate::CancellationToken
     /// [`Error::Cancelled`]: crate::Error::Cancelled

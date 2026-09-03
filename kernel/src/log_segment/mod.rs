@@ -972,8 +972,8 @@ impl LogSegment {
         }
     }
 
-    /// Reads a parquet footer schema, threading the cancellation token so a cancelled request can
-    /// stop before or during the read (the read itself fails fast on an already-cancelled token).
+    /// Reads a parquet footer schema, passing the cancellation token to the Engine. Engines may
+    /// additionally use it to interrupt a read already in flight.
     fn read_footer_schema(
         engine: &dyn Engine,
         file: &FileMeta,
