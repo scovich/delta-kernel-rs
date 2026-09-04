@@ -6,92 +6,87 @@
 //! blocking on kernel while kernel invokes connector code:
 //!
 //! ```text
-//!   +---------------------------------------------------------------------------+
-//!   |                                   CONNECTOR                               |
-//!   |                                                                           |
-//!   |                        +-----------------------------+                    |
-//!   |                        |                             |                    |
-//!   |                        |     +-----KERNEL------+     |                    |
-//! ----> analyze_query        |     |                 |     |                    |
-//!   |     |                  |     |                 |     |                    |
-//!   |     +--------------------------> load_snapshot |     |                    |
-//!   |     .                  |     |        |        |     |                    |
-//!   |     .                  |     |        +----------------> list             |
-//!   |     .                  |     |        .        |     |    |               |
-//!   |     .                  |     |        .        |     |    |               |
-//!   |     .                  |     |        + <-----------------+               |
-//!   |     .                  |     |        |        |     |                    |
-//!   |     .                  |     |        +----------------> read_json        |
-//!   |     .                  |     |        .        |     |    |               |
-//!   |     .                  |     |        .        |     |    |               |
-//!   |     .                  |     |        + <-----------------+               |
-//!   |     .                  |     |        |        |     |                    |
-//!   |     .                  |     |        +----------------> read_parquet     |
-//!   |     .                  |     |        .        |     |    |               |
-//!   |     .                  |     |        .        |     |    |               |
-//!   |     .                  |     |        + <-----------------+               |
-//!   |     .                  |     |        |        |     |                    |
-//!   |     + <-----(snapshot return value)---+        |     |                    |
-//!   |     |                  |     |                 |     |                    |
-//! <-------+                  |     |                 |     |                    |
-//!   |                        |     |                 |     |                    |
-//!   +------------------------+     +-----------------+     +--------------------+
+//!   ╔══════════════════════════════ CONNECTOR ══════════════════════════════╗
+//!   ║                                                                       ║
+//! ----> analyze_query          ┌──── KERNEL ─────┐                          ║
+//!   ║     |                    │                 │                          ║
+//!   ║     +----------------------> load_snapshot │                          ║
+//!   ║                          │     |           │                          ║
+//!   ║                          │     +-------------------> list             ║
+//!   ║                          │                 │          |               ║
+//!   ║                          │                 │          |               ║
+//!   ║                          │     + <--------------------+               ║
+//!   ║                          │     |           │                          ║
+//!   ║                          │     +-------------------> read_json        ║
+//!   ║                          │                 │          |               ║
+//!   ║                          │                 │          |               ║
+//!   ║                          │     + <--------------------+               ║
+//!   ║                          │     |           │                          ║
+//!   ║                          │     +-------------------> read_parquet     ║
+//!   ║                          │                 │          |               ║
+//!   ║                          │                 │          |               ║
+//!   ║                          │     + <--------------------+               ║
+//!   ║                          │     |           │                          ║
+//!   ║     + <-----------(snapshot)---+           │                          ║
+//!   ║     |                    │                 │                          ║
+//! <-------+                    └─────────────────┘                          ║
+//!   ║                                                                       ║
+//!   ╚═══════════════════════════════════════════════════════════════════════╝
 //! ```
 //!
-//! Because kernel is wedged between two "halves" of the connector, it interferes with connector's
-//! scheduling model (sync/async/parallel/distributed), error handling, etc. It also depends on the
-//! complex [`Engine`](crate::Engine) trait hierarchy.
+//! Because kernel is stuck "inside" the connector, it interferes with connector's scheduling model
+//! (sync/async/parallel/distributed), error handling, etc. It also forces connector to implement
+//! the complex [`Engine`](crate::Engine) trait hierarchy so kernel can call back out to it.
 //!
 //! Coroutines flip the control flow around by modeling kernel's work as a resumable continuation
 //! function. Connector still invokes a kernel function to start running kernel, but kernel
 //! delegates requests back to the connector by suspending itself. When that happens, the
-//! connector's function call returns with a (request, continuation) pair as a return value, and
-//! connector inovkes the continuation function to pass a response to kernel and allow it to
-//! continue. The process repeats until the coroutine finishes and returns the requested value:
+//! connector's function call returns with a (request, resume) pair as a return value, and connector
+//! invokes the resume function to pass a response to kernel and allow it to continue. The process
+//! repeats until the coroutine finishes and returns the requested value:
 //!
 //! ```text
-//!   +------------------------+     +-----------------+
-//!   |       CONNECTOR        |     |     KERNEL      |
-//!   |                        |     |                 |
-//! ----> analyze_query        |     |                 |
-//!   |     |                  |     |                 |
-//!   |     +--------------------------> load_snapshot |
-//!   |     .                  |     |        |        |
-//!   |     + <----------(request listing)----S        |
-//!   |     |                  |     |        .        |
-//!   |     +---> list         |     |        .        |
-//!   |            |           |     |        .        |
-//!   |            |           |     |        .        |
-//!   |     + <----+           |     |        .        |
-//!   |     |                  |     |        .        |
-//!   |     +---(listing response)----------> R        |
-//!   |     .                  |     |        |        |
-//!   |     + <--------(request JSON read)----S        |
-//!   |     |                  |     |        .        |
-//!   |     +---> read_json    |     |        .        |
-//!   |            |           |     |        .        |
-//!   |            |           |     |        .        |
-//!   |     + <----+           |     |        .        |
-//!   |     |                  |     |        .        |
-//!   |     +---(JSON data response)--------> R        |
-//!   |     .                  |     |        |        |
-//!   |     + <------(request parquet read)---S        |
-//!   |     |                  |     |        .        |
-//!   |     +---> read_parquet |     |        .        |
-//!   |            |           |     |        .        |
-//!   |            |           |     |        .        |
-//!   |     + <----+           |     |        .        |
-//!   |     |                  |     |        .        |
-//!   |     +---(parquet data response)-----> R        |
-//!   |     .                  |     |        |        |
-//!   |     + <-----(snapshot return value)---+        |
-//!   |     |                  |     |                 |
-//! <-------+                  |     |                 |
-//!   |                        |     |                 |
-//!   +------------------------+     +-----------------+
+//!   ╔══════ CONNECTOR ════════╗          ┌──────── KERNEL ─────────┐
+//!   ║                         ║          │                         │
+//! ----> analyze_query         ║          │                         │
+//!   ║     |                   ║          │                         │
+//!   ║     +-----------------------------------> load_snapshot      │
+//!   ║                         ║          │        |                │
+//!   ║     + <------------(list request, resume)---*                │
+//!   ║     |                   ║          │        .                │
+//!   ║     +---> list          ║          │        .                │
+//!   ║            |            ║          │        .                │
+//!   ║            |            ║          │        .                │
+//!   ║     + <----+            ║          │        .                │
+//!   ║     |                   ║          │        .                │
+//!   ║     +---(list response)-----------------> (resume)           │
+//!   ║                         ║          │        |                │
+//!   ║     + <------------(JSON request, resume)---*                │
+//!   ║     |                   ║          │        .                │
+//!   ║     +---> read_json     ║          │        .                │
+//!   ║            |            ║          │        .                │
+//!   ║            |            ║          │        .                │
+//!   ║     + <----+            ║          │        .                │
+//!   ║     |                   ║          │        .                │
+//!   ║     +---(JSON data)---------------------> (resume)           │
+//!   ║                         ║          │        |                │
+//!   ║     + <---------(parquet request, resume)---*                │
+//!   ║     |                   ║          │        .                │
+//!   ║     +---> read_parqueet ║          │        .                │
+//!   ║            |            ║          │        .                │
+//!   ║            |            ║          │        .                │
+//!   ║     + <----+            ║          │        .                │
+//!   ║     |                   ║          │        .                │
+//!   ║     +-----(parquet data)----------------> (resume)           │
+//!   ║                         ║          │        |                │
+//!   ║     + <------------------------(snapshot)---+                │
+//!   ║     |                   ║          │                         │
+//! <-------+                   ║          │                         │
+//!   ║                         ║          │                         │
+//!   ╚═════════════════════════╝          └─────────────────────────┘
 //! ```
 //!
-//! This way, the connector always invokes its own code, acting on behalf of kenrel as needd. The
+//! This way, the connector always invokes its own code, acting on behalf of kernel as needed. The
 //! coroutines are "stackless" because there is no kernel code in the call stack while the connector
 //! processes a kernel request. When the connector starts or resumes a kernel coroutine, kernel runs
 //! synchronously in the calling thread until it either completes or suspends again (which happens
