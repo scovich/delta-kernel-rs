@@ -7,9 +7,10 @@ use tracing::field::Empty;
 use tracing::info_span;
 use url::Url;
 
+use super::core::{Exchange, Outbox};
+use super::engine::EngineConnector;
+use super::kernel::PendingRequest;
 use super::*;
-use crate::coroutine::core::{Exchange, Mailbox, PendingRequest};
-use crate::coroutine::engine::EngineConnector;
 use crate::engine::sync::SyncEngine;
 use crate::metrics::MetricEvent;
 use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
@@ -264,20 +265,22 @@ fn pending_without_connector_work_fails_instead_of_hanging() {
 }
 
 #[test]
-fn stale_weak_mailbox_entries_do_not_block_reuse() {
-    let core = Mailbox::default();
+fn stale_weak_outbox_entries_do_not_block_reuse() {
+    let outbox = Outbox::default();
     let abandoned = Arc::new(Exchange::new((
         Url::parse("memory:///abandoned").unwrap(),
         None,
     )));
-    core.publish(PendingRequest::ReadSmallFile(Arc::downgrade(&abandoned)))
+    outbox
+        .put(PendingRequest::ReadSmallFile(Arc::downgrade(&abandoned)))
         .unwrap();
     drop(abandoned);
 
     let live = Arc::new(Exchange::new((Url::parse("memory:///live").unwrap(), None)));
-    core.publish(PendingRequest::ReadSmallFile(Arc::downgrade(&live)))
+    outbox
+        .put(PendingRequest::ReadSmallFile(Arc::downgrade(&live)))
         .unwrap();
-    core.take_pending().unwrap();
+    outbox.take_request().unwrap();
 }
 
 #[test]

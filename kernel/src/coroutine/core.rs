@@ -1,252 +1,108 @@
 //! Core infrastructure for kernel coroutines.
 //!
-//! The [`Wait`] future is the heart of the coroutine implementation, along with.
+//! Kernel coroutines are normal async tasks that call normal async functions. The coroutine's
+//! synchronous driver code launches the coroutine by polling the compiler-generated future that
+//! represents it. As with all async code, the task runs inside [`Future::poll`] and can invoke
+//! other functions as it goes. Async functions return futures that it polls in turn. When the
+//! coroutine needs to communicate with the connector, it creates and polls a special [`Wait`]
+//! future whose [`poll`](Wait::poll) method immediately returns [`Poll::Pending`]. That triggers a
+//! cascading unwind of all the parent `poll` invocations until control returns to the synchronous
+//! coroutine driver. The driver then returns the coroutine's request to the connector, along with a
+//! [`Resume`] closure. When the connector invokes the `Resume` with its response, the closure again
+//! polls the coroutine's future, which rebuilds the chain of `poll` calls back to
+//! [`Wait::poll`]. This time, that call returns [`Poll::Ready`] with the connector's response, and
+//! execution continues until the coroutine either completes or suspends again.
+//!
+//! Because [`Poll::Pending`] does not carry a payload, the coroutine driver creates an [`Outbox`]
+//! which it shares with the coroutine via a [`Channel`](crate::coroutine::Channel). Whenever the
+//! coroutine needs to suspend, it creates an [`Exchange`] in [`Outbound`](ExchangeState::Outbound)
+//! state. It stores one reference to the exchange in the outbox so the sync coroutine driver can
+//! access the request, and initializes a [`Wait`] instance with a second reference to the
+//! exchange. [`Wait::poll`] returns [`Poll::Pending`] because the exchange is still
+//! [`Outbound`](ExchangeState::Outbound), the async poll stack unwinds, and the sync driver
+//! extracts the exchange from the outbox, leaving it empty again. When invoked, the [`Resume`]
+//! closure stores the connector's response in the exchange as [`Inbound`](ExchangeState::Inbound),
+//! the async poll stack builds back up, and [`Wait::poll`] extracts the response from the exchange.
+//!
+//! [`Resume`]: crate::coroutine::Resume
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::task::{Context, Poll, Waker};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::{Context, Poll};
 
-use bytes::Bytes;
-use delta_kernel_derive::internal_api;
 use tracing::error;
 
-#[cfg(feature = "declarative-plans")]
-use super::PlanOperation;
-use super::{
-    BackwardListing, Cursor, ForwardListing, Generator, Page, PageRequest, PagedOperation,
-    ReadJsonFiles, ReadParquetFiles, Request, Resume, Workflow, WriteBytes,
-};
-use crate::{DeltaResult, Error, FileMeta, FileSlice, ParquetFooter};
+use crate::{DeltaResult, Error};
 
-/// A sendable future that resolves to a kernel result.
-#[internal_api]
-pub(crate) trait DeltaFuture<O>: Future<Output = DeltaResult<O>> + Send {}
-
-impl<O, F> DeltaFuture<O> for F where F: Future<Output = DeltaResult<O>> + Send {}
-
-/// Type-erased coroutine task.
-pub(super) type Task<O> = Pin<Box<dyn DeltaFuture<O> + 'static>>;
-/// Exchange used to suspend a generator at a yielded item.
-pub(super) type YieldExchange<Y> = Exchange<Y, ()>;
-
-/// Shared mailbox entry used by workflows and generators.
-pub(super) trait MailboxEntry: Default {
+/// Entry stored in a coroutine outbox.
+///
+/// Entries are always weak references, in case the future that posted an entry gets dropped while
+/// the coroutine's poll stack is unwinding (after [`Wait::poll`] returned `Pending` but before
+/// control returns to the coroutine driver that would claim the entry). If that ever happened, the
+/// outbox (and the coroutine as a whole) would be unable to process any more requests, effectively
+/// killing the coroutine. This would require unusual circumstances, such as a kernel generator
+/// racing requests against yields and dropping the loser (even tho neither request nor yield is a
+/// terminal state for a generator).
+pub(super) trait OutboxEntry: Default {
+    /// True if the entry's weak reference is still valid.
     fn is_live(&self) -> bool;
 }
 
-/// Thread-safe single-slot storage for an entry that can be live or empty.
+/// Single-slot outbox that delivers [`Exchange`] instances to the coroutine's driver when the
+/// coroutine suspends. It is always empty, except while the async poll stack unwinds.
 ///
-/// Starting a coroutine gives one handle to the coroutine `Task` and one to the driver. Both are
-/// encapsulated behind kernel APIs and owned by the `TypedResume` that kernel surfaces to
-/// connectors, so the handles are always accessed sequentially (kernel side) and move between
-/// threads together or not at all (connector side).
-///
-/// The compiler cannot infer these invariants, so the mailbox uses `Arc` and `Mutex` to make its
-/// handles `Send`. Otherwise, `Rc<RefCell<T>>` would suffice.
+/// Each outbox has exactly two shared references. The coroutine driver holds one reference, and the
+/// coroutine's [`Channel`](crate::coroutine::Channel) holds the other. While the coroutine is
+/// executing, both handles are owned by their respective stack frames, ensuring sequential
+/// access. The [`Resume`](crate::coroutine::Resume) closure holds both references while the
+/// coroutine is suspended, so the references move between threads together or not at all.
+// NOTE: Rc+RefCell would be safe, but Arc+Mutex allows the compiler to derive Send
 #[derive(Default)]
-pub(super) struct Mailbox<T: MailboxEntry>(Mutex<T>);
+pub(super) struct Outbox<T: OutboxEntry>(Mutex<T>);
 
-impl<T: MailboxEntry> Mailbox<T> {
-    /// Publish an entry, returning an error if the mailbox is poisoned or already occupied.
-    pub(super) fn publish(&self, pending: T) -> DeltaResult<()> {
+impl<T: OutboxEntry> Outbox<T> {
+    /// Put an entry, returning an error if the outbox is poisoned or already occupied.
+    pub(super) fn put(&self, entry: T) -> DeltaResult<()> {
         // WARNING: Never acquire another lock or invoke external code while holding this guard.
-        let Ok(mut mailbox) = self.0.lock() else {
-            return Err(Error::internal_error(
-                "coroutine mailbox mutex was poisoned",
-            ));
+        let Ok(mut existing_entry) = self.0.lock() else {
+            return Err(Error::internal_error("coroutine outbox mutex was poisoned"));
         };
-        if mailbox.is_live() {
+        if existing_entry.is_live() {
             return Err(Error::internal_error(
-                "coroutine mailbox already contains a live entry",
+                "coroutine outbox is already occupied",
             ));
         }
-        *mailbox = pending;
+        *existing_entry = entry;
         Ok(())
     }
 
-    fn take_pending_opt(&self) -> DeltaResult<Option<T>> {
+    /// Take the entry, returning `None` if the outbox is empty.
+    pub(super) fn take(&self) -> DeltaResult<Option<T>> {
         // WARNING: Never acquire another lock or invoke external code while holding this guard.
-        let Ok(mut mailbox) = self.0.lock() else {
-            return Err(Error::internal_error(
-                "coroutine mailbox mutex was poisoned",
-            ));
+        let Ok(mut entry) = self.0.lock() else {
+            return Err(Error::internal_error("coroutine outbox mutex was poisoned"));
         };
-        let pending = std::mem::take(&mut *mailbox);
-        Ok(pending.is_live().then_some(pending))
+        let entry = std::mem::take(&mut *entry);
+        Ok(entry.is_live().then_some(entry))
     }
-}
-
-impl Mailbox<PendingRequest> {
-    /// Connector-side: Retrieve a pending kernel request after the coroutine suspends.
-    pub(super) fn take_pending(&self) -> DeltaResult<PendingRequest> {
-        self.take_pending_opt()?.ok_or_else(|| {
-            Error::internal_error("coroutine returned Pending without a live connector request")
-        })
-    }
-}
-
-/// Type-erased requests stored while a coroutine is suspended.
-pub(super) enum PendingRequest {
-    ListForward(PendingPageRequest<ForwardListing>),
-    ListBackward(PendingPageRequest<BackwardListing>),
-    ReadSmallFile(Weak<Exchange<FileSlice, Bytes>>),
-    ReadParquetFooter(Weak<Exchange<FileMeta, ParquetFooter>>),
-    ReadJson(PendingPageRequest<ReadJsonFiles>),
-    ReadParquet(PendingPageRequest<ReadParquetFiles>),
-    #[cfg(feature = "declarative-plans")]
-    ExecutePlan(PendingPageRequest<PlanOperation>),
-    WriteBytes(Weak<Exchange<WriteBytes, ()>>),
-}
-
-/// A suspended phase of a paginated operation.
-pub(super) enum PendingPageRequest<Op: PagedOperation> {
-    Start(Weak<Exchange<Op, Page<Op>>>),
-    Prepare(Weak<Exchange<Op, Cursor<Op>>>),
-    Continue(Weak<Exchange<Cursor<Op>, Page<Op>>>),
-}
-
-impl Default for PendingRequest {
-    fn default() -> Self {
-        // Any variant with an empty weak reference marks an empty mailbox.
-        Self::ReadSmallFile(Weak::new())
-    }
-}
-
-impl MailboxEntry for PendingRequest {
-    fn is_live(&self) -> bool {
-        match self {
-            Self::ListForward(pending) => pending.is_live(),
-            Self::ListBackward(pending) => pending.is_live(),
-            Self::ReadSmallFile(exchange) => exchange.strong_count() > 0,
-            Self::ReadParquetFooter(exchange) => exchange.strong_count() > 0,
-            Self::ReadJson(pending) => pending.is_live(),
-            Self::ReadParquet(pending) => pending.is_live(),
-            #[cfg(feature = "declarative-plans")]
-            Self::ExecutePlan(pending) => pending.is_live(),
-            Self::WriteBytes(exchange) => exchange.strong_count() > 0,
-        }
-    }
-}
-
-impl PendingRequest {
-    /// Converts a kernel-provided pending request into a connector-facing request.
-    fn into_request<N: Send + 'static, O: Send + 'static>(
-        self,
-        task: Task<O>,
-        mailbox: Arc<Mailbox<PendingRequest>>,
-        advance: impl FnOnce(Task<O>, Arc<Mailbox<PendingRequest>>) -> DeltaResult<N> + Send + 'static,
-    ) -> DeltaResult<Request<N>> {
-        match self {
-            Self::ListForward(pending) => Ok(Request::ListForward(
-                pending.into_request(task, mailbox, advance)?,
-            )),
-            Self::ListBackward(pending) => Ok(Request::ListBackward(
-                pending.into_request(task, mailbox, advance)?,
-            )),
-            Self::ReadSmallFile(exchange) => {
-                request_from_exchange(exchange, task, mailbox, advance, Request::ReadSmallFile)
-            }
-            Self::ReadParquetFooter(exchange) => {
-                request_from_exchange(exchange, task, mailbox, advance, Request::ReadParquetFooter)
-            }
-            Self::ReadJson(pending) => Ok(Request::ReadJson(
-                pending.into_request(task, mailbox, advance)?,
-            )),
-            Self::ReadParquet(pending) => Ok(Request::ReadParquet(
-                pending.into_request(task, mailbox, advance)?,
-            )),
-            #[cfg(feature = "declarative-plans")]
-            Self::ExecutePlan(pending) => Ok(Request::ExecutePlan(
-                pending.into_request(task, mailbox, advance)?,
-            )),
-            Self::WriteBytes(exchange) => {
-                request_from_exchange(exchange, task, mailbox, advance, Request::WriteBytes)
-            }
-        }
-    }
-}
-
-impl<Op: PagedOperation> PendingPageRequest<Op> {
-    /// False if the underlying weak reference is empty.
-    fn is_live(&self) -> bool {
-        match self {
-            Self::Start(exchange) => exchange.strong_count() > 0,
-            Self::Prepare(exchange) => exchange.strong_count() > 0,
-            Self::Continue(exchange) => exchange.strong_count() > 0,
-        }
-    }
-
-    fn into_request<N: Send + 'static, O: Send + 'static>(
-        self,
-        task: Task<O>,
-        mailbox: Arc<Mailbox<PendingRequest>>,
-        advance: impl FnOnce(Task<O>, Arc<Mailbox<PendingRequest>>) -> DeltaResult<N> + Send + 'static,
-    ) -> DeltaResult<PageRequest<N, Op>> {
-        match self {
-            Self::Start(exchange) => {
-                request_from_exchange(exchange, task, mailbox, advance, PageRequest::Start)
-            }
-            Self::Prepare(exchange) => {
-                request_from_exchange(exchange, task, mailbox, advance, PageRequest::Prepare)
-            }
-            Self::Continue(exchange) => {
-                request_from_exchange(exchange, task, mailbox, advance, PageRequest::Continue)
-            }
-        }
-    }
-}
-
-/// Extracts a pending kernel-side request from the exchange and converts it to a `TypedResume` the
-/// connector can consume.
-fn request_from_exchange<N, O, Out, In, T>(
-    exchange: Weak<Exchange<Out, In>>,
-    task: Task<O>,
-    mailbox: Arc<Mailbox<PendingRequest>>,
-    advance: impl FnOnce(Task<O>, Arc<Mailbox<PendingRequest>>) -> DeltaResult<N> + Send + 'static,
-    make_request: impl FnOnce(Out, Resume<N, In>) -> T,
-) -> DeltaResult<T>
-where
-    N: Send + 'static,
-    O: Send + 'static,
-    Out: Send + 'static,
-    In: Send + 'static,
-{
-    let Some(exchange) = exchange.upgrade() else {
-        return Err(Error::internal_error(
-            "coroutine request expired before it was claimed",
-        ));
-    };
-    let outbound = exchange.claim()?;
-    let resume = Box::new(move |response| {
-        exchange.respond(response)?;
-        advance(task, mailbox)
-    });
-    Ok(make_request(outbound, resume))
 }
 
 /// Single-use operation or yield handoff shared by its waiter and resume handle.
 ///
-/// Its references move through these phases:
-///
-/// - After publication, [`Wait`] inside the task owns the only strong reference; the corresponding
-///   mailbox stores a weak reference.
-/// - Claiming the handoff upgrades the weak reference. The resulting [`Resume`] owns that strong
-///   reference directly and owns the other indirectly through the captured task's `Wait`.
-/// - Resuming writes the response through the direct reference, then polls the task, whose `Wait`
-///   reads the response through the other reference.
-/// - Dropping the resume drops both strong references.
-///
-/// These accesses are sequential on the thread invoking `resume`. The compiler cannot infer this
-/// ownership invariant, so the exchange uses a `Mutex` to make its `Arc` references `Send`.
+/// Each exchange has exactly two shared references. The task holds one, and places the other in an
+/// [`Outbox`] before suspending, for use by the synchronous coroutine driver. All accesses are
+/// sequential. The [`Resume`](crate::coroutine::Resume) closure holds both references while the
+/// coroutine is suspended, so the references move between threads together or not at all.
+// NOTE: Rc+RefCell would be safe, but Arc+Mutex allows the compiler to derive Send
 pub(super) struct Exchange<Out, In>(Mutex<ExchangeState<Out, In>>);
 
 /// Lifecycle state of an exchange.
 enum ExchangeState<Out, In> {
-    /// Kernel has offered a request and is suspending the workflow.
+    /// Kernel offered a request and has suspended the workflow.
     Outbound(Out),
-    /// Connector has claimed the request but has not responded yet.
+    /// Connector claimed the request but has not responded yet.
     InFlight,
-    /// Connector has supplied a response for the next poll.
+    /// Connector supplied a response but kernel did not claim it yet.
     Inbound(DeltaResult<In>),
     /// Kernel has consumed the response.
     Complete,
@@ -267,7 +123,7 @@ impl<Out, In> Exchange<Out, In> {
             previous => {
                 *state = previous;
                 Err(Error::internal_error(
-                    "coroutine exchange outbound value was not available",
+                    "coroutine suspended without providing any outbound exchange",
                 ))
             }
         }
@@ -286,7 +142,6 @@ impl<Out, In> Exchange<Out, In> {
         Ok(())
     }
 
-    // WARNING: Never acquire another lock or invoke external code while holding this guard.
     fn lock(&self) -> DeltaResult<MutexGuard<'_, ExchangeState<Out, In>>> {
         self.0
             .lock()
@@ -296,19 +151,19 @@ impl<Out, In> Exchange<Out, In> {
 
 /// The `Future` suspension boundary between kernel coroutines and the connector driving them.
 ///
-/// When the connector starts or resumes a kernel coroutine, the compiler-generated `poll` runs
+/// When the connector starts or resumes a kernel coroutine, its compiler-generated `poll` runs
 /// kernel code until it reaches a suspension point that creates and polls this `Wait`. The
 /// connector has not yet seen the request, so that first call returns `Pending`, which suspends the
 /// entire nested chain of futures and returns control to the connector. The futures remain
-/// suspended indefinitely, unless/until the connector calls `TypedResume::resume` to trigger a
-/// second poll. That second `poll` propagates through the suspended chain of futures until it
-/// reaches `Wait::poll`, which now returns `Ready` and physically resumes the kernel coroutine.
+/// suspended indefinitely, unless/until the connector invokes its [`crate::coroutine::Resume`] to
+/// trigger a second poll. That second `poll` propagates through the suspended chain of futures
+/// until it reaches `Wait::poll`, which now returns `Ready` and allows the kernel coroutine to
+/// continue executing until it completes or suspends again.
 ///
 /// Generator yields use the same mechanism, with the yield consumer taking the connector's role.
 ///
-/// Polling is strictly sequential in the connector's calling thread, using a no-op waker. No async
-/// runtime is involved in suspending and resuming coroutines. Suspending a kernel coroutine does
-/// not disturb the connector's async futures because start and resume are synchronous boundaries.
+/// Polling is strictly sequential in the connector's calling thread, using a no-op waker. The side
+/// channels afforded by [`Exchange`] and [`Outbox`] elminate the need for an async runtime.
 pub(super) struct Wait<Out, In>(pub(super) Arc<Exchange<Out, In>>);
 
 impl<Out: Send, In: Send> Future for Wait<Out, In> {
@@ -316,10 +171,9 @@ impl<Out: Send, In: Send> Future for Wait<Out, In> {
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         // WARNING: Never acquire another lock or invoke external code while holding this guard.
-        let Ok(mut state) = self.0.lock() else {
-            return Poll::Ready(Err(Error::internal_error(
-                "coroutine exchange mutex was poisoned",
-            )));
+        let mut state = match self.0.lock() {
+            Err(err) => return Poll::Ready(Err(err)),
+            Ok(state) => state,
         };
         match std::mem::replace(&mut *state, ExchangeState::Complete) {
             pending @ (ExchangeState::Outbound(_) | ExchangeState::InFlight) => {
@@ -334,11 +188,11 @@ impl<Out: Send, In: Send> Future for Wait<Out, In> {
     }
 }
 
-/// An instrumented `Future` enters its owning span both on `poll` and on `drop`. The former ensures
+/// An instrumented `Future` enters its owning span on both `poll` and on `drop`. The former ensures
 /// that kernel's work is correctly attributed to the span that created the workflow; the latter
 /// (here) lets us mark an abandoned workflow as failed (otherwise, it defaults to success). This
-/// works because `poll` always stores `Complete` before returning `Ready`; any other state means
-/// the `Task` (which owns this `Wait`) was dropped while still suspended.
+/// works because `poll` always stores `Complete` in the exchange before returning `Ready`; any
+/// other state means the task (which owns this `Wait`) was dropped while still suspended.
 impl<Out, In> Drop for Wait<Out, In> {
     fn drop(&mut self) {
         // WARNING: We must drop the lock before invoking other code.
@@ -352,69 +206,5 @@ impl<Out, In> Drop for Wait<Out, In> {
                 "kernel coroutine was abandoned while suspended"
             );
         }
-    }
-}
-
-impl<O: Send + 'static> Workflow<O> {
-    /// Connector-side helper that starts or resumes a kernel workflow
-    pub(super) fn advance(
-        mut task: Task<O>,
-        mailbox: Arc<Mailbox<PendingRequest>>,
-    ) -> DeltaResult<Workflow<O>> {
-        let mut context = Context::from_waker(Waker::noop());
-        match task.as_mut().poll(&mut context) {
-            Poll::Ready(output) => output.map(Workflow::Done),
-            Poll::Pending => {
-                let pending = mailbox.take_pending()?;
-                let request = pending.into_request(task, mailbox, Self::advance)?;
-                Ok(Workflow::Request(request))
-            }
-        }
-    }
-}
-
-impl<O: Send + 'static, Y: Send + 'static> Generator<O, Y> {
-    /// Connector-side helper that starts or resumes a kernel generator
-    pub(super) fn advance(
-        mut task: Task<O>,
-        mailbox: Arc<Mailbox<PendingRequest>>,
-        yields: Arc<Mailbox<Weak<YieldExchange<Y>>>>,
-    ) -> DeltaResult<Generator<O, Y>> {
-        let mut context = Context::from_waker(Waker::noop());
-        if let Poll::Ready(output) = task.as_mut().poll(&mut context) {
-            return output.map(Generator::Done);
-        }
-
-        if let Some(pending) = yields.take_pending()? {
-            let item = pending.claim()?;
-            let resume = Box::new(move |response| {
-                pending.respond(response)?;
-                Self::advance(task, mailbox, yields)
-            });
-            return Ok(Generator::Yield(item, resume));
-        }
-
-        let pending = mailbox.take_pending()?;
-        let next_yields = Arc::clone(&yields);
-        let request = pending.into_request(task, mailbox, move |task, mailbox| {
-            Self::advance(task, mailbox, next_yields)
-        })?;
-        Ok(Generator::Request(request))
-    }
-}
-
-/// Yields publish a weak [`YieldExchange`] so an abandoned waiter does not occupy the slot.
-impl<Y> MailboxEntry for Weak<YieldExchange<Y>> {
-    fn is_live(&self) -> bool {
-        self.strong_count() > 0
-    }
-}
-
-impl<Y> Mailbox<Weak<YieldExchange<Y>>> {
-    /// Connector-side: Take a pending yield item (if any) after the coroutine suspends.
-    pub(super) fn take_pending(&self) -> DeltaResult<Option<Arc<YieldExchange<Y>>>> {
-        Ok(self
-            .take_pending_opt()?
-            .and_then(|pending| pending.upgrade()))
     }
 }

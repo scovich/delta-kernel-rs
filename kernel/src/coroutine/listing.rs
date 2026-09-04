@@ -3,7 +3,7 @@
 use delta_kernel_derive::internal_api;
 use url::Url;
 
-use super::core::{PendingPageRequest, PendingRequest};
+use super::kernel::{PendingPageRequest, PendingRequest};
 use super::{Channel, Cursor, Page, PageRequest, PagedOperation};
 use crate::path::may_begin_listable_log_path;
 use crate::{DeltaResult, Error, FileMeta, Version};

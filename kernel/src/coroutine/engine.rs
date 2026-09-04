@@ -1,5 +1,10 @@
 //! Reference connector that serves coroutine requests through [`Engine`] handlers.
 //!
+//! Kernel provides `Engine`-based entry points for all public workflows, for connectors that are
+//! unawae of (or opt out of) coroutines. Each entry point launches the corresponding workflow, then
+//! drives it to completion using an [`EngineConnector`] that uses the caller-provided `Engine`
+//! instance to serve requestse.
+//!
 //! Engine iterators travel in boxed cursors. [`drive_storage`] serves only listing and small-file
 //! requests.
 

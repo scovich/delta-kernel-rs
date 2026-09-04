@@ -5,7 +5,7 @@ use std::ops::Range;
 use bytes::Bytes;
 use url::Url;
 
-use super::core::{PendingPageRequest, PendingRequest};
+use super::kernel::{PendingPageRequest, PendingRequest};
 use super::{Channel, Cursor, DeltaFuture, Page, PageRequest, PagedOperation};
 use crate::engine_data::EngineData;
 #[cfg(feature = "declarative-plans")]

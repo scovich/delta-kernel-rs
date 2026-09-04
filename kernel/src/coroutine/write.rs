@@ -3,7 +3,7 @@
 use bytes::Bytes;
 use url::Url;
 
-use super::core::PendingRequest;
+use super::kernel::PendingRequest;
 use super::Channel;
 use crate::DeltaResult;
 
