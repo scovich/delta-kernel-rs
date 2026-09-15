@@ -27,7 +27,7 @@ use delta_kernel::parquet::schema::types::Type as ParquetType;
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{schema_ref, SchemaRef, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
-use delta_kernel::transaction::{BoundWriteContext, CommitResult, Transaction};
+use delta_kernel::transaction::{BoundWriteContext, CommitResult, TransactionWithCommitter};
 use delta_kernel::{DeltaResult, Engine, Snapshot, Version};
 use serde_json::json;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
@@ -498,7 +498,7 @@ pub async fn write_deletion_vector_to_store(
 pub fn create_dv_update_transaction(
     table_url: &Url,
     engine: &dyn Engine,
-) -> Result<Transaction, Box<dyn std::error::Error>> {
+) -> Result<TransactionWithCommitter, Box<dyn std::error::Error>> {
     Ok(load_and_begin_transaction(table_url.clone(), engine)?
         .with_engine_info("test engine")
         .with_operation("DELETE".to_string()))

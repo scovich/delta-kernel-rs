@@ -31,13 +31,14 @@ use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 
-use crate::committer::{Committer, FileSystemCommitter};
+use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
 use crate::table_features::{Operation, TableFeature};
 use crate::transaction::alter_table::AlterTableTransaction;
 use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
+use crate::transaction::{AlterTable, TransactionWithCommitter};
 use crate::utils::PhantomType;
 use crate::{DeltaResult, Engine, Error};
 
@@ -184,11 +185,7 @@ impl AlterTableTransactionBuilder<Modifying> {
     /// - Table does not support writes (unsupported features)
     /// - The evolved schema requires protocol features not enabled on the table (e.g. adding a
     ///   `timestampNtz` column without the `timestampNtz` feature)
-    pub fn build(
-        self,
-        _engine: &dyn Engine,
-        committer: Box<dyn Committer>,
-    ) -> DeltaResult<AlterTableTransaction> {
+    pub fn build(self, _engine: &dyn Engine) -> DeltaResult<AlterTableTransaction> {
         let table_config = self.snapshot.table_configuration();
         // kernel doesn't currently support altering tables with these features
         let unsupported_iceberg_compat =
@@ -217,29 +214,25 @@ impl AlterTableTransactionBuilder<Modifying> {
         AlterTableTransaction::try_new_alter_table(
             self.snapshot,
             evolved_table_config,
-            committer,
             self.correlation_id,
         )
     }
 
-    /// Builds an alter-table transaction bound to `committer`.
-    ///
-    /// Returns an error if the table does not support the requested schema changes.
+    /// Binds `committer` to the transaction produced by [`Self::build`].
     pub fn build_with_committer(
         self,
         engine: &dyn Engine,
         committer: Box<dyn Committer>,
-    ) -> DeltaResult<AlterTableTransaction> {
-        self.build(engine, committer)
+    ) -> DeltaResult<TransactionWithCommitter<AlterTable>> {
+        Ok(self.build(engine)?.with_committer(committer))
     }
 
-    /// Builds an alter-table transaction bound to a [`FileSystemCommitter`].
-    ///
-    /// Returns an error if the table does not support the requested schema changes.
+    /// Binds a [`FileSystemCommitter`](crate::committer::FileSystemCommitter) to the transaction
+    /// produced by [`Self::build`].
     pub fn build_with_filesystem_committer(
         self,
         engine: &dyn Engine,
-    ) -> DeltaResult<AlterTableTransaction> {
-        self.build_with_committer(engine, Box::new(FileSystemCommitter))
+    ) -> DeltaResult<TransactionWithCommitter<AlterTable>> {
+        Ok(self.build(engine)?.with_filesystem_committer())
     }
 }

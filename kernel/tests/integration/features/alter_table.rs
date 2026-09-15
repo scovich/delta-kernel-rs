@@ -329,7 +329,7 @@ async fn add_column_failures(
     let err = snapshot
         .alter_table()
         .add_column(field)
-        .build_with_committer(engine.as_ref(), committer());
+        .build(engine.as_ref());
     assert!(err.is_err());
     assert!(err.unwrap_err().to_string().contains(error_contains));
 
@@ -682,7 +682,7 @@ async fn add_column_at_rejects_duplicate_field_in_same_builder() -> DeltaResult<
             column_name!("address"),
             StructField::nullable("dup", DataType::STRING),
         )
-        .build_with_committer(engine.as_ref(), committer());
+        .build(engine.as_ref());
     assert_result_error_with_message(result, "already exists");
 
     Ok(())
@@ -700,7 +700,7 @@ async fn add_column_at_rejects_non_struct_parent() -> DeltaResult<()> {
             column_name!("id"),
             StructField::nullable("added", DataType::STRING),
         )
-        .build_with_committer(engine.as_ref(), committer());
+        .build(engine.as_ref());
     assert_result_error_with_message(result, "path target is not a struct");
 
     Ok(())
@@ -982,7 +982,7 @@ async fn set_nullable_nonexistent_column_fails() -> DeltaResult<()> {
     let err = snapshot
         .alter_table()
         .set_nullable(column_name!("nonexistent"))
-        .build_with_committer(engine.as_ref(), committer());
+        .build(engine.as_ref());
     assert!(err.is_err());
     assert!(err.unwrap_err().to_string().contains("does not exist"));
 
@@ -1202,7 +1202,7 @@ async fn alter_blocked_when_iceberg_compat_enabled(
     let msg = snapshot
         .alter_table()
         .add_column(StructField::nullable("new_col", DataType::STRING))
-        .build_with_committer(engine.as_ref(), committer())
+        .build(engine.as_ref())
         .unwrap_err()
         .to_string();
     assert!(
@@ -1269,7 +1269,7 @@ async fn alter_blocked_when_allow_column_defaults_enabled() -> Result<(), Box<dy
     let msg = snapshot
         .alter_table()
         .add_column(StructField::nullable("new_col", DataType::STRING))
-        .build_with_committer(&engine, committer())
+        .build(&engine)
         .unwrap_err()
         .to_string();
     assert!(
@@ -1498,7 +1498,7 @@ async fn add_column_with_id_colliding_existing_field_is_rejected() -> DeltaResul
     let err = snapshot
         .alter_table()
         .add_column(field)
-        .build_with_committer(engine.as_ref(), committer())
+        .build(engine.as_ref())
         .unwrap_err()
         .to_string();
     assert!(

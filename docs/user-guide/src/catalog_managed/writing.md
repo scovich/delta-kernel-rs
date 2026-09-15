@@ -52,10 +52,10 @@ To begin a write, create a transaction with your catalog's `Committer`, add file
 call `commit()`:
 
 ```rust,ignore
-// transaction() moves the Box<dyn Committer> into the Transaction, and commit()
-// consumes the Transaction, so the boxed committer is gone by the time you need
-// to publish. Construct a second committer for publish() in Phase 3 and clone
-// any catalog-client state you need to keep in scope across both calls.
+// transaction_with_committer() moves the Box<dyn Committer> into the bound
+// transaction, and commit() consumes it. Construct a second committer for
+// publish() in Phase 3, and clone any catalog-client state you need across
+// both calls.
 let committer = Box::new(MyCatalogCommitter::new(
     catalog_client.clone(),
     table_id.clone(),

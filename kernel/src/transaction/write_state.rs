@@ -462,7 +462,7 @@ mod tests {
         )
         .with_data_layout(DataLayout::partitioned(["year"]))
         .with_table_properties(properties)
-        .build_with_filesystem_committer(engine.as_ref())
+        .build(engine.as_ref())
         .unwrap();
 
         let mut write_state = txn.write_state().unwrap();

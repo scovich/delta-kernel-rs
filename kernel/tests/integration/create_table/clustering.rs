@@ -150,7 +150,7 @@ async fn test_clustering_stats_columns_within_limit() -> DeltaResult<()> {
     // Create clustered table on col5
     let txn = create_table(&table_path, schema, "Test/1.0")
         .with_data_layout(DataLayout::clustered(["col5"]))
-        .build_with_filesystem_committer(engine.as_ref())?;
+        .build(engine.as_ref())?;
 
     // Verify stats_columns includes the clustering column
     let stats_cols = txn.stats_columns();
@@ -175,7 +175,7 @@ async fn test_clustering_stats_columns_beyond_limit() -> DeltaResult<()> {
     // Create clustered table on col35 (position > 32)
     let txn = create_table(&table_path, schema, "Test/1.0")
         .with_data_layout(DataLayout::clustered(["col35"]))
-        .build_with_filesystem_committer(engine.as_ref())?;
+        .build(engine.as_ref())?;
 
     // Verify stats_columns includes the clustering column even beyond limit
     let stats_cols = txn.stats_columns();
@@ -211,7 +211,7 @@ async fn test_clustering_column_error(
         .with_data_layout(DataLayout::Clustered {
             columns: vec![ColumnName::new(col_path.iter().copied())],
         })
-        .build_with_filesystem_committer(engine.as_ref());
+        .build(engine.as_ref());
 
     assert_result_error_with_message(result, expected_error);
 
