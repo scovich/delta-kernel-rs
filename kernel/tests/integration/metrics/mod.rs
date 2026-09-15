@@ -76,6 +76,7 @@ async fn insert_rows(
     for val in start_val..(start_val + count) {
         let committed = insert_data(snap, engine, vec![Arc::new(Int32Array::from(vec![val]))])
             .await?
+            .0
             .unwrap_committed();
         snap = committed
             .post_commit_snapshot()
@@ -113,6 +114,7 @@ async fn setup_table_with_v1_checkpoint() -> DeltaResult<(
         vec![Arc::new(Int32Array::from(vec![1]))],
     )
     .await?
+    .0
     .unwrap_committed();
     committed
         .post_commit_snapshot()

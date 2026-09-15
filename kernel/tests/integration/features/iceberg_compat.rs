@@ -328,10 +328,14 @@ async fn iceberg_compat_commit_validates_num_records(
     txn.add_files(add_files);
 
     if num_records.is_some() {
-        let committed = txn.commit(engine.as_ref()).unwrap().unwrap_committed();
+        let committed = txn.commit(engine.as_ref()).unwrap().0.unwrap_committed();
         assert_eq!(committed.commit_version(), 1);
     } else {
-        let err = txn.commit(engine.as_ref()).unwrap_err().to_string();
+        let err = txn
+            .commit(engine.as_ref())
+            .err()
+            .expect("commit should reject an add without stats.numRecords")
+            .to_string();
         assert!(
             err.contains("'stats.numRecords' is required") && err.contains("part-fake.parquet"),
             "expected missing numRecords error for part-fake.parquet, got: {err}",
@@ -363,6 +367,7 @@ async fn v2_partitioned_write_materializes_partition_and_nested_field_ids() {
         .unwrap()
         .commit(engine.as_ref())
         .unwrap()
+        .0
         .unwrap_post_commit_snapshot();
 
     let data_schema = schema! {

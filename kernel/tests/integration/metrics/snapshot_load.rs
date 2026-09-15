@@ -222,6 +222,7 @@ async fn snapshot_with_v1_checkpoint_and_tail_commit_emits_expected_metrics() ->
         vec![Arc::new(Int32Array::from(vec![2]))],
     )
     .await?
+    .0
     .unwrap_committed();
 
     let (measure_engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
@@ -405,6 +406,7 @@ async fn crc_at_prior_version_roots_replay_at_crc_for_both_modes(
     let create_committed = create_table(&table_path, simple_schema(), "Test/1.0")
         .build_with_filesystem_committer(setup_engine.as_ref())?
         .commit(setup_engine.as_ref())?
+        .0
         .unwrap_committed();
     create_committed
         .post_commit_snapshot()
@@ -424,6 +426,7 @@ async fn crc_at_prior_version_roots_replay_at_crc_for_both_modes(
             vec![Arc::new(Int32Array::from(vec![val]))],
         )
         .await?
+        .0
         .unwrap_committed();
         snap = c
             .post_commit_snapshot()
@@ -476,6 +479,7 @@ async fn checkpoint_with_multiple_tail_commits_emits_expected_metrics() -> Delta
             vec![Arc::new(Int32Array::from(vec![val]))],
         )
         .await?
+        .0
         .unwrap_committed();
         snap = c
             .post_commit_snapshot()
@@ -561,6 +565,7 @@ async fn setup_table_with_dms_and_set_txns(
         .with_data_layout(DataLayout::clustered(["id"]))
         .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
 
     let snap_v1 = snap_v0
@@ -569,6 +574,7 @@ async fn setup_table_with_dms_and_set_txns(
         .with_domain_metadata("myapp.config".to_string(), "v1".to_string())
         .with_transaction_id("my-app".to_string(), 1)
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
 
     if write_crc {
@@ -594,6 +600,7 @@ async fn write_transaction_loads_domain_metadata_internally(
     reporter.reset();
     insert_data(snap, &engine, vec![Arc::new(Int32Array::from(vec![1]))])
         .await?
+        .0
         .unwrap_post_commit_snapshot();
 
     // Clustering domain (creating the transaction) + row-tracking domain (committing the append).

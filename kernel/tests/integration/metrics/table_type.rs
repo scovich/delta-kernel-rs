@@ -48,6 +48,7 @@ async fn test_metric_events_carry_table_type(#[case] catalog_managed: bool) -> D
         /* is_blind_append */ false,
     )
     .await?
+    .0
     .unwrap_committed();
 
     // When: a fresh snapshot is built and scanned with a metrics reporter installed.
@@ -193,6 +194,7 @@ pub(super) fn create_simple_table(
     builder
         .build_with_committer(engine, make_committer(catalog_managed))?
         .commit(engine)?
+        .0
         .unwrap_committed();
     Ok(())
 }

@@ -123,11 +123,11 @@ mod tests {
         let err = snapshot
             .transaction_with_committer(committer, &engine)
             .unwrap()
-            .commit(&engine)
-            .unwrap_err();
+            .commit(&engine);
         assert!(matches!(
             err,
-            crate::Error::Generic(e) if e.contains("This table is catalog-managed and requires a catalog committer.")
+            Err(Error::Generic(e))
+                if e.contains("This table is catalog-managed and requires a catalog committer.")
         ));
     }
 

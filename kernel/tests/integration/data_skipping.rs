@@ -957,6 +957,7 @@ async fn scan_with_replace_table_schema_change(
         .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
         .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
 
     let store: Arc<delta_kernel::object_store::DynObjectStore> = Arc::new(LocalFileSystem::new());
@@ -1223,6 +1224,7 @@ async fn partition_pruning_honors_rfc3339_offset_partition_values(
         .with_data_layout(DataLayout::partitioned(["ts"]))
         .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     // v1: adds in the style of an offset-emitting foreign writer. Pruning never opens data
@@ -1300,6 +1302,7 @@ async fn interval_partition_values_do_not_prune_files(
         .with_data_layout(DataLayout::partitioned(["period"]))
         .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
     let data_schema = schema! { nullable "v": LONG };
     let batch = RecordBatch::try_new(

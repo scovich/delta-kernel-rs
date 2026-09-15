@@ -136,7 +136,7 @@ async fn test_no_add_actions() -> Result<(), Box<dyn std::error::Error>> {
             .with_engine_info("default engine");
 
         // Commit without adding any add files
-        assert!(txn.commit(&engine)?.is_committed());
+        assert!(txn.commit(&engine)?.0.is_committed());
 
         let commit1 = store
             .get(&Path::from(format!(
@@ -259,7 +259,7 @@ async fn test_append_partitioned(
         }
 
         // commit!
-        assert!(txn.commit(engine.as_ref())?.is_committed());
+        assert!(txn.commit(engine.as_ref())?.0.is_committed());
 
         let commit1 = store
             .get(&Path::from(format!(
@@ -443,9 +443,10 @@ async fn commit_rejects_add_missing_required_field() -> Result<(), Box<dyn std::
 
         let err = txn
             .commit(engine.as_ref())
-            .expect_err(&format!(
-                "commit should reject an add missing required field '{field}'"
-            ))
+            .err()
+            .unwrap_or_else(|| {
+                panic!("commit should reject an add missing required field '{field}'")
+            })
             .to_string();
         assert!(
             err.contains(&format!("missing required field '{field}'")),
@@ -503,6 +504,7 @@ async fn commit_rejects_add_with_invalid_partition_keys(
     builder
         .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
 
     let data_schema = schema! { nullable "d": INTEGER };

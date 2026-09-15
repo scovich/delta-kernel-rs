@@ -409,6 +409,7 @@ async fn test_same_phy_name_different_path(
         .with_table_properties([("delta.columnMapping.mode", cm_mode)])
         .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
 
     // Build a RecordBatch matching the logical schema.
