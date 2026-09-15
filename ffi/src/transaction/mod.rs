@@ -11,7 +11,7 @@ pub use deletion_vector::{
     free_dv_descriptor_map, transaction_update_deletion_vectors, ExclusiveDvDescriptor,
     ExclusiveDvDescriptorMap, KernelDvStorageType,
 };
-use delta_kernel::committer::{Committer, FileSystemCommitter};
+use delta_kernel::committer::Committer;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::transaction::create_table::{
     CreateTableTransaction, CreateTableTransactionBuilder,
@@ -91,8 +91,7 @@ fn transaction_impl(
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
     let engine = extern_engine.engine();
     let snapshot = Snapshot::builder_for(url?).build(engine.as_ref())?;
-    let committer = Box::new(FileSystemCommitter::new());
-    let transaction = snapshot.transaction(committer, engine.as_ref());
+    let transaction = snapshot.transaction_with_filesystem_committer(engine.as_ref());
     Ok(Box::new(transaction?).into())
 }
 
@@ -120,7 +119,7 @@ fn transaction_with_committer_impl(
     committer: Box<dyn Committer>,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
     let engine = extern_engine.engine();
-    let transaction = snapshot.transaction(committer, engine.as_ref());
+    let transaction = snapshot.transaction_with_committer(committer, engine.as_ref());
     Ok(Box::new(transaction?).into())
 }
 
@@ -759,8 +758,9 @@ fn create_table_builder_with_table_property_impl(
     Ok(Box::new(builder).into())
 }
 
-/// Build a create-table transaction using the default [`FileSystemCommitter`]. Returns a
-/// create-table transaction handle that can be used with [`create_table_add_files`],
+/// Build a create-table transaction using the default
+/// [`FileSystemCommitter`](delta_kernel::committer::FileSystemCommitter). Returns a create-table
+/// transaction handle that can be used with [`create_table_add_files`],
 /// [`create_table_set_data_change`], [`create_table_with_engine_info`], and
 /// [`create_table_commit`] to optionally stage initial data before committing.
 ///
@@ -775,9 +775,7 @@ pub unsafe extern "C" fn create_table_builder_build(
 ) -> ExternResult<Handle<ExclusiveCreateTransaction>> {
     let builder = unsafe { *builder.into_inner() };
     let extern_engine = unsafe { engine.as_ref() };
-    let committer = Box::new(FileSystemCommitter::new());
-    create_table_builder_build_impl(builder, committer, extern_engine)
-        .into_extern_result(&extern_engine)
+    create_table_builder_build_impl(builder, extern_engine).into_extern_result(&extern_engine)
 }
 
 /// Build a create-table transaction with a custom committer. Same as
@@ -796,17 +794,26 @@ pub unsafe extern "C" fn create_table_builder_build_with_committer(
     let builder = unsafe { *builder.into_inner() };
     let committer = unsafe { committer.into_inner() };
     let extern_engine = unsafe { engine.as_ref() };
-    create_table_builder_build_impl(builder, committer, extern_engine)
+    create_table_builder_build_with_committer_impl(builder, committer, extern_engine)
         .into_extern_result(&extern_engine)
 }
 
 fn create_table_builder_build_impl(
     builder: CreateTableTransactionBuilder,
+    extern_engine: &dyn ExternEngine,
+) -> DeltaResult<Handle<ExclusiveCreateTransaction>> {
+    let engine = extern_engine.engine();
+    let create_txn = builder.build_with_filesystem_committer(engine.as_ref())?;
+    Ok(Box::new(create_txn).into())
+}
+
+fn create_table_builder_build_with_committer_impl(
+    builder: CreateTableTransactionBuilder,
     committer: Box<dyn Committer>,
     extern_engine: &dyn ExternEngine,
 ) -> DeltaResult<Handle<ExclusiveCreateTransaction>> {
     let engine = extern_engine.engine();
-    let create_txn = builder.build(engine.as_ref(), committer)?;
+    let create_txn = builder.build_with_committer(engine.as_ref(), committer)?;
     Ok(Box::new(create_txn).into())
 }
 
@@ -885,6 +892,7 @@ mod tests {
     use delta_kernel::arrow::ffi::to_ffi;
     use delta_kernel::arrow::json::reader::ReaderBuilder;
     use delta_kernel::arrow::record_batch::RecordBatch;
+    use delta_kernel::committer::FileSystemCommitter;
     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::object_store::path::Path;
@@ -3720,7 +3728,7 @@ mod tests {
             .build(kernel_engine.as_ref())?;
         let mut add_txn = snapshot
             .clone()
-            .transaction(Box::new(FileSystemCommitter::new()), kernel_engine.as_ref())?
+            .transaction_with_filesystem_committer(kernel_engine.as_ref())?
             .with_engine_info("test-engine/1.0")
             .with_operation("WRITE".to_string());
         let add_files_schema = add_txn.add_files_schema();

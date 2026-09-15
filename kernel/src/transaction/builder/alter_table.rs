@@ -18,17 +18,20 @@
 //!
 //! ```ignore
 //! // Allowed: at least one op queued before build().
-//! snapshot.alter_table().add_column(field).build(engine, committer)?;
+//! snapshot
+//!     .alter_table()
+//!     .add_column(field)
+//!     .build_with_committer(engine, committer)?;
 //!
 //! // Not allowed: build() is not defined on Ready (no ops queued).
-//! snapshot.alter_table().build(engine, committer)?;  // compile error
+//! snapshot.alter_table().build_with_committer(engine, committer)?; // compile error
 //! ```
 
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 
-use crate::committer::Committer;
+use crate::committer::{Committer, FileSystemCommitter};
 use crate::expressions::ColumnName;
 use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
@@ -217,5 +220,26 @@ impl AlterTableTransactionBuilder<Modifying> {
             committer,
             self.correlation_id,
         )
+    }
+
+    /// Builds an alter-table transaction bound to `committer`.
+    ///
+    /// Returns an error if the table does not support the requested schema changes.
+    pub fn build_with_committer(
+        self,
+        engine: &dyn Engine,
+        committer: Box<dyn Committer>,
+    ) -> DeltaResult<AlterTableTransaction> {
+        self.build(engine, committer)
+    }
+
+    /// Builds an alter-table transaction bound to a [`FileSystemCommitter`].
+    ///
+    /// Returns an error if the table does not support the requested schema changes.
+    pub fn build_with_filesystem_committer(
+        self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<AlterTableTransaction> {
+        self.build_with_committer(engine, Box::new(FileSystemCommitter))
     }
 }

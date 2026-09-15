@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
-use crate::committer::Committer;
+use crate::committer::{Committer, FileSystemCommitter};
 use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
 use crate::schema::variant_utils::schema_contains_variant_type;
@@ -1053,6 +1053,29 @@ impl CreateTableTransactionBuilder {
             data_layout_result.clustering_columns,
             self.correlation_id,
         )
+    }
+
+    /// Builds a create-table transaction bound to `committer`.
+    ///
+    /// Returns an error if the table path, schema, data layout, properties, or feature flags are
+    /// invalid, or if a table already exists at the path.
+    pub fn build_with_committer(
+        self,
+        engine: &dyn Engine,
+        committer: Box<dyn Committer>,
+    ) -> DeltaResult<CreateTableTransaction> {
+        self.build(engine, committer)
+    }
+
+    /// Builds a create-table transaction bound to a [`FileSystemCommitter`].
+    ///
+    /// Returns an error if the table path, schema, data layout, properties, or feature flags are
+    /// invalid, or if a table already exists at the path.
+    pub fn build_with_filesystem_committer(
+        self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<CreateTableTransaction> {
+        self.build_with_committer(engine, Box::new(FileSystemCommitter))
     }
 }
 

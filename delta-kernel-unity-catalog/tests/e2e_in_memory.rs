@@ -122,7 +122,7 @@ fn commit(
 ) -> Result<Arc<Snapshot>, TestError> {
     Ok(snapshot
         .clone()
-        .transaction(Box::new(uc_committer(update_table_client)), engine)?
+        .transaction_with_committer(Box::new(uc_committer(update_table_client)), engine)?
         .with_operation("WRITE".to_string())
         .commit(engine)?
         .unwrap_post_commit_snapshot())
@@ -190,7 +190,7 @@ async fn test_insert_without_publish_hits_limit() -> Result<(), TestError> {
     let committer = Box::new(uc_committer(&update_table_client));
     let err = snapshot
         .clone()
-        .transaction(committer, &engine)?
+        .transaction_with_committer(committer, &engine)?
         .commit(&engine)
         .unwrap_err();
     assert!(
@@ -263,7 +263,7 @@ async fn test_append_scan_back_and_incremental_read() -> Result<(), TestError> {
     // v0 create: writes 000.json directly to storage, does not call the catalog.
     create_table(table_uri.as_str(), schema, "delta-kernel-uc-test")
         .with_table_properties(get_required_properties_for_disk(TABLE_ID))
-        .build(engine.as_ref(), Box::new(uc_committer(&client)))?
+        .build_with_committer(engine.as_ref(), Box::new(uc_committer(&client)))?
         .commit(engine.as_ref())?
         .unwrap_committed();
     client.create_table(TABLE_ID)?;

@@ -9,7 +9,6 @@
 //! ```rust,no_run
 //! use delta_kernel::transaction::create_table::create_table;
 //! use delta_kernel::schema::{StructType, StructField, DataType};
-//! use delta_kernel::committer::FileSystemCommitter;
 //! use std::sync::Arc;
 //! # use delta_kernel::Engine;
 //! # fn example(engine: &dyn Engine) -> delta_kernel::DeltaResult<()> {
@@ -20,7 +19,7 @@
 //!
 //! let result = create_table("/path/to/table", schema, "MyApp/1.0")
 //!     .with_table_properties([("myapp.version", "1.0")])
-//!     .build(engine, Box::new(FileSystemCommitter::new()))?
+//!     .build_with_filesystem_committer(engine)?
 //!     .commit(engine)?;
 //! # Ok(())
 //! # }
@@ -69,7 +68,6 @@ use crate::DeltaResult;
 /// ```rust,no_run
 /// use delta_kernel::transaction::create_table::create_table;
 /// use delta_kernel::schema::{StructType, StructField, DataType};
-/// use delta_kernel::committer::FileSystemCommitter;
 /// use std::sync::Arc;
 /// # use delta_kernel::Engine;
 /// # fn example(engine: &dyn Engine) -> delta_kernel::DeltaResult<()> {
@@ -79,7 +77,7 @@ use crate::DeltaResult;
 /// ])?);
 ///
 /// let result = create_table("/path/to/table", schema, "MyApp/1.0")
-///     .build(engine, Box::new(FileSystemCommitter::new()))?
+///     .build_with_filesystem_committer(engine)?
 ///     .commit(engine)?;
 /// # Ok(())
 /// # }
@@ -103,7 +101,6 @@ pub type CreateTableTransaction = Transaction<CreateTable>;
 /// use std::sync::Arc;
 /// use delta_kernel::transaction::create_table::create_table;
 /// use delta_kernel::schema::{DataType, StructField, StructType};
-/// use delta_kernel::committer::FileSystemCommitter;
 /// use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 /// use test_utils::delta_kernel_default_engine::storage::store_from_url;
 ///
@@ -117,7 +114,7 @@ pub type CreateTableTransaction = Transaction<CreateTable>;
 /// let engine = DefaultEngineBuilder::new(store_from_url(&url)?).build();
 ///
 /// let transaction = create_table("/tmp/my_table", schema, "MyApp/1.0")
-///     .build(&engine, Box::new(FileSystemCommitter::new()))?;
+///     .build_with_filesystem_committer(&engine)?;
 ///
 /// // Commit the transaction to create the table
 /// transaction.commit(&engine)?;
