@@ -13,6 +13,7 @@ pub(crate) use column_mapping::{
     StaleAnnotationPolicy,
 };
 use delta_kernel_derive::internal_api;
+use derive_more::Constructor;
 #[cfg(feature = "geo-type-in-dev")]
 pub(crate) use geospatial::validate_geospatial_feature_support;
 pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
@@ -270,15 +271,10 @@ pub(crate) enum FeatureRequirement {
 }
 
 /// Minimum protocol versions for legacy (pre-feature-list) inference.
+#[derive(Constructor)]
 pub(crate) struct MinReaderWriterVersion {
     pub reader: i32,
     pub writer: i32,
-}
-
-impl MinReaderWriterVersion {
-    pub(crate) const fn new(reader: i32, writer: i32) -> Self {
-        Self { reader, writer }
-    }
 }
 
 /// Rich metadata about a table feature including version requirements, dependencies, and support
