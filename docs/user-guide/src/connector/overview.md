@@ -37,7 +37,8 @@ using Delta Kernel to fulfill them:
 │  Uses Kernel to fulfill those interfaces:               │
 │    Snapshot  ->  table metadata, schema, version        │
 │    Scan      ->  which files to read, data skipping     │
-│    Transaction -> write files, commit atomically        │
+│    Transaction -> describe a table write                │
+│    Committer   -> commit atomically                      │
 └───────────────────────┬─────────────────────────────────┘
                         │ calls Kernel APIs
                         ▼

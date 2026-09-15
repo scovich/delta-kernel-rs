@@ -36,7 +36,7 @@ column. The flow is:
 1. Load a `Snapshot` of the table.
 2. Call `snapshot.alter_table()` to get an `AlterTableTransactionBuilder`.
 3. Call `add_column()` with the new field.
-4. Call `build()` to produce an `AlterTableTransaction`.
+4. Call `build_with_filesystem_committer()` to produce a bound transaction.
 5. Call `commit()` to atomically apply the schema change.
 
 ```rust,no_run
@@ -78,8 +78,8 @@ column by including it in the `RecordBatch` they pass to
 
 ## Validation rules
 
-`add_column()` checks the new field at `build()` time. If any rule is violated,
-`build()` returns an error and no commit is attempted.
+`add_column()` checks the new field when the builder is consumed. If any rule is violated, the
+build method returns an error and no commit is attempted.
 
 | Rule | Why |
 |------|-----|
@@ -109,7 +109,7 @@ let result = snapshot
 ```
 
 The builder uses a type-state pattern to enforce that at least one operation is
-queued before `build()` is callable. Calling `.build()` directly on
+queued before a build method is callable. Calling a build method directly on
 `snapshot.alter_table()` without first calling `add_column()` is a compile
 error.
 

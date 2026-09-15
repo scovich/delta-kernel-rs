@@ -284,7 +284,7 @@ mod tests {
     ) -> DeltaResult<(Arc<dyn Engine>, Transaction)> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let txn = snapshot
-            .transaction_with_filesystem_committer(engine.as_ref())?
+            .transaction(engine.as_ref())?
             .with_operation("WRITE".to_string())
             .fold_with(engine_commit_info, |txn, (data, schema)| {
                 txn.with_commit_info(data, schema)

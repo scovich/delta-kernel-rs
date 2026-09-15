@@ -35,7 +35,6 @@ use std::sync::Arc;
 // Re-export the builder so callers can still access it from this module path.
 pub use super::builder::create_table::CreateTableTransactionBuilder;
 use crate::actions::DomainMetadata;
-use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::metrics::MetricId;
 use crate::schema::SchemaRef;
@@ -140,7 +139,6 @@ impl CreateTableTransaction {
     pub(crate) fn try_new_create_table(
         effective_table_config: TableConfiguration,
         engine_info: String,
-        committer: Box<dyn Committer>,
         system_domain_metadata: Vec<DomainMetadata>,
         clustering_columns: Option<Vec<ColumnName>>,
         correlation_id: Option<Arc<str>>,
@@ -164,7 +162,6 @@ impl CreateTableTransaction {
             effective_table_config,
             should_emit_protocol: true,
             should_emit_metadata: true,
-            committer,
             operation: Some("CREATE TABLE".to_string()),
             engine_info: Some(engine_info),
             add_files_metadata: vec![],

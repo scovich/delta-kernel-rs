@@ -22,7 +22,6 @@ use crate::actions::deletion_vector::DeletionVectorDescriptor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::BackReference;
 use crate::actions::{LOG_ADD_SCHEMA, NUM_RECORDS, TIGHT_BOUNDS};
-use crate::committer::Committer;
 use crate::engine_data::{
     FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData,
 };
@@ -64,7 +63,6 @@ impl Transaction {
     /// a snapshot.
     pub(crate) fn try_new_existing_table(
         snapshot: impl Into<SnapshotRef>,
-        committer: Box<dyn Committer>,
         engine: &dyn Engine,
     ) -> DeltaResult<Self> {
         let read_snapshot = snapshot.into();
@@ -111,7 +109,6 @@ impl Transaction {
             effective_table_config,
             should_emit_protocol: false,
             should_emit_metadata: false,
-            committer,
             operation: None,
             engine_info: None,
             add_files_metadata: vec![],
@@ -376,7 +373,7 @@ impl Transaction {
     /// ```rust,ignore
     /// let mut txn = snapshot
     ///     .clone()
-    ///     .transaction_with_filesystem_committer(engine.as_ref())?
+    ///     .transaction_with_filesystem_committer(engine)?
     ///     .with_operation("UPDATE".to_string());
     ///
     /// let scan = snapshot.scan_builder().build()?;

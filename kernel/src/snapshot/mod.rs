@@ -17,7 +17,7 @@ use crate::checkpoint::{
     CheckpointSpec, CheckpointWriter, V2CheckpointConfig, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
 };
 use crate::clustering::{parse_clustering_columns, ClusteringColumnInfo, CLUSTERING_DOMAIN_NAME};
-use crate::committer::{Committer, FileSystemCommitter, PublishMetadata};
+use crate::committer::{Committer, PublishMetadata};
 use crate::crc::{
     try_write_crc_file, Crc, CrcDelta, DomainMetadataState, FileSizeHistogram, FileStats,
     SetTransactionState,
@@ -37,7 +37,7 @@ use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration
 use crate::table_features::{physical_to_logical_column_name_and_type, Operation, TableFeature};
 use crate::table_properties::TableProperties;
 use crate::transaction::builder::alter_table::AlterTableTransactionBuilder;
-use crate::transaction::Transaction;
+use crate::transaction::{Transaction, TransactionWithCommitter};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, LogCompactionWriter, Version};
 
@@ -1010,39 +1010,30 @@ impl Snapshot {
         IncrementalScanBuilder::new(self, base_version)
     }
 
-    /// Create a [`Transaction`] for this `SnapshotRef`. With the specified [`Committer`].
+    /// Creates a [`Transaction`] for this `SnapshotRef`.
     ///
     /// Note: For tables with clustering enabled, this performs log replay to read clustering
     /// columns from domain metadata, which may have a performance cost.
-    pub fn transaction(
-        self: Arc<Self>,
-        committer: Box<dyn Committer>,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Transaction> {
-        Transaction::try_new_existing_table(self, committer, engine)
+    pub fn transaction(self: Arc<Self>, engine: &dyn Engine) -> DeltaResult<Transaction> {
+        Transaction::try_new_existing_table(self, engine)
     }
 
-    /// Creates a [`Transaction`] bound to `committer`.
-    ///
-    /// Returns an error if the table does not support writes or its clustering metadata cannot be
-    /// loaded.
+    /// Binds `committer` to the transaction produced by [`Self::transaction`].
     pub fn transaction_with_committer(
         self: Arc<Self>,
         committer: Box<dyn Committer>,
         engine: &dyn Engine,
-    ) -> DeltaResult<Transaction> {
-        self.transaction(committer, engine)
+    ) -> DeltaResult<TransactionWithCommitter> {
+        Ok(self.transaction(engine)?.with_committer(committer))
     }
 
-    /// Creates a [`Transaction`] bound to a [`FileSystemCommitter`].
-    ///
-    /// Returns an error if the table does not support writes or its clustering metadata cannot be
-    /// loaded.
+    /// Binds a [`FileSystemCommitter`](crate::committer::FileSystemCommitter) to the transaction
+    /// produced by [`Self::transaction`].
     pub fn transaction_with_filesystem_committer(
         self: Arc<Self>,
         engine: &dyn Engine,
-    ) -> DeltaResult<Transaction> {
-        self.transaction_with_committer(Box::new(FileSystemCommitter), engine)
+    ) -> DeltaResult<TransactionWithCommitter> {
+        Ok(self.transaction(engine)?.with_filesystem_committer())
     }
 
     /// Creates a builder for altering this table's metadata. Currently supports schema change

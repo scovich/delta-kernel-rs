@@ -106,7 +106,7 @@ impl RootManifestFile {
         SetTransactionMap,
         Option<CheckpointAction>,
     )> {
-        let snapshot = self.read_snapshot.as_ref();
+        let snapshot = &self.read_snapshot;
         let crc = snapshot.crc_at_version();
         let domain_metadata_complete_in_crc = matches!(
             crc.map(|crc| &crc.domain_metadata_state),

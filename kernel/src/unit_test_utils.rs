@@ -1106,7 +1106,7 @@ pub(crate) fn setup_column_mapping_txn(
 
     let txn = create_table("memory:///test_table", schema, "DefaultEngine")
         .with_table_properties([("delta.columnMapping.mode", mode_str)])
-        .build_with_filesystem_committer(engine.as_ref())?;
+        .build(engine.as_ref())?;
     Ok((engine, txn))
 }
 

@@ -46,7 +46,7 @@ fn v3_create_table_rejects_incompatible_props(
 
     let err = create_table(&table_path, super::simple_schema()?, "Test/1.0")
         .with_table_properties(props)
-        .build_with_filesystem_committer(engine.as_ref())
+        .build(engine.as_ref())
         .unwrap_err()
         .to_string();
     assert!(
@@ -80,7 +80,7 @@ fn v3_create_table_rejects_void_column(#[case] void_field: StructField) -> Delta
 
     let err = create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.enableIcebergCompatV3", "true")])
-        .build_with_filesystem_committer(engine.as_ref())
+        .build(engine.as_ref())
         .unwrap_err()
         .to_string();
     assert!(
@@ -110,7 +110,7 @@ fn v3_create_table_rejects_interval_column(
 
     let err = create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.enableIcebergCompatV3", "true")])
-        .build_with_filesystem_committer(engine.as_ref())
+        .build(engine.as_ref())
         .unwrap_err()
         .to_string();
     assert!(

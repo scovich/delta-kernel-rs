@@ -121,7 +121,7 @@ fn test_create_table_variant_clustering_rejected() -> DeltaResult<()> {
 
     let result = create_table(&table_path, top_level_variant_schema(), "Test/1.0")
         .with_data_layout(DataLayout::clustered(["col"]))
-        .build_with_filesystem_committer(engine.as_ref());
+        .build(engine.as_ref());
 
     assert_result_error_with_message(result, "unsupported type");
 
