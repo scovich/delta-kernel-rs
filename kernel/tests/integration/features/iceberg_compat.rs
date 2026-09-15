@@ -269,14 +269,20 @@ async fn v3_commit_validates_num_records(
 
     match expected {
         Ok(expected_version) => {
-            let committed = txn.commit(engine.as_ref()).unwrap().unwrap_committed();
+            let committed = txn.commit(engine.as_ref()).unwrap().0.unwrap_committed();
             assert_eq!(committed.commit_version(), expected_version);
         }
         Err(needle) => {
-            let err = txn.commit(engine.as_ref()).unwrap_err().to_string();
+            let err = txn.commit(engine.as_ref());
             assert!(
-                err.contains(needle) && err.contains("part-fake.parquet"),
-                "expected error containing {needle:?} and 'part-fake.parquet', got: {err}",
+                matches!(
+                    err,
+                    Err(e) if {
+                        let err = e.to_string();
+                        err.contains(needle) && err.contains("part-fake.parquet")
+                    }
+                ),
+                "expected error containing {needle:?} and 'part-fake.parquet'",
             );
         }
     }

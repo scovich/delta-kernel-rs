@@ -28,6 +28,7 @@ async fn test_checkpoint_and_checksum_return_updated_snapshots(
     let committed = builder
         .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     let snapshot = committed.post_commit_snapshot().unwrap();
 
@@ -85,6 +86,7 @@ async fn test_checkpoint_already_exists(#[case] v2_checkpoint: bool) -> DeltaRes
     let committed = builder
         .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     let snapshot = committed.post_commit_snapshot().unwrap();
 

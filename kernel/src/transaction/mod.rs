@@ -373,22 +373,9 @@ impl<S> TransactionWithCommitter<S> {
     }
 
     /// Commits this transaction through `engine` using its bound committer.
-    pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult<Self>> {
-        match self.transaction.commit(engine, self.committer.as_ref())? {
-            CommitResult::Committed(committed) => Ok(CommitResult::Committed(committed)),
-            CommitResult::Conflicted(conflicted) => {
-                Ok(CommitResult::Conflicted(ConflictedTransaction {
-                    transaction: conflicted.transaction.with_committer(self.committer),
-                    conflict_version: conflicted.conflict_version,
-                }))
-            }
-            CommitResult::Retryable(retryable) => {
-                Ok(CommitResult::Retryable(RetryableTransaction {
-                    transaction: retryable.transaction.with_committer(self.committer),
-                    error: retryable.error,
-                }))
-            }
-        }
+    pub fn commit(self, engine: &dyn Engine) -> DeltaResult<(CommitResult<S>, Box<dyn Committer>)> {
+        let result = self.transaction.commit(engine, self.committer.as_ref())?;
+        Ok((result, self.committer))
     }
 }
 
@@ -509,7 +496,7 @@ impl<S> Transaction<S> {
         self,
         engine: &dyn Engine,
         committer: &dyn Committer,
-    ) -> DeltaResult<CommitResult<Transaction<S>>> {
+    ) -> DeltaResult<CommitResult<S>> {
         let commit_start = Instant::now();
 
         // Kernel cannot distinguish Remove actions and DV updates that only delete rows from those
@@ -1612,14 +1599,14 @@ impl<S> Transaction<S> {
         })
     }
 
-    fn into_conflicted(self, conflict_version: Version) -> ConflictedTransaction<Transaction<S>> {
+    fn into_conflicted(self, conflict_version: Version) -> ConflictedTransaction<S> {
         ConflictedTransaction {
             transaction: self,
             conflict_version,
         }
     }
 
-    fn into_retryable(self, error: Error) -> RetryableTransaction<Transaction<S>> {
+    fn into_retryable(self, error: Error) -> RetryableTransaction<S> {
         RetryableTransaction {
             transaction: self,
             error,
@@ -1811,7 +1798,7 @@ pub struct PostCommitStats {
 ///   transaction can be retried without rebasing.
 #[derive(Debug)]
 #[must_use]
-pub enum CommitResult<T = Transaction> {
+pub enum CommitResult<S = ExistingTable> {
     /// The transaction was successfully committed.
     Committed(CommittedTransaction),
     /// This transaction conflicted with an existing version (see
@@ -1820,20 +1807,20 @@ pub enum CommitResult<T = Transaction> {
     /// conflicted).
     // TODO(zach): in order to make the returning of a transaction useful, we need to add APIs to
     // update the transaction to a new version etc.
-    Conflicted(ConflictedTransaction<T>),
+    Conflicted(ConflictedTransaction<S>),
     /// An IO (retryable) error occurred during the commit.
-    Retryable(RetryableTransaction<T>),
+    Retryable(RetryableTransaction<S>),
 }
 
-impl<T> CommitResult<T> {
+impl<S> CommitResult<S> {
     /// Returns true if the commit was successful.
     pub fn is_committed(&self) -> bool {
         matches!(self, CommitResult::Committed(_))
     }
 }
 
-impl<T: std::fmt::Debug> CommitResult<T> {
-    /// Unwraps the [`CommittedTransaction`], panicking if the commit was not successful.
+impl<S: std::fmt::Debug> CommitResult<S> {
+    /// Unwraps the committed transaction state, panicking if the commit was not successful.
     #[cfg(any(test, feature = "test-utils"))]
     #[allow(clippy::panic)]
     pub fn unwrap_committed(self) -> CommittedTransaction {
@@ -1898,14 +1885,14 @@ impl CommittedTransaction {
 ///
 /// [conflict version]: Self::conflict_version
 #[derive(Debug)]
-pub struct ConflictedTransaction<T = Transaction> {
+pub struct ConflictedTransaction<S = ExistingTable> {
     // TODO: remove after rebase APIs
     #[allow(dead_code)]
-    transaction: T,
+    transaction: Transaction<S>,
     conflict_version: Version,
 }
 
-impl<T> ConflictedTransaction<T> {
+impl<S> ConflictedTransaction<S> {
     /// The version attempted commit that yielded a conflict
     pub fn conflict_version(&self) -> Version {
         self.conflict_version
@@ -1916,9 +1903,9 @@ impl<T> ConflictedTransaction<T> {
 /// can be recovered with `RetryableTransaction::transaction` and retried without rebasing. The
 /// associated error can be inspected via `RetryableTransaction::error`.
 #[derive(Debug)]
-pub struct RetryableTransaction<T = Transaction> {
+pub struct RetryableTransaction<S = ExistingTable> {
     /// The transaction that failed to commit due to a retryable error.
-    pub transaction: T,
+    pub transaction: Transaction<S>,
     /// Transient error that caused the commit to fail.
     pub error: Error,
 }
@@ -2323,6 +2310,7 @@ mod tests {
             )])?
             .with_filesystem_committer()
             .commit(engine.as_ref())?
+            .0
             .unwrap_post_commit_snapshot();
         assert!(snapshot.schema().contains("first_column"));
 
@@ -2334,6 +2322,7 @@ mod tests {
             )])?
             .with_filesystem_committer()
             .commit(engine.as_ref())?
+            .0
             .unwrap_post_commit_snapshot();
 
         let schema = snapshot.schema();
@@ -2361,6 +2350,7 @@ mod tests {
         let snapshot = create_table("memory:///set_nullable", schema, "test")
             .build_with_filesystem_committer(engine.as_ref())?
             .commit(engine.as_ref())?
+            .0
             .unwrap_post_commit_snapshot();
 
         let snapshot = snapshot
@@ -2370,6 +2360,7 @@ mod tests {
             }])?
             .with_filesystem_committer()
             .commit(engine.as_ref())?
+            .0
             .unwrap_post_commit_snapshot();
 
         assert!(snapshot.schema().field("id").unwrap().is_nullable());
@@ -2393,6 +2384,7 @@ mod tests {
             ])?
             .with_filesystem_committer()
             .commit(engine.as_ref())?
+            .0
             .unwrap_post_commit_snapshot();
 
         let schema = snapshot.schema();
@@ -2420,6 +2412,7 @@ mod tests {
         let snapshot = txn
             .with_filesystem_committer()
             .commit(engine.as_ref())?
+            .0
             .unwrap_post_commit_snapshot();
 
         assert!(snapshot.schema().contains("fresh_column"));
@@ -3365,7 +3358,8 @@ mod tests {
         let err = txn
             .with_filesystem_committer()
             .commit(engine.as_ref())
-            .expect_err("Blind append with no adds should fail");
+            .err()
+            .expect("Blind append with no adds should fail");
         assert!(
             err.to_string()
                 .contains("Blind append requires at least one added data file"),
@@ -3407,10 +3401,11 @@ mod tests {
             .with_committer(Box::new(IoErrorCommitter))
             .commit(engine.as_ref())?;
         assert!(
-            matches!(result, CommitResult::Retryable(_)),
-            "Expected Retryable, got: {result:?}"
+            matches!(&result.0, CommitResult::Retryable(_)),
+            "Expected Retryable, got: {:?}",
+            result.0
         );
-        if let CommitResult::Retryable(retryable) = result {
+        if let CommitResult::Retryable(retryable) = &result.0 {
             assert!(
                 retryable.error.to_string().contains("simulated IO error"),
                 "Unexpected error: {}",
@@ -3877,11 +3872,11 @@ mod tests {
         let err = snapshot
             .transaction_with_committer(committer, &engine)
             .unwrap()
-            .commit(&engine)
-            .unwrap_err();
+            .commit(&engine);
         assert!(matches!(
             err,
-            crate::Error::Generic(e) if e.contains("This table is path-based and cannot be committed to with a catalog committer")
+            Err(Error::Generic(e))
+                if e.contains("This table is path-based and cannot be committed to with a catalog committer")
         ));
     }
 
@@ -3896,11 +3891,11 @@ mod tests {
         let err = create_table("memory:///", schema, "test-engine")
             .build_with_committer(&engine, committer)
             .unwrap()
-            .commit(&engine)
-            .unwrap_err();
+            .commit(&engine);
         assert!(matches!(
             err,
-            crate::Error::Generic(e) if e.contains("This table is path-based and cannot be committed to with a catalog committer")
+            Err(Error::Generic(e))
+                if e.contains("This table is path-based and cannot be committed to with a catalog committer")
         ));
     }
 
@@ -4006,7 +4001,7 @@ mod tests {
 
         let result = txn.commit(&engine)?;
         assert!(
-            matches!(result, CommitResult::Conflicted(_)),
+            matches!(&result.0, CommitResult::Conflicted(_)),
             "Expected Conflicted from capturing committer"
         );
 
@@ -4042,7 +4037,7 @@ mod tests {
             snapshot.transaction_with_committer(Box::new(IoErrorCommitter), engine.as_ref())?;
         add_dummy_file(&mut txn);
         let result = txn.commit(engine.as_ref())?;
-        assert!(matches!(result, CommitResult::Retryable(_)));
+        assert!(matches!(&result.0, CommitResult::Retryable(_)));
         let failure = commit_failure_event(&reporter).expect("commit failure event");
         assert_eq!(failure.reason, CommitFailureReason::RetryableIo);
         assert_eq!(failure.table_type, TableType::PathBased);

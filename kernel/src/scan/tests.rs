@@ -341,6 +341,7 @@ fn test_scan_builder_accepts_predicate_on_unprojected_data_column() {
         .unwrap()
         .commit(&engine)
         .unwrap()
+        .0
         .unwrap_committed();
 
     let snapshot = Snapshot::builder_for(url::Url::parse(url).unwrap())
@@ -372,6 +373,7 @@ fn test_scan_builder_rejects_predicate_on_projection_only_metadata_column() {
         .unwrap()
         .commit(&engine)
         .unwrap()
+        .0
         .unwrap_committed();
 
     let snapshot = Snapshot::builder_for(url::Url::parse(url).unwrap())

@@ -5,7 +5,7 @@ use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::{Engine, Snapshot};
+use delta_kernel::{Engine, Error, Snapshot};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel_unity_catalog::{
@@ -125,6 +125,7 @@ fn commit(
         .transaction_with_committer(Box::new(uc_committer(update_table_client)), engine)?
         .with_operation("WRITE".to_string())
         .commit(engine)?
+        .0
         .unwrap_post_commit_snapshot())
 }
 
@@ -191,11 +192,8 @@ async fn test_insert_without_publish_hits_limit() -> Result<(), TestError> {
     let err = snapshot
         .clone()
         .transaction_with_committer(committer, &engine)?
-        .commit(&engine)
-        .unwrap_err();
-    assert!(
-        matches!(err, delta_kernel::Error::Generic(msg) if msg.contains("Max unpublished commits"))
-    );
+        .commit(&engine);
+    assert!(matches!(err, Err(Error::Generic(msg)) if msg.contains("Max unpublished commits")));
     Ok(())
 }
 
@@ -209,8 +207,15 @@ async fn test_checkpoint_after_publish() -> Result<(), TestError> {
         _tmp_dir,
     } = setup().await?;
 
-    commit(&snapshot, &update_table_client, &engine)?
-        .publish(&engine, &uc_committer(&update_table_client))?
+    let (result, committer) = snapshot
+        .transaction_with_committer(Box::new(uc_committer(&update_table_client)), &engine)?
+        .with_operation("WRITE".to_string())
+        .commit(&engine)?;
+    result
+        .unwrap_committed()
+        .post_commit_snapshot()
+        .expect("post-commit snapshot")
+        .publish(&engine, committer.as_ref())?
         .checkpoint(&engine, None)?;
 
     // Load a fresh snapshot and verify checkpoint was written
@@ -265,6 +270,7 @@ async fn test_append_scan_back_and_incremental_read() -> Result<(), TestError> {
         .with_table_properties(get_required_properties_for_disk(TABLE_ID))
         .build_with_committer(engine.as_ref(), Box::new(uc_committer(&client)))?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     client.create_table(TABLE_ID)?;
 
@@ -290,6 +296,7 @@ async fn test_append_scan_back_and_incremental_read() -> Result<(), TestError> {
         false,
     )
     .await?
+    .0
     .unwrap_committed();
 
     let snap_v1 = build_snapshot(&client, &engine, &table_uri)?;
@@ -327,6 +334,7 @@ async fn test_append_scan_back_and_incremental_read() -> Result<(), TestError> {
         false,
     )
     .await?
+    .0
     .unwrap_committed();
 
     let snap_v2 = build_snapshot(&client, &engine, &table_uri)?;

@@ -537,6 +537,7 @@ mod tests {
             .unwrap()
             .commit(&engine)
             .unwrap()
+            .0
             .unwrap_committed();
 
         let url = url::Url::parse(url_str).unwrap();
