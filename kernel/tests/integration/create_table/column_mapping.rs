@@ -238,7 +238,7 @@ fn test_column_mapping_feature_only_without_mode() -> DeltaResult<()> {
     // Create table with ONLY the feature flag, no delta.columnMapping.mode
     let _ = create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.feature.columnMapping", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
@@ -363,7 +363,7 @@ fn test_create_clustered_table_with_column_mapping(
     let _ = create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.columnMapping.mode", "name")])
         .with_data_layout(DataLayout::clustered(clustering_cols.iter().copied()))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     // Load snapshot (validates column mapping annotations on read)
@@ -547,7 +547,7 @@ fn test_create_clustered_table_nested_with_column_mapping(
         .with_data_layout(DataLayout::Clustered {
             columns: expected_cols.clone(),
         })
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
@@ -607,7 +607,7 @@ fn test_partitioned_table_stores_logical_column_names_with_column_mapping(
     let _ = create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.columnMapping.mode", "name")])
         .with_data_layout(DataLayout::partitioned(partition_cols.iter().copied()))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;

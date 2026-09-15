@@ -54,7 +54,7 @@ fn test_create_table_with_variant(
 
     let _ = create_table(&table_path, schema.clone(), "Test/1.0")
         .with_table_properties(cm_properties(cm_mode))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
@@ -100,7 +100,7 @@ fn test_create_table_no_variant_no_feature() -> DeltaResult<()> {
     };
 
     let _ = create_table(&table_path, schema, "Test/1.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;

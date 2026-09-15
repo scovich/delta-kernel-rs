@@ -220,7 +220,7 @@ async fn run_ctas_test(
             builder = builder.with_data_layout(DataLayout::clustered(["row_number"]));
         }
         let result = builder
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .build_with_filesystem_committer(engine.as_ref())?
             .commit(engine.as_ref())?;
         match result {
             CommitResult::Committed(c) => c

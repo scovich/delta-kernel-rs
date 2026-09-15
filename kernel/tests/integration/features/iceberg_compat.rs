@@ -12,7 +12,6 @@ use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
 use delta_kernel::expressions::{ColumnName, Scalar};
 use delta_kernel::object_store::local::LocalFileSystem;
@@ -224,7 +223,7 @@ async fn v3_invalid_type_change_blocks_writes_but_not_snapshot_loading() {
         .build(engine.as_ref())
         .unwrap();
     let err = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())
+        .transaction_with_filesystem_committer(engine.as_ref())
         .unwrap_err()
         .to_string();
     assert!(
@@ -248,7 +247,7 @@ async fn v3_commit_validates_num_records(
 
     let _ = create_table(TABLE_ROOT, simple_schema(), "Test/1.0")
         .with_table_properties([("delta.enableIcebergCompatV3", "true")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(engine.as_ref())
         .unwrap()
         .commit(engine.as_ref())
         .unwrap();
@@ -257,7 +256,7 @@ async fn v3_commit_validates_num_records(
         .unwrap();
 
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())
+        .transaction_with_filesystem_committer(engine.as_ref())
         .unwrap()
         .with_engine_info("Test/1.0")
         .with_data_change(true);
@@ -352,7 +351,7 @@ async fn v3_e2e_partitioned_writes_with_field_ids(
     let _ = create_table(&table_path, schema.clone(), "Test/1.0")
         .with_table_properties(props)
         .with_data_layout(DataLayout::partitioned(["region"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(engine.as_ref())
         .unwrap()
         .commit(engine.as_ref())
         .unwrap();

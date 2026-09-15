@@ -1156,7 +1156,7 @@ pub async fn insert_data_with<E: TaskExecutor>(
     let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
     let mut txn = snapshot
-        .transaction(committer, engine.as_ref())?
+        .transaction_with_committer(committer, engine.as_ref())?
         .with_operation(operation.to_string())
         .with_data_change(data_change);
     txn.ack_column_defaults();
@@ -1176,7 +1176,7 @@ pub async fn insert_data_with<E: TaskExecutor>(
 
 /// Starts a transaction using the passed snapshot using a [`FileSystemCommitter`].
 pub fn begin_transaction(snapshot: Arc<Snapshot>, engine: &dyn Engine) -> DeltaResult<Transaction> {
-    snapshot.transaction(Box::new(FileSystemCommitter::new()), engine)
+    snapshot.transaction_with_filesystem_committer(engine)
 }
 
 /// A catalog [`Committer`] for tests: writes every commit directly to the published Delta log
@@ -1574,7 +1574,7 @@ pub async fn write_batch_to_table(
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let mut txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+        .transaction_with_filesystem_committer(engine)?
         .with_engine_info("DefaultEngine")
         .with_data_change(true);
     txn.ack_column_defaults();
@@ -1885,12 +1885,11 @@ pub fn create_table_and_load_snapshot(
     engine: &dyn Engine,
     properties: &[(&str, &str)],
 ) -> DeltaResult<Arc<Snapshot>> {
-    use delta_kernel::committer::FileSystemCommitter;
     use delta_kernel::transaction::create_table::create_table;
 
     let _ = create_table(table_path, schema, "Test/1.0")
         .with_table_properties(properties.to_vec())
-        .build(engine, Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine)?
         .commit(engine)?;
 
     let table_url = delta_kernel::try_parse_uri(table_path)?;
@@ -2057,7 +2056,7 @@ pub fn remove_all_and_get_remove_actions(
 
     let mut txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+        .transaction_with_filesystem_committer(engine)?
         .with_engine_info("DefaultEngine")
         .with_data_change(true);
     for sm in all_scan_metadata {

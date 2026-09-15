@@ -1,5 +1,4 @@
 //! Interval-type integration tests for the CreateTable API.
-
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::expressions::column_name;
 use delta_kernel::schema::{schema_ref, DataType};
@@ -86,7 +85,7 @@ mod supported {
 
         let _ = create_table(&table_path, schema.clone(), "Test/1.0")
             .with_table_properties(cm_properties(cm_mode))
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .build_with_filesystem_committer(engine.as_ref())?
             .commit(engine.as_ref())?;
 
         let table_url = delta_kernel::try_parse_uri(&table_path)?;

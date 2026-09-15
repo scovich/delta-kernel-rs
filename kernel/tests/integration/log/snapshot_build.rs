@@ -86,7 +86,7 @@ async fn setup_multi_version_table<E: TaskExecutor>(
         ]),
     };
     let create_snapshot = builder
-        .build(engine.as_ref(), kind.committer())?
+        .build_with_committer(engine.as_ref(), kind.committer())?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
 

@@ -42,7 +42,6 @@ column. The flow is:
 ```rust,no_run
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField};
@@ -58,7 +57,7 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let result = snapshot
     .alter_table()
     .add_column(StructField::nullable("country", DataType::STRING))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build_with_filesystem_committer(&engine)?
     .with_engine_info("my-app/1.0")
     .commit(&engine)?;
 
@@ -105,7 +104,7 @@ let result = snapshot
     .alter_table()
     .add_column(StructField::nullable("country", DataType::STRING))
     .add_column(StructField::nullable("postal_code", DataType::STRING))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build_with_filesystem_committer(&engine)?
     .commit(&engine)?;
 ```
 

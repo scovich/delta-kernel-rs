@@ -62,7 +62,7 @@ async fn test_create_clustered_table(#[case] col_paths: Vec<Vec<&str>>) -> Delta
         .with_data_layout(DataLayout::Clustered {
             columns: input_cols,
         })
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(engine.as_ref())?;
 
     let stats_cols = txn.stats_columns();
     for col in &expected_cols {
@@ -109,7 +109,7 @@ async fn test_clustering_with_explicit_feature_signal_no_duplicates() -> DeltaRe
     let _ = create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.feature.domainMetadata", "supported")])
         .with_data_layout(DataLayout::clustered(["id"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     // Read back using kernel APIs and verify no duplicate features
