@@ -106,7 +106,8 @@ async fn try_main() -> DeltaResult<()> {
                 "Exceeded maximum 5 retries for committing transaction",
             ));
         }
-        txn = match txn.commit(&engine)? {
+        let (result, committer) = txn.commit(&engine)?;
+        txn = match result {
             CommitResult::Committed(committed) => break committed,
             CommitResult::Conflicted(conflicted) => {
                 let conflicting_version = conflicted.conflict_version();
@@ -115,7 +116,7 @@ async fn try_main() -> DeltaResult<()> {
             }
             CommitResult::Retryable(RetryableTransaction { transaction, error }) => {
                 println!("✗ Failed to commit, retrying... retryable error: {error}");
-                transaction
+                transaction.with_committer(committer)
             }
         };
         retries += 1;

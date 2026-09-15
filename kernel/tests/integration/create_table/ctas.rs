@@ -20,7 +20,6 @@ use delta_kernel::table_features::{
 };
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::CommitResult;
 use delta_kernel::{Engine, FileMeta};
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
@@ -221,13 +220,7 @@ async fn run_ctas_test(
         let result = builder
             .build_with_filesystem_committer(engine.as_ref())?
             .commit(engine.as_ref())?;
-        match result {
-            CommitResult::Committed(c) => c
-                .post_commit_snapshot()
-                .expect("should have post_commit_snapshot")
-                .clone(),
-            _ => panic!("Source create should succeed"),
-        }
+        result.0.unwrap_post_commit_snapshot()
     };
 
     // 2. Write seed data to the source table
@@ -268,13 +261,7 @@ async fn run_ctas_test(
     let commit_result = tgt_txn
         .with_filesystem_committer()
         .commit(engine.as_ref())?;
-    let tgt_snapshot = match commit_result {
-        CommitResult::Committed(c) => c
-            .post_commit_snapshot()
-            .expect("should have post_commit_snapshot")
-            .clone(),
-        _ => panic!("CTAS commit should succeed"),
-    };
+    let tgt_snapshot = commit_result.0.unwrap_post_commit_snapshot();
 
     // 5. Verify target version, feature flags, and column naming consistency
     assert_eq!(tgt_snapshot.version(), 0, "CTAS should produce version-0");

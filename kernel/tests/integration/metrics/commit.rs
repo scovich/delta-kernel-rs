@@ -56,6 +56,7 @@ fn setup_empty_table() -> DeltaResult<(tempfile::TempDir, Url)> {
     create_table(&table_path, simple_schema(), "Test/1.0")
         .build_with_filesystem_committer(setup_engine.as_ref())?
         .commit(setup_engine.as_ref())?
+        .0
         .unwrap_committed();
     Ok((temp_dir, table_url))
 }
@@ -86,6 +87,7 @@ async fn commit_append_emits_success_metrics(
         is_blind_append,
     )
     .await?
+    .0
     .unwrap_committed();
 
     let success = reporter.take_success();
@@ -132,7 +134,7 @@ async fn commit_reports_added_file_count_not_batch_count() -> DeltaResult<()> {
             .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
         txn.add_files(metadata);
     }
-    txn.commit(engine.as_ref())?.unwrap_committed();
+    txn.commit(engine.as_ref())?.0.unwrap_committed();
 
     let success = reporter.take_success();
     assert_eq!(success.num_add_files, 4);
@@ -151,6 +153,7 @@ async fn commit_success_carries_correlation_id() -> DeltaResult<()> {
         .build_with_filesystem_committer(setup_engine.as_ref())?
         .with_correlation_id("commit-req-1")
         .commit(setup_engine.as_ref())?
+        .0
         .unwrap_committed();
 
     let success = reporter.take_success();
@@ -182,6 +185,7 @@ async fn create_table_builder_carries_correlation_id(
     builder
         .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     let success = reporter.take_success();
@@ -207,6 +211,7 @@ async fn alter_table_builder_carries_correlation_id(
     create_table(&table_path, simple_schema(), "Test/1.0")
         .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     // Install the reporter after the create commit so the captured event is the alter commit.
@@ -224,6 +229,7 @@ async fn alter_table_builder_carries_correlation_id(
         .add_column(StructField::nullable("extra", DataType::STRING))
         .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     let success = reporter.take_success();
@@ -248,12 +254,13 @@ async fn commit_conflict_emits_conflict_metric() -> DeltaResult<()> {
         vec![Arc::new(Int32Array::from(vec![1]))],
     )
     .await?
+    .0
     .unwrap_committed();
     // AND a second append reuses the SAME v0 snapshot, so it also targets v1 (already written).
     let result = insert_data(snap, &engine, vec![Arc::new(Int32Array::from(vec![2]))]).await?;
 
     // THEN the second commit conflicts and emits exactly one conflict metric.
-    assert!(matches!(result, CommitResult::Conflicted(_)));
+    assert!(matches!(&result.0, CommitResult::Conflicted(_)));
     assert_eq!(reporter.transaction_commits.get(), 1);
     assert_eq!(reporter.commit_conflicts.get(), 1);
     assert_eq!(reporter.commit_errors.get(), 0);
@@ -289,6 +296,7 @@ async fn commit_success_carries_table_type(#[case] catalog_managed: bool) -> Del
         /* is_blind_append */ false,
     )
     .await?
+    .0
     .unwrap_committed();
 
     let success = reporter.take_success();
@@ -336,7 +344,7 @@ async fn commit_dv_update_reports_updated_file_count_not_batch_count(
     let mut scan_files = get_scan_files(snapshot, engine.as_ref())?;
     let dv_map = sequential_dv_descriptors(&file_paths);
     txn.update_deletion_vectors(dv_map, scan_files.drain(..).map(Ok))?;
-    txn.commit(engine.as_ref())?.unwrap_committed();
+    txn.commit(engine.as_ref())?.0.unwrap_committed();
 
     let success = reporter.take_success();
     assert_eq!(success.num_dv_updates, 3);
@@ -372,7 +380,7 @@ async fn commit_dv_update_accumulates_file_count_across_calls(
         let dv_map = std::iter::once((path.clone(), all_descriptors[path].clone())).collect();
         txn.update_deletion_vectors(dv_map, scan_files.drain(..).map(Ok))?;
     }
-    txn.commit(engine.as_ref())?.unwrap_committed();
+    txn.commit(engine.as_ref())?.0.unwrap_committed();
 
     let success = reporter.take_success();
     assert_eq!(success.num_dv_updates, 2);

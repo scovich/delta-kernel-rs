@@ -66,6 +66,7 @@ async fn append_row<E: TaskExecutor>(
         false, /* is_blind_append */
     )
     .await?
+    .0
     .unwrap_post_commit_snapshot())
 }
 
@@ -89,6 +90,7 @@ async fn setup_multi_version_table<E: TaskExecutor>(
     let create_snapshot = builder
         .build_with_committer(engine.as_ref(), kind.committer())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
 
     // The create-table snapshot is built as latest (version 0 is necessarily the latest).
@@ -205,6 +207,7 @@ async fn snapshot_load_validates_reader_protocol(
     )
     .build_with_filesystem_committer(&engine)?
     .commit(&engine)?
+    .0
     .unwrap_committed();
     let base = Snapshot::builder_for(table_url.as_str()).build(&engine)?;
     assert_eq!(base.version(), 0);
@@ -275,6 +278,7 @@ async fn row_tracking_configuration_rejects_only_enabled_and_suspended(
         .with_table_properties([("delta.feature.rowTracking", "supported")])
         .build_with_filesystem_committer(&engine)?
         .commit(&engine)?
+        .0
         .unwrap_committed();
 
     let base = Snapshot::builder_for(&table_url).build(&engine)?;

@@ -84,6 +84,7 @@ fn test_create_table_ict(
         .with_table_properties(properties.iter().copied())
         .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     // Verify via post-commit snapshot (reads ICT from in-memory CRC delta)

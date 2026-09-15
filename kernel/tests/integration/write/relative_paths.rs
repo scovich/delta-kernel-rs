@@ -29,7 +29,7 @@ async fn write_batch_to_table_simple(
         .write_parquet(&ArrowEngineData::new(data), &write_context)
         .await?;
     txn.add_files(add_meta);
-    let committed = txn.commit(engine)?.unwrap_committed();
+    let committed = txn.commit(engine)?.0.unwrap_committed();
     Ok(committed.post_commit_snapshot().unwrap().clone())
 }
 
@@ -84,7 +84,7 @@ async fn test_multiple_files_in_commit_all_use_relative_paths(
             .await?;
         txn.add_files(add_meta);
     }
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let committed = txn.commit(engine.as_ref())?.0.unwrap_committed();
     let snapshot = committed.post_commit_snapshot().unwrap().clone();
 
     let add_infos = read_add_infos(&snapshot, engine.as_ref())?;
@@ -143,7 +143,7 @@ async fn test_create_table_with_data_uses_relative_paths() -> Result<(), Box<dyn
         )
         .await?;
     txn.add_files(add_meta);
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let committed = txn.commit(engine.as_ref())?.0.unwrap_committed();
     let snapshot = committed.post_commit_snapshot().unwrap().clone();
 
     let add_infos = read_add_infos(&snapshot, engine.as_ref())?;

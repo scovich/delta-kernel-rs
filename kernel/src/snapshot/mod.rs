@@ -2757,6 +2757,7 @@ mod tests {
                 .unwrap()
                 .commit(&engine)
                 .unwrap()
+                .0
                 .unwrap_committed();
             Snapshot::builder_for("memory:///").build(&engine).unwrap()
         }

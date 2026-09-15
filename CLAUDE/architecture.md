@@ -85,14 +85,15 @@ directory. The transaction registers the resulting files, enforces protocol comp
 commit actions, and delegates the atomic commit to a `Committer`.
 
 **Data-write steps:**
-1. Create `Transaction` from a snapshot with a `Committer` (e.g. `FileSystemCommitter`)
+1. Create a `TransactionWithCommitter` from a snapshot
 2. Call `txn.write_state()` after configuring the transaction, then use
    `WriteState::write_context_builder()` to bind partition values and build a `BoundWriteContext`.
    Distributed writers can encode the state and decode it on each worker before binding partition
    values.
 3. Write Parquet files (via engine), collect file metadata
 4. Register files via `txn.add_files(metadata)` and stage any removals or deletion-vector updates
-5. Commit: returns `CommitResult::Committed`, `Conflicted`, or `Retryable`
+5. Commit: returns the `CommitResult` and committer together so every outcome retains the
+   committer for retry or catalog publish
 
 - **Transaction** (`kernel/src/transaction/`): blind append writes, file removals, deletion-vector
   updates, table creation (including clustered tables via `DataLayout`), and limited schema

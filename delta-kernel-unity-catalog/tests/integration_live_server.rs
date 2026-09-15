@@ -205,6 +205,7 @@ async fn live_create_table() {
         .expect("failed to build create-table transaction")
         .commit(engine.as_ref())
         .expect("failed to commit create-table transaction")
+        .0
         .unwrap_committed();
 
     // ===== Step 5: Load the post-commit v0 snapshot =====
@@ -297,6 +298,7 @@ async fn live_create_table() {
     )
     .await
     .expect("append failed")
+    .0
     .unwrap_committed();
 
     let post = uc

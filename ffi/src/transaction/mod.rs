@@ -57,13 +57,20 @@ pub struct ExclusiveTransaction;
 #[handle_descriptor(target=TransactionWithCommitter<CreateTable>, mutable=true, sized=true)]
 pub struct ExclusiveCreateTransaction;
 
-/// A handle for a [`CommittedTransaction`].
+/// A successful transaction and the committer that executed it.
+#[doc(hidden)]
+pub struct FfiCommittedTransaction {
+    transaction: CommittedTransaction,
+    committer: Box<dyn Committer>,
+}
+
+/// A handle for a successful transaction and its retained committer.
 ///
 /// Returned by [`commit`] and [`create_table_commit`]. Carries the committed version and,
 /// when available, the post-commit snapshot. Use [`committed_transaction_version`] and
 /// [`committed_transaction_post_commit_snapshot`] to read the contents, then release with
 /// [`free_committed_transaction`].
-#[handle_descriptor(target=CommittedTransaction, mutable=true, sized=true)]
+#[handle_descriptor(target=FfiCommittedTransaction, mutable=true, sized=true)]
 pub struct ExclusiveCommittedTransaction;
 
 /// Handle for a mutable boxed committer that can be passed across FFI
@@ -123,18 +130,23 @@ fn transaction_with_committer_impl(
     Ok(Box::new(transaction?).into())
 }
 
-/// Convert a [`CommitResult`] into a [`CommittedTransaction`] handle, or an error if the commit
-/// was not successful.
+/// Convert a [`CommitResult`] into a committed-transaction handle, or an error if the commit was
+/// not successful.
 ///
-/// The returned handle owns the [`CommittedTransaction`] and must be freed with
+/// The returned handle owns the transaction and retained committer and must be freed with
 /// [`free_committed_transaction`].
 ///
 /// TODO: expose the full `CommitResult` enum through FFI for conflict resolution.
 fn commit_result_to_committed_handle<S>(
-    result: DeltaResult<CommitResult<S>>,
+    result: DeltaResult<(CommitResult<S>, Box<dyn Committer>)>,
 ) -> DeltaResult<Handle<ExclusiveCommittedTransaction>> {
-    match result? {
-        CommitResult::Committed(committed) => Ok(Box::new(committed).into()),
+    let (result, committer) = result?;
+    match result {
+        CommitResult::Committed(transaction) => Ok(Box::new(FfiCommittedTransaction {
+            transaction,
+            committer,
+        })
+        .into()),
         CommitResult::Retryable(_) => Err(delta_kernel::Error::unsupported(
             "commit failed: retryable transaction not supported in FFI (yet)",
         )),
@@ -370,9 +382,10 @@ pub unsafe extern "C" fn set_data_change(mut txn: Handle<ExclusiveTransaction>, 
     underlying_txn.set_data_change(data_change);
 }
 
-/// Attempt to commit a transaction to the table. On success, returns a handle to the
-/// [`CommittedTransaction`] from which the caller can read the version and the optional
-/// post-commit snapshot. The returned handle must be freed with [`free_committed_transaction`].
+/// Attempt to commit a transaction to the table. On success, returns a handle from which the
+/// caller can read the version and optional post-commit snapshot. The returned handle must be
+/// freed with
+/// [`free_committed_transaction`].
 ///
 /// Returns an error if the commit fails. The FFI surfaces conflicted and retryable
 /// `CommitResult` variants as errors today (see TODO on `commit_result_to_committed_handle`).
@@ -495,9 +508,10 @@ pub unsafe extern "C" fn create_table_set_data_change(
     underlying_txn.set_data_change(data_change);
 }
 
-/// Attempt to commit a create-table transaction. On success, returns a handle to the
-/// [`CommittedTransaction`] from which the caller can read the version and the optional
-/// post-commit snapshot. The returned handle must be freed with [`free_committed_transaction`].
+/// Attempt to commit a create-table transaction. On success, returns a handle from which the
+/// caller can read the version and optional post-commit snapshot. The returned handle must be
+/// freed with
+/// [`free_committed_transaction`].
 ///
 /// Returns an error if the commit fails.
 ///
@@ -521,9 +535,9 @@ pub unsafe extern "C" fn create_table_commit(
 // Committed transaction accessors
 // ============================================================================
 
-// TODO: expose CommittedTransaction::post_commit_stats through FFI.
+// TODO: expose committed transaction post-commit stats through FFI.
 
-/// Free a [`CommittedTransaction`] handle.
+/// Free a committed-transaction handle.
 ///
 /// # Safety
 ///
@@ -533,7 +547,7 @@ pub unsafe extern "C" fn free_committed_transaction(txn: Handle<ExclusiveCommitt
     txn.drop_handle();
 }
 
-/// Read the committed version from a [`CommittedTransaction`] handle.
+/// Read the committed version from a committed-transaction handle.
 ///
 /// Does not consume the handle; the caller still owns it and must eventually pass it to
 /// [`free_committed_transaction`].
@@ -545,7 +559,7 @@ pub unsafe extern "C" fn free_committed_transaction(txn: Handle<ExclusiveCommitt
 pub unsafe extern "C" fn committed_transaction_version(
     txn: &Handle<ExclusiveCommittedTransaction>,
 ) -> u64 {
-    unsafe { txn.as_ref() }.commit_version()
+    unsafe { txn.as_ref() }.transaction.commit_version()
 }
 
 /// Reads the post-commit snapshot, if available.
@@ -553,10 +567,8 @@ pub unsafe extern "C" fn committed_transaction_version(
 /// Returns `Some` with a fresh [`SharedSnapshot`] handle if the committed transaction has an
 /// associated post-commit snapshot. Returns `None` otherwise.
 ///
-/// Not every commit path produces a post-commit snapshot (see
-/// [`CommittedTransaction::post_commit_snapshot`] for the kernel-side rationale); callers
-/// can fall back to building a snapshot via [`get_snapshot_builder`](crate::get_snapshot_builder)
-/// in that case.
+/// Not every commit path produces a post-commit snapshot; callers can fall back to building a
+/// snapshot via [`get_snapshot_builder`](crate::get_snapshot_builder) in that case.
 ///
 /// Each `Some` result contains an independent handle that the caller must eventually free with
 /// [`free_snapshot`](crate::free_snapshot). Does not consume the input handle; the caller must
@@ -570,9 +582,32 @@ pub unsafe extern "C" fn committed_transaction_post_commit_snapshot(
     txn: &Handle<ExclusiveCommittedTransaction>,
 ) -> OptionalValue<Handle<SharedSnapshot>> {
     unsafe { txn.as_ref() }
+        .transaction
         .post_commit_snapshot()
         .map(|snap| Arc::clone(snap).into())
         .into()
+}
+
+/// Publishes the post-commit snapshot using the committer retained by this transaction.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid committed-transaction and engine handles.
+#[no_mangle]
+pub unsafe extern "C" fn committed_transaction_publish(
+    txn: &Handle<ExclusiveCommittedTransaction>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<SharedSnapshot>> {
+    let engine = unsafe { engine.as_ref() };
+    let txn = unsafe { txn.as_ref() };
+    txn.transaction
+        .post_commit_snapshot()
+        .ok_or_else(|| {
+            delta_kernel::Error::generic("Cannot publish without a post-commit snapshot")
+        })
+        .and_then(|snapshot| snapshot.publish(engine.engine().as_ref(), txn.committer.as_ref()))
+        .map(Into::into)
+        .into_extern_result(&engine)
 }
 
 // ============================================================================
@@ -2445,22 +2480,8 @@ mod tests {
                 };
             assert_eq!(unsafe { version(post_commit_snapshot.shallow_copy()) }, 1);
 
-            let publish_committer = unsafe {
-                ok_or_panic(get_uc_committer(
-                    uc_client.shallow_copy(),
-                    kernel_string_slice!(table_id),
-                    kernel_string_slice!(catalog),
-                    kernel_string_slice!(schema),
-                    kernel_string_slice!(table_name),
-                    allocate_err,
-                ))
-            };
             let published_snapshot = ok_or_panic(unsafe {
-                snapshot_publish_with_committer(
-                    post_commit_snapshot.shallow_copy(),
-                    publish_committer,
-                    engine.shallow_copy(),
-                )
+                committed_transaction_publish(&committed, engine.shallow_copy())
             });
             assert_eq!(unsafe { version(published_snapshot.shallow_copy()) }, 1);
             assert!(
@@ -3740,6 +3761,7 @@ mod tests {
         let _ = add_txn
             .with_filesystem_committer()
             .commit(kernel_engine.as_ref())?
+            .0
             .unwrap_committed();
 
         // Build and write a connector-authored DV file deleting rows 1 and 2 (ids 20, 30).

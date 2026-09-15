@@ -165,9 +165,9 @@ txn.add_files(file_metadata);
 
 // Commit atomically
 match txn.commit(&engine)? {
-    CommitResult::Committed(c) => println!("v{}", c.commit_version()),
-    CommitResult::Conflicted(_) => { /* handle conflict */ }
-    CommitResult::Retryable(_) => { /* retry */ }
+    (CommitResult::Committed(c), _) => println!("v{}", c.commit_version()),
+    (CommitResult::Conflicted(_), _) => { /* handle conflict */ }
+    (CommitResult::Retryable(_), _) => { /* retry */ }
 }
 ```
 
@@ -234,9 +234,9 @@ the kernel never touches raw bytes. It works purely with metadata and delegates 
    catalog-managed tables, it goes through the catalog.
 
 4. HANDLE RESULT
-   CommittedTransaction: success.
-   ConflictedTransaction: another writer committed first.
-   RetryableTransaction: transient I/O error, safe to retry.
+   Committed: success.
+   Conflicted: another writer committed first.
+   Retryable: transient I/O error, safe to retry.
 ```
 
 ## EngineData: staying engine-agnostic

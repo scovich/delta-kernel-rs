@@ -1168,7 +1168,7 @@ pub async fn insert_data<E: TaskExecutor>(
     snapshot: Arc<Snapshot>,
     engine: &Arc<DefaultEngine<E>>,
     columns: Vec<ArrayRef>,
-) -> DeltaResult<CommitResult<TransactionWithCommitter>> {
+) -> DeltaResult<(CommitResult, Box<dyn Committer>)> {
     insert_data_with(
         snapshot,
         engine,
@@ -1192,7 +1192,7 @@ pub async fn insert_data_with<E: TaskExecutor>(
     operation: &str,
     data_change: bool,
     is_blind_append: bool,
-) -> DeltaResult<CommitResult<TransactionWithCommitter>> {
+) -> DeltaResult<(CommitResult, Box<dyn Committer>)> {
     let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
     let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
@@ -1639,13 +1639,7 @@ pub async fn write_batch_to_table(
         .write_parquet(&ArrowEngineData::new(data), &write_context)
         .await?;
     txn.add_files(add_meta);
-    match txn.commit(engine)? {
-        delta_kernel::transaction::CommitResult::Committed(c) => Ok(c
-            .post_commit_snapshot()
-            .expect("Failed to get post_commit_snapshot")
-            .clone()),
-        _ => panic!("Write commit should succeed"),
-    }
+    Ok(txn.commit(engine)?.0.unwrap_post_commit_snapshot())
 }
 
 /// An add info extracted from the log segment.
@@ -2106,10 +2100,7 @@ pub fn remove_all_and_get_remove_actions(
     for sm in all_scan_metadata {
         txn.remove_files(sm.scan_files);
     }
-    let committed = match txn.commit(engine)? {
-        CommitResult::Committed(c) => c,
-        _ => panic!("Transaction should be committed"),
-    };
+    let committed = txn.commit(engine)?.0.unwrap_committed();
     read_actions_from_commit(table_url, committed.commit_version(), "remove")
 }
 

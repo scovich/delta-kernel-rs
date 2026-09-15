@@ -245,6 +245,7 @@ async fn test_blind_append_to_column_defaults_table_is_supported(
     ];
     assert!(insert_data(snapshot, &engine, columns.clone())
         .await?
+        .0
         .is_committed());
 
     // Round-trip read.
@@ -380,6 +381,7 @@ async fn assert_materialized_column_default_round_trips(
     let values = scalar.to_array(1)?;
     insert_data(snapshot, &engine, vec![values.clone()])
         .await?
+        .0
         .unwrap_committed();
 
     let expected = RecordBatch::try_new(
@@ -706,6 +708,7 @@ async fn test_defaulted_clustering_column_round_trips_with_stats(
         .with_data_layout(DataLayout::clustered(["c"]))
         .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     add_column_defaults_feature_commit(Path::new(&table_path), 1, None)?;
 
@@ -759,6 +762,7 @@ async fn test_column_default_round_trips_with_column_mapping_and_checkpoint(
         .with_table_properties(table_properties)
         .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     add_column_defaults_feature_commit(Path::new(&table_path), 1, None)?;
 
@@ -968,6 +972,7 @@ async fn test_column_default_with_iceberg_compat_v3_e2e() -> Result<(), Box<dyn 
     ];
     assert!(insert_data(snapshot, &engine, columns.clone())
         .await?
+        .0
         .is_committed());
 
     let data = RecordBatch::try_new(Arc::new(schema.as_ref().try_into_arrow()?), columns)?;

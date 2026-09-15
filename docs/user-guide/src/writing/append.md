@@ -75,7 +75,7 @@ txn.add_files(file_metadata);
 
 // 6. Commit
 match txn.commit(&engine)? {
-    CommitResult::Committed(committed) => {
+    (CommitResult::Committed(committed), _) => {
         println!("Committed version {}", committed.commit_version());
     }
     _ => eprintln!("commit did not succeed"),
@@ -215,11 +215,11 @@ You can call `add_files` multiple times to write multiple files in one transacti
 
 ## Committing
 
-`commit()` consumes the transaction and returns a `CommitResult`:
+`commit()` consumes the transaction and returns its `CommitResult` together with the committer:
 
 ```rust,ignore
 match txn.commit(&engine)? {
-    CommitResult::Committed(committed) => {
+    (CommitResult::Committed(committed), _) => {
         println!("Committed version {}", committed.commit_version());
     }
     _ => {
@@ -229,7 +229,7 @@ match txn.commit(&engine)? {
 ```
 
 > [!NOTE]
-> `commit()` returns a `CommitResult` with three variants: `Committed` on success, `Conflicted` if
+> The canonical `CommitResult` has three variants: `Committed` on success, `Conflicted` if
 > another writer committed first, and `Retryable` for transient IO errors. Automatic conflict
 > resolution is not yet supported. A blind append to a table with no concurrent writers always
 > succeeds.
@@ -308,7 +308,7 @@ snapshot and post-commit statistics:
 
 ```rust,ignore
 let committed = match txn.commit(&engine)? {
-    CommitResult::Committed(c) => c,
+    (CommitResult::Committed(c), _) => c,
     _ => panic!("unexpected result"),
 };
 

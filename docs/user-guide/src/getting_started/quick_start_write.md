@@ -95,13 +95,13 @@ async fn main() -> DeltaResult<()> {
 
     // Commit
     match txn.commit(&engine)? {
-        CommitResult::Committed(committed) => {
+        (CommitResult::Committed(committed), _) => {
             println!("Committed version {}", committed.commit_version());
         }
-        CommitResult::Conflicted(_) => {
+        (CommitResult::Conflicted(_), _) => {
             panic!("unexpected conflict on a brand new table");
         }
-        CommitResult::Retryable(retry) => {
+        (CommitResult::Retryable(retry), _) => {
             panic!("commit failed with retryable error: {}", retry.error);
         }
     }
@@ -193,14 +193,14 @@ transaction needs. `add_files` registers that metadata with the transaction.
 **Commit:**
 ```rust,ignore
 match txn.commit(&engine)? {
-    CommitResult::Committed(committed) => { /* success */ }
-    CommitResult::Conflicted(_) => { /* another writer won */ }
-    CommitResult::Retryable(retry) => { /* transient error, retry */ }
+    (CommitResult::Committed(committed), _) => { /* success */ }
+    (CommitResult::Conflicted(_), _) => { /* another writer won */ }
+    (CommitResult::Retryable(retry), _) => { /* transient error, retry */ }
 }
 ```
 
-`commit()` returns a `CommitResult` with three variants. For blind appends to a table with no
-concurrent writers, you'll always get `CommitResult::Committed`.
+The canonical `CommitResult` has three variants. For blind appends to a table with no concurrent
+writers, you'll always get `CommitResult::Committed`.
 
 ## Run it
 

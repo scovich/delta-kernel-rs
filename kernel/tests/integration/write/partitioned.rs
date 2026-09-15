@@ -782,6 +782,7 @@ fn create_interval_partitioned_table(
         .with_table_properties(properties)
         .build_with_filesystem_committer(engine)?
         .commit(engine)?
+        .0
         .unwrap_post_commit_snapshot();
     Ok(snapshot)
 }
@@ -1022,7 +1023,7 @@ async fn test_materialized_partition_columns_excluded_from_stats(
         .build()?;
     let result = engine.write_parquet(&data, &write_context).await?;
     txn.add_files(result);
-    assert!(txn.commit(engine.as_ref())?.is_committed());
+    assert!(txn.commit(engine.as_ref())?.0.is_committed());
 
     let (add, _) = read_single_add(&table_path, 1)?;
     let stats: serde_json::Value = serde_json::from_str(add["stats"].as_str().unwrap()).unwrap();
@@ -1125,7 +1126,7 @@ async fn test_materialize_partition_columns_e2e(
             .await?;
         txn.add_files(add);
     }
-    let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    let snapshot = txn.commit(engine.as_ref())?.0.unwrap_post_commit_snapshot();
 
     // ===== Verify the materialized partition columns from parquet =====
     let logical_schema = snapshot.schema();
