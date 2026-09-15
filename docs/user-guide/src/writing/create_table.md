@@ -39,8 +39,9 @@ The three required arguments are:
 - **`schema`**: The table's column definitions as a `StructType`
 - **`engine_info`**: A string identifying your application (stored in the commit log)
 
-`.build()` validates the inputs and creates a `CreateTableTransaction`. `.commit()` writes
-version 0 of the table, producing the initial Protocol and Metadata actions.
+`.build_with_filesystem_committer()` validates the inputs and creates a transaction bound to a
+`FileSystemCommitter`. `.commit()` writes version 0 of the table, producing the initial Protocol
+and Metadata actions.
 
 ## Defining a schema
 
@@ -211,7 +212,7 @@ create_table(url.as_str(), schema, "my-app/1.0")
 
 ### Validation rules
 
-`build()` validates partition columns against these rules:
+`build_with_filesystem_committer()` validates partition columns against these rules:
 
 - **Top-level only**: partition columns must be top-level fields in the schema. Nested paths
   like `address.city` are not supported.
@@ -238,15 +239,15 @@ features may additionally materialize them into the data files; see
 
 ## The Committer
 
-The `build()` method takes a `Box<dyn Committer>` that controls how the commit is
-persisted:
+Choose the build method based on how the commit is persisted:
 
 - **`FileSystemCommitter`**: For standalone filesystem-based tables. Writes commit files
-  directly to `_delta_log/` using atomic put-if-absent. This is the default for most use
-  cases.
+  directly to `_delta_log/` using atomic put-if-absent. Call
+  `build_with_filesystem_committer(engine)`.
 
 - **Custom `Committer`**: For catalog-managed tables (e.g. Unity Catalog), you implement
-  the `Committer` trait to route commits through the catalog. See
+  the `Committer` trait to route commits through the catalog. Call
+  `build_with_committer(engine, committer)`. See
   [Catalog-Managed Tables](../catalog_managed/overview.md).
 
 ## Handling the result
@@ -274,7 +275,7 @@ indicates a transient error.
 
 ## Validations
 
-`build()` performs these checks before creating the transaction:
+The build methods perform these checks before creating the transaction:
 
 **Path and existence:**
 - The path is a valid URI
@@ -309,7 +310,7 @@ indicates a transient error.
 
 ## Auto-enabled features
 
-`build()` auto-enables certain table features based on the schema, properties, and data
+The build methods auto-enable certain table features based on the schema, properties, and data
 layout, so you do not need to set them manually. The triggers fall into four groups.
 Each enabled feature is either a reader/writer feature (bumps both the reader and writer
 protocol) or a writer-only feature (bumps the writer protocol only).

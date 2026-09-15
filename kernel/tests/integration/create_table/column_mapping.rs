@@ -266,7 +266,7 @@ fn test_column_mapping_invalid_mode_rejected() {
     // Try to create table with invalid column mapping mode
     let result = create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.columnMapping.mode", "invalid")])
-        .build_with_filesystem_committer(engine.as_ref());
+        .build(engine.as_ref());
 
     assert!(result.is_err());
     assert!(result
@@ -671,11 +671,13 @@ fn test_create_table_dup_physical_name(
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let result = create_table(&table_path, Arc::new(schema), "Test/1.0")
         .with_table_properties([("delta.columnMapping.mode", cm_mode)])
-        .build_with_filesystem_committer(engine.as_ref());
+        .build(engine.as_ref());
 
     match expected_error_substring {
         None => {
-            let _commit = result?.commit(engine.as_ref())?;
+            let _commit = result?
+                .with_filesystem_committer()
+                .commit(engine.as_ref())?;
         }
         Some(substr) => {
             let msg = result

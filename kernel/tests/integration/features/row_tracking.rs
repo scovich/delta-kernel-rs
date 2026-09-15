@@ -13,7 +13,7 @@ use delta_kernel::engine::to_json_bytes;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt};
 use delta_kernel::schema::{schema_ref, MetadataColumnSpec, SchemaRef, StructField};
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, TransactionWithCommitter};
 use delta_kernel::{DeltaResult, Error, Snapshot};
 use itertools::Itertools;
 use rstest::rstest;
@@ -91,7 +91,7 @@ async fn write_data_to_table(
     table_url: &Url,
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     data: Vec<ArrowEngineData>,
-) -> DeltaResult<CommitResult> {
+) -> DeltaResult<CommitResult<TransactionWithCommitter>> {
     let mut txn =
         load_and_begin_transaction(table_url.clone(), engine.as_ref())?.with_data_change(true);
 

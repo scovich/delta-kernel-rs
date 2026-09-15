@@ -153,7 +153,7 @@ fn test_create_table_rejects_col_defaults() -> DeltaResult<()> {
 
     let err = kernel_create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.feature.allowColumnDefaults", "supported")])
-        .build_with_filesystem_committer(engine.as_ref())
+        .build(engine.as_ref())
         .expect_err("kernel create_table must reject allowColumnDefaults")
         .to_string();
     assert!(

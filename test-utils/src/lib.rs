@@ -199,7 +199,7 @@ use delta_kernel::schema::{
     schema_ref, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructType,
 };
 use delta_kernel::table_features::{assign_column_mapping_metadata, find_max_column_id_in_schema};
-use delta_kernel::transaction::{CommitResult, Transaction};
+use delta_kernel::transaction::{CommitResult, TransactionWithCommitter};
 use delta_kernel::{
     try_parse_uri, CancellationToken, CancellationTokenRef, CancelledFuture, DeltaResult,
     DeltaResultIterator, Engine, EngineData, Error, FileDataReadResultIterator, FileMeta,
@@ -1168,7 +1168,7 @@ pub async fn insert_data<E: TaskExecutor>(
     snapshot: Arc<Snapshot>,
     engine: &Arc<DefaultEngine<E>>,
     columns: Vec<ArrayRef>,
-) -> DeltaResult<CommitResult> {
+) -> DeltaResult<CommitResult<TransactionWithCommitter>> {
     insert_data_with(
         snapshot,
         engine,
@@ -1192,7 +1192,7 @@ pub async fn insert_data_with<E: TaskExecutor>(
     operation: &str,
     data_change: bool,
     is_blind_append: bool,
-) -> DeltaResult<CommitResult> {
+) -> DeltaResult<CommitResult<TransactionWithCommitter>> {
     let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
     let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
@@ -1216,7 +1216,10 @@ pub async fn insert_data_with<E: TaskExecutor>(
 }
 
 /// Starts a transaction using the passed snapshot using a [`FileSystemCommitter`].
-pub fn begin_transaction(snapshot: Arc<Snapshot>, engine: &dyn Engine) -> DeltaResult<Transaction> {
+pub fn begin_transaction(
+    snapshot: Arc<Snapshot>,
+    engine: &dyn Engine,
+) -> DeltaResult<TransactionWithCommitter> {
     snapshot.transaction_with_filesystem_committer(engine)
 }
 
@@ -1257,7 +1260,7 @@ impl Committer for TestCatalogCommitter {
 pub fn load_and_begin_transaction(
     table_url: impl AsRef<str>,
     engine: &dyn Engine,
-) -> DeltaResult<Transaction> {
+) -> DeltaResult<TransactionWithCommitter> {
     let snapshot = Snapshot::builder_for(table_url).build(engine)?;
     begin_transaction(snapshot, engine)
 }

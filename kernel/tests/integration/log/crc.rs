@@ -2245,7 +2245,7 @@ async fn commit_data<E: TaskExecutor>(
     )
     .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
     let txn = snapshot
-        .transaction_with_filesystem_committer(engine.as_ref())?
+        .transaction(engine.as_ref())?
         .with_operation("WRITE".to_string())
         .with_data_change(true);
     let mut txn = customize(txn);
@@ -2254,7 +2254,10 @@ async fn commit_data<E: TaskExecutor>(
         .write_parquet(&ArrowEngineData::new(batch), &write_context)
         .await?;
     txn.add_files(adds);
-    Ok(txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot())
+    Ok(txn
+        .with_filesystem_committer()
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

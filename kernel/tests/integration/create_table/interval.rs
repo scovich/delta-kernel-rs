@@ -34,7 +34,7 @@ fn test_create_table_rejects_interval_clustering(
         .with_data_layout(DataLayout::Clustered {
             columns: vec![clustering_column],
         })
-        .build_with_filesystem_committer(engine.as_ref());
+        .build(engine.as_ref());
     test_utils::assert_result_error_with_message(result, "unsupported type");
     Ok(())
 }

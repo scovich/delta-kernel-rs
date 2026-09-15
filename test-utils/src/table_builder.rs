@@ -72,6 +72,7 @@ use delta_kernel::snapshot::ChecksumWriteResult;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
+use delta_kernel::transaction::{CommitResult, TransactionWithCommitter};
 use delta_kernel::{DeltaResult, Engine, Snapshot};
 use delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
@@ -1441,7 +1442,7 @@ async fn write_data_commit<E: TaskExecutor>(
     rows_per_file: usize,
     partition_columns: &[String],
     version: u64,
-) -> DeltaResult<delta_kernel::transaction::CommitResult> {
+) -> DeltaResult<CommitResult<TransactionWithCommitter>> {
     let logical_schema = snapshot.schema().clone();
     let arrow_schema: ArrowSchema = TryFromKernel::try_from_kernel(logical_schema.as_ref())
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;

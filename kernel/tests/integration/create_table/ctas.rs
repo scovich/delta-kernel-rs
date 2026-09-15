@@ -257,7 +257,7 @@ async fn run_ctas_test(
     if tgt_clustered {
         tgt_builder = tgt_builder.with_data_layout(DataLayout::clustered(["row_number"]));
     }
-    let mut tgt_txn = tgt_builder.build_with_filesystem_committer(engine.as_ref())?;
+    let mut tgt_txn = tgt_builder.build(engine.as_ref())?;
 
     let write_context = tgt_txn.write_state()?.write_context_builder().build()?;
     let add_meta = engine
@@ -265,7 +265,9 @@ async fn run_ctas_test(
         .await?;
     tgt_txn.add_files(add_meta);
 
-    let commit_result = tgt_txn.commit(engine.as_ref())?;
+    let commit_result = tgt_txn
+        .with_filesystem_committer()
+        .commit(engine.as_ref())?;
     let tgt_snapshot = match commit_result {
         CommitResult::Committed(c) => c
             .post_commit_snapshot()
