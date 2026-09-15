@@ -17,7 +17,6 @@ use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::schema::{schema, schema_ref, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
 use itertools::Itertools;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
@@ -276,9 +275,7 @@ async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
     )
     .await?;
 
-    let CommitResult::Committed(committed) = result else {
-        panic!("Expected Committed");
-    };
+    let committed = result.0.unwrap_committed();
 
     let snapshot = committed
         .post_commit_snapshot()
@@ -355,11 +352,13 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
         vec![Arc::new(Int32Array::from(vec![17])) as ArrayRef, info_array],
     )
     .await?
+    .0
     .unwrap_post_commit_snapshot();
 
     let post_ckpt_snapshot = begin_transaction(post_ckpt_snapshot, engine.as_ref())?
         .with_domain_metadata("app.settings".to_string(), r#"{"version":3}"#.to_string())
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
 
     // === Step 4: Validate `_last_checkpoint` (version, size, sizeInBytes, numOfAddFiles) ===
@@ -901,6 +900,7 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
     for (i, name) in names.iter().enumerate() {
         snapshot = insert_data(snapshot, engine, make_columns(i as i32 + 1, name))
             .await?
+            .0
             .unwrap_post_commit_snapshot();
     }
 
@@ -913,6 +913,7 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
             r#"{"dark_mode":true}"#.to_string(),
         )
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
 
     // Another domain metadata commit -- updates "app.settings" to verify reconciliation
@@ -924,6 +925,7 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
         )
         .with_domain_metadata("app.settings".to_string(), r#"{"version":2}"#.to_string())
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
 
     // SetTransaction commits -- exercise `txn` actions in checkpoint. Two distinct app_ids
@@ -932,6 +934,7 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
         snapshot = begin_transaction(snapshot, engine.as_ref())?
             .with_transaction_id(app_id.to_string(), version)
             .commit(engine.as_ref())?
+            .0
             .unwrap_post_commit_snapshot();
     }
 
@@ -943,7 +946,7 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
     for sm in scan.scan_metadata(engine.as_ref())? {
         txn.remove_files(sm?.scan_files);
     }
-    snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    snapshot = txn.commit(engine.as_ref())?.0.unwrap_post_commit_snapshot();
 
     // Insert 8 fresh files (one per commit) -> ids 9..=16
     let names = [
@@ -952,6 +955,7 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
     for (i, name) in names.iter().enumerate() {
         snapshot = insert_data(snapshot, engine, make_columns(i as i32 + 9, name))
             .await?
+            .0
             .unwrap_post_commit_snapshot();
     }
 
@@ -1454,7 +1458,7 @@ async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add(
         scan_files.into_iter().map(Ok),
     )?;
     txn.ack_row_tracking_preservation();
-    let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    let snapshot = txn.commit(engine.as_ref())?.0.unwrap_post_commit_snapshot();
 
     // === Step 4: Write a V2 sidecar checkpoint. ===
     snapshot.checkpoint(
@@ -1527,7 +1531,7 @@ async fn test_v2_sidecar_default_hint_splits_at_50k() -> Result<(), Box<dyn std:
             .map(|p| (p.as_str(), 100, 0, Some(1)))
             .collect();
         txn.add_files(create_add_files_metadata(&add_files_schema, files)?);
-        snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+        snapshot = txn.commit(engine.as_ref())?.0.unwrap_post_commit_snapshot();
     }
 
     // === Step 3: Sidecar checkpoint with default hint (None -> 50_000). ===
@@ -1681,6 +1685,7 @@ async fn snapshot_selects_uuid_checkpoint_over_classic_at_one_version() -> Delta
         vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
     )
     .await?
+    .0
     .unwrap_post_commit_snapshot();
     let version = snapshot.version();
 

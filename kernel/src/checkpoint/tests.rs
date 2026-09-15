@@ -806,7 +806,7 @@ async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
         let result = txn
             .with_domain_metadata(domain.to_string(), value.to_string())
             .commit(&engine)?;
-        assert!(result.is_committed());
+        assert!(result.0.is_committed());
         Ok(())
     };
 
@@ -882,7 +882,7 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> DeltaResult<()
     let result = txn
         .with_domain_metadata("foo".to_string(), "bar".to_string())
         .commit(&engine)?;
-    assert!(result.is_committed());
+    assert!(result.0.is_committed());
 
     // Verify domain exists before removal
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
@@ -897,7 +897,7 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> DeltaResult<()
     let result = txn
         .with_domain_metadata_removed("foo".to_string())
         .commit(&engine)?;
-    assert!(result.is_committed());
+    assert!(result.0.is_committed());
 
     // Verify domain is gone before checkpoint
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;

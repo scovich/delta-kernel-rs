@@ -57,6 +57,7 @@ mod supported {
             .with_table_properties([("delta.checkpoint.writeStatsAsStruct", "true")])
             .build_with_filesystem_committer(engine.as_ref())?
             .commit(engine.as_ref())?
+            .0
             .unwrap_post_commit_snapshot();
         let table_url = snapshot.table_root().clone();
 
@@ -89,7 +90,7 @@ mod supported {
             .write_parquet(&ArrowEngineData::new(data.clone()), &write_context)
             .await?;
         txn.add_files(add_files_metadata);
-        let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+        let snapshot = txn.commit(engine.as_ref())?.0.unwrap_post_commit_snapshot();
 
         let add_actions = read_actions_from_commit(&table_url, 1, "add")?;
         let add = &add_actions[0];
@@ -206,6 +207,7 @@ mod supported {
             .with_table_properties([(property_name, property_value)])
             .build_with_filesystem_committer(engine.as_ref())?
             .commit(engine.as_ref())?
+            .0
             .unwrap_post_commit_snapshot();
 
         let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow()?;

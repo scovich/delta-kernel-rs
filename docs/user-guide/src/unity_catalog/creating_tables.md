@@ -92,16 +92,16 @@ let create_txn = create_table(table_uri.as_str(), Arc::new(schema), "MyApp/1.0")
     .build_with_committer(&engine, committer)?;
 
 let post_commit_snapshot = match create_txn.commit(&engine)? {
-    CommitResult::Committed(committed) => committed
+    (CommitResult::Committed(committed), _) => committed
         .post_commit_snapshot()
         .cloned()
         .expect("post-commit snapshot is always populated for create table"),
-    CommitResult::Conflicted(_) => {
+    (CommitResult::Conflicted(_), _) => {
         // Another writer created the table first. Delete the UC reservation
         // and fail, or fall through to read the existing table.
         return Err("table already exists".into());
     }
-    CommitResult::Retryable(_) => {
+    (CommitResult::Retryable(_), _) => {
         return Err("version 0 commit failed with a transient error; retry".into());
     }
 };

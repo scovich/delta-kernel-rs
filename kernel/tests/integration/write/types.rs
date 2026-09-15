@@ -75,7 +75,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     txn.add_files(add_files_metadata);
 
     // Commit the transaction
-    assert!(txn.commit(engine.as_ref())?.is_committed());
+    assert!(txn.commit(engine.as_ref())?.0.is_committed());
 
     // Verify the commit was written correctly
     let commit1 = store
@@ -150,7 +150,7 @@ async fn test_append_timestamp_stats_are_millisecond_truncated(
         .write_parquet(&ArrowEngineData::new(data.clone()), &write_context)
         .await?;
     txn.add_files(add_files_metadata);
-    assert!(txn.commit(engine.as_ref())?.is_committed());
+    assert!(txn.commit(engine.as_ref())?.0.is_committed());
 
     let commit1 = store
         .get(&Path::from(
@@ -326,7 +326,7 @@ async fn test_append_variant(
     txn.add_files(add_files_metadata);
 
     // Commit the transaction
-    assert!(txn.commit(engine.as_ref())?.is_committed());
+    assert!(txn.commit(engine.as_ref())?.0.is_committed());
 
     // Verify the commit was written correctly
     let commit1_url = tmp_test_dir_url
@@ -481,7 +481,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     txn.add_files(add_files_metadata);
 
     // Commit the transaction
-    assert!(txn.commit(engine.as_ref())?.is_committed());
+    assert!(txn.commit(engine.as_ref())?.0.is_committed());
 
     // Verify the commit was written correctly
     let commit1_url = tmp_test_dir_url
@@ -611,7 +611,8 @@ async fn try_write_with_void_schema(schema: SchemaRef) -> KernelError {
             .expect("metadata creation should succeed");
     txn.add_files(metadata);
     txn.commit(engine.as_ref())
-        .expect_err("commit should fail for invalid void schema")
+        .err()
+        .expect("commit should fail for invalid void schema")
 }
 
 #[rstest]

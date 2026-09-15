@@ -140,6 +140,7 @@ async fn create_table_validates_cdf_column_names(
     } else {
         let snapshot = result?
             .commit(engine.as_ref())?
+            .0
             .unwrap_post_commit_snapshot();
         assert!(snapshot.schema().contains(column_name));
         assert_eq!(
@@ -185,6 +186,7 @@ async fn create_table_validates_cdf_reserved_physical_column_names(
     } else {
         let snapshot = result?
             .commit(engine.as_ref())?
+            .0
             .unwrap_post_commit_snapshot();
         let expected_physical_name =
             (cm_mode != "none").then(|| MetadataValue::String("_change_type".into()));
@@ -289,6 +291,7 @@ async fn test_create_table_empty_schema_succeeds() -> DeltaResult<()> {
     create_table(&table_path, schema, "EmptySchemaApp/0.1.0")
         .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
@@ -321,6 +324,7 @@ async fn test_create_table_empty_schema_checkpoint_round_trip(
     builder
         .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;

@@ -220,6 +220,7 @@ mod tests {
             .unwrap()
             .commit(engine)
             .unwrap()
+            .0
             .unwrap_committed();
         let snapshot = Snapshot::builder_for(table_path)
             .with_max_catalog_version(0)
@@ -348,6 +349,7 @@ mod tests {
             .with_domain_metadata("myApp.retention".to_string(), r#"{"days":30}"#.to_string())
             .commit(&engine)
             .unwrap()
+            .0
             .unwrap_committed();
 
         let snapshot = Snapshot::builder_for(table_path)
@@ -430,7 +432,7 @@ mod tests {
             .unwrap()
             .commit(&engine)
             .unwrap();
-        assert!(result.is_committed());
+        assert!(result.0.is_committed());
 
         // Load snapshot at version 1.
         let snapshot = Snapshot::builder_for(table_path)

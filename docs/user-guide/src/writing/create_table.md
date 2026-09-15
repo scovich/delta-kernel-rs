@@ -252,17 +252,17 @@ Choose the build method based on how the commit is persisted:
 
 ## Handling the result
 
-`commit()` returns a `CommitResult`:
+`commit()` returns its `CommitResult` together with the committer:
 
 ```rust,ignore
 match txn.commit(&engine)? {
-    CommitResult::Committed(committed) => {
+    (CommitResult::Committed(committed), _) => {
         println!("Created table at version {}", committed.commit_version());
     }
-    CommitResult::Conflicted(_) => {
+    (CommitResult::Conflicted(_), _) => {
         // Another writer created the table concurrently
     }
-    CommitResult::Retryable(retry) => {
+    (CommitResult::Retryable(retry), _) => {
         // Transient I/O error. Safe to retry.
         println!("Retryable error: {}", retry.error);
     }

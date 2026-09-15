@@ -98,6 +98,7 @@ async fn append_only_enforces_data_change_for_file_actions(
         ])
         .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
     let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
     let write_context = txn.write_state()?.write_context_builder().build()?;
@@ -114,7 +115,7 @@ async fn append_only_enforces_data_change_for_file_actions(
         )?);
         txn.add_files(engine.write_parquet(&data, &write_context).await?);
     }
-    let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    let snapshot = txn.commit(engine.as_ref())?.0.unwrap_post_commit_snapshot();
 
     let staged_batches = (0..2)
         .map(|index| {
@@ -171,7 +172,7 @@ async fn append_only_enforces_data_change_for_file_actions(
     if let Some(expected_error) = expected_error {
         assert_result_error_with_message(commit_result, expected_error);
     } else {
-        commit_result?.unwrap_committed();
+        commit_result?.0.unwrap_committed();
     }
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
@@ -348,7 +349,7 @@ async fn commit_validates_staged_remove_fields(
         ],
     )?;
     txn.add_files(adds);
-    txn.commit(engine.as_ref())?.unwrap_committed();
+    txn.commit(engine.as_ref())?.0.unwrap_committed();
 
     // === Modify staged remove metadata ===
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
@@ -387,7 +388,7 @@ async fn commit_validates_staged_remove_fields(
     if let Some(expected_error) = expected_error {
         assert_result_error_with_message(result, expected_error);
     } else {
-        let snapshot = result?.unwrap_post_commit_snapshot();
+        let snapshot = result?.0.unwrap_post_commit_snapshot();
         let mut surviving_paths = Vec::new();
         for scan_files in get_scan_files(snapshot, engine.as_ref())? {
             let (data, selection_vector) = scan_files.into_parts();
@@ -439,7 +440,7 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
 
     let result = txn.commit(engine.as_ref())?;
 
-    match result {
+    match result.0 {
         CommitResult::Committed(committed) => {
             let commit_version = committed.commit_version();
 
@@ -593,6 +594,7 @@ async fn remove_on_adaptive_metadata_table_nulls_deletion_timestamp_and_forces_e
     txn.ack_row_tracking_preservation();
     let version = txn
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed()
         .commit_version();
 
@@ -642,7 +644,7 @@ async fn test_remove_scanned_file_sets_extended_metadata(
         )?);
     }
     let commit_result = txn.commit(engine.as_ref());
-    commit_result?.unwrap_committed();
+    commit_result?.0.unwrap_committed();
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
 
     let remove_actions = read_actions_from_commit(&table_url, 2, "remove")?;
@@ -743,7 +745,7 @@ async fn test_update_deletion_vectors_adds_expected_entries(
     // Commit the transaction
     let result = txn.commit(engine.as_ref())?;
 
-    match result {
+    match result.0 {
         CommitResult::Committed(committed) => {
             let commit_version = committed.commit_version();
 
@@ -1259,7 +1261,7 @@ async fn test_update_deletion_vectors_multiple_files(
     // Commit the transaction
     let result = txn.commit(engine.as_ref())?;
 
-    match result {
+    match result.0 {
         CommitResult::Committed(committed) => {
             let commit_version = committed.commit_version();
 
@@ -1393,7 +1395,7 @@ async fn test_update_deletion_vectors_respects_selection_vector(
             .into_iter()
             .map(Ok),
     )?;
-    setup_txn.commit(engine.as_ref())?.unwrap_committed();
+    setup_txn.commit(engine.as_ref())?.0.unwrap_committed();
 
     let targeted: Vec<String> = target_indexes
         .iter()
@@ -1444,7 +1446,7 @@ async fn test_update_deletion_vectors_respects_selection_vector(
     } else {
         update_result?;
     }
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let committed = txn.commit(engine.as_ref())?.0.unwrap_committed();
     let version = committed.commit_version();
 
     // Read the commit directly from the (in-memory) store.
@@ -1582,7 +1584,7 @@ async fn test_remove_files_verify_files_excluded_from_scan(
         // Commit the transaction
         let result = txn.commit(engine.as_ref());
 
-        match result? {
+        match result?.0 {
             CommitResult::Committed(committed) => {
                 assert_eq!(committed.commit_version(), 2);
 
@@ -1765,7 +1767,7 @@ async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dy
         // Commit the transaction
         let result = txn.commit(engine.as_ref())?;
 
-        match result {
+        match result.0 {
             CommitResult::Committed(committed) => {
                 assert_eq!(committed.commit_version(), 6);
 
@@ -1895,7 +1897,7 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
             txn.remove_files(scan_metadata?.scan_files);
         }
 
-        let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+        let committed = txn.commit(engine.as_ref())?.0.unwrap_committed();
         assert_eq!(committed.commit_version(), expected_commit_version);
 
         let remove_actions =
@@ -2013,7 +2015,7 @@ async fn test_remove_files_partitioned_with_parsed_columns(
             let add_meta = engine.write_parquet(data?.as_ref(), &ctx).await?;
             txn.add_files(add_meta);
         }
-        txn.commit(engine.as_ref())?.unwrap_committed();
+        txn.commit(engine.as_ref())?.0.unwrap_committed();
 
         let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
         let mut scan_builder = snapshot
@@ -2030,7 +2032,7 @@ async fn test_remove_files_partitioned_with_parsed_columns(
         for scan_metadata in scan.scan_metadata(engine.as_ref())? {
             txn.remove_files(scan_metadata?.scan_files);
         }
-        let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+        let committed = txn.commit(engine.as_ref())?.0.unwrap_committed();
         assert_eq!(committed.commit_version(), 2);
 
         let remove_actions = read_actions_from_commit(&table_url, 2, "remove")?;
@@ -2166,6 +2168,7 @@ async fn create_number_table(
         vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
     )
     .await?
+    .0
     .unwrap_post_commit_snapshot();
     Ok((temp_dir, table_url, engine, snapshot))
 }

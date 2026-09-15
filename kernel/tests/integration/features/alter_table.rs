@@ -82,7 +82,7 @@ async fn add_column_validates_cdf_column_names(
     let result = snapshot
         .alter_table()
         .add_column(StructField::nullable(column_name, DataType::STRING))
-        .build(engine.as_ref(), committer());
+        .build_with_committer(engine.as_ref(), committer());
 
     if let Some(expected_error) = expected_error {
         assert_result_error_with_message(result, expected_error);
@@ -92,6 +92,7 @@ async fn add_column_validates_cdf_column_names(
     } else {
         let snapshot = result?
             .commit(engine.as_ref())?
+            .0
             .unwrap_post_commit_snapshot();
         assert_eq!(snapshot.version(), 1);
         assert!(snapshot.schema().contains(column_name));
@@ -130,7 +131,7 @@ async fn add_column_validates_cdf_physical_column_names(
                 "_change_type",
             )]),
         )
-        .build(engine.as_ref(), committer());
+        .build_with_committer(engine.as_ref(), committer());
 
     if let Some(expected_error) = expected_error {
         assert_result_error_with_message(result, expected_error);
@@ -140,6 +141,7 @@ async fn add_column_validates_cdf_physical_column_names(
     } else {
         let snapshot = result?
             .commit(engine.as_ref())?
+            .0
             .unwrap_post_commit_snapshot();
         assert_eq!(snapshot.version(), 1);
         let expected_physical_name =
@@ -196,6 +198,7 @@ async fn add_columns_lifecycle(
             .add_column(StructField::nullable(name, DataType::STRING))
             .build_with_committer(engine.as_ref(), committer())?
             .commit(engine.as_ref())?
+            .0
             .unwrap_committed();
         let post = committed
             .post_commit_snapshot()
@@ -379,6 +382,7 @@ async fn add_complex_type_column(
         .add_column(field)
         .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     let reloaded = Snapshot::builder_for(table_path).build(engine.as_ref())?;
@@ -460,6 +464,7 @@ async fn back_to_back_alters_with_checkpoint() -> Result<(), Box<dyn std::error:
         .add_column(StructField::nullable("a", DataType::STRING))
         .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     let v1_snap = v1
         .post_commit_snapshot()
@@ -474,6 +479,7 @@ async fn back_to_back_alters_with_checkpoint() -> Result<(), Box<dyn std::error:
         .add_column(StructField::nullable("b", DataType::INTEGER))
         .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     let v2_snap = v2
         .post_commit_snapshot()
@@ -559,6 +565,7 @@ async fn add_column_at_round_trip(
         )
         .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -614,6 +621,7 @@ async fn add_column_at_nested_struct_with_column_mapping(
         )
         .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -682,6 +690,7 @@ async fn add_column_at_containers_round_trip(
         )
         .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -745,6 +754,7 @@ async fn add_column_at_struct_fields_named_like_container_segments() -> DeltaRes
         )
         .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -862,6 +872,7 @@ async fn empty_create_then_add_column(
         .add_column(StructField::nullable("id", DataType::INTEGER))
         .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     let v1 = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -961,6 +972,7 @@ async fn set_nullable_succeeds(
         .set_nullable(column.clone())
         .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     let reloaded = Snapshot::builder_for(table_path).build(engine.as_ref())?;
@@ -1007,6 +1019,7 @@ async fn set_nullable_on_layout_column_with_checkpoint(
         .with_table_properties(properties)
         .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     let v0 = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert!(!v0.schema().field(col_name).unwrap().is_nullable());
@@ -1050,6 +1063,7 @@ async fn set_nullable_on_layout_column_with_checkpoint(
         .set_nullable(ColumnName::new([col_name]))
         .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     let v2_snap = v2
         .post_commit_snapshot()
@@ -1137,6 +1151,7 @@ async fn chain_add_column_and_set_nullable(
         .set_nullable(column_name!("id"))
         .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     let v1_snap = v1
         .post_commit_snapshot()
@@ -1148,6 +1163,7 @@ async fn chain_add_column_and_set_nullable(
         .set_nullable(column_name!("name"))
         .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     let v2_snap = v2
         .post_commit_snapshot()
@@ -1234,6 +1250,7 @@ async fn add_column_with_stray_cm_metadata_on_non_cm_table_is_stripped(
         .add_column(field)
         .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     // Reload from disk so we assert on the persisted schemaString, not the in-memory config.
@@ -1276,6 +1293,7 @@ async fn add_column_strip_is_none_mode_only(
         .add_column(field)
         .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -1335,6 +1353,7 @@ async fn add_column_with_orphan_default_metadata_succeeds() -> DeltaResult<()> {
         .add_column(field)
         .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -1435,6 +1454,7 @@ async fn add_column_preserves_complete_cm_metadata(
         .add_column(field)
         .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -1474,6 +1494,7 @@ async fn add_column_with_only_physical_name_allocates_id(
         .add_column(field)
         .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -1512,6 +1533,7 @@ async fn add_column_with_only_id_fills_physical_name(
         .add_column(field)
         .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -1562,6 +1584,7 @@ async fn add_column_with_id_below_max_column_id_succeeds() -> DeltaResult<()> {
         .add_column(field)
         .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -1659,6 +1682,7 @@ async fn add_column_on_stale_table_leaves_schema_untouched(
         .add_column(added_field)
         .build_with_committer(&engine, committer())?
         .commit(&engine)?
+        .0
         .unwrap_committed();
 
     // Reload from disk so we assert on the persisted schemaString, not the in-memory config.

@@ -91,6 +91,7 @@ mod row_tracking_preservation {
         .with_table_properties(test_case.create_table_properties().iter().copied())
         .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
         let snapshot = if test_case == CommitInfoTagTestCase::Suspended {
             set_table_properties(
@@ -111,6 +112,7 @@ mod row_tracking_preservation {
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
         )
         .await?
+        .0
         .unwrap_committed()
         .commit_version();
         assert_row_tracking_preserved_tag(&table_url, commit_version, test_case.expected_tag())?;
@@ -130,6 +132,7 @@ mod row_tracking_preservation {
         .with_table_properties([("delta.enableRowTracking", "true")])
         .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed()
         .commit_version();
 
@@ -149,12 +152,14 @@ mod row_tracking_preservation {
         .with_table_properties([("delta.enableRowTracking", "true")])
         .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
         let commit_version = snapshot
             .alter_table()
             .add_column(StructField::nullable("added", DataType::INTEGER))
             .build_with_filesystem_committer(engine.as_ref())?
             .commit(engine.as_ref())?
+            .0
             .unwrap_committed()
             .commit_version();
 
@@ -180,6 +185,7 @@ mod row_tracking_preservation {
         .with_table_properties([("delta.enableRowTracking", "true")])
         .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
 
         // === Commit with connector-provided CommitInfo ===
@@ -192,6 +198,7 @@ mod row_tracking_preservation {
                 connector_commit_info_schema,
             )
             .commit(engine.as_ref())?
+            .0
             .unwrap_committed()
             .commit_version();
 
@@ -349,6 +356,7 @@ mod row_tracking_preservation {
             .with_table_properties(test_case.create_table_properties().iter().copied())
             .build_with_filesystem_committer(engine.as_ref())?
             .commit(engine.as_ref())?
+            .0
             .unwrap_committed();
 
         let initial_snapshot = if test_case == RemoveTestCase::SuspendedUnacknowledged {
@@ -368,6 +376,7 @@ mod row_tracking_preservation {
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
         )
         .await?
+        .0
         .unwrap_committed();
 
         // === Stage file removal and optionally acknowledge preservation ===
@@ -390,7 +399,7 @@ mod row_tracking_preservation {
         if let Some(expected_error) = test_case.expects_error() {
             assert_result_error_with_message(txn.commit(engine.as_ref()), expected_error);
         } else {
-            let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+            let snapshot = txn.commit(engine.as_ref())?.0.unwrap_post_commit_snapshot();
             let scan = snapshot.scan_builder().build()?;
             let row_count: usize = read_scan(&scan, engine)?
                 .iter()
@@ -420,6 +429,7 @@ mod row_tracking_preservation {
             vec![Arc::new(Int32Array::from(vec![1, 2]))],
         )
         .await?
+        .0
         .unwrap_post_commit_snapshot();
 
         // === Stage a deletion-vector update without preservation acknowledgment ===
@@ -471,6 +481,7 @@ mod row_tracking_preservation {
             .with_table_properties(table_properties.iter().copied())
             .build_with_filesystem_committer(engine.as_ref())?
             .commit(engine.as_ref())?
+            .0
             .unwrap_post_commit_snapshot();
         let snapshot = insert_data(
             snapshot,
@@ -478,6 +489,7 @@ mod row_tracking_preservation {
             vec![Arc::new(Int32Array::from(vec![10, 20]))],
         )
         .await?
+        .0
         .unwrap_post_commit_snapshot();
         let source_snapshot = insert_data(
             snapshot,
@@ -485,6 +497,7 @@ mod row_tracking_preservation {
             vec![Arc::new(Int32Array::from(vec![30, 40, 50]))],
         )
         .await?
+        .0
         .unwrap_post_commit_snapshot();
 
         // === Read and merge the source files ===
@@ -582,6 +595,7 @@ mod row_tracking_preservation {
         ])
         .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
         let source_snapshot = insert_data(
             snapshot,
@@ -589,6 +603,7 @@ mod row_tracking_preservation {
             vec![Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50]))],
         )
         .await?
+        .0
         .unwrap_post_commit_snapshot();
 
         // === Delete rows 20 and 40 with a deletion vector ===
@@ -614,7 +629,7 @@ mod row_tracking_preservation {
                 .map(Ok),
         )?;
         txn.ack_row_tracking_preservation();
-        let deletion_vector_snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+        let deletion_vector_snapshot = txn.commit(engine.as_ref())?.0.unwrap_post_commit_snapshot();
 
         // === Read and merge the surviving rows ===
         let survivor_batches = read_row_tracking_scan(
@@ -689,7 +704,7 @@ mod row_tracking_preservation {
             txn.remove_files(files);
         }
         txn.ack_row_tracking_preservation();
-        Ok(txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot())
+        Ok(txn.commit(engine.as_ref())?.0.unwrap_post_commit_snapshot())
     }
 
     fn collect_checkpoint_row_tracking_metadata(
@@ -753,6 +768,7 @@ fn write_context_row_tracking_columns_respect_iceberg_compat_v3(
     .with_table_properties(table_properties.iter().copied())
     .build_with_filesystem_committer(engine.as_ref())?
     .commit(engine.as_ref())?
+    .0
     .unwrap_post_commit_snapshot();
     let txn = snapshot.transaction_with_filesystem_committer(engine.as_ref())?;
     let result = txn
@@ -787,6 +803,7 @@ async fn write_context_maps_row_tracking_metadata_to_physical(
         ])
         .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
     let snapshot = insert_data(
         snapshot,
@@ -794,6 +811,7 @@ async fn write_context_maps_row_tracking_metadata_to_physical(
         vec![Arc::new(Int32Array::from(vec![10, 20]))],
     )
     .await?
+    .0
     .unwrap_post_commit_snapshot();
     let source_snapshot = insert_data(
         snapshot,
@@ -801,6 +819,7 @@ async fn write_context_maps_row_tracking_metadata_to_physical(
         vec![Arc::new(Int32Array::from(vec![30, 40, 50]))],
     )
     .await?
+    .0
     .unwrap_post_commit_snapshot();
 
     // === Read data with row tracking ===
