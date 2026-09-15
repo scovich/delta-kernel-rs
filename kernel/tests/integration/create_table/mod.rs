@@ -13,7 +13,6 @@ mod variant;
 
 use std::sync::Arc;
 
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{
     schema_ref, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
 };
@@ -176,7 +175,7 @@ async fn test_create_table_already_exists() -> DeltaResult<()> {
 
     // Try to create again - should fail at build time (table already exists)
     let result = create_table(&table_path, schema.clone(), "UserManagementService/1.2.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+        .build(engine.as_ref());
 
     assert_result_error_with_message(result, "already exists");
 
@@ -259,7 +258,7 @@ async fn test_create_table_empty_schema_layout_errors(
     let schema = schema_ref! {};
     let result = create_table(&table_path, schema, "EmptySchemaApp/0.1.0")
         .with_data_layout(layout)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+        .build(engine.as_ref());
 
     assert_result_error_with_message(result, expected_err);
 
@@ -368,8 +367,7 @@ async fn test_create_table_rejects_delta_invariants_metadata() -> DeltaResult<()
     );
     let schema = schema_ref! { (field) };
 
-    let result = create_table(&table_path, schema, "Test/1.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+    let result = create_table(&table_path, schema, "Test/1.0").build(engine.as_ref());
 
     assert_result_error_with_message(result, "delta.invariants");
 
@@ -505,8 +503,7 @@ fn create_test_create_table_txn() -> DeltaResult<(
         nullable "id": INTEGER,
         nullable "name": STRING,
     };
-    let txn = create_table(&table_path, schema, "test_engine")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    let txn = create_table(&table_path, schema, "test_engine").build(engine.as_ref())?;
     Ok((engine, txn, tempdir))
 }
 
@@ -754,11 +751,11 @@ fn test_create_table_special_char_column_name(#[case] cm_enabled: bool) -> Delta
     if cm_enabled {
         builder = builder.with_table_properties([("delta.columnMapping.mode", "name")]);
     }
-    let result = builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+    let result = builder.build(engine.as_ref());
 
     if cm_enabled {
         let txn = result?;
-        let _ = txn.commit(engine.as_ref())?;
+        let _ = txn.with_filesystem_committer().commit(engine.as_ref())?;
 
         let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
         assert_eq!(snapshot.version(), 0);

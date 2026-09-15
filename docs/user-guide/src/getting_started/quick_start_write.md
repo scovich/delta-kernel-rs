@@ -141,8 +141,9 @@ create_table(url.as_str(), schema.clone(), "quick-start/1.0")
 - A schema (using kernel's `StructType`)
 - An engine info string (identifies your application)
 
-`.build()` takes the engine and a `Committer`. For local filesystem tables, use
-`FileSystemCommitter`. For catalog-managed tables, you provide your own committer.
+`.build_with_filesystem_committer()` validates the builder and binds the resulting transaction to
+a `FileSystemCommitter`. For catalog-managed tables, call `.build_with_committer(engine,
+committer)` instead.
 [Catalog-Managed Tables](../catalog_managed/overview.md) covers that topic.
 
 `.commit()` writes version 0 of the table (the initial Protocol and Metadata actions).

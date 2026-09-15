@@ -37,7 +37,8 @@ using Delta Kernel to fulfill them:
 │  Uses Kernel to fulfill those interfaces:               │
 │    Snapshot  ->  table metadata, schema, version        │
 │    Scan      ->  which files to read, data skipping     │
-│    Transaction -> write files, commit atomically        │
+│    Transaction -> describe a table write                │
+│    Committer   -> commit atomically                      │
 └───────────────────────┬─────────────────────────────────┘
                         │ calls Kernel APIs
                         ▼
@@ -91,7 +92,7 @@ From a snapshot, you can:
 |-----------|-----------|-------------------------------|
 | Get schema and metadata | `snapshot.schema()`, `snapshot.table_properties()` | Table schema discovery |
 | Read data | `snapshot.scan_builder()` | Scan / PartitionReader |
-| Write data | `snapshot.transaction(committer, &engine)` | Writer / Committer |
+| Write data | `snapshot.transaction_with_filesystem_committer(&engine)` | Writer / Committer |
 | Checkpoint | `snapshot.create_checkpoint_writer(&engine)` | Maintenance task |
 
 ## What your connector does vs. what Kernel does

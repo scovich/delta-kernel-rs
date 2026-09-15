@@ -151,7 +151,8 @@ The advanced path is how you build a distributed connector. See
 
 ### Transaction
 
-A `Transaction` writes data to a table. It is built from a snapshot:
+A `Transaction` describes a write to a table. Bind it to a `Committer` before committing. For a
+filesystem-managed table, use the convenience method on `Snapshot`:
 
 ```rust,ignore
 let mut txn = snapshot                              // Arc<Snapshot>
@@ -218,8 +219,8 @@ the kernel never touches raw bytes. It works purely with metadata and delegates 
 
 ```text
 1. START TRANSACTION (kernel)
-   Create a Transaction from a snapshot. The snapshot pins the
-   table version you're writing against.
+   Create a Transaction from a snapshot and bind it to a Committer.
+   The snapshot pins the table version you're writing against.
 
 2. WRITE DATA (engine / your code)
    Write Parquet files using the engine. Collect file metadata

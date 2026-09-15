@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::crc::{Crc, DomainMetadataState, SetTransactionState};
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -2113,7 +2112,7 @@ async fn commit_data<E: TaskExecutor>(
     )
     .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
     let txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(engine.as_ref())?
         .with_operation("WRITE".to_string())
         .with_data_change(true);
     let mut txn = customize(txn);
@@ -2122,7 +2121,10 @@ async fn commit_data<E: TaskExecutor>(
         .write_parquet(&ArrowEngineData::new(batch), &write_context)
         .await?;
     txn.add_files(adds);
-    Ok(txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot())
+    Ok(txn
+        .with_filesystem_committer()
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

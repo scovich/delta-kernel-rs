@@ -11,13 +11,13 @@ pub use deletion_vector::{
     free_dv_descriptor_map, transaction_update_deletion_vectors, ExclusiveDvDescriptor,
     ExclusiveDvDescriptorMap, KernelDvStorageType,
 };
-use delta_kernel::committer::{Committer, FileSystemCommitter};
+use delta_kernel::committer::Committer;
 use delta_kernel::engine_data::FilteredEngineData;
-use delta_kernel::transaction::create_table::{
-    CreateTableTransaction, CreateTableTransactionBuilder,
-};
+use delta_kernel::transaction::create_table::CreateTableTransactionBuilder;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::{CommitResult, CommittedTransaction, Transaction};
+use delta_kernel::transaction::{
+    CommitResult, CommittedTransaction, CreateTable, TransactionWithCommitter,
+};
 use delta_kernel_ffi_macros::handle_descriptor;
 pub use partition_value::{
     free_partition_value_map, partition_value_map_insert_binary, partition_value_map_insert_bool,
@@ -42,19 +42,19 @@ use crate::{
     TryFromStringSlice, Url,
 };
 
-/// A handle for an existing-table transaction (`Transaction<ExistingTable>`).
+/// A handle for an existing-table transaction with a bound committer.
 ///
 /// Returned by [`transaction`] and [`transaction_with_committer`]. Supports all transaction
 /// operations including existing-table-only operations like blind append and file removal.
-#[handle_descriptor(target=Transaction, mutable=true, sized=true)]
+#[handle_descriptor(target=TransactionWithCommitter, mutable=true, sized=true)]
 pub struct ExclusiveTransaction;
 
-/// A handle for a create-table transaction (`Transaction<CreateTable>`).
+/// A handle for a create-table transaction with a bound committer.
 ///
 /// Returned by [`create_table_builder_build`]. Only supports operations valid during table
 /// creation: adding files, setting data change, engine info, and committing. Operations like
 /// file removal, blind append, and deletion vector updates are not available.
-#[handle_descriptor(target=CreateTableTransaction, mutable=true, sized=true)]
+#[handle_descriptor(target=TransactionWithCommitter<CreateTable>, mutable=true, sized=true)]
 pub struct ExclusiveCreateTransaction;
 
 /// A handle for a [`CommittedTransaction`].
@@ -91,8 +91,7 @@ fn transaction_impl(
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
     let engine = extern_engine.engine();
     let snapshot = Snapshot::builder_for(url?).build(engine.as_ref())?;
-    let committer = Box::new(FileSystemCommitter::new());
-    let transaction = snapshot.transaction(committer, engine.as_ref());
+    let transaction = snapshot.transaction_with_filesystem_committer(engine.as_ref());
     Ok(Box::new(transaction?).into())
 }
 
@@ -120,8 +119,8 @@ fn transaction_with_committer_impl(
     committer: Box<dyn Committer>,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
     let engine = extern_engine.engine();
-    let transaction = snapshot.transaction(committer, engine.as_ref());
-    Ok(Box::new(transaction?).into())
+    let transaction = snapshot.transaction_with_committer(committer, engine.as_ref())?;
+    Ok(Box::new(transaction).into())
 }
 
 /// Convert a [`CommitResult`] into a [`CommittedTransaction`] handle, or an error if the commit
@@ -177,7 +176,7 @@ pub unsafe extern "C" fn with_engine_info(
 }
 
 fn with_engine_info_impl(
-    txn: Transaction,
+    txn: TransactionWithCommitter,
     engine_info: KernelStringSlice,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
     let info: &str = unsafe { TryFromStringSlice::try_from_slice(&engine_info) }?;
@@ -203,7 +202,7 @@ pub unsafe extern "C" fn with_operation(
 }
 
 fn with_operation_impl(
-    txn: Transaction,
+    txn: TransactionWithCommitter,
     operation: KernelStringSlice,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
     let operation: String = unsafe { TryFromStringSlice::try_from_slice(&operation) }?;
@@ -237,7 +236,7 @@ pub unsafe extern "C" fn with_domain_metadata(
 }
 
 fn with_domain_metadata_impl(
-    txn: Transaction,
+    txn: TransactionWithCommitter,
     domain: KernelStringSlice,
     configuration: KernelStringSlice,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
@@ -268,7 +267,7 @@ pub unsafe extern "C" fn with_domain_metadata_removed(
 }
 
 fn with_domain_metadata_removed_impl(
-    txn: Transaction,
+    txn: TransactionWithCommitter,
     domain: KernelStringSlice,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
     let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
@@ -301,7 +300,7 @@ pub unsafe extern "C" fn with_row_tracking_high_water_mark(
 }
 
 fn with_row_tracking_high_water_mark_impl(
-    txn: Transaction,
+    txn: TransactionWithCommitter,
     high_water_mark: i64,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
     Ok(Box::new(txn.with_row_tracking_high_water_mark(high_water_mark)?).into())
@@ -326,7 +325,7 @@ pub unsafe extern "C" fn with_root_manifest_file(
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn with_root_manifest_file_impl(
-    txn: Transaction,
+    txn: TransactionWithCommitter,
     file: &FileMeta,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
     let path: &str = unsafe { TryFromStringSlice::try_from_slice(&file.path) }?;
@@ -425,7 +424,7 @@ pub unsafe extern "C" fn create_table_with_engine_info(
 }
 
 fn create_table_with_engine_info_impl(
-    txn: CreateTableTransaction,
+    txn: TransactionWithCommitter<CreateTable>,
     engine_info: KernelStringSlice,
 ) -> DeltaResult<Handle<ExclusiveCreateTransaction>> {
     let info: &str = unsafe { TryFromStringSlice::try_from_slice(&engine_info) }?;
@@ -455,7 +454,7 @@ pub unsafe extern "C" fn create_table_with_domain_metadata(
 }
 
 fn create_table_with_domain_metadata_impl(
-    txn: CreateTableTransaction,
+    txn: TransactionWithCommitter<CreateTable>,
     domain: KernelStringSlice,
     configuration: KernelStringSlice,
 ) -> DeltaResult<Handle<ExclusiveCreateTransaction>> {
@@ -759,8 +758,9 @@ fn create_table_builder_with_table_property_impl(
     Ok(Box::new(builder).into())
 }
 
-/// Build a create-table transaction using the default [`FileSystemCommitter`]. Returns a
-/// create-table transaction handle that can be used with [`create_table_add_files`],
+/// Build a create-table transaction using the default
+/// [`FileSystemCommitter`](delta_kernel::committer::FileSystemCommitter). Returns a create-table
+/// transaction handle that can be used with [`create_table_add_files`],
 /// [`create_table_set_data_change`], [`create_table_with_engine_info`], and
 /// [`create_table_commit`] to optionally stage initial data before committing.
 ///
@@ -775,9 +775,7 @@ pub unsafe extern "C" fn create_table_builder_build(
 ) -> ExternResult<Handle<ExclusiveCreateTransaction>> {
     let builder = unsafe { *builder.into_inner() };
     let extern_engine = unsafe { engine.as_ref() };
-    let committer = Box::new(FileSystemCommitter::new());
-    create_table_builder_build_impl(builder, committer, extern_engine)
-        .into_extern_result(&extern_engine)
+    create_table_builder_build_impl(builder, extern_engine).into_extern_result(&extern_engine)
 }
 
 /// Build a create-table transaction with a custom committer. Same as
@@ -796,17 +794,26 @@ pub unsafe extern "C" fn create_table_builder_build_with_committer(
     let builder = unsafe { *builder.into_inner() };
     let committer = unsafe { committer.into_inner() };
     let extern_engine = unsafe { engine.as_ref() };
-    create_table_builder_build_impl(builder, committer, extern_engine)
+    create_table_builder_build_with_committer_impl(builder, committer, extern_engine)
         .into_extern_result(&extern_engine)
 }
 
 fn create_table_builder_build_impl(
     builder: CreateTableTransactionBuilder,
+    extern_engine: &dyn ExternEngine,
+) -> DeltaResult<Handle<ExclusiveCreateTransaction>> {
+    let engine = extern_engine.engine();
+    let create_txn = builder.build_with_filesystem_committer(engine.as_ref())?;
+    Ok(Box::new(create_txn).into())
+}
+
+fn create_table_builder_build_with_committer_impl(
+    builder: CreateTableTransactionBuilder,
     committer: Box<dyn Committer>,
     extern_engine: &dyn ExternEngine,
 ) -> DeltaResult<Handle<ExclusiveCreateTransaction>> {
     let engine = extern_engine.engine();
-    let create_txn = builder.build(engine.as_ref(), committer)?;
+    let create_txn = builder.build_with_committer(engine.as_ref(), committer)?;
     Ok(Box::new(create_txn).into())
 }
 
@@ -885,6 +892,7 @@ mod tests {
     use delta_kernel::arrow::ffi::to_ffi;
     use delta_kernel::arrow::json::reader::ReaderBuilder;
     use delta_kernel::arrow::record_batch::RecordBatch;
+    use delta_kernel::committer::FileSystemCommitter;
     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::object_store::path::Path;
@@ -3461,7 +3469,7 @@ mod tests {
             .build(kernel_engine.as_ref())?;
         let mut add_txn = snapshot
             .clone()
-            .transaction(Box::new(FileSystemCommitter::new()), kernel_engine.as_ref())?
+            .transaction(kernel_engine.as_ref())?
             .with_engine_info("test-engine/1.0")
             .with_operation("WRITE".to_string());
         let add_files_schema = add_txn.add_files_schema();
@@ -3470,7 +3478,10 @@ mod tests {
             vec![(&data_file_path, parquet_len as i64, 1_000_000, Some(4))],
         )?;
         add_txn.add_files(add_metadata);
-        let _ = add_txn.commit(kernel_engine.as_ref())?.unwrap_committed();
+        let _ = add_txn
+            .with_filesystem_committer()
+            .commit(kernel_engine.as_ref())?
+            .unwrap_committed();
 
         // Build and write a connector-authored DV file deleting rows 1 and 2 (ids 20, 30).
         let mut dv = KernelDeletionVector::new();

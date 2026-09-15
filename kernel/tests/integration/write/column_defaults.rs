@@ -8,7 +8,6 @@ use std::sync::Arc;
 use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT};
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use delta_kernel::expressions::{ColumnName, Scalar};
@@ -154,7 +153,7 @@ fn test_create_table_rejects_col_defaults() -> DeltaResult<()> {
 
     let err = kernel_create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.feature.allowColumnDefaults", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build(engine.as_ref())
         .expect_err("kernel create_table must reject allowColumnDefaults")
         .to_string();
     assert!(

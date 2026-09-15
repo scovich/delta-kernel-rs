@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::expressions::{column_name, ColumnName};
 use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
@@ -151,7 +150,7 @@ async fn test_clustering_stats_columns_within_limit() -> DeltaResult<()> {
     // Create clustered table on col5
     let txn = create_table(&table_path, schema, "Test/1.0")
         .with_data_layout(DataLayout::clustered(["col5"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
 
     // Verify stats_columns includes the clustering column
     let stats_cols = txn.stats_columns();
@@ -176,7 +175,7 @@ async fn test_clustering_stats_columns_beyond_limit() -> DeltaResult<()> {
     // Create clustered table on col35 (position > 32)
     let txn = create_table(&table_path, schema, "Test/1.0")
         .with_data_layout(DataLayout::clustered(["col35"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
 
     // Verify stats_columns includes the clustering column even beyond limit
     let stats_cols = txn.stats_columns();
@@ -212,7 +211,7 @@ async fn test_clustering_column_error(
         .with_data_layout(DataLayout::Clustered {
             columns: vec![ColumnName::new(col_path.iter().copied())],
         })
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+        .build(engine.as_ref());
 
     assert_result_error_with_message(result, expected_error);
 
