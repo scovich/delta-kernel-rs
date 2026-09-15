@@ -61,7 +61,7 @@ let committer = Box::new(MyCatalogCommitter::new(
     table_id.clone(),
 ));
 let mut txn = snapshot
-    .transaction(committer, &engine)?
+    .transaction_with_committer(committer, &engine)?
     .with_operation("INSERT".to_string());
 
 // Drive your Parquet writer from the write context, then hand the resulting

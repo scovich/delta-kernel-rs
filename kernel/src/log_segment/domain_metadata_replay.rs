@@ -136,7 +136,6 @@ mod tests {
     use url::Url;
 
     use crate::actions::visitors::DomainMetadataVisitor;
-    use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::schema::schema_ref;
@@ -164,7 +163,7 @@ mod tests {
             "test",
         )
         .with_table_properties([("delta.feature.domainMetadata", "supported")])
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&engine)
         .unwrap()
         .with_domain_metadata("domainC".to_string(), "cfgC".to_string())
         .commit(&engine)
@@ -173,7 +172,7 @@ mod tests {
         // Commit 1: add domainA and domainB via an existing-table transaction.
         let snapshot = Snapshot::builder_for(url.clone()).build(&engine).unwrap();
         let _ = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)
+            .transaction_with_filesystem_committer(&engine)
             .unwrap()
             .with_domain_metadata("domainA".to_string(), "cfgA".to_string())
             .with_domain_metadata("domainB".to_string(), "cfgB".to_string())
@@ -315,7 +314,7 @@ mod tests {
         let (engine, snapshot) = build_two_commit_log();
         let table_root = snapshot.table_root().clone();
         let _ = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)
+            .transaction_with_filesystem_committer(&engine)
             .unwrap()
             .with_domain_metadata_removed("domainA".to_string())
             .commit(&engine)

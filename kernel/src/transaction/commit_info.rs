@@ -184,7 +184,6 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::arrow::record_batch::RecordBatch;
-    use crate::committer::FileSystemCommitter;
     use crate::engine::arrow_conversion::TryIntoKernel;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::schema::{schema_ref, Schema, SchemaRef, ToSchema};
@@ -285,7 +284,7 @@ mod tests {
     ) -> DeltaResult<(Arc<dyn Engine>, Transaction)> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .transaction_with_filesystem_committer(engine.as_ref())?
             .with_operation("WRITE".to_string())
             .fold_with(engine_commit_info, |txn, (data, schema)| {
                 txn.with_commit_info(data, schema)
