@@ -18,7 +18,6 @@ use crate::checkpoint::{
     create_last_checkpoint_data, CheckpointWriter, LastCheckpointHintStats,
     CHECKPOINT_ACTIONS_SCHEMA_V2,
 };
-use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::sync::SyncEngine;
 use crate::log_replay::HasSelectionVector;
@@ -803,7 +802,7 @@ async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
 
     let commit_domain_metadata = |domain: &str, value: &str| -> DeltaResult<()> {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        let txn = snapshot.transaction_with_filesystem_committer(&engine)?;
         let result = txn
             .with_domain_metadata(domain.to_string(), value.to_string())
             .commit(&engine)?;
@@ -879,7 +878,7 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> DeltaResult<()
 
     // ===== Commit domain metadata for "foo" =====
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+    let txn = snapshot.transaction_with_filesystem_committer(&engine)?;
     let result = txn
         .with_domain_metadata("foo".to_string(), "bar".to_string())
         .commit(&engine)?;
@@ -894,7 +893,7 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> DeltaResult<()
 
     // ===== Remove domain metadata for "foo" (tombstone) =====
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+    let txn = snapshot.transaction_with_filesystem_committer(&engine)?;
     let result = txn
         .with_domain_metadata_removed("foo".to_string())
         .commit(&engine)?;
@@ -928,7 +927,7 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
         schema_ref! { nullable "value": INTEGER },
         "test",
     )
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build_with_filesystem_committer(&engine)?
     .commit(&engine)?;
 
     // Version 1
