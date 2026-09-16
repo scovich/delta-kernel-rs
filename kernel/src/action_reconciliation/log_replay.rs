@@ -33,8 +33,6 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock};
 
-use derive_more::Constructor;
-
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::deduplicator::{Deduplicator as _, FileActionInfo};
 use crate::log_replay::{
@@ -334,10 +332,16 @@ pub(crate) struct ActionReconciliationVisitor<'seen> {
 ///
 /// Invariant: these constants must match the order in
 /// `ActionReconciliationVisitor::selected_column_names_and_types()`.
-#[derive(Debug, Copy, Clone, Constructor)]
+#[derive(Debug, Copy, Clone)]
 struct GetterColumn {
     index: usize,
     name: &'static str,
+}
+
+impl GetterColumn {
+    const fn new(index: usize, name: &'static str) -> Self {
+        GetterColumn { index, name }
+    }
 }
 
 #[allow(unused)]
@@ -1207,6 +1211,8 @@ mod tests {
 
     // Test-only mock utilities module to avoid coverage noise
     mod test_mocks {
+        use derive_more::Constructor;
+
         use super::*;
 
         /// Mock GetData implementation that can simulate type errors for testing error paths
