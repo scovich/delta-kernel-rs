@@ -28,7 +28,7 @@
 use std::collections::{HashMap, HashSet};
 
 use delta_kernel::actions::Protocol;
-use delta_kernel::{DeltaResult, Engine, Error, Snapshot};
+use delta_kernel::{DeltaResult, Engine, Error, SnapshotRef};
 use unity_catalog_delta_client_api::{
     CreateTableRequest, Protocol as WireProtocol, StorageCredential,
 };
@@ -113,7 +113,7 @@ pub fn aws_object_store_options(
 /// Returns an error if `snapshot` is not at version 0, if the schema can't be serialized, or if the
 /// engine fails to read clustering metadata or the commit timestamp.
 pub fn build_uc_create_table_request(
-    snapshot: &Snapshot,
+    snapshot: &SnapshotRef,
     engine: &dyn Engine,
     table_name: impl Into<String>,
 ) -> DeltaResult<CreateTableRequest> {

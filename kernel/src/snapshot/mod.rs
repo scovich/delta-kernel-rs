@@ -83,7 +83,7 @@ pub enum CheckpointWriteResult {
 /// frozen log segment.
 pub struct Snapshot {
     span: tracing::Span,
-    log_segment: LogSegment,
+    log_segment: Arc<LogSegment>,
     table_configuration: TableConfiguration,
     /// The newest CRC resolved at construction, kept so later queries and CRC writes reuse it
     /// instead of re-reading from disk. Queried via [`Snapshot::crc_at_version`] (authoritative,
@@ -173,12 +173,13 @@ impl Snapshot {
     /// (best-effort). See [`Snapshot::built_as_latest`]. `skipped_new_checkpoints` records the last
     /// applicable incremental build's checkpoint policy.
     pub(crate) fn new_with_crc(
-        log_segment: LogSegment,
+        log_segment: impl Into<Arc<LogSegment>>,
         table_configuration: TableConfiguration,
         crc: Option<Arc<Crc>>,
         built_as_latest: bool,
         skipped_new_checkpoints: bool,
     ) -> DeltaResult<Self> {
+        let log_segment = log_segment.into();
         // Will perform version validations.
         let crc = SnapshotCrc::try_new(
             crc,
@@ -216,6 +217,7 @@ impl Snapshot {
         built_as_latest: bool,
     ) -> DeltaResult<Self> {
         let pm_start = std::time::Instant::now();
+        let log_segment = Arc::new(log_segment);
 
         // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
         //         (or use it as-is when already there) per `incremental_replay`.
@@ -317,7 +319,7 @@ impl Snapshot {
 
     /// Log segment this snapshot uses
     #[internal_api]
-    pub(crate) fn log_segment(&self) -> &LogSegment {
+    pub(crate) fn log_segment(&self) -> &Arc<LogSegment> {
         &self.log_segment
     }
 
@@ -375,8 +377,8 @@ impl Snapshot {
     /// Estimated owned heap size in bytes for this snapshot. Best-effort estimate
     /// for capacity tracking, not authoritative.
     ///
-    /// Counts only the dominant per-snapshot heap contributors, normally > 70% of the snapshot's
-    /// owned heap size:
+    /// Counts only the dominant heap contributors retained by the snapshot, normally > 70% of its
+    /// heap size:
     /// - For every listed log path (commit, compaction, checkpoint, latest CRC, latest commit): the
     ///   filename / extension / Url string heap.
     /// - Vec buffer capacity (`capacity * size_of::<ParsedLogPath>()`) for the three Vec fields on
@@ -384,8 +386,9 @@ impl Snapshot {
     /// - The log root Url string.
     /// - The raw `schemaString` JSON on table metadata.
     ///
-    /// The Arc-shared variables (e.g. logical/physical schemas, `crc`) are not counted,
-    /// as they can be shared between multiple snapshots and are not owned by a single snapshot.
+    /// The full log-segment storage is charged to each snapshot even when snapshots share its
+    /// `Arc`, making this a conservative capacity estimate. Other Arc-shared values (e.g.
+    /// logical/physical schemas and `crc`) are not counted.
     ///
     /// Other variables' contributions to heap size are relatively small, so they are not counted
     /// here.
@@ -478,7 +481,7 @@ impl Snapshot {
         fields(report, from_cache, found)
     )]
     pub fn get_app_id_version(
-        &self,
+        self: &SnapshotRef,
         application_id: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<i64>> {
@@ -563,7 +566,7 @@ impl Snapshot {
     ///
     /// Note that this method performs log replay (fetches and processes metadata from storage).
     pub fn get_domain_metadata(
-        &self,
+        self: &SnapshotRef,
         domain: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<String>> {
@@ -585,7 +588,7 @@ impl Snapshot {
     /// Reads domain metadata, potentially replaying the log, and returns an error if the metadata
     /// cannot be read or its JSON configuration is malformed.
     pub fn get_row_tracking_high_water_mark(
-        &self,
+        self: &SnapshotRef,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<i64>> {
         self.get_domain_metadata_internal(ROW_TRACKING_DOMAIN_NAME, engine)?
@@ -613,7 +616,7 @@ impl Snapshot {
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
     pub(crate) fn get_clustering_column_infos(
-        &self,
+        self: &SnapshotRef,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<Vec<ClusteringColumnInfo>>> {
         let Some(physical_columns) = self.get_physical_clustering_columns(engine)? else {
@@ -650,7 +653,7 @@ impl Snapshot {
     /// Note that this method performs log replay (fetches and processes metadata from storage).
     #[internal_api]
     pub(crate) fn get_physical_clustering_columns(
-        &self,
+        self: &SnapshotRef,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<Vec<ColumnName>>> {
         match self.get_clustering_domain_metadata(engine)? {
@@ -665,7 +668,7 @@ impl Snapshot {
     /// the domain has no current entry. The JSON has the shape
     /// `{"clusteringColumns":[["col1"],["addr","city"], ...]}` with physical column names.
     pub(crate) fn get_clustering_domain_metadata(
-        &self,
+        self: &SnapshotRef,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<String>> {
         if !self
@@ -693,7 +696,7 @@ impl Snapshot {
     )]
     #[internal_api]
     pub(crate) fn get_domain_metadatas_internal(
-        &self,
+        self: &SnapshotRef,
         engine: &dyn Engine,
         domains: Option<&HashSet<&str>>,
     ) -> DeltaResult<DomainMetadataMap> {
@@ -780,7 +783,7 @@ impl Snapshot {
     #[allow(unused)]
     #[internal_api]
     pub(crate) fn get_domain_metadata_internal(
-        &self,
+        self: &SnapshotRef,
         domain: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<String>> {
@@ -794,7 +797,7 @@ impl Snapshot {
     #[allow(unused)]
     #[internal_api]
     pub(crate) fn get_all_domain_metadata(
-        &self,
+        self: &SnapshotRef,
         engine: &dyn Engine,
     ) -> DeltaResult<Vec<DomainMetadata>> {
         let all_metadata = self.get_domain_metadatas_internal(engine, None)?;
@@ -823,7 +826,10 @@ impl Snapshot {
     /// - `Err(...)` - ICT is enabled but cannot be read, or enablement version is invalid
     #[instrument(parent = &self.span, name = "snap.get_ict", skip_all, err)]
     #[internal_api]
-    pub(crate) fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
+    pub(crate) fn get_in_commit_timestamp(
+        self: &SnapshotRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<i64>> {
         // Get ICT enablement info and check if we should read ICT for this version
         let enablement = self
             .table_configuration()
@@ -885,7 +891,7 @@ impl Snapshot {
     /// [`get_in_commit_timestamp`]: Self::get_in_commit_timestamp
     #[allow(unused)]
     #[instrument(parent = &self.span, name = "snap.get_ts", skip_all, err)]
-    pub fn get_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
+    pub fn get_timestamp(self: &SnapshotRef, engine: &dyn Engine) -> DeltaResult<i64> {
         match self
             .table_configuration()
             .in_commit_timestamp_enablement()?
@@ -1084,7 +1090,7 @@ impl Snapshot {
     ///
     /// The `root` span field records which root resolved the CRC.
     #[instrument(parent = &self.span, name = "snap.resolve_crc_for_write", skip_all, err, fields(root))]
-    fn resolve_crc_for_write(&self, engine: &dyn Engine) -> DeltaResult<Arc<Crc>> {
+    fn resolve_crc_for_write(self: &SnapshotRef, engine: &dyn Engine) -> DeltaResult<Arc<Crc>> {
         let span = tracing::Span::current();
         // Case 1: an in-memory CRC at this version is ready to write as-is.
         if let Some(crc) = self.crc_at_version() {
@@ -2109,10 +2115,11 @@ mod tests {
             .at_version(0)
             .build(&engine)?;
 
-        let snapshot_no_commit = create_snapshot_with_commit_file_absent_from_log_segment(
-            &url,
-            snapshot.table_configuration().clone(),
-        )?;
+        let snapshot_no_commit =
+            Arc::new(create_snapshot_with_commit_file_absent_from_log_segment(
+                &url,
+                snapshot.table_configuration().clone(),
+            )?);
 
         let result = snapshot_no_commit.get_in_commit_timestamp(&engine);
         assert!(matches!(result, Err(Error::MissingVersion(0))));
@@ -2272,10 +2279,11 @@ mod tests {
             .at_version(0)
             .build(&engine)?;
 
-        let snapshot_no_commit = create_snapshot_with_commit_file_absent_from_log_segment(
-            &url,
-            snapshot.table_configuration().clone(),
-        )?;
+        let snapshot_no_commit =
+            Arc::new(create_snapshot_with_commit_file_absent_from_log_segment(
+                &url,
+                snapshot.table_configuration().clone(),
+            )?);
 
         let result = snapshot_no_commit.get_timestamp(&engine);
         assert!(matches!(result, Err(Error::MissingVersion(0))));
@@ -2302,13 +2310,13 @@ mod tests {
         commit(table_root, store.as_ref(), 0, commit_data).await;
         let loaded_snapshot = Snapshot::builder_for(table_root).build(&engine)?;
         // Drop the synthesized CRC so timestamp resolution reads the referenced commit file.
-        let snapshot = Snapshot::new_with_crc(
+        let snapshot = Arc::new(Snapshot::new_with_crc(
             loaded_snapshot.log_segment().clone(),
             loaded_snapshot.table_configuration().clone(),
             None,
             false,
             false, /* skipped_new_checkpoints */
-        )?;
+        )?);
         store.delete(&delta_path_for_version(0, "json")).await?;
 
         let result = snapshot.get_timestamp(&engine);
@@ -2726,7 +2734,7 @@ mod tests {
     where
         F: FnOnce(&mut LogSegmentFiles, &Url),
     {
-        let mut new_log_segment = baseline.log_segment().clone();
+        let mut new_log_segment = baseline.log_segment().as_ref().clone();
         mutate(&mut new_log_segment.listed, &new_log_segment.log_root);
         Snapshot::new(new_log_segment, baseline.table_configuration().clone()).unwrap()
     }

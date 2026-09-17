@@ -1032,12 +1032,12 @@ impl Scan {
             latest_commit_file: log_segment.listed.latest_commit_file.clone(),
             ..Default::default()
         };
-        let new_log_segment = LogSegment::try_new(
+        let new_log_segment = Arc::new(LogSegment::try_new(
             log_segment_files,
             log_segment.log_root.clone(),
             Some(log_segment.end_version),
             None, // No checkpoint in this incremental segment
-        )?;
+        )?);
 
         // For incremental reads, new_log_segment has no checkpoint but we use the
         // checkpoint schema returned by the function for consistency.

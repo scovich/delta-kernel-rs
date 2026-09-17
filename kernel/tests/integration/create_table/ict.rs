@@ -7,7 +7,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::snapshot::Snapshot;
+use delta_kernel::snapshot::{Snapshot, SnapshotRef};
 use delta_kernel::table_features::{
     TableFeature, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
@@ -17,7 +17,7 @@ use test_utils::test_table_setup;
 
 /// Asserts the ICT protocol and enablement state of a snapshot, returning the ICT value.
 fn assert_ict_state(
-    snapshot: &Snapshot,
+    snapshot: &SnapshotRef,
     engine: &dyn Engine,
     expect_supported: bool,
     expect_enabled: bool,

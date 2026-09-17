@@ -32,7 +32,7 @@ use url::Url;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::{list_delta_log_from_storage, should_process_log_file};
 use crate::path::{LogPathFileType, ParsedLogPath};
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::InCommitTimestampEnablement;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error as DeltaError, Version};
@@ -379,7 +379,7 @@ fn binary_search_ict_timestamps(
 /// Propagates a [`LogHistoryError`] from getting the earliest recreatable commit when
 /// `resolved_commit_type` is [`HistoryCommitType::Recreatable`].
 pub(crate) fn timestamp_to_version(
-    snapshot: &Snapshot,
+    snapshot: &SnapshotRef,
     engine: &dyn Engine,
     timestamp: Timestamp,
     bound: Bound,
@@ -529,7 +529,7 @@ pub(crate) fn timestamp_to_version(
 /// ```
 #[tracing::instrument(skip(snapshot, engine), ret, fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
 pub fn latest_version_as_of(
-    snapshot: &Snapshot,
+    snapshot: &SnapshotRef,
     engine: &dyn Engine,
     timestamp: Timestamp,
     resolved_commit_type: HistoryCommitType,
@@ -570,7 +570,7 @@ pub fn latest_version_as_of(
 /// ```
 #[tracing::instrument(skip(snapshot, engine), ret, fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
 pub fn first_version_after(
-    snapshot: &Snapshot,
+    snapshot: &SnapshotRef,
     engine: &dyn Engine,
     timestamp: Timestamp,
     resolved_commit_type: HistoryCommitType,
@@ -630,7 +630,7 @@ pub fn first_version_after(
 /// ```
 #[tracing::instrument(skip(snapshot, engine), ret, fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
 pub fn timestamp_range_to_versions(
-    snapshot: &Snapshot,
+    snapshot: &SnapshotRef,
     engine: &dyn Engine,
     start_timestamp: Timestamp,
     end_timestamp: Option<Timestamp>,

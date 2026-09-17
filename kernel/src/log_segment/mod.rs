@@ -727,7 +727,7 @@ impl LogSegment {
     #[internal_api]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_actions_with_projected_checkpoint_actions(
-        &self,
+        self: &Arc<Self>,
         engine: &dyn Engine,
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
@@ -769,7 +769,7 @@ impl LogSegment {
     /// the schema, so callers do not need to supply them.
     #[internal_api]
     pub(crate) fn read_actions(
-        &self,
+        self: &Arc<Self>,
         engine: &dyn Engine,
         action_schema: SchemaRef,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
@@ -947,7 +947,7 @@ impl LogSegment {
     ///   - Has sidecar column (V2): extract sidecars, read first sidecar's schema
     ///   - No sidecar column (V1): use checkpoint schema directly
     fn get_file_actions_schema_and_sidecars(
-        &self,
+        self: &Arc<Self>,
         engine: &dyn Engine,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<(Option<SchemaRef>, Vec<FileMeta>)> {
@@ -1054,7 +1054,7 @@ impl LogSegment {
     ///
     /// Returns a tuple of the actions iterator and [`CheckpointReadInfo`].
     fn create_checkpoint_stream(
-        &self,
+        self: &Arc<Self>,
         engine: &dyn Engine,
         action_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,

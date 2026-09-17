@@ -985,8 +985,8 @@ impl<S> Transaction<S> {
 
     // Returns the read snapshot. Returns an error if this is a create-table transaction.
     // To get the `Option<SnapshotRef>` directly, use the `read_snapshot_opt` field.
-    fn read_snapshot(&self) -> DeltaResult<&Snapshot> {
-        self.read_snapshot_opt.as_deref().ok_or_else(|| {
+    fn read_snapshot(&self) -> DeltaResult<&SnapshotRef> {
+        self.read_snapshot_opt.as_ref().ok_or_else(|| {
             Error::internal_error("read_snapshot() called on create-table transaction")
         })
     }

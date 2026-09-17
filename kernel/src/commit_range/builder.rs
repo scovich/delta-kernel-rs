@@ -73,7 +73,7 @@ impl CommitRangeBuilder {
         let end_version = self.end_version;
 
         let log_segment = match &self.snapshot {
-            Some(snapshot) => snapshot.log_segment().clone(),
+            Some(snapshot) => snapshot.log_segment().as_ref().clone(),
             None => LogSegment::for_table_changes(
                 engine.storage_handler().as_ref(),
                 log_root,

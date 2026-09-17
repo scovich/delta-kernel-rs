@@ -206,7 +206,7 @@ fn collect_materialized_adds(
 }
 
 fn collect_projected_adds(
-    log_segment: &LogSegment,
+    log_segment: &Arc<LogSegment>,
     engine: &dyn Engine,
 ) -> DeltaResult<(usize, Vec<String>)> {
     let actions = log_segment
@@ -1328,7 +1328,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
 
     let v2_checkpoint_read_schema = LOG_METADATA_SCHEMA.clone();
 
-    let log_segment = LogSegment::try_new(
+    let log_segment = Arc::new(LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path(&checkpoint_one_file)],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
@@ -1337,7 +1337,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         log_root,
         None,
         None,
-    )?;
+    )?);
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
@@ -1399,7 +1399,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
 
     let v2_checkpoint_read_schema = CHECKPOINT_READ_SCHEMA.clone();
 
-    let log_segment = LogSegment::try_new(
+    let log_segment = Arc::new(LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![
                 create_log_path_with_size(&checkpoint_one_file, cp1_size),
@@ -1411,7 +1411,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         log_root,
         None,
         None,
-    )?;
+    )?);
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
@@ -1465,7 +1465,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
 
     let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
-    let log_segment = LogSegment::try_new(
+    let log_segment = Arc::new(LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path_with_size(
                 &checkpoint_one_file,
@@ -1477,7 +1477,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         log_root,
         None,
         None,
-    )?;
+    )?);
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
@@ -1552,7 +1552,7 @@ async fn test_scan_checkpoint_read_handles_all_remove_row_groups(
     let checkpoint_file = log_root.join(checkpoint_name)?.to_string();
     let checkpoint_size = get_file_size(&store, &format!("_delta_log/{checkpoint_name}")).await;
 
-    let log_segment = LogSegment::try_new(
+    let log_segment = Arc::new(LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, checkpoint_size)],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
@@ -1561,7 +1561,7 @@ async fn test_scan_checkpoint_read_handles_all_remove_row_groups(
         log_root,
         None,
         None,
-    )?;
+    )?);
 
     // The projected checkpoint read derives `add.path IS NOT NULL`. Engines may use it to skip
     // all-remove row groups or ignore it and return extra rows; both paths must surface the same
@@ -1612,7 +1612,7 @@ async fn test_scan_checkpoint_read_tolerates_unfiltered_json_rows() -> DeltaResu
     .await?;
 
     let checkpoint_file = log_root.join(checkpoint_name)?.to_string();
-    let log_segment = LogSegment::try_new(
+    let log_segment = Arc::new(LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path(&checkpoint_file)],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
@@ -1621,7 +1621,7 @@ async fn test_scan_checkpoint_read_tolerates_unfiltered_json_rows() -> DeltaResu
         log_root,
         None,
         None,
-    )?;
+    )?);
 
     let (materialized_rows, add_paths) = collect_projected_adds(&log_segment, &engine)?;
     assert_eq!(
@@ -1678,7 +1678,7 @@ async fn test_scan_checkpoint_read_handles_all_remove_sidecar_row_groups(
     let checkpoint_file = log_root.join(checkpoint_name)?.to_string();
     let checkpoint_size = get_file_size(&store, &format!("_delta_log/{checkpoint_name}")).await;
 
-    let log_segment = LogSegment::try_new(
+    let log_segment = Arc::new(LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, checkpoint_size)],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
@@ -1687,7 +1687,7 @@ async fn test_scan_checkpoint_read_handles_all_remove_sidecar_row_groups(
         log_root,
         None,
         None,
-    )?;
+    )?);
 
     // Sidecar discovery reads the manifest without a predicate, so pruning its null-`add.path`
     // rows from the projected action stream cannot hide sidecar references.
@@ -1732,7 +1732,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
 
     let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
-    let log_segment = LogSegment::try_new(
+    let log_segment = Arc::new(LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path(&checkpoint_one_file)],
             ..Default::default()
@@ -1740,7 +1740,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
         log_root,
         None,
         None,
-    )?;
+    )?);
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema,
@@ -1821,7 +1821,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     // Sidecar batches now use the same schema as checkpoint (including sidecar column)
     let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
-    let log_segment = LogSegment::try_new(
+    let log_segment = Arc::new(LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path_with_size(
                 &checkpoint_file_path,
@@ -1833,7 +1833,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         log_root,
         None,
         None,
-    )?;
+    )?);
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
@@ -3411,7 +3411,7 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
     // Build a commit that uses v1 checkpoint and a hint that describes a different schema
     let commit_v2_path = log_root.join("00000000000000000002.json")?.to_string();
     let commit_v2 = create_log_path(&commit_v2_path);
-    let log_segment = LogSegment::try_new(
+    let log_segment = Arc::new(LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, cp_size)],
             ascending_commit_files: vec![commit_v2.clone()],
@@ -3425,7 +3425,7 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
             checkpoint_schema: Some(hint_schema.clone()),
             ..Default::default()
         }),
-    )?;
+    )?);
 
     // Verify that checkpoint_schema only returns schema if it is valid
     assert_eq!(log_segment.checkpoint_version, Some(1));
@@ -3489,7 +3489,7 @@ async fn test_get_file_actions_schema_v2_identity_filter(
 
     let commit_v2_path = log_root.join("00000000000000000002.json")?.to_string();
     let commit_v2 = create_log_path(&commit_v2_path);
-    let log_segment = LogSegment::try_new(
+    let log_segment = Arc::new(LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, cp_size)],
             ascending_commit_files: vec![commit_v2.clone()],
@@ -3507,7 +3507,7 @@ async fn test_get_file_actions_schema_v2_identity_filter(
             }),
             ..Default::default()
         }),
-    )?;
+    )?);
 
     let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine, None)?;
     let schema = schema.expect("leaf V2 checkpoint should yield a file actions schema");
@@ -3572,7 +3572,7 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
     let cp1_file = log_root.join(checkpoint_part_1)?.to_string();
     let cp2_file = log_root.join(checkpoint_part_2)?.to_string();
 
-    let log_segment = LogSegment::try_new(
+    let log_segment = Arc::new(LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![
                 create_log_path_with_size(&cp1_file, cp1_size),
@@ -3588,7 +3588,7 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
             checkpoint_schema: Some(v1_schema.clone()),
             ..Default::default()
         }),
-    )?;
+    )?);
 
     let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine, None)?;
     let schema = schema.expect("Multi-part V1 should return file actions schema");
@@ -3857,7 +3857,7 @@ async fn test_checkpoint_stream_resolves_stats_projection(
         .to_string();
     let checkpoint_size =
         get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
-    let log_segment = LogSegment::try_new(
+    let log_segment = Arc::new(LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, checkpoint_size)],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
@@ -3866,7 +3866,7 @@ async fn test_checkpoint_stream_resolves_stats_projection(
         log_root,
         None,
         None,
-    )?;
+    )?);
     let stats_schema = create_stats_schema(vec![StructField::nullable("id", DataType::LONG)]);
 
     let checkpoint_result = log_segment.create_checkpoint_stream(
@@ -4458,7 +4458,7 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResul
         },
     };
 
-    let log_segment = LogSegment::try_new(
+    let log_segment = Arc::new(LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, checkpoint_size)],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
@@ -4467,7 +4467,7 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResul
         log_root,
         None,
         None,
-    )?;
+    )?);
 
     // Pass a partition schema to trigger partitionValues_parsed detection
     let partition_schema = schema! { nullable "id": INTEGER };
@@ -4523,7 +4523,7 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
 
     let read_schema = get_all_actions_schema().project(&[ADD_NAME])?;
 
-    let log_segment = LogSegment::try_new(
+    let log_segment = Arc::new(LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, checkpoint_size)],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
@@ -4532,7 +4532,7 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
         log_root,
         None,
         None,
-    )?;
+    )?);
 
     // Pass a partition schema — but the checkpoint doesn't have partitionValues_parsed
     let partition_schema = schema! { nullable "id": INTEGER };
@@ -5267,9 +5267,10 @@ async fn read_actions_with_null_map_values(
 
     // Build engine and read actions -- same as DeltaActionExtractor::get_actions.
     let engine = SyncEngine::new_with_store(store);
-    let log_segment =
+    let log_segment = Arc::new(
         LogSegment::for_table_changes(engine.storage_handler().as_ref(), log_root, 0, Some(0))
-            .unwrap();
+            .unwrap(),
+    );
 
     // Use all_actions_schema to cover sidecar and checkpointMetadata (checkpoint-only actions).
     let action_schema = get_all_actions_schema().clone();

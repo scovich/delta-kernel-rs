@@ -5,6 +5,7 @@
 //! after an authoritative stale CRC and reconciles them against its active-domain map.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use tracing::instrument;
 
@@ -26,7 +27,7 @@ impl LogSegment {
     /// (`removed=true`) — removed domain metadatas will _never_ be present in the returned map.
     #[instrument(name = "domain_metadata.scan", skip_all, fields(domains = ?domains.map(|d| d.iter().collect::<Vec<_>>())), err)]
     pub(crate) fn scan_domain_metadatas(
-        &self,
+        self: &Arc<Self>,
         domains: Option<&HashSet<&str>>,
         engine: &dyn Engine,
     ) -> DeltaResult<DomainMetadataMap> {
@@ -46,15 +47,14 @@ impl LogSegment {
     /// active domains; `Some(filter)` answers only the requested ones. Returned maps never contain
     /// tombstones.
     pub(crate) fn scan_domain_metadatas_rooted_in_crc(
-        &self,
+        self: &Arc<Self>,
         base_version: Version,
         base_active: &HashMap<String, DomainMetadata>,
         domains: Option<&HashSet<&str>>,
         engine: &dyn Engine,
     ) -> DeltaResult<DomainMetadataMap> {
-        let tail = self
-            .segment_after_version(base_version)
-            .scan_tail_including_tombstones(domains, engine)?;
+        let tail_segment = Arc::new(self.segment_after_version(base_version));
+        let tail = tail_segment.scan_tail_including_tombstones(domains, engine)?;
         let reconciled = match domains {
             // Filtered: the newest tail action per requested domain wins; a tombstone settles the
             // answer as absent. Fall back to `base_active` only when the tail never mentions it.
@@ -80,7 +80,7 @@ impl LogSegment {
     /// every requested domain is decided (a tombstone counts as decided). The CRC-rooted path keeps
     /// tombstones so a removal in a newer commit can suppress a domain the base holds.
     fn scan_tail_including_tombstones(
-        &self,
+        self: &Arc<Self>,
         domains: Option<&HashSet<&str>>,
         engine: &dyn Engine,
     ) -> DeltaResult<DomainMetadataMap> {
@@ -95,7 +95,7 @@ impl LogSegment {
     /// replayed. The caller chooses whether to keep or strip tombstones from the returned
     /// visitor.
     fn visit_domain_metadatas(
-        &self,
+        self: &Arc<Self>,
         domains: Option<&HashSet<&str>>,
         engine: &dyn Engine,
     ) -> DeltaResult<DomainMetadataVisitor> {
@@ -121,7 +121,7 @@ impl LogSegment {
 
     /// Read action batches from the log, projecting rows to only contain domain metadata columns.
     fn read_domain_metadata_batches(
-        &self,
+        self: &Arc<Self>,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         self.read_actions(engine, LOG_DOMAIN_METADATA_SCHEMA.clone())

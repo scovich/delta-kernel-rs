@@ -1192,7 +1192,7 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> DeltaResult<()>
         .unwrap_committed();
 
     // Asserts domain metadata on any snapshot, regardless of how it was loaded.
-    let assert_domain_metadata = |snapshot: &Snapshot, engine: &dyn delta_kernel::Engine| {
+    let assert_domain_metadata = |snapshot: &SnapshotRef, engine: &dyn delta_kernel::Engine| {
         assert_eq!(
             snapshot.get_domain_metadata("zip", engine).unwrap(),
             Some("zap1".to_string())

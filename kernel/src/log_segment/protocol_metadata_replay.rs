@@ -41,7 +41,7 @@ impl LogSegment {
     /// This is the checked variant of [`Self::read_protocol_metadata_opt`], used for fresh
     /// snapshot creation where both Protocol and Metadata must exist.
     pub(crate) fn read_protocol_metadata(
-        &self,
+        self: &Arc<Self>,
         engine: &dyn Engine,
         crc: Option<&Arc<Crc>>,
     ) -> DeltaResult<(Metadata, Protocol, ProtocolMetadataSource)> {
@@ -64,7 +64,7 @@ impl LogSegment {
     /// short-circuit or seed the replay.
     #[instrument(name = "log_seg.load_p_m", skip_all, fields(enable_call_frame), err)]
     pub(crate) fn read_protocol_metadata_opt(
-        &self,
+        self: &Arc<Self>,
         engine: &dyn Engine,
         crc: Option<&Arc<Crc>>,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>, ProtocolMetadataSource)> {
@@ -93,7 +93,7 @@ impl LogSegment {
                 "Pruning log segment to commits after CRC version {}",
                 crc.version
             );
-            let pruned = self.segment_after_version(crc.version);
+            let pruned = Arc::new(self.segment_after_version(crc.version));
             let PmCandidate {
                 metadata: metadata_opt,
                 protocol: protocol_opt,
@@ -144,7 +144,7 @@ impl LogSegment {
     /// With `declarative-plans`, P&M is first read via the declarative plan. [`Error::Unsupported`]
     /// (no executor, or an executor that does not implement a given operator) falls back to
     /// ordinary log replay. Other plan errors are returned unchanged.
-    fn replay_for_pm(&self, engine: &dyn Engine) -> DeltaResult<PmCandidate> {
+    fn replay_for_pm(self: &Arc<Self>, engine: &dyn Engine) -> DeltaResult<PmCandidate> {
         #[cfg(feature = "declarative-plans")]
         match engine
             .require_plan_executor()
@@ -239,7 +239,7 @@ impl LogSegment {
 
     /// Reads the P&M commit cover and checkpoint, tagging each batch with its version.
     fn read_pm_batches(
-        &self,
+        self: &Arc<Self>,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<VersionedBatch>> + Send> {
         let (commit_schema, checkpoint_schema) = pm_replay_schemas();

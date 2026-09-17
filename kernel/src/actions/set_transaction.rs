@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 pub(crate) use crate::actions::visitors::SetTransactionMap;
 use crate::actions::visitors::SetTransactionVisitor;
 use crate::actions::{SetTransaction, LOG_TXN_SCHEMA};
@@ -19,7 +21,7 @@ impl SetTransactionScanner {
     /// Note that each call to this function repeats log replay. Thus, if callers are interested
     /// in multiple app ids, use `get_all` (once) instead and probe the map returned.
     pub(crate) fn get_one(
-        log_segment: &LogSegment,
+        log_segment: &Arc<LogSegment>,
         application_id: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<SetTransaction>> {
@@ -31,7 +33,7 @@ impl SetTransactionScanner {
     /// Scan the Delta Log for the latest `txn` action of every application id.
     #[allow(unused)]
     pub(crate) fn get_all(
-        log_segment: &LogSegment,
+        log_segment: &Arc<LogSegment>,
         engine: &dyn Engine,
     ) -> DeltaResult<SetTransactionMap> {
         scan_application_transactions(log_segment, None, engine)
@@ -46,17 +48,14 @@ impl SetTransactionScanner {
     /// newest wins; otherwise the result is that id's entry in `base_active`, the value the CRC
     /// recorded at `base_version`.
     pub(crate) fn get_one_rooted_in_crc(
-        log_segment: &LogSegment,
+        log_segment: &Arc<LogSegment>,
         application_id: &str,
         base_active: &SetTransactionMap,
         base_version: Version,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<SetTransaction>> {
-        let tail = Self::get_one(
-            &log_segment.segment_after_version(base_version),
-            application_id,
-            engine,
-        )?;
+        let tail_segment = Arc::new(log_segment.segment_after_version(base_version));
+        let tail = Self::get_one(&tail_segment, application_id, engine)?;
         Ok(tail.or_else(|| base_active.get(application_id).cloned()))
     }
 }
@@ -65,7 +64,7 @@ impl SetTransactionScanner {
 /// is provided
 // TODO: we could have this track _multiple_ application ids instead of only up to one.
 fn scan_application_transactions(
-    log_segment: &LogSegment,
+    log_segment: &Arc<LogSegment>,
     application_id: Option<&str>,
     engine: &dyn Engine,
 ) -> DeltaResult<SetTransactionMap> {
@@ -86,7 +85,7 @@ fn scan_application_transactions(
 
 // Factored out to facilitate testing
 fn replay_for_app_ids(
-    log_segment: &LogSegment,
+    log_segment: &Arc<LogSegment>,
     engine: &dyn Engine,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
     log_segment.read_actions(engine, LOG_TXN_SCHEMA.clone())

@@ -153,7 +153,7 @@ impl LogSegment {
     /// `in_commit_timestamp_opt` is left `None`: a checkpoint carries no `commitInfo`, so the
     /// caller sets the ICT on the returned CRC afterward.
     pub(crate) fn build_crc_from_checkpoint(
-        &self,
+        self: &Arc<Self>,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<Crc>> {
         let Some(version) = self.checkpoint_version else {

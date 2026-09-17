@@ -15,7 +15,7 @@ use delta_kernel::expressions::{column_name, ColumnName};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
-use delta_kernel::snapshot::Snapshot;
+use delta_kernel::snapshot::{Snapshot, SnapshotRef};
 use delta_kernel::table_features::{
     get_any_level_column_physical_name, ColumnMappingMode, TableFeature,
 };
@@ -41,7 +41,7 @@ const VERIFIED_PATHS: &[&[&str]] = &[&["row_number"], &["address", "street"]];
 /// table metadata surfaces: schema annotations, stats, clustering domain
 /// metadata, and Parquet file footers.
 async fn verify_column_names_in_metadata(
-    snapshot: &Snapshot,
+    snapshot: &SnapshotRef,
     engine: &impl Engine,
     store: &DynObjectStore,
     table_url: &Url,
@@ -96,7 +96,7 @@ fn verify_column_names_in_stats(
 /// Asserts that column paths stored in clustering domain metadata use the
 /// expected names (physical when column mapping is enabled, logical otherwise).
 fn verify_column_names_in_clustering_metadata(
-    snapshot: &Snapshot,
+    snapshot: &SnapshotRef,
     engine: &impl Engine,
     cm_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {

@@ -181,6 +181,7 @@ impl Snapshot {
                 (combined_log_segment, new_end_version)
             }
         };
+        let combined_log_segment = Arc::new(combined_log_segment);
 
         // Advance the latest available base (the existing snapshot's in-memory CRC, or a newer
         // on-disk CRC the combined segment carries) to the new end version, subject to
@@ -212,8 +213,7 @@ impl Snapshot {
                 let newer_base = base_crc
                     .as_ref()
                     .filter(|c| c.version > existing_snapshot_version);
-                combined_log_segment
-                    .segment_after_version(existing_snapshot_version)
+                Arc::new(combined_log_segment.segment_after_version(existing_snapshot_version))
                     .read_protocol_metadata_opt(engine, newer_base)
                     .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?
             }
