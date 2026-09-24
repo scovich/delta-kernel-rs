@@ -591,16 +591,14 @@ pub fn pub_macro(
     item: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
     let input = parse_macro_input!(item as Item);
-    pub_macro_impl(input)
-        .unwrap_or_else(Error::into_compile_error)
-        .into()
+    expand_attribute(input, pub_macro_impl).into()
 }
 
 /// Mark items as `internal_api` to make them public iff the `internal-api` feature is enabled.
 ///
-/// A `macro_rules!` declaration is exposed through a hidden crate-root implementation and a
-/// re-export at the declaration site. Its expansion follows [`pub_macro`], except the public
-/// re-export is enabled only by the `internal-api` feature; otherwise it is crate-visible.
+/// A `macro_rules!` declaration is exposed through a hidden implementation and a re-export at the
+/// declaration site. The implementation and re-export are public only when the `internal-api`
+/// feature is enabled; otherwise the re-export is crate-visible.
 ///
 /// NOTE: This macro does not support `mod` declarations because of nuances in how the mod expander
 /// and proc macro system interact for non-inline modules such as `mod foo;`. Use explicit
@@ -611,9 +609,20 @@ pub fn internal_api(
     item: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
     let input = parse_macro_input!(item as Item);
-    internal_api_impl(input)
-        .unwrap_or_else(Error::into_compile_error)
-        .into()
+    expand_attribute(input, internal_api_impl).into()
+}
+
+fn expand_attribute(
+    input: Item,
+    implementation: impl FnOnce(Item) -> Result<TokenStream, Error>,
+) -> TokenStream {
+    match implementation(input.clone()) {
+        Ok(output) => output,
+        Err(error) => {
+            let error = error.into_compile_error();
+            quote!(#input #error)
+        }
+    }
 }
 
 fn internal_api_impl(input: Item) -> Result<TokenStream, Error> {
@@ -622,7 +631,9 @@ fn internal_api_impl(input: Item) -> Result<TokenStream, Error> {
             let Some(public_name) = item.ident.clone() else {
                 return Ok(quote!(#item)); // malformed, let compiler deal with it
             };
-            let (definition, reexport) = make_macro_api(item, public_name)?;
+            let macro_export =
+                syn::parse_quote!(#[cfg_attr(feature = "internal-api", macro_export)]);
+            let (definition, reexport) = make_macro_api(item, public_name, macro_export)?;
             (Some(definition), reexport)
         }
         input => (None, input),
@@ -649,7 +660,8 @@ fn pub_macro_impl(input: Item) -> Result<TokenStream, Error> {
             let Some(public_name) = item.ident.clone() else {
                 return Ok(quote!(#item)); // malformed, let compiler deal with it
             };
-            let (definition, reexport) = make_macro_api(item, public_name)?;
+            let macro_export = syn::parse_quote!(#[macro_export]);
+            let (definition, reexport) = make_macro_api(item, public_name, macro_export)?;
             let reexport = make_public(reexport)?;
             Ok(quote! {
                 #definition
@@ -663,7 +675,11 @@ fn pub_macro_impl(input: Item) -> Result<TokenStream, Error> {
     }
 }
 
-fn make_macro_api(mut item: ItemMacro, public_name: Ident) -> Result<(Item, Item), Error> {
+fn make_macro_api(
+    mut item: ItemMacro,
+    public_name: Ident,
+    macro_export: Attribute,
+) -> Result<(Item, Item), Error> {
     if item
         .attrs
         .iter()
@@ -674,7 +690,7 @@ fn make_macro_api(mut item: ItemMacro, public_name: Ident) -> Result<(Item, Item
 
     let implementation_name = hidden_macro_name(&item, &public_name);
     item.ident = Some(implementation_name.clone());
-    item.attrs.push(syn::parse_quote!(#[macro_export]));
+    item.attrs.push(macro_export);
     item.attrs.push(syn::parse_quote!(#[doc(hidden)]));
 
     let reexport: Item = syn::parse_quote! {
@@ -758,6 +774,21 @@ mod tests {
     }
 
     #[test]
+    fn attribute_errors_preserve_input() {
+        let input: Item = parse_quote!(
+            pub fn preserved() {}
+        );
+        let output = expand_attribute(input, |item| {
+            Err(Error::new(item.span(), "attribute rejected item"))
+        })
+        .to_string();
+
+        assert!(output.contains("pub fn preserved"));
+        assert!(output.contains("compile_error"));
+        assert!(output.contains("attribute rejected item"));
+    }
+
+    #[test]
     fn internal_api_generates_complete_macro_rules_api() {
         let input = parse_quote! {
             #[doc = "Returns its argument."]
@@ -770,7 +801,7 @@ mod tests {
         let implementation_name = implementation_name(&input);
         let expected = quote! {
             #[doc = "Returns its argument."]
-            #[macro_export]
+            #[cfg_attr(feature = "internal-api", macro_export)]
             #[doc(hidden)]
             macro_rules! #implementation_name {
                 ($value:expr) => {
