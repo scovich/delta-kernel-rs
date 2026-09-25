@@ -572,8 +572,7 @@ fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
 /// ```
 ///
 /// Distinct declarations can use the same public name because the hidden name includes a
-/// deterministic hash of the declaration. Byte-identical declarations with the same name still
-/// collide.
+/// deterministic hash of the declaration. Only token-identical declarations with the same collide.
 ///
 /// The expansion has this shape:
 ///
@@ -764,6 +763,17 @@ mod tests {
         hidden_macro_name(item, item.ident.as_ref().unwrap())
     }
 
+    fn identity_macro() -> Item {
+        parse_quote! {
+            #[doc = "Returns its argument."]
+            macro_rules! identity {
+                ($value:expr) => {
+                    $value
+                };
+            }
+        }
+    }
+
     #[test]
     fn internal_api_rejects_public_items() {
         let input = parse_quote!(
@@ -789,15 +799,32 @@ mod tests {
     }
 
     #[test]
-    fn internal_api_generates_complete_macro_rules_api() {
-        let input = parse_quote! {
+    fn pub_macro_generates_complete_macro_rules_api() {
+        let input = identity_macro();
+        let implementation_name = implementation_name(&input);
+        let expected = quote! {
             #[doc = "Returns its argument."]
-            macro_rules! identity {
+            #[macro_export]
+            #[doc(hidden)]
+            macro_rules! #implementation_name {
                 ($value:expr) => {
                     $value
                 };
             }
+
+            #[doc(inline)]
+            pub use #implementation_name as identity;
         };
+
+        assert_eq!(
+            pub_macro_impl(input).unwrap().to_string(),
+            expected.to_string()
+        );
+    }
+
+    #[test]
+    fn internal_api_generates_complete_macro_rules_api() {
+        let input = identity_macro();
         let implementation_name = implementation_name(&input);
         let expected = quote! {
             #[doc = "Returns its argument."]
