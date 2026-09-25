@@ -571,8 +571,8 @@ fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
 /// assert_eq!(second::identity!(), 2);
 /// ```
 ///
-/// Distinct declarations can use the same public name because the hidden name includes a
-/// deterministic hash of the declaration. Only token-identical declarations with the same collide.
+/// Distinct declarations can use the same public name because the hidden name includes a hash of
+/// the declaration's tokens. Only token-identical declarations with the same name collide.
 ///
 /// The expansion has this shape:
 ///
