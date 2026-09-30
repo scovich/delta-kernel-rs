@@ -1,7 +1,7 @@
 //! [`MeteredParquetHandler`] wraps any [`ParquetHandler`] so its `read_parquet_files`
 //! emits the kernel's standard `ParquetReadCompleted` span, carrying
 //! `(num_files, bytes_read)` exactly once when the returned iterator is exhausted or
-//! dropped. `read_parquet_footer` and `write_parquet_file` pass through.
+//! dropped. `read_parquet_footer`, `write_parquet_file`, and `write_parquet_files` pass through.
 
 use std::sync::Arc;
 
@@ -10,12 +10,14 @@ use crate::metrics::PrecountedMetricsIterator;
 use crate::schema::SchemaRef;
 use crate::{
     CancellationTokenRef, DeltaResult, DeltaResultIteratorStatic, EngineData,
-    FileDataReadResultIterator, FileMeta, ParquetFooter, ParquetHandler, PredicateRef,
+    FileDataReadResultIterator, FileMeta, ParquetFooter, ParquetHandler, ParquetMultiFileWrite,
+    PredicateRef,
 };
 
 /// Decorator over an engine-provided `Arc<dyn ParquetHandler>` that emits a
 /// `ParquetReadCompleted` span on every `read_parquet_files` call.
-/// `read_parquet_footer` and `write_parquet_file` are pass-through and emit nothing.
+/// `read_parquet_footer`, `write_parquet_file`, and `write_parquet_files` are pass-through
+/// and emit nothing.
 pub struct MeteredParquetHandler {
     inner: Arc<dyn ParquetHandler>,
 }
@@ -90,6 +92,14 @@ impl ParquetHandler for MeteredParquetHandler {
         data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
     ) -> DeltaResult<()> {
         self.inner.write_parquet_file(location, data)
+    }
+
+    fn write_parquet_files(
+        &self,
+        write: ParquetMultiFileWrite,
+        data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
+    ) -> DeltaResult<Vec<url::Url>> {
+        self.inner.write_parquet_files(write, data)
     }
 
     fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {

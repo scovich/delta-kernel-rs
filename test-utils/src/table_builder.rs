@@ -141,7 +141,7 @@ pub enum CheckpointFormat {
     /// V2 with sidecar files. Honored only when `v2Checkpoint` is enabled;
     /// silently falls back to [`CheckpointFormat::Default`] otherwise.
     V2WithSidecarsIfEnabled {
-        /// Suggested file actions per sidecar; `None` uses the kernel default.
+        /// Preferred file actions per sidecar; `None` lets the connector choose its default.
         file_actions_per_sidecar_hint: Option<usize>,
     },
 }
@@ -275,8 +275,8 @@ impl LogState {
         self
     }
 
-    /// Switch every checkpoint to V2 with sidecars. Pass `None` for the kernel
-    /// default `file_actions_per_sidecar_hint`, or `Some(n)` to override.
+    /// Switch every checkpoint to V2 with sidecars. Pass `None` to let the connector choose its
+    /// default `file_actions_per_sidecar_hint`, or `Some(n)` to provide a preference.
     /// Honored only when the paired [`FeatureSet`] enables `v2_checkpoint()`;
     /// silently falls back to the default format otherwise so that
     /// `#[values]` sweeps mixing both axes don't fail on invalid combinations.
@@ -2037,7 +2037,7 @@ mod tests {
     /// and `with_sidecars_if_enabled(...)` on the `LogState`. The checkpoint writer
     /// emits sidecar parquet files into `_delta_log/_sidecars/`.
     #[rstest::rstest]
-    #[case::default_hint(None)]
+    #[case::connector_default(None)]
     #[case::explicit_hint(Some(1))]
     fn test_v2_sidecars_emit_sidecar_files(#[case] hint: Option<usize>) -> DeltaResult<()> {
         let log_state = LogState::with_latest_version(2)

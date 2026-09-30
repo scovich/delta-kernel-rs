@@ -99,7 +99,8 @@
 //! [`LastCheckpointHint`]: crate::last_checkpoint_hint::LastCheckpointHint
 //! [`Snapshot::checkpoint`]: crate::Snapshot::checkpoint
 //! [`Snapshot::create_checkpoint_writer`]: crate::Snapshot::create_checkpoint_writer
-use std::sync::{Arc, LazyLock, Mutex};
+use std::num::NonZero;
+use std::sync::{Arc, LazyLock};
 
 use tracing::info;
 use url::Url;
@@ -125,7 +126,6 @@ use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{
     version_as_i64, DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, Error, FileMeta,
-    Version,
 };
 
 #[cfg(feature = "declarative-plans")]
@@ -139,7 +139,7 @@ pub(crate) use checkpoint_shape::{CheckpointShape, CheckpointType};
 use checkpoint_transform::{
     build_checkpoint_read_schema, build_checkpoint_transform, StatsTransformConfig,
 };
-use sidecar::{create_sidecar_action_batch, SidecarSplitter, SingleSidecarDataIterator};
+use sidecar::{create_sidecar_action_batch, SidecarSplitter};
 #[cfg(test)]
 mod tests;
 
@@ -242,11 +242,6 @@ struct CheckpointSchemaContext {
     is_v2: bool,
 }
 
-/// Default value for [`V2CheckpointConfig::WithSidecar::file_actions_per_sidecar_hint`].
-/// It's the suggested upper bound of file actions (`add` and `remove`) per sidecar file when
-/// the caller does not provide an explicit hint.
-pub const DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT: usize = 50_000;
-
 /// Specifies the checkpoint format and behavior.
 #[derive(Debug)]
 pub enum CheckpointSpec {
@@ -271,8 +266,8 @@ pub enum CheckpointSpec {
 pub enum V2CheckpointConfig {
     /// Write a V2 checkpoint without sidecar files.
     NoSidecar,
-    /// Write a V2 checkpoint with file actions split into [Sidecar Files]. A main
-    /// checkpoint file is written, with one `sidecar` action pointing to each sidecar file.
+    /// Write a V2 checkpoint with file actions split into [Sidecar Files]. A main checkpoint file
+    /// is written, with one `sidecar` action pointing to each sidecar file.
     ///
     /// # Benefits of Sidecars
     /// - **Read parallelism**: readers can fetch sidecars in parallel.
@@ -284,15 +279,11 @@ pub enum V2CheckpointConfig {
     ///
     /// [Sidecar Files]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#sidecar-files
     WithSidecar {
-        /// Suggested number of file actions per sidecar file. When there are X file actions,
-        /// the number of sidecars will roughly be `X / file_actions_per_sidecar_hint`.
+        /// Preferred number of file actions per sidecar file.
         ///
-        /// This is a hint, not a strict limit, because file actions are stored in `EngineData`
-        /// batches that cannot be split. For example, if the hint is 99 but a single
-        /// `EngineData` batch contains 100 file actions, all 100 will be written to one sidecar.
-        ///
-        /// When `None`, kernel uses [`DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT`] (50,000) as the
-        /// default.
+        /// This is an advisory hint forwarded to the connector. The connector may ignore it, and
+        /// sidecars may exceed it because kernel does not split [`EngineData`] batches.
+        /// `None` lets the connector choose its default.
         file_actions_per_sidecar_hint: Option<usize>,
     },
 }
@@ -568,7 +559,7 @@ impl CheckpointWriter {
     pub(crate) fn write_v2_checkpoint_with_sidecars(
         &self,
         engine: &dyn Engine,
-        file_actions_per_sidecar_hint: usize,
+        file_actions_per_sidecar_hint: Option<NonZero<usize>>,
     ) -> DeltaResult<WrittenCheckpointInfo> {
         let data_iter = self.checkpoint_data(engine)?;
         let iter_state = data_iter.state();
@@ -579,25 +570,32 @@ impl CheckpointWriter {
             self.output_schema.clone(),
         )?;
 
-        // Write sidecar files
-        let mut sidecar_metas: Vec<(String, FileMeta)> = Vec::new();
-        loop {
-            if let Some(entry) = write_single_sidecar(
-                engine,
-                &splitter,
-                file_actions_per_sidecar_hint,
-                self.snapshot.table_root(),
-                self.snapshot.version(),
-            )? {
-                sidecar_metas.push(entry);
-            }
-            let is_exhausted = splitter
-                .lock()
-                .map_err(|e| Error::internal_error(format!("sidecar splitter lock poisoned: {e}")))?
-                .is_exhausted();
-            if is_exhausted {
-                break;
-            }
+        let write = path::sidecar_parquet_write(
+            self.snapshot.table_root(),
+            self.snapshot.version(),
+            file_actions_per_sidecar_hint,
+        )?;
+        let data = SidecarSplitter::file_action_batches(splitter.clone());
+        let sidecar_urls = engine
+            .parquet_handler()
+            .write_parquet_files(write.clone(), Box::new(data))?;
+        let mut sidecar_metas = Vec::with_capacity(sidecar_urls.len());
+        for url in sidecar_urls {
+            let filename = write
+                .directory
+                .make_relative(&url)
+                .filter(|name| !name.contains('/'))
+                .filter(|name| {
+                    name.starts_with(&write.file_name_prefix)
+                        && name.ends_with(&write.file_name_suffix)
+                })
+                .ok_or_else(|| {
+                    Error::checkpoint_write(format!(
+                        "connector returned invalid sidecar path: {url}"
+                    ))
+                })?;
+            let meta = engine.storage_handler().head(&url)?;
+            sidecar_metas.push((filename, meta));
         }
 
         // Collect non-file action batches(e.g., `protocol`, `metaData`, `txn`, etc.)
@@ -792,27 +790,6 @@ pub(crate) fn create_last_checkpoint_data(
             add_actions_counter.into(),
         ]],
     )
-}
-
-/// Writes one sidecar file. Returns `None` if the splitter yielded no rows for this sidecar.
-fn write_single_sidecar(
-    engine: &dyn Engine,
-    splitter: &Arc<Mutex<SidecarSplitter>>,
-    file_actions_per_sidecar_hint: usize,
-    table_root: &Url,
-    version: Version,
-) -> DeltaResult<Option<(String, FileMeta)>> {
-    let mut iter =
-        SingleSidecarDataIterator::new(splitter.clone(), file_actions_per_sidecar_hint)?.peekable();
-    if iter.peek().is_none() {
-        return Ok(None);
-    }
-    let (filename, sidecar_url) = path::new_sidecar(table_root, version)?;
-    engine
-        .parquet_handler()
-        .write_parquet_file(sidecar_url.clone(), Box::new(iter))?;
-    let meta = engine.storage_handler().head(&sidecar_url)?;
-    Ok(Some((filename, meta)))
 }
 
 fn build_written_checkpoint_info(

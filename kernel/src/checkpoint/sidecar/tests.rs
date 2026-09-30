@@ -1,3 +1,4 @@
+use std::num::NonZero;
 use std::sync::Arc;
 
 use rstest::rstest;
@@ -10,7 +11,7 @@ use crate::action_reconciliation::{
 use crate::actions::{Add, ADD_NAME, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::arrow::array::{Array, ArrayRef, AsArray, RecordBatch, StructArray};
 use crate::arrow::datatypes::{ArrowPrimitiveType, Int32Type, Int64Type};
-use crate::checkpoint::sidecar::{SidecarSplitter, SingleSidecarDataIterator};
+use crate::checkpoint::sidecar::SidecarSplitter;
 use crate::checkpoint::tests::{
     create_add_action, create_metadata_action, create_metadata_with_stats_config_and_partitions,
     create_remove_action, create_v2_checkpoint_protocol_action, new_in_memory_store,
@@ -24,7 +25,8 @@ use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
 use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use crate::schema::{schema, schema_ref, DataType, StructType};
+use crate::path::sidecar_parquet_write;
+use crate::schema::{schema, DataType, StructType};
 use crate::unit_test_utils::Action;
 use crate::{DeltaResult, Engine, EngineData, Snapshot};
 
@@ -34,10 +36,9 @@ struct CheckpointParts {
     iter_state: Arc<ActionReconciliationIteratorState>,
 }
 
-/// Test helper: generates sidecar parquet files using the [`SidecarSplitter`] +
-/// [`SingleSidecarDataIterator`] pipeline. Writes real parquet files to storage via
-/// `engine.parquet_handler().write_parquet_file()` with names `sidecar_1.parquet`,
-/// `sidecar_2.parquet`, etc. Does NOT write the main checkpoint or `_last_checkpoint`.
+/// Test helper: generates sidecar parquet files using the [`SidecarSplitter`] pipeline.
+/// Writes real parquet files to storage via [`crate::ParquetHandler::write_parquet_files`].
+/// Does NOT write the main checkpoint or `_last_checkpoint`.
 fn generate_checkpoint_parts(
     writer: &CheckpointWriter,
     engine: &dyn Engine,
@@ -53,26 +54,15 @@ fn generate_checkpoint_parts(
         output_schema,
     )?;
 
-    let sidecars_base = writer.snapshot.log_segment().log_root.join("_sidecars/")?;
-    let mut sidecar_files = Vec::new();
-    let mut sidecar_index = 1usize;
-    loop {
-        let mut single_sidecar_iter =
-            SingleSidecarDataIterator::new(splitter.clone(), file_actions_per_sidecar_hint)?
-                .peekable();
-        if single_sidecar_iter.peek().is_some() {
-            let sidecar_url = sidecars_base.join(&format!("sidecar_{sidecar_index}.parquet"))?;
-            engine
-                .parquet_handler()
-                .write_parquet_file(sidecar_url.clone(), Box::new(single_sidecar_iter))?;
-            sidecar_files.push(sidecar_url);
-            sidecar_index += 1;
-        }
-
-        if splitter.lock().expect("splitter lock").is_exhausted() {
-            break;
-        }
-    }
+    let write = sidecar_parquet_write(
+        writer.snapshot.table_root(),
+        writer.snapshot.version(),
+        NonZero::new(file_actions_per_sidecar_hint),
+    )?;
+    let data = SidecarSplitter::file_action_batches(splitter.clone());
+    let sidecar_files = engine
+        .parquet_handler()
+        .write_parquet_files(write, Box::new(data))?;
 
     let non_file_batches = Arc::into_inner(splitter)
         .expect("splitter Arc should have no other references")
@@ -336,10 +326,8 @@ async fn test_generate_sidecars_single_sidecar() -> DeltaResult<()> {
     Ok(())
 }
 
-/// V2 table with adds and removes across multiple commits, `max_file_actions_hint` = 3.
-/// Verifies: multiple sidecar files produced with adds/removes distributed across sidecars,
-/// batches with both file and non-file actions correctly split, and the row count of the
-/// file and non-file batches is correct.
+/// V2 table with adds and removes across multiple commits.
+/// Verifies: file vs non-file actions are split correctly. SyncEngine writes one sidecar.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_multiple_chunks() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
@@ -359,8 +347,7 @@ async fn test_generate_sidecars_multiple_chunks() -> DeltaResult<()> {
     )
     .await?;
 
-    // Spread adds and removes across commits so the hint=3 causes chunking at batch
-    // boundaries, with removes landing in multiple sidecars.
+    // Spread adds and removes across commits so mixed file/non-file batches are split.
     write_commit_to_store(
         &store,
         vec![
@@ -387,15 +374,6 @@ async fn test_generate_sidecars_multiple_chunks() -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
-    // hint=3: with DefaultEngine, each commit is one batch. Reconciliation replays
-    // in reverse: commit 3 (1 add), commit 2 (2 adds + 1 remove = 3 file rows),
-    // commit 1 (2 adds + 1 remove = 3 file rows, file0a add reconciled out of commit 0),
-    // commit 0 (1 add [file0a,file0b reconciled away] + protocol + metadata),
-    // checkpointMetadata (1 row).
-    //
-    // Sidecar 1: commit 3 (1) + commit 2 (3) = 4 file action rows (hint exceeded)
-    // Sidecar 2: commit 1 (3) = 3 file action rows (hint reached)
-    // Sidecar 3: commit 0 file part (1) = 1 file action row
     let result = generate_checkpoint_parts(&writer, &engine, 3)?;
 
     assert!(result.iter_state.is_exhausted());
@@ -412,46 +390,29 @@ async fn test_generate_sidecars_multiple_chunks() -> DeltaResult<()> {
         },
     );
 
+    assert_eq!(result.sidecar_files.len(), 1);
+    let batches = read_sidecar_batches(&store, &result.sidecar_files).await;
+    let (adds, removes) = collect_file_action_paths(&batches);
     assert_eq!(
-        result.sidecar_files.len(),
-        3,
-        "should produce exactly 3 sidecars"
+        adds,
+        vec![
+            "file0c.parquet",
+            "file1.parquet",
+            "file2.parquet",
+            "file3.parquet",
+            "file4.parquet",
+            "file5.parquet",
+        ]
     );
-
-    // Sidecar 1: file5 (add) from commit 3, file3+file4 (add) + file0b (remove) from commit 2
-    let s1 = read_sidecar_batches(&store, &result.sidecar_files[..1]).await;
-    let s1_rows: usize = s1.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(s1_rows, 4);
-    let (s1_adds, s1_removes) = collect_file_action_paths(&s1);
-    assert_eq!(
-        s1_adds,
-        vec!["file3.parquet", "file4.parquet", "file5.parquet"]
-    );
-    assert_eq!(s1_removes, vec!["file0b.parquet"]);
-
-    // Sidecar 2: file1+file2 (add) + file0a (remove) from commit 1
-    let s2 = read_sidecar_batches(&store, &result.sidecar_files[1..2]).await;
-    let s2_rows: usize = s2.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(s2_rows, 3);
-    let (s2_adds, s2_removes) = collect_file_action_paths(&s2);
-    assert_eq!(s2_adds, vec!["file1.parquet", "file2.parquet"]);
-    assert_eq!(s2_removes, vec!["file0a.parquet"]);
-
-    // Sidecar 3: file0c (add) from commit 0 (file0a and file0b reconciled away)
-    let s3 = read_sidecar_batches(&store, &result.sidecar_files[2..]).await;
-    let s3_rows: usize = s3.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(s3_rows, 1);
-    let (s3_adds, s3_removes) = collect_file_action_paths(&s3);
-    assert_eq!(s3_adds, vec!["file0c.parquet"]);
-    assert!(s3_removes.is_empty());
+    assert_eq!(removes, vec!["file0a.parquet", "file0b.parquet"]);
 
     Ok(())
 }
 
-/// V2 table with adds across multiple commits, hint=1 (very small).
-/// Verifies: produces multiple sidecar files, splitter is exhausted.
+/// V2 table with adds across multiple commits.
+/// Verifies: SyncEngine writes one sidecar containing every remaining add.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_generate_sidecars_hint_one_per_batch() -> DeltaResult<()> {
+async fn test_generate_sidecars_adds_across_commits() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = new_sync_engine(store.clone());
 
@@ -489,27 +450,23 @@ async fn test_generate_sidecars_hint_one_per_batch() -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
-    // hint=1: each batch exceeds the hint, so each gets its own sidecar.
     let result = generate_checkpoint_parts(&writer, &engine, 1)?;
 
     assert!(result.iter_state.is_exhausted());
+    assert_eq!(result.sidecar_files.len(), 1);
+
+    let batches = read_sidecar_batches(&store, &result.sidecar_files).await;
+    let (adds, removes) = collect_file_action_paths(&batches);
     assert_eq!(
-        result.sidecar_files.len(),
-        2,
-        "hint=1 sidecar count mismatch"
+        adds,
+        vec![
+            "file1.parquet",
+            "file2.parquet",
+            "file3.parquet",
+            "file4.parquet"
+        ]
     );
-
-    // sidecar_1: commit 2 (reverse replay order)
-    let s1 = read_sidecar_batches(&store, &result.sidecar_files[..1]).await;
-    let (s1_adds, s1_removes) = collect_file_action_paths(&s1);
-    assert_eq!(s1_adds, vec!["file3.parquet", "file4.parquet"]);
-    assert!(s1_removes.is_empty());
-
-    // sidecar_2: commit 1
-    let s2 = read_sidecar_batches(&store, &result.sidecar_files[1..]).await;
-    let (s2_adds, s2_removes) = collect_file_action_paths(&s2);
-    assert_eq!(s2_adds, vec!["file1.parquet", "file2.parquet"]);
-    assert!(s2_removes.is_empty());
+    assert!(removes.is_empty());
 
     Ok(())
 }
@@ -660,11 +617,10 @@ async fn test_splitter_no_file_actions() -> DeltaResult<()> {
         output_schema,
     )?;
 
-    let iter = SingleSidecarDataIterator::new(splitter.clone(), usize::MAX)?;
-    let total_file_rows: usize = iter.map(|batch| batch.unwrap().len()).sum();
+    let total_file_rows: usize = SidecarSplitter::file_action_batches(splitter.clone())
+        .map(|batch| batch.unwrap().len())
+        .sum();
     assert_eq!(total_file_rows, 0, "should have no file-action rows");
-
-    assert!(splitter.lock().expect("splitter lock").is_exhausted());
 
     let non_file_batches = Arc::into_inner(splitter)
         .expect("splitter Arc should have no other references")
@@ -720,23 +676,5 @@ fn test_splitter_rejects_invalid_schema(#[case] schema: StructType, #[case] expe
     assert!(
         err.to_string().contains(expected_msg),
         "error '{err}' should contain '{expected_msg}'"
-    );
-}
-
-#[test]
-fn test_single_sidecar_data_iterator_rejects_zero_max_file_actions_hint() {
-    let schema = schema_ref! {
-        nullable "add": (dummy_struct()),
-        nullable "remove": (dummy_struct()),
-    };
-    let iter = ActionReconciliationIterator::new(Box::new(std::iter::empty()));
-    let splitter = SidecarSplitter::new_mut_shared(iter, &ArrowEvaluationHandler, schema).unwrap();
-    let result = SingleSidecarDataIterator::new(splitter, 0);
-    assert!(result.is_err());
-    let err = result.err().unwrap();
-    assert!(
-        err.to_string()
-            .contains("max_file_actions_hint must be greater than 0"),
-        "error '{err}' should mention max_file_actions_hint"
     );
 }

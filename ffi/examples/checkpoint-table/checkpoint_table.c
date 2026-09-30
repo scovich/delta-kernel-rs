@@ -37,9 +37,8 @@ static int run_sub_flow(HandleSharedSnapshot snapshot,
     spec.tag = FfiCheckpointSpecV2NoSidecar;
     spec_ptr = &spec;
   } else if (strcmp(sub_flow, "v2_with_sidecars") == 0) {
-    // Pass a small hint (2) so the fixture's handful of file actions splits across
-    // multiple sidecars, making the on-disk shape observably different from the
-    // V2-no-sidecar sub-flow. Pass `Noneusize` instead to use the kernel default hint.
+    // Use a small preference so the fixture emits multiple sidecars. `Noneusize` lets the
+    // connector choose its default.
     spec.tag = FfiCheckpointSpecV2WithSidecar;
     spec.v2_with_sidecar.file_actions_per_sidecar_hint.tag = Someusize;
     spec.v2_with_sidecar.file_actions_per_sidecar_hint.some = 2;

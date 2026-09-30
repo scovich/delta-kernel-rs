@@ -1472,7 +1472,11 @@ async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add(
     //     live add: `add.deletionVector.*`, `add.baseRowId`, `add.defaultRowCommitVersion`. ===
     let sidecars =
         list_sidecar_parquet_files(&std::path::Path::new(&table_path).join("_delta_log/_sidecars"));
-    assert_eq!(sidecars.len(), 1, "default hint should produce one sidecar");
+    assert_eq!(
+        sidecars.len(),
+        1,
+        "DefaultEngine fallback should produce one sidecar"
+    );
     let batch = read_parquet_file(&sidecars[0].path());
     let add = get_struct_column_from_record_batch(&batch, "add");
     let live = valid_row_indices(add, batch.num_rows());
@@ -1500,9 +1504,8 @@ async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add(
     Ok(())
 }
 
-/// Verify the default `file_actions_per_sidecar_hint` (50_000): staging 60_000 add actions
-/// across 60 batches of 1000 (so the splitter cuts cleanly at the 50k boundary) must
-/// produce exactly 2 sidecar files.
+/// Verify DefaultEngine's 50,000-row fallback when the caller supplies no preference: staging
+/// 60,000 add actions across 60 batches of 1,000 must produce exactly two sidecar files.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_v2_sidecar_default_hint_splits_at_50k() -> Result<(), Box<dyn std::error::Error>> {
     const PER_COMMIT: usize = 1_000;
@@ -1534,7 +1537,7 @@ async fn test_v2_sidecar_default_hint_splits_at_50k() -> Result<(), Box<dyn std:
         snapshot = txn.commit(engine.as_ref())?.0.unwrap_post_commit_snapshot();
     }
 
-    // === Step 3: Sidecar checkpoint with default hint (None -> 50_000). ===
+    // === Step 3: No preference, so DefaultEngine uses its 50k-row fallback. ===
     snapshot.checkpoint(
         engine.as_ref(),
         Some(&CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {

@@ -132,6 +132,7 @@ pub(super) fn parquet_footer(
 #[cfg(test)]
 mod tests {
     use std::fs::File;
+    use std::num::NonZero;
     use std::sync::Arc;
 
     use tempfile::tempdir;
@@ -140,7 +141,8 @@ mod tests {
     use super::*;
     use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
     use crate::engine::arrow_conversion::TryIntoKernel as _;
-    use crate::EngineData;
+    use crate::schema::schema_ref;
+    use crate::{EngineData, ParquetMultiFileWrite};
 
     fn test_data_iter() -> DeltaResultIteratorStatic<Box<dyn EngineData>> {
         let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
@@ -359,4 +361,52 @@ mod tests {
     // fn parquet_handler_reads_file_with_arrow_schema() {
     //     test_parquet_handler_reads_file_with_arrow_schema(&SyncParquetHandler::new(None));
     // }
+
+    #[test]
+    fn test_sync_write_parquet_files_batches_and_empty_input() {
+        let handler = SyncParquetHandler::new(None);
+        let temp_dir = tempdir().unwrap();
+        let directory = Url::from_directory_path(temp_dir.path()).unwrap();
+        let write = ParquetMultiFileWrite::new(directory, "part-", ".parquet", NonZero::new(2));
+        let batch = || -> Box<dyn EngineData> {
+            Box::new(ArrowEngineData::new(
+                RecordBatch::try_from_iter(vec![(
+                    "id",
+                    Arc::new(Int64Array::from(vec![1])) as Arc<dyn Array>,
+                )])
+                .unwrap(),
+            ))
+        };
+        let data = Box::new([Ok(batch()), Ok(batch()), Ok(batch())].into_iter());
+        let files = handler.write_parquet_files(write.clone(), data).unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files.iter().all(|file| {
+            let name = file.path_segments().unwrap().next_back().unwrap();
+            name.starts_with("part-") && name.ends_with(".parquet")
+        }));
+
+        let schema = schema_ref! { nullable "id": LONG };
+        let row_counts: Vec<_> = files
+            .iter()
+            .map(|location| {
+                let file_path = location.to_file_path().unwrap();
+                let file_meta = FileMeta {
+                    location: location.clone(),
+                    last_modified: 0,
+                    size: std::fs::metadata(file_path).unwrap().len(),
+                };
+                handler
+                    .read_parquet_files(std::slice::from_ref(&file_meta), schema.clone(), None)
+                    .unwrap()
+                    .map(|batch| batch.unwrap().len())
+                    .sum::<usize>()
+            })
+            .collect();
+        assert_eq!(row_counts, vec![3]);
+
+        let empty = handler
+            .write_parquet_files(write, Box::new(std::iter::empty()))
+            .unwrap();
+        assert!(empty.is_empty());
+    }
 }

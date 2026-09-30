@@ -34,7 +34,8 @@ use crate::transaction::create_table::create_table;
 use crate::unit_test_utils::TestCancellationToken;
 use crate::{
     CancellationTokenRef, DeltaResultIteratorStatic, Engine, EngineData,
-    FileDataReadResultIterator, FileMeta, ParquetFooter, ParquetHandler, PredicateRef, Snapshot,
+    FileDataReadResultIterator, FileMeta, ParquetFooter, ParquetHandler, ParquetMultiFileWrite,
+    PredicateRef, Snapshot,
 };
 
 fn field_names(s: &StructArray) -> Vec<String> {
@@ -1759,6 +1760,14 @@ impl ParquetHandler for RecordingParquetHandler {
         data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
     ) -> DeltaResult<()> {
         self.inner.write_parquet_file(location, data)
+    }
+
+    fn write_parquet_files(
+        &self,
+        write: ParquetMultiFileWrite,
+        data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
+    ) -> DeltaResult<Vec<url::Url>> {
+        self.inner.write_parquet_files(write, data)
     }
 }
 

@@ -22,7 +22,7 @@ use delta_kernel::LogPath;
 use delta_kernel::{
     DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, EvaluationHandler,
     FileDataReadResultIterator, FileMeta, FileStats, JsonHandler, ParquetFooter, ParquetHandler,
-    PredicateRef, StorageHandler, Version,
+    ParquetMultiFileWrite, PredicateRef, StorageHandler, Version,
 };
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
@@ -2573,6 +2573,14 @@ impl ParquetHandler for NoParquetReadsHandler {
         data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
     ) -> DeltaResult<()> {
         self.inner.write_parquet_file(location, data)
+    }
+
+    fn write_parquet_files(
+        &self,
+        write: ParquetMultiFileWrite,
+        data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
+    ) -> DeltaResult<Vec<Url>> {
+        self.inner.write_parquet_files(write, data)
     }
 
     fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {

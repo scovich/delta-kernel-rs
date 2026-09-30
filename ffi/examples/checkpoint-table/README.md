@@ -26,9 +26,8 @@ The `<sub-flow>` argument selects one of three demos:
   declare the `v2Checkpoint` reader/writer feature.
 - `v2_with_sidecars` -- `FfiCheckpointSpec::V2WithSidecar` with
   `file_actions_per_sidecar_hint = Some(2)` requests a V2 manifest that emits
-  sidecar parquet files. The hint is the suggested upper bound of file actions
-  per sidecar parquet (the example passes `2` so multiple sidecars are emitted
-  even for the small fixture); pass `None` to use the kernel default.
+  sidecar parquet files. The hint is the preferred number of file actions per
+  sidecar parquet; pass `None` to let the connector choose its default.
   Requires the table to declare the `v2Checkpoint` feature.
 
 ## Test harness

@@ -2,6 +2,7 @@
 //! has schema etc.)
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZero;
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
@@ -13,9 +14,7 @@ use crate::actions::set_transaction::SetTransactionScanner;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::visitors::SetTransactionMap;
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
-use crate::checkpoint::{
-    CheckpointSpec, CheckpointWriter, V2CheckpointConfig, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
-};
+use crate::checkpoint::{CheckpointSpec, CheckpointWriter, V2CheckpointConfig};
 use crate::clustering::{parse_clustering_columns, ClusteringColumnInfo, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
 use crate::crc::{
@@ -1266,10 +1265,10 @@ impl Snapshot {
     /// Note:
     ///     - It is still possible that an existing checkpoint gets overwritten if that checkpoint
     ///       was written by a concurrent writer.
-    ///     - This function uses [`crate::ParquetHandler::write_parquet_file`] and
-    ///       [`crate::StorageHandler::head`], which may not be implemented by all engines. If you
-    ///       are using the default engine, make sure to build it with the multi-threaded executor
-    ///       if you want to use this method.
+    ///     - This function uses [`crate::ParquetHandler::write_parquet_file`],
+    ///       [`crate::ParquetHandler::write_parquet_files`], and [`crate::StorageHandler::head`],
+    ///       which may not be implemented by all engines. If you are using the default engine, make
+    ///       sure to build it with the multi-threaded executor if you want to use this method.
     ///
     /// [`CheckpointSpec`]: crate::checkpoint::CheckpointSpec
     ///
@@ -1328,11 +1327,10 @@ impl Snapshot {
         let write_result = match spec {
             Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
                 file_actions_per_sidecar_hint,
-            })) => {
-                let hint =
-                    file_actions_per_sidecar_hint.unwrap_or(DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT);
-                writer.write_v2_checkpoint_with_sidecars(engine, hint)
-            }
+            })) => writer.write_v2_checkpoint_with_sidecars(
+                engine,
+                file_actions_per_sidecar_hint.and_then(NonZero::new),
+            ),
             _ => writer.write_checkpoint_without_sidecars(engine),
         };
 

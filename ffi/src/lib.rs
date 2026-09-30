@@ -1230,7 +1230,7 @@ pub enum FfiCheckpointSpec {
     V2NoSidecar,
     /// See [`V2CheckpointConfig::WithSidecar`].
     V2WithSidecar {
-        /// See [`V2CheckpointConfig::WithSidecar`]. `None` selects the kernel default hint.
+        /// See [`V2CheckpointConfig::WithSidecar`]. `None` lets the connector choose its default.
         file_actions_per_sidecar_hint: OptionalValue<usize>,
     },
 }
@@ -1243,9 +1243,8 @@ impl FfiCheckpointSpec {
             FfiCheckpointSpec::V2WithSidecar {
                 file_actions_per_sidecar_hint,
             } => {
-                // Forward the hint verbatim (including `Some(0)`) so the kernel applies the same
-                // validation as a native `V2CheckpointConfig::WithSidecar`; `None` => kernel
-                // default.
+                // Forward the hint verbatim, including zero, so the kernel validates both APIs
+                // consistently.
                 let file_actions_per_sidecar_hint = match file_actions_per_sidecar_hint {
                     OptionalValue::Some(hint) => Some(*hint),
                     OptionalValue::None => None,
@@ -3194,7 +3193,7 @@ mod tests {
     #[case::none_spec_v1(false, 2, None, 0)]
     // V2 table, explicit no-sidecar => V2 manifest with file actions inline.
     #[case::v2_no_sidecar(true, 2, Some(FfiCheckpointSpec::V2NoSidecar), 0)]
-    // V2 table, default hint (50k) => 3 actions fit in a single sidecar.
+    // V2 table, connector default (50k) => 3 actions fit in a single sidecar.
     #[case::v2_default_hint(
         true,
         3,

@@ -74,12 +74,14 @@ extern crate self as delta_kernel;
 use std::any::Any;
 use std::cmp::Ordering;
 use std::fs::DirEntry;
+use std::num::NonZero;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use bytes::Bytes;
 use url::Url;
+use uuid::Uuid;
 
 use self::schema::{DataType, SchemaRef};
 
@@ -291,6 +293,52 @@ impl FileMeta {
     pub(crate) fn size_as_i64(&self) -> DeltaResult<i64> {
         i64::try_from(self.size)
             .map_err(|_| Error::generic(format!("file size {} exceeds i64::MAX", self.size)))
+    }
+}
+
+/// Policy for writing one input stream to zero or more Parquet files.
+///
+/// The connector chooses physical file boundaries and unique names satisfying the supplied
+/// directory, prefix, and suffix. Callers may provide an advisory row target for each file.
+#[derive(Debug, Clone)]
+pub struct ParquetMultiFileWrite {
+    /// Directory receiving every output file.
+    pub directory: Url,
+    /// Required prefix for each output file name.
+    pub file_name_prefix: String,
+    /// Required suffix for each output file name.
+    pub file_name_suffix: String,
+    /// Preferred number of rows per output file.
+    ///
+    /// This is advisory: connectors may ignore it, and batches need not be split to meet it.
+    pub preferred_rows_per_file: Option<NonZero<usize>>,
+}
+
+impl ParquetMultiFileWrite {
+    /// Construct a multi-file Parquet write policy.
+    pub fn new(
+        directory: Url,
+        file_name_prefix: impl Into<String>,
+        file_name_suffix: impl Into<String>,
+        preferred_rows_per_file: Option<NonZero<usize>>,
+    ) -> Self {
+        Self {
+            directory,
+            file_name_prefix: file_name_prefix.into(),
+            file_name_suffix: file_name_suffix.into(),
+            preferred_rows_per_file,
+        }
+    }
+
+    /// Generate a unique file URL satisfying this write's naming constraints.
+    pub fn new_file_url(&self) -> DeltaResult<Url> {
+        let filename = format!(
+            "{}{}{}",
+            self.file_name_prefix,
+            Uuid::new_v4(),
+            self.file_name_suffix
+        );
+        Ok(self.directory.join(&filename)?)
     }
 }
 
@@ -985,6 +1033,29 @@ pub trait ParquetHandler: AsAny {
         location: url::Url,
         data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
     ) -> DeltaResult<()>;
+
+    /// Write a stream to zero or more Parquet files using connector-selected file boundaries.
+    ///
+    /// Empty input produces no files. Every returned URL must identify a newly written file
+    /// satisfying `write`'s naming constraints, in input order.
+    ///
+    /// The default implementation writes the entire stream to one file via
+    /// [`write_parquet_file`](Self::write_parquet_file), ignoring
+    /// [`ParquetMultiFileWrite::preferred_rows_per_file`]. Connectors that want multiple files
+    /// should override this method.
+    fn write_parquet_files(
+        &self,
+        write: ParquetMultiFileWrite,
+        data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
+    ) -> DeltaResult<Vec<Url>> {
+        let mut data = data.peekable();
+        if data.peek().is_none() {
+            return Ok(Vec::new());
+        }
+        let location = write.new_file_url()?;
+        self.write_parquet_file(location.clone(), Box::new(data))?;
+        Ok(vec![location])
+    }
 
     /// Read the footer metadata from a Parquet file without reading the data.
     ///

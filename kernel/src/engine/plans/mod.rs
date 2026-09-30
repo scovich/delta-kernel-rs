@@ -30,10 +30,10 @@ use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandl
 /// [`Operation`](crate::plans::Operation)s and delegated to the plan executor.
 ///
 /// Operations not yet implemented on the plan-execution path (e.g. `write_json_file`,
-/// `write_parquet_file`) are delegated to `fallback` when one is configured, and otherwise return
-/// an unsupported error. A fallback is optional because a connector may be unable to construct one:
-/// an FFI-backed engine resolves table paths itself, which fails for a path only the connector can
-/// resolve.
+/// `write_parquet_file`, `write_parquet_files`) are delegated to `fallback` when one is configured,
+/// and otherwise return an unsupported error. A fallback is optional because a connector may be
+/// unable to construct one: an FFI-backed engine resolves table paths itself, which fails for a
+/// path only the connector can resolve.
 pub struct PlanBasedEngine {
     executor: Arc<dyn PlanExecutor>,
     evaluation: Arc<dyn EvaluationHandler>,
@@ -106,7 +106,7 @@ mod tests {
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine::sync::SyncEngine;
     use crate::engine_data::FilteredEngineData;
-    use crate::{Engine as _, EngineData, Error};
+    use crate::{Engine as _, EngineData, Error, ParquetMultiFileWrite};
 
     fn plan_engine(fallback: Option<Arc<dyn crate::Engine>>) -> PlanBasedEngine {
         PlanBasedEngine::new(fallback, Arc::new(SyncPlanExecutor::default()))
@@ -198,8 +198,15 @@ mod tests {
 
         let parquet_err = engine
             .parquet_handler()
-            .write_parquet_file(location, Box::new(std::iter::empty()))
+            .write_parquet_file(location.clone(), Box::new(std::iter::empty()))
             .expect_err("no fallback is configured");
         assert!(matches!(parquet_err, Error::Unsupported(_)));
+
+        let write = ParquetMultiFileWrite::new(location, "part-", ".parquet", None);
+        let files_err = engine
+            .parquet_handler()
+            .write_parquet_files(write, Box::new(std::iter::empty()))
+            .expect_err("no fallback is configured");
+        assert!(matches!(files_err, Error::Unsupported(_)));
     }
 }
