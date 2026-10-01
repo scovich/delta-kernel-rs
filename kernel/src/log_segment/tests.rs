@@ -5208,14 +5208,14 @@ fn test_combine_checkpoint_predicates(
     r#"{"commitInfo":{"timestamp":1000,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","description":null}}}"#
 )]
 // metaData.configuration.key2: null
-#[should_panic(expected = "StructArray re-validation failed")]
+#[should_panic(expected = "Found unmasked nulls for non-nullable StructArray field")]
 #[case::metadata_configuration_known_issue(
     "metaData",
     "configuration",
     r#"{"metaData":{"id":"test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"key1":"val1","key2":null},"createdTime":1000}}"#
 )]
 // metaData.format.options.k: null
-#[should_panic(expected = "StructArray re-validation failed")]
+#[should_panic(expected = "Found unmasked nulls for non-nullable StructArray field")]
 #[case::metadata_format_options_known_issue(
     "metaData",
     "format.options",
