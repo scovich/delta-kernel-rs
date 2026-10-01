@@ -227,6 +227,10 @@ pub struct Transaction<S = ExistingTable> {
     committer: Box<dyn Committer>,
     operation: Option<String>,
     engine_info: Option<String>,
+    // Engine-provided CommitInfo.operationParameters. None uses CommitInfo's empty-map default.
+    operation_parameters: Option<HashMap<String, Option<String>>>,
+    // Engine-provided CommitInfo.operationMetrics. None uses CommitInfo's omitted default.
+    operation_metrics: Option<HashMap<String, Option<String>>>,
     engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
     add_files_metadata: Vec<Box<dyn EngineData>>,
     remove_files_metadata: Vec<FilteredEngineData>,
@@ -469,6 +473,12 @@ impl<S> Transaction<S> {
             self.engine_info.clone(),
             self.is_blind_append,
         );
+        if let Some(operation_parameters) = self.operation_parameters.clone() {
+            kernel_commit_info.set_operation_parameters(operation_parameters);
+        }
+        if let Some(operation_metrics) = self.operation_metrics.clone() {
+            kernel_commit_info.set_operation_metrics(operation_metrics);
+        }
 
         // Kernel requires every commit on an existing Row Tracking-enabled table to preserve
         // Stable Row IDs and Stable Row Commit Versions, so it always emits true. CREATE TABLE has
@@ -656,6 +666,46 @@ impl<S> Transaction<S> {
         self
     }
 
+    /// Set `CommitInfo.operationParameters` for this transaction.
+    ///
+    /// Common parameters include the write `mode`, `partitionBy` columns, and the `predicate` used
+    /// by update or delete operations.
+    ///
+    /// Present values must already be stringified as expected in table history. Kernel writes the
+    /// map as-is without interpreting or validating its keys; `None` writes a null map value.
+    /// Kernel ignores `operationParameters` supplied through [`Transaction::with_commit_info`],
+    /// so this is the only way to set it. A later call replaces the complete map. If a key occurs
+    /// more than once in one call, the last value wins.
+    pub fn with_operation_parameters<I, K, V>(mut self, operation_parameters: I) -> Self
+    where
+        I: IntoIterator<Item = (K, Option<V>)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.operation_parameters = Some(collect_string_map(operation_parameters));
+        self
+    }
+
+    /// Set `CommitInfo.operationMetrics` for this transaction.
+    ///
+    /// Common metrics include `numFiles`, `numOutputRows`, `numOutputBytes`, and `executionTimeMs`.
+    ///
+    /// Present values must already be stringified as expected in table history. Kernel writes the
+    /// map as-is without interpreting or validating its keys; `None` writes a null map value.
+    /// Kernel ignores `operationMetrics` supplied through [`Transaction::with_commit_info`], so
+    /// this is the only way to set it. When unset, `operationMetrics` is omitted; an explicitly
+    /// empty map is written as `{}`. A later call replaces the complete map. If a key occurs more
+    /// than once in one call, the last value wins.
+    pub fn with_operation_metrics<I, K, V>(mut self, operation_metrics: I) -> Self
+    where
+        I: IntoIterator<Item = (K, Option<V>)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.operation_metrics = Some(collect_string_map(operation_metrics));
+        self
+    }
+
     /// Attach an opaque, caller-supplied correlation id for joining this transaction's commit
     /// metric events to the caller's own request or operation id. An empty id is treated as unset.
     /// When unset, behavior is unchanged.
@@ -678,6 +728,9 @@ impl<S> Transaction<S> {
     /// - `isBlindAppend`
     /// - `engineInfo`
     /// - `txnId`
+    ///
+    /// Use [`Transaction::with_operation_parameters`] and
+    /// [`Transaction::with_operation_metrics`] to set the operation maps.
     ///
     /// Kernel merges the following field if it is set:
     ///
@@ -1821,6 +1874,18 @@ pub struct RetryableTransaction<S = ExistingTable> {
     pub transaction: Transaction<S>,
     /// Transient error that caused the commit to fail.
     pub error: KernelError,
+}
+
+fn collect_string_map<I, K, V>(pairs: I) -> HashMap<String, Option<String>>
+where
+    I: IntoIterator<Item = (K, Option<V>)>,
+    K: Into<String>,
+    V: Into<String>,
+{
+    pairs
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.map(Into::into)))
+        .collect()
 }
 
 #[cfg(test)]
