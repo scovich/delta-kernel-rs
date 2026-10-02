@@ -23,12 +23,11 @@ use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
 use crate::plans::ir::plan::Plan;
 use crate::scan::log_replay::{PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME};
 use crate::schema::{
-    lazy_schema_ref, schema, schema_ref, DataType, SchemaRef, SchemaStructPatchBuilder,
-    StructField, StructType,
+    lazy_schema_ref, schema, schema_ref, DataType, SchemaRef, SchemaStructPatchBuilder, StructField,
 };
-use crate::struct_patch::ProjectionStructPatchBuilder;
+use crate::struct_patch::{project_struct_preserving_nulls, ProjectionStructPatchBuilder};
 use crate::transforms::{transform_output_type, ExpressionTransform};
-use crate::utils::{CollectInto, FoldWithOption as _};
+use crate::utils::FoldWithOption as _;
 use crate::{DeltaResult, KernelError, PlanBuilder};
 
 // === Internal column names ===
@@ -141,7 +140,7 @@ impl Scan {
     /// fields above. A parsed field is omitted when its schema is absent.
     fn checkpoint_arm(&self, shape: &CheckpointShape) -> DeltaResult<PlanBuilder> {
         let log_segment = self.snapshot.log_segment();
-        let physical_stats = self.state_info.physical_stats_schema.as_ref();
+        let physical_stats = self.state_info.physical_stats_read_schema();
         let physical_partitions = self.state_info.physical_partition_schema.as_ref();
         let source_physical_stats =
             physical_stats.and_then(|schema| shape.compatible_stats_parsed_schema(schema));
@@ -220,7 +219,7 @@ impl Scan {
                 // Commits never carry source-native parsed columns, so normalize from the raw
                 // encodings.
                 patch
-                    .with_parsed_add_stats(self.state_info.physical_stats_schema.as_ref())
+                    .with_parsed_add_stats(self.state_info.physical_stats_read_schema())
                     .with_parsed_add_partition_values(
                         self.state_info.physical_partition_schema.as_ref(),
                     )
@@ -241,10 +240,10 @@ impl Scan {
     }
 
     fn normalized_add_field(&self) -> DeltaResult<StructField> {
-        let physical_stats_schema = self.state_info.physical_stats_schema.as_ref();
+        let physical_stats_read_schema = self.state_info.physical_stats_read_schema();
         let physical_partition_schema = self.state_info.physical_partition_schema.as_ref();
         let patch = SchemaStructPatchBuilder::new()
-            .fold_with(physical_stats_schema, |patch, schema| {
+            .fold_with(physical_stats_read_schema, |patch, schema| {
                 patch.append(StructField::nullable(STATS_PARSED, schema.as_ref().clone()))
             })
             .fold_with(physical_partition_schema, |patch, schema| {
@@ -301,11 +300,14 @@ impl Scan {
         };
 
         // Parsed stats output.
-        let projection = match (self.physical_stats_output_schema.as_ref(), has_stats_parsed) {
+        let projection = match (
+            self.state_info.physical_stats_output_schema(),
+            has_stats_parsed,
+        ) {
             (Some(physical_stats), _) => projection.replace(
                 STATS_PARSED,
                 StructField::nullable(STATS_PARSED, physical_stats.as_ref().clone()),
-                project_nested_struct_to_schema([ADD_NAME, STATS_PARSED_NAME], physical_stats),
+                project_struct_preserving_nulls([ADD_NAME, STATS_PARSED_NAME], physical_stats),
             ),
             (None, true) => projection.drop(STATS_PARSED),
             (None, false) => projection,
@@ -323,7 +325,7 @@ impl Scan {
             (Some(schema), true) => projection.replace(
                 PARTITION_VALUES_PARSED,
                 StructField::nullable(PARTITION_VALUES_PARSED, schema.as_ref().clone()),
-                project_nested_struct_to_schema([ADD_NAME, PARTITION_VALUES_PARSED_NAME], schema),
+                project_struct_preserving_nulls([ADD_NAME, PARTITION_VALUES_PARSED_NAME], schema),
             ),
             (Some(_), false) => {
                 return Err(KernelError::internal_error(
@@ -507,26 +509,6 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
             (Some(_), true) | (None, _) => self,
         }
     }
-}
-
-/// Rebuilds `root` to match a narrowed schema while preserving a null parent struct. A direct
-/// column reference would retain fields not requested by the caller.
-fn project_nested_struct_to_schema(
-    root: impl CollectInto<ColumnName>,
-    schema: &StructType,
-) -> Expr {
-    let root = root.collect_into();
-    let fields = schema.fields().map(|field| {
-        let column = root.join(&ColumnName::new([field.name()]));
-        match field.data_type() {
-            DataType::Struct(schema) => project_nested_struct_to_schema(column, schema),
-            _ => Expr::from(column),
-        }
-    });
-    Expr::struct_with_nullability_from(
-        fields,
-        Expr::from_pred(Expr::from(root.clone()).is_not_null()),
-    )
 }
 
 /// Build the metadata pruning predicate, or `None` when no pruning is possible.
@@ -761,8 +743,8 @@ mod tests {
             .build()
             .unwrap()
             .state_info
-            .physical_stats_schema
-            .clone()
+            .physical_stats_read_schema()
+            .cloned()
             .expect("stats schema")
     }
 

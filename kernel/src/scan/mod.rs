@@ -15,7 +15,7 @@ use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
-use crate::actions::{Add, ADD_FIELD, ADD_NAME, NULL_COUNT, REMOVE_FIELD, SIDECAR_FIELD};
+use crate::actions::{Add, ADD_FIELD, ADD_NAME, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
@@ -74,6 +74,8 @@ pub(crate) static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 pub(crate) static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     (&ADD_FIELD),
 };
+
+pub use crate::table_configuration::StatsOutputSchemas;
 
 /// Initial checkpoint projection without JSON `add.stats`.
 /// Discovery restores JSON stats when structured stats cannot satisfy the scan.
@@ -147,13 +149,16 @@ pub enum StructStats {
     /// disables stats reading entirely.
     None,
     /// Emit all indexed columns, plus the `extra_indexed` columns.
+    ///
+    /// Clustering columns outside these sets are not added automatically.
     AllIndexed {
         /// Columns outside the indexed set that may have on-disk stats. Names that cannot be
         /// resolved are omitted with a warning. Missing per-file values read as NULL and do not
         /// prune.
         extra_indexed: Vec<ColumnName>,
     },
-    /// Emit stats for at least the `requested` columns, regardless of the table's indexed set.
+    /// Emit only the `requested` data columns, regardless of the table's indexed set.
+    /// Predicate-only statistics may still be read for data skipping but are not returned.
     Columns {
         /// Columns to request, even outside the indexed set. Names that cannot be resolved return
         /// an error. Missing per-file values read as NULL and do not prune.
@@ -189,7 +194,8 @@ impl StatsOptions {
         }
     }
 
-    /// Returns struct stats for at least `cols`, regardless of the table's indexed set.
+    /// Returns struct stats for only `cols`, regardless of the table's indexed set.
+    /// Predicate-only statistics may still be read for data skipping but are not returned.
     ///
     /// Names that cannot be resolved return an error. Missing per-file values read as NULL and do
     /// not prune.
@@ -356,6 +362,22 @@ impl ScanBuilder {
         self
     }
 
+    /// Returns the logical and physical schemas for structured statistics emitted by this scan.
+    ///
+    /// The result reflects the current [`StatsOptions`]. It is `None` when structured statistics
+    /// are disabled or no data columns are selected. Predicate-only statistics used internally
+    /// for data skipping are not included. Clustering columns are included only when selected by
+    /// the table's stats configuration or passed as extra-indexed columns.
+    ///
+    /// # Errors
+    ///
+    /// Extra-indexed columns that cannot be resolved are omitted with a warning. Returns an error
+    /// when a column requested through [`StatsOptions::struct_columns`] cannot be resolved, or when
+    /// the selected fields cannot form a valid statistics schema.
+    pub fn stats_output_schemas(&self) -> DeltaResult<Option<StatsOutputSchemas>> {
+        build_stats_output_schemas(self.snapshot.table_configuration(), &self.stats)
+    }
+
     /// Attach an opaque, caller-supplied correlation id for joining this scan's metric events to
     /// the caller's own request or operation id. An empty id is treated as unset. When unset,
     /// behavior is unchanged.
@@ -459,12 +481,6 @@ impl ScanBuilder {
         // per-row partition-value parse done only to build them.
         state_info.skip_row_transforms = self.without_row_transforms;
 
-        let physical_stats_output_schema = build_physical_stats_output_schema(
-            self.snapshot.table_configuration(),
-            &state_info,
-            &self.stats,
-        )?;
-
         let commits_since_checkpoint = self.snapshot.log_segment().commits_since_checkpoint();
         if self.snapshot.skipped_new_checkpoints() && commits_since_checkpoint > 0 {
             warn!(
@@ -480,7 +496,6 @@ impl ScanBuilder {
             snapshot: self.snapshot,
             state_info: Arc::new(state_info),
             stats: self.stats,
-            physical_stats_output_schema,
             correlation_id: self.correlation_id,
             partition_values: self.partition_values,
             cancellation_token: self.cancellation_token,
@@ -735,8 +750,6 @@ pub struct Scan {
     snapshot: SnapshotRef,
     state_info: Arc<StateInfo>,
     stats: StatsOptions,
-    #[allow(dead_code)] // Only used when `declarative-plans` is enabled
-    physical_stats_output_schema: Option<SchemaRef>,
     correlation_id: Option<Arc<str>>,
     partition_values: PartitionValuesOptions,
     /// Optional cooperative cancellation token supplied via
@@ -744,41 +757,20 @@ pub struct Scan {
     cancellation_token: Option<CancellationTokenRef>,
 }
 
-/// Builds the physical `stats_parsed` output schema requested through `StatsOptions`.
-///
-/// For example, if the caller requests `[a, b]` and the predicate references `c`,
-/// `StateInfo::physical_stats_schema` contains `[a, b, c]`, while this returns `[a, b]`.
-/// Returns `None` when no struct stats are requested. `Columns` names were already resolved
-/// strictly into `StateInfo::requested_physical_stats_columns` when the `StateInfo` was built.
-fn build_physical_stats_output_schema(
+/// Builds the consumer-visible stats schemas without predicate-only fields.
+fn build_stats_output_schemas(
     table_configuration: &TableConfiguration,
-    state_info: &StateInfo,
     stats: &StatsOptions,
-) -> DeltaResult<Option<SchemaRef>> {
+) -> DeltaResult<Option<StatsOutputSchemas>> {
     match &stats.struct_stats {
         StructStats::None => Ok(None),
-        StructStats::AllIndexed { .. } => Ok(state_info.physical_stats_schema.clone()),
-        StructStats::Columns { .. } => {
-            // The requested columns are also the output filter, so the emitted schema contains
-            // exactly those columns.
-            let requested = &state_info.requested_physical_stats_columns;
-            if requested.is_empty() {
-                return Ok(None);
-            }
-            let stats_schema = table_configuration
-                .build_expected_stats_schemas(Some(requested), Some(requested))?
-                .physical;
-            Ok(stats_schema_with_data_columns(stats_schema))
+        StructStats::AllIndexed { extra_indexed } => {
+            table_configuration.build_indexed_stats_output_schemas(extra_indexed)
+        }
+        StructStats::Columns { requested } => {
+            table_configuration.build_selected_stats_output_schemas(requested)
         }
     }
-}
-
-/// Returns `schema` only when it contains stats for at least one data column.
-///
-/// Expected stats schemas always contain `numRecords` and `tightBounds`. `nullCount` is present
-/// only when at least one data column survives stats filtering.
-fn stats_schema_with_data_columns(schema: SchemaRef) -> Option<SchemaRef> {
-    schema.field(NULL_COUNT).is_some().then_some(schema)
 }
 
 impl std::fmt::Debug for Scan {
@@ -800,11 +792,11 @@ impl Scan {
 
     fn checkpoint_read_options(&self) -> (SchemaRef, Option<PredicateRef>, Option<&StructType>) {
         let skip_stats = self.skip_stats();
-        // `physical_stats_schema` is the typed shape this scan can consume, not evidence that the
+        // The read schema is the typed shape this scan can consume, not evidence that the
         // checkpoint contains `stats_parsed`. Checkpoint discovery validates availability and
         // restores `add.stats` before opening the reader when the structured field is incompatible.
         let can_replace_json_with_structured_stats =
-            !self.stats.synthesize_json && self.state_info.physical_stats_schema.is_some();
+            !self.stats.synthesize_json && self.state_info.physical_stats_read_schema().is_some();
         let checkpoint_schema = if skip_stats || can_replace_json_with_structured_stats {
             CHECKPOINT_READ_SCHEMA_NO_JSON_STATS.clone()
         } else {
@@ -818,12 +810,18 @@ impl Scan {
         };
         // Discovery uses this schema to augment the checkpoint projection, so `none()` must
         // suppress it as well as the initial JSON stats field.
-        let physical_stats_schema = if skip_stats {
+        let physical_stats_read_schema = if skip_stats {
             None
         } else {
-            self.state_info.physical_stats_schema.as_deref()
+            self.state_info
+                .physical_stats_read_schema()
+                .map(AsRef::as_ref)
         };
-        (checkpoint_schema, meta_predicate, physical_stats_schema)
+        (
+            checkpoint_schema,
+            meta_predicate,
+            physical_stats_read_schema,
+        )
     }
 
     /// Build the read-options bundle passed to [`ScanLogReplayProcessor`].
@@ -1044,14 +1042,14 @@ impl Scan {
 
         // For incremental reads, new_log_segment has no checkpoint but we use the
         // checkpoint schema returned by the function for consistency.
-        let (checkpoint_schema, meta_predicate, physical_stats_schema) =
+        let (checkpoint_schema, meta_predicate, physical_stats_read_schema) =
             self.checkpoint_read_options();
         let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
             engine,
             COMMIT_READ_SCHEMA.clone(),
             checkpoint_schema,
             meta_predicate,
-            physical_stats_schema,
+            physical_stats_read_schema,
             None,
             self.cancellation_token.as_ref(),
         )?;
@@ -1146,7 +1144,7 @@ impl Scan {
         // Resolve the checkpoint shape once. Retain the leaf schema only when parsed metadata is
         // needed for output or pruning.
         let plan_executor = engine.require_plan_executor()?;
-        let needs_leaf_schema = self.state_info.physical_stats_schema.is_some()
+        let needs_leaf_schema = self.state_info.physical_stats_read_schema().is_some()
             || self.state_info.physical_partition_schema.is_some();
         let shape = if needs_leaf_schema {
             CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), &self.snapshot)?
@@ -1163,7 +1161,7 @@ impl Scan {
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
-        let (checkpoint_schema, meta_predicate, physical_stats_schema) =
+        let (checkpoint_schema, meta_predicate, physical_stats_read_schema) =
             self.checkpoint_read_options();
         // Checkpoints already represent reconciled state, so scans project only Add actions. This
         // derives `add.path IS NOT NULL` and allows readers to skip non-Add row groups.
@@ -1174,7 +1172,7 @@ impl Scan {
                 COMMIT_READ_SCHEMA.clone(),
                 checkpoint_schema,
                 meta_predicate,
-                physical_stats_schema,
+                physical_stats_read_schema,
                 self.state_info
                     .physical_partition_schema
                     .as_ref()
@@ -1204,7 +1202,7 @@ impl Scan {
         // Skipping needs either data-column stats or partition values to rewrite against; a
         // partition-only predicate has no `stats_parsed` schema, a data-only predicate on an
         // unpartitioned table has no partition schema.
-        if self.state_info.physical_stats_schema.is_none()
+        if self.state_info.physical_stats_read_schema().is_none()
             && self.state_info.physical_partition_schema.is_none()
         {
             return None;
