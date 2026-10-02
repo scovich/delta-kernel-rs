@@ -75,6 +75,10 @@ mod bound_write_context;
 mod commit_info;
 mod domain_metadata;
 #[cfg(feature = "adaptive-metadata-in-dev")]
+mod leaf_writer;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+mod manifest_commit_state;
+#[cfg(feature = "adaptive-metadata-in-dev")]
 mod root_manifest_file;
 pub(crate) mod schema_evolution;
 #[cfg_attr(not(feature = "internal-api"), allow(unused_imports))]
@@ -89,6 +93,14 @@ mod write_state;
 mod write_validation;
 
 pub use bound_write_context::BoundWriteContext;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[cfg_attr(not(feature = "internal-api"), allow(unused_imports))]
+#[internal_api]
+pub(crate) use leaf_writer::{LeafNodeWriter, LeafNodeWriterResult};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[cfg_attr(not(feature = "internal-api"), allow(unused_imports))]
+#[internal_api]
+pub(crate) use manifest_commit_state::ManifestCommitState;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use root_manifest_file::RootManifestFile;
 use stats_verifier::StatsColumnVerifier;
@@ -268,9 +280,10 @@ pub struct Transaction<S = ExistingTable> {
     dv_matched_files: Vec<FilteredEngineData>,
     // Count of files whose deletion vector was updated.
     num_dv_updates: usize,
-    // Caller-supplied root manifest file to commit, set via with_root_manifest_file().
+    // The manifest this transaction will write, if any. The two ways of writing it are mutually
+    // exclusive, so a single field makes staging both unrepresentable.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    root_manifest_file: Option<RootManifestFile>,
+    manifest_write: Option<ManifestWrite>,
     // Clustering columns from domain metadata. Only populated if the ClusteredTable feature is
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
@@ -278,6 +291,19 @@ pub struct Transaction<S = ExistingTable> {
     // PhantomType marker for transaction state (ExistingTable or CreateTable).
     // Zero-sized; only affects the type system.
     _state: PhantomType<S>,
+}
+
+/// The manifest a transaction will write. Root-file and content-tree commits are mutually
+/// exclusive ways of writing the manifest, so representing them as one enum makes staging both
+/// unrepresentable.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+enum ManifestWrite {
+    /// Caller-supplied root manifest file, staged via
+    /// [`with_root_manifest_file`](Transaction::with_root_manifest_file).
+    RootFile(RootManifestFile),
+    /// In-progress manifest (content-tree) commit, staged via
+    /// [`with_manifest_commit`](Transaction::with_manifest_commit).
+    Commit(ManifestCommitState),
 }
 
 impl<S> std::fmt::Debug for Transaction<S> {
@@ -405,7 +431,7 @@ impl<S> Transaction<S> {
         self.validate_append_only_semantics()?;
         self.ensure_schema_non_empty_for_data_writes()?;
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        self.validate_root_manifest_file_semantics()?;
+        self.validate_manifest_write_semantics()?;
 
         // Validate that the schema supports data writes when files are being added. Reads and
         // metadata-only commits are always allowed.
@@ -890,24 +916,26 @@ impl<S> Transaction<S> {
         Ok(())
     }
 
-    /// Validate that a root manifest file commit targets an `adaptiveMetadata-preview` table and
-    /// carries no file actions.
+    /// Validate the staged manifest write, if any. A root-manifest-file commit must carry no data
+    /// file actions; a manifest (content-tree) commit cannot be committed yet (its write path is
+    /// not built). The `adaptiveMetadata-preview` feature and root/commit mutual exclusion are
+    /// enforced when staging, so they need no check here.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn validate_root_manifest_file_semantics(&self) -> DeltaResult<()> {
-        if self.root_manifest_file.is_none() {
-            return Ok(());
+    fn validate_manifest_write_semantics(&self) -> DeltaResult<()> {
+        match &self.manifest_write {
+            Some(ManifestWrite::RootFile(_)) => {
+                require!(
+                    !self.has_data_file_actions(),
+                    KernelError::generic("root manifest file commit cannot include file actions")
+                );
+            }
+            Some(ManifestWrite::Commit(_)) => {
+                return Err(KernelError::unsupported(
+                    "committing a manifest commit is not yet supported",
+                ));
+            }
+            None => {}
         }
-        require!(
-            self.effective_table_config
-                .is_feature_supported(&TableFeature::AdaptiveMetadataPreview),
-            KernelError::generic(
-                "root manifest file commit requires the adaptiveMetadata-preview feature"
-            )
-        );
-        require!(
-            !self.has_data_file_actions(),
-            KernelError::generic("root manifest file commit cannot include file actions")
-        );
         Ok(())
     }
 
@@ -920,19 +948,17 @@ impl<S> Transaction<S> {
         commit_version: Version,
         dm_changes: &[DomainMetadata],
     ) -> DeltaResult<Option<Box<dyn EngineData>>> {
-        self.root_manifest_file
-            .as_ref()
-            .map(|root_manifest_file| {
-                let action = root_manifest_file.compute_checkpoint_action(
-                    engine,
-                    commit_version,
-                    &self.effective_table_config,
-                    dm_changes,
-                    &self.set_transactions,
-                )?;
-                action.into_engine_data(engine)
-            })
-            .transpose()
+        let Some(ManifestWrite::RootFile(root_manifest_file)) = &self.manifest_write else {
+            return Ok(None);
+        };
+        let action = root_manifest_file.compute_checkpoint_action(
+            engine,
+            commit_version,
+            &self.effective_table_config,
+            dm_changes,
+            &self.set_transactions,
+        )?;
+        Ok(Some(action.into_engine_data(engine)?))
     }
 
     // Reject data-file removals / DV updates on appendOnly tables when `data_change` is true.
@@ -1892,6 +1918,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    // Manifest-commit and root-manifest tests live in their own file
+    // (tests/manifest_commit_tests.rs) but as a submodule of `tests`, so they reuse this
+    // module's private helpers (e.g. `create_existing_table_txn`) without widening their
+    // visibility.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    mod manifest_commit_tests;
+
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -1937,8 +1970,6 @@ mod tests {
         test_schema_flat, test_schema_nested, test_schema_with_array, test_schema_with_map,
         CapturingReporter,
     };
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    use crate::unit_test_utils::{MockProtocolBuilder, MockTableConfigurationBuilder};
     use crate::{DeltaResultIterator, EvaluationHandler, Snapshot};
 
     impl Transaction {
@@ -3302,62 +3333,6 @@ mod tests {
             result,
             Err(KernelError::InvalidTransactionState(_))
         ));
-        Ok(())
-    }
-
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn dummy_root_manifest_file(read_snapshot: SnapshotRef) -> RootManifestFile {
-        let file = FileMeta {
-            location: read_snapshot.table_root().join("root-v1.parquet").unwrap(),
-            last_modified: 0,
-            size: 1024,
-        };
-        RootManifestFile::new(file, read_snapshot)
-    }
-
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn adaptive_table_config() -> TableConfiguration {
-        MockTableConfigurationBuilder::new()
-            .with_protocol(
-                MockProtocolBuilder::new()
-                    .with_features([TableFeature::AdaptiveMetadataPreview])
-                    .build(),
-            )
-            .build()
-    }
-
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[test]
-    fn test_validate_root_manifest_file_succeeds_on_adaptive_table() -> DeltaResult<()> {
-        let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        let read_snapshot = txn.read_snapshot_opt.clone().unwrap();
-        txn.effective_table_config = adaptive_table_config();
-        txn.root_manifest_file = Some(dummy_root_manifest_file(read_snapshot));
-        txn.validate_root_manifest_file_semantics()?;
-        Ok(())
-    }
-
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[test]
-    fn test_validate_root_manifest_file_rejects_non_adaptive_table() -> DeltaResult<()> {
-        let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        let read_snapshot = txn.read_snapshot_opt.clone().unwrap();
-        txn.root_manifest_file = Some(dummy_root_manifest_file(read_snapshot));
-        let result = txn.validate_root_manifest_file_semantics();
-        assert!(result.is_err());
-        Ok(())
-    }
-
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[test]
-    fn test_validate_root_manifest_file_rejects_file_actions() -> DeltaResult<()> {
-        let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        let read_snapshot = txn.read_snapshot_opt.clone().unwrap();
-        txn.effective_table_config = adaptive_table_config();
-        txn.root_manifest_file = Some(dummy_root_manifest_file(read_snapshot));
-        add_dummy_file(&mut txn);
-        let result = txn.validate_root_manifest_file_semantics();
-        assert!(result.is_err());
         Ok(())
     }
 

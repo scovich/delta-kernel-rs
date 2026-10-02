@@ -16,7 +16,11 @@ use delta_kernel_derive::internal_api;
 use tracing::instrument;
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
+use super::manifest_commit_state::ManifestCommitState;
+#[cfg(feature = "adaptive-metadata-in-dev")]
 use super::root_manifest_file::RootManifestFile;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use super::ManifestWrite;
 use super::Transaction;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -132,7 +136,7 @@ impl Transaction {
             dv_matched_files: vec![],
             num_dv_updates: 0,
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            root_manifest_file: None,
+            manifest_write: None,
             physical_clustering_columns: clustering_columns,
             _state: PhantomType::default(),
         })
@@ -163,8 +167,9 @@ impl Transaction {
     /// # Errors
     ///
     /// Returns an error if `changes` is empty, Iceberg compatibility or column defaults are
-    /// enabled, data-file actions have already been staged, or an operation is invalid for the
-    /// current schema or table configuration.
+    /// enabled, data-file actions have already been staged, an operation is invalid for the
+    /// current schema or table configuration, or a manifest (content-tree) commit was already
+    /// staged (adaptive-metadata-in-dev only).
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn with_schema_changes(
@@ -195,6 +200,13 @@ impl Transaction {
             !self.has_data_file_actions(),
             KernelError::invalid_transaction_state(
                 "with_schema_changes must be called before staging data files"
+            )
+        );
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        require!(
+            !matches!(self.manifest_write, Some(ManifestWrite::Commit(_))),
+            KernelError::invalid_transaction_state(
+                "with_schema_changes cannot be called after staging a manifest commit"
             )
         );
         self.effective_table_config = evolve_table_config(&self.effective_table_config, changes)?;
@@ -264,13 +276,88 @@ impl Transaction {
     }
 
     /// Stages `file` to be committed as the table's root manifest.
+    ///
+    /// Mutually exclusive with [`with_manifest_commit`](Self::with_manifest_commit), which has
+    /// kernel build the tree instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table does not support the `adaptiveMetadata-preview` feature, or if
+    /// a manifest (content-tree) commit was already staged.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     pub fn with_root_manifest_file(mut self, file: FileMeta) -> DeltaResult<Self> {
+        require!(
+            !matches!(self.manifest_write, Some(ManifestWrite::Commit(_))),
+            KernelError::invalid_transaction_state(
+                "explicit root manifest and manifest commit are mutually exclusive"
+            )
+        );
+        require!(
+            self.effective_table_config
+                .is_feature_supported(&TableFeature::AdaptiveMetadataPreview),
+            KernelError::unsupported(
+                "root manifest file commit requires the adaptiveMetadata-preview feature"
+            )
+        );
         let read_snapshot = self.read_snapshot_opt.clone().ok_or_else(|| {
             KernelError::internal_error("existing-table transaction unexpectedly has no snapshot")
         })?;
-        self.root_manifest_file = Some(RootManifestFile::new(file, read_snapshot));
+        self.manifest_write = Some(ManifestWrite::RootFile(RootManifestFile::new(
+            file,
+            read_snapshot,
+        )));
         Ok(self)
+    }
+
+    /// Enables a manifest (content-tree) commit for this transaction, returning the
+    /// [`ManifestCommitState`] that hands out leaf writers accepting file changes.
+    ///
+    /// Mutually exclusive with [`with_root_manifest_file`](Self::with_root_manifest_file), which
+    /// commits a caller-supplied root manifest instead of having kernel build the tree. Repeated
+    /// calls return the state initialized by the first call. Call after
+    /// [`with_schema_changes`](Self::with_schema_changes), which rejects any staged manifest
+    /// commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table does not support the `adaptiveMetadata-preview` feature, if a
+    /// root manifest file was already staged, or if delta log commits exist after the last manifest
+    /// commit (not yet supported).
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[internal_api]
+    pub(crate) fn with_manifest_commit(
+        &mut self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<&mut ManifestCommitState> {
+        match &self.manifest_write {
+            Some(ManifestWrite::RootFile(_)) => {
+                return Err(KernelError::invalid_transaction_state(
+                    "explicit root manifest and manifest commit are mutually exclusive",
+                ))
+            }
+            // Repeated calls reuse the state from the first call.
+            Some(ManifestWrite::Commit(_)) => {}
+            None => {
+                let read_snapshot = self.read_snapshot_opt.clone().ok_or_else(|| {
+                    KernelError::internal_error(
+                        "existing-table transaction unexpectedly has no snapshot",
+                    )
+                })?;
+                let state = ManifestCommitState::try_new(
+                    engine,
+                    read_snapshot,
+                    self.get_commit_version(),
+                    &self.effective_table_config,
+                )?;
+                self.manifest_write = Some(ManifestWrite::Commit(state));
+            }
+        }
+        match &mut self.manifest_write {
+            Some(ManifestWrite::Commit(state)) => Ok(state),
+            _ => Err(KernelError::internal_error(
+                "manifest commit state missing after initialization",
+            )),
+        }
     }
 
     /// Remove files from the table in this transaction. This API generally enables the engine to
