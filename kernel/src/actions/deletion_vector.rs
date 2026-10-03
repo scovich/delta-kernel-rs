@@ -494,7 +494,8 @@ impl DeletionVectorDescriptor {
         storage: Arc<dyn StorageHandler>,
         parent: &Url,
     ) -> DeltaResult<Vec<u64>> {
-        Ok(self.read(storage, parent)?.into_iter().collect())
+        let result = self.read(storage, parent)?;
+        Ok(Vec::from_iter(result))
     }
 }
 

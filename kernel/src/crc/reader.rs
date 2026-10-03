@@ -38,7 +38,8 @@ pub(crate) fn read_crc_file_or_none(
     engine: &dyn Engine,
     crc_file: &ParsedLogPath,
 ) -> Option<Arc<Crc>> {
-    try_read_crc_file(engine, crc_file).ok().map(Arc::new)
+    let result = try_read_crc_file(engine, crc_file);
+    result.ok().map(Arc::new)
 }
 
 #[cfg(test)]

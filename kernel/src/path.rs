@@ -391,8 +391,9 @@ impl ParsedLogPath<FileMeta> {
             )));
         }
 
+        let files = slice::from_ref(&self.location);
         let mut action_iter = engine.json_handler().read_json_files(
-            slice::from_ref(&self.location),
+            files,
             InCommitTimestampVisitor::schema(),
             None,
         )?;

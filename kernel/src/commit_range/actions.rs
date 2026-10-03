@@ -127,8 +127,9 @@ impl CommitAction {
     /// `Protocol` / `Metadata` the commit carries onto `self` (a `None` extraction does NOT clear
     /// the inherited value), and return the commit's `inCommitTimestamp` if present.
     fn read_commit_header(&mut self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
+        let files = slice::from_ref(&self.log_path.location);
         let json_iter = engine.json_handler().read_json_files(
-            slice::from_ref(&self.log_path.location),
+            files,
             HEADER_READ_SCHEMA.clone(),
             None,
         )?;
