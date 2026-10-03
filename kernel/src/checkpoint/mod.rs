@@ -115,6 +115,9 @@ use crate::actions::{
     ADD_FIELD, CHECKPOINT_METADATA_NAME, DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD,
     REMOVE_FIELD, SET_TRANSACTION_FIELD, SIDECAR_FIELD,
 };
+use crate::coroutine::kernel::request::FileWriteMode;
+use crate::coroutine::kernel::{Channel, StaticGeneratorCoroutine};
+use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ExpressionRef, Scalar, StructData};
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -521,6 +524,17 @@ impl CheckpointWriter {
         engine: &dyn Engine,
         last_checkpoint_stats: &LastCheckpointHintStats,
     ) -> DeltaResult<()> {
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.finalize_with_channel(channel, last_checkpoint_stats)
+                .await
+        })
+    }
+
+    async fn finalize_with_channel(
+        self,
+        channel: &Channel,
+        last_checkpoint_stats: &LastCheckpointHintStats,
+    ) -> DeltaResult<()> {
         // Skip writing `_last_checkpoint` if the existing hint already points to a newer
         // checkpoint, to avoid regressing the hint.
         let checkpoint_version = self.snapshot.version();
@@ -535,8 +549,8 @@ impl CheckpointWriter {
             }
         }
 
-        let data = create_last_checkpoint_data(
-            engine,
+        let data = create_last_checkpoint_data_with_channel(
+            channel,
             self.version,
             last_checkpoint_stats.num_actions,
             last_checkpoint_stats.num_of_add_files,
@@ -545,12 +559,14 @@ impl CheckpointWriter {
 
         let last_checkpoint_path = LastCheckpointHint::path(&self.snapshot.log_segment().log_root)?;
 
+        let data = data.await;
         // Write the `_last_checkpoint` file to `table/_delta_log/_last_checkpoint`
         let filtered_data = FilteredEngineData::with_all_rows_selected(data?);
         let input = Box::new(std::iter::once(Ok(filtered_data)));
-        engine
-            .json_handler()
-            .write_json_file(&last_checkpoint_path, input, true)?;
+        let input = StaticGeneratorCoroutine::from_iterator(input);
+        channel
+            .write_json_file(&last_checkpoint_path, FileWriteMode::Overwrite, input)
+            .await?;
 
         Ok(())
     }
@@ -684,6 +700,17 @@ impl CheckpointWriter {
         engine: &dyn Engine,
         schema: &SchemaRef,
     ) -> DeltaResult<ActionReconciliationBatch> {
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.create_checkpoint_metadata_batch_with_channel(channel, schema)
+                .await
+        })
+    }
+
+    async fn create_checkpoint_metadata_batch_with_channel(
+        &self,
+        channel: &Channel,
+        schema: &SchemaRef,
+    ) -> DeltaResult<ActionReconciliationBatch> {
         // Build the checkpointMetadata struct value
         let checkpoint_metadata_value = Scalar::Struct(StructData::try_new(
             vec![StructField::not_null("version", DataType::LONG)],
@@ -700,9 +727,7 @@ impl CheckpointWriter {
                 }
             })
             .collect();
-        let checkpoint_metadata_batch = engine
-            .evaluation_handler()
-            .create_many(schema.clone(), vec![row])?;
+        let checkpoint_metadata_batch = channel.create_many(schema.clone(), vec![row]).await?;
 
         let filtered_data = FilteredEngineData::with_all_rows_selected(checkpoint_metadata_batch);
 
@@ -772,8 +797,28 @@ impl CheckpointWriter {
 /// TODO(#839): Add `checkpoint_schema` field to `_last_checkpoint` file
 /// TODO(#1054): Add `tags` field to `_last_checkpoint` file
 /// TODO(#1052): Add `v2Checkpoint` field to `_last_checkpoint` file
+#[cfg(test)]
 pub(crate) fn create_last_checkpoint_data(
     engine: &dyn Engine,
+    version: i64,
+    actions_counter: i64,
+    add_actions_counter: i64,
+    size_in_bytes: i64,
+) -> DeltaResult<Box<dyn EngineData>> {
+    run_coroutine_with_engine!(engine, async move |channel| {
+        create_last_checkpoint_data_with_channel(
+            channel,
+            version,
+            actions_counter,
+            add_actions_counter,
+            size_in_bytes,
+        )
+        .await
+    })
+}
+
+pub(crate) async fn create_last_checkpoint_data_with_channel(
+    channel: &Channel,
     version: i64,
     actions_counter: i64,
     add_actions_counter: i64,
@@ -786,9 +831,9 @@ pub(crate) fn create_last_checkpoint_data(
         size_in_bytes.into(),
         add_actions_counter.into(),
     ]];
-    engine
-        .evaluation_handler()
+    channel
         .create_many(LAST_CHECKPOINT_SCHEMA.clone(), rows)
+        .await
 }
 
 fn build_written_checkpoint_info(
@@ -798,7 +843,26 @@ fn build_written_checkpoint_info(
     sidecar_sizes_sum: u64,
     sidecar_count: u64,
 ) -> DeltaResult<WrittenCheckpointInfo> {
-    let file_meta = engine.storage_handler().head(checkpoint_path)?;
+    run_coroutine_with_engine!(engine, async move |channel| {
+        build_written_checkpoint_info_with_channel(
+            channel,
+            checkpoint_path,
+            state,
+            sidecar_sizes_sum,
+            sidecar_count,
+        )
+        .await
+    })
+}
+
+async fn build_written_checkpoint_info_with_channel(
+    channel: &Channel,
+    checkpoint_path: &Url,
+    state: Arc<ActionReconciliationIteratorState>,
+    sidecar_sizes_sum: u64,
+    sidecar_count: u64,
+) -> DeltaResult<WrittenCheckpointInfo> {
+    let file_meta = channel.head(checkpoint_path).await?;
     let total_size_in_bytes = file_meta
         .size
         .checked_add(sidecar_sizes_sum)

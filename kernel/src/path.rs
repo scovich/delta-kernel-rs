@@ -9,6 +9,9 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::actions::visitors::InCommitTimestampVisitor;
+use crate::coroutine::kernel::request::ReadJsonFiles;
+use crate::coroutine::kernel::Channel;
+use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _, GeneratorExt as _};
 use crate::engine_data::RowVisitor;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta, ParquetMultiFileWrite, Version};
@@ -381,8 +384,17 @@ impl ParsedLogPath<FileMeta> {
     ///
     /// Returns the inCommitTimestamp value, or an error if ICT is not found or cannot be read.
     /// Callers should handle enablement version checks before calling this method.
-    #[tracing::instrument(skip(engine), ret, fields(version = self.version, path = %self.location.as_url()))]
     pub(crate) fn read_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.read_in_commit_timestamp_with_channel(channel).await
+        })
+    }
+
+    #[tracing::instrument(skip(channel), ret, fields(version = self.version, path = %self.location.as_url()))]
+    pub(crate) async fn read_in_commit_timestamp_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> DeltaResult<i64> {
         // Only works on commit files
         if !self.is_commit() {
             return Err(Error::generic(format!(
@@ -392,16 +404,17 @@ impl ParsedLogPath<FileMeta> {
         }
 
         let files = slice::from_ref(&self.location);
-        let mut action_iter = engine.json_handler().read_json_files(
+        let files = files.to_vec();
+        let mut action_iter = channel.flattened(ReadJsonFiles::new(
             files,
             InCommitTimestampVisitor::schema(),
             None,
-        )?;
+        ));
 
         // Process the actions to find inCommitTimestamp
         // According to protocol, CommitInfo MUST be the first action when ICT is enabled,
         // so we can optimize by only reading the first batch
-        match action_iter.next() {
+        match action_iter.next().await? {
             Some(Ok(actions)) => {
                 let mut visitor = InCommitTimestampVisitor::default();
                 visitor.visit_rows_of(actions.as_ref())?;

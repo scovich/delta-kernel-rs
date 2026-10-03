@@ -12,6 +12,8 @@ use roaring::RoaringTreemap;
 use serde::Deserialize;
 use url::Url;
 
+use crate::coroutine::kernel::Channel;
+use crate::coroutine::{run_coroutine_with_storage, ChannelExt as _};
 use crate::schema::DataType;
 use crate::utils::require;
 use crate::{DeltaResult, Error, StorageHandler};
@@ -345,6 +347,16 @@ impl DeletionVectorDescriptor {
         storage: Arc<dyn StorageHandler>,
         parent: &Url,
     ) -> DeltaResult<RoaringTreemap> {
+        run_coroutine_with_storage!(storage.as_ref(), None, async move |channel| {
+            self.read_with_channel(channel, parent).await
+        })
+    }
+
+    pub(crate) async fn read_with_channel(
+        &self,
+        channel: &Channel,
+        parent: &Url,
+    ) -> DeltaResult<RoaringTreemap> {
         match self.absolute_path(parent)? {
             None => {
                 let byte_slice = z85::decode(&self.path_or_inline_dv)
@@ -378,12 +390,9 @@ impl DeletionVectorDescriptor {
                             "size_in_bytes doesn't fit in usize for {path}"
                         ))))?;
 
-                let dv_data = storage
-                    .read_files(vec![(path.clone(), None)])?
-                    .next()
-                    .ok_or(Error::missing_data(format!(
-                        "No deletion vector data for {path}"
-                    )))??;
+                let dv_data = channel.read_small_file(path.clone(), None).await?.ok_or(
+                    Error::missing_data(format!("No deletion vector data for {path}")),
+                )?;
                 let dv_data_len = dv_data.len();
 
                 let mut cursor = Cursor::new(dv_data);
@@ -494,7 +503,17 @@ impl DeletionVectorDescriptor {
         storage: Arc<dyn StorageHandler>,
         parent: &Url,
     ) -> DeltaResult<Vec<u64>> {
-        let result = self.read(storage, parent)?;
+        run_coroutine_with_storage!(storage.as_ref(), None, async move |channel| {
+            self.row_indexes_with_channel(channel, parent).await
+        })
+    }
+
+    pub(crate) async fn row_indexes_with_channel(
+        &self,
+        channel: &Channel,
+        parent: &Url,
+    ) -> DeltaResult<Vec<u64>> {
+        let result = self.read_with_channel(channel, parent).await?;
         Ok(Vec::from_iter(result))
     }
 }

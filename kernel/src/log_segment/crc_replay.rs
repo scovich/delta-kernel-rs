@@ -23,6 +23,9 @@ use crate::actions::{
     DomainMetadata, SetTransaction, ADD_NAME, COMMIT_INFO_NAME, DOMAIN_METADATA_FIELD,
     METADATA_FIELD, PROTOCOL_FIELD, REMOVE_NAME, SET_TRANSACTION_FIELD,
 };
+use crate::coroutine::kernel::request::ReadJsonFiles;
+use crate::coroutine::kernel::Channel;
+use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _, GeneratorExt as _};
 use crate::crc::{
     is_incremental_safe_operation, read_crc_file_or_none, size_to_u64, Crc, CrcDelta,
     FileSizeHistogram, FileStatsDelta,
@@ -266,13 +269,23 @@ impl LogSegment {
             .rev()
             .map(|c| c.location.clone())
             .collect();
-        let mut acc = CrcReplayAccumulator::new(seed_histogram);
-        let batches =
-            engine
-                .json_handler()
-                .read_json_files(&locations, REPLAY_SCHEMA.clone(), None)?;
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.replay_commits_into_crc_delta_with_channel(channel, locations, seed_histogram)
+                .await
+        })
+    }
 
-        for batch_result in batches {
+    async fn replay_commits_into_crc_delta_with_channel(
+        &self,
+        channel: &Channel,
+        locations: Vec<FileMeta>,
+        seed_histogram: Option<FileSizeHistogram>,
+    ) -> DeltaResult<CrcDelta> {
+        let mut acc = CrcReplayAccumulator::new(seed_histogram);
+        let mut batches =
+            channel.flattened(ReadJsonFiles::new(locations, REPLAY_SCHEMA.clone(), None));
+
+        while let Some(batch_result) = batches.next().await? {
             // Transient visitor borrows the shared accumulator for the duration of the
             // batch; same pattern as `ActionReconciliationVisitor`.
             let mut visitor = CommitCrcVisitor { acc: &mut acc };
