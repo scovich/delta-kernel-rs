@@ -19,6 +19,10 @@ use crate::actions::{Add, ADD_FIELD, ADD_NAME, NULL_COUNT, REMOVE_FIELD, SIDECAR
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
+use crate::coroutine::kernel::{static_coroutine, Channel, StaticCoroutine};
+use crate::coroutine::run_coroutine_with_storage;
+#[cfg(feature = "declarative-plans")]
+use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef};
 use crate::kernel_predicates::{
@@ -1135,21 +1139,45 @@ impl Scan {
     ///
     /// Returns an error if the engine provides no [`PlanExecutor`](crate::plans::PlanExecutor),
     /// or if log discovery, checkpoint inspection, or plan construction fails.
+    pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.declarative_metadata_scan_plan_with_channel(channel)
+                .await
+        })
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    #[internal_api]
+    #[allow(unused)]
+    pub(crate) fn declarative_metadata_scan_plan_workflow(
+        self: Arc<Self>,
+    ) -> StaticCoroutine<Option<Plan>> {
+        static_coroutine!(async move |channel| {
+            self.declarative_metadata_scan_plan_with_channel(channel)
+                .await
+        })
+    }
+
+    #[cfg(feature = "declarative-plans")]
     #[tracing::instrument(
         name = "scan.declarative_metadata_scan_plan",
         skip_all,
         fields(enable_call_frame),
         err
     )]
-    pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
+    async fn declarative_metadata_scan_plan_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> DeltaResult<Option<Plan>> {
+        channel.require_plan_executor().await?;
         // Resolve the checkpoint shape once: it selects the leaf-vs-manifest arm and reports
         // whether the checkpoint carries a compatible parsed-stats column.
-        let plan_executor = engine.require_plan_executor()?;
-        let shape = CheckpointShape::try_new(
-            plan_executor.as_ref(),
+        let shape = CheckpointShape::try_new_with_channel(
+            channel,
             &self.snapshot,
             self.state_info.physical_stats_schema.as_ref(),
-        )?;
+        )
+        .await?;
         self.build_metadata_scan_plan(&shape)
     }
 
@@ -1499,6 +1527,27 @@ pub fn selection_vector(
     table_root: &Url,
 ) -> DeltaResult<Vec<bool>> {
     let storage = engine.storage_handler();
-    let dv_treemap = descriptor.read(storage, table_root)?;
+    run_coroutine_with_storage!(storage.as_ref(), None, async move |channel| {
+        selection_vector_with_channel(channel, descriptor, table_root).await
+    })
+}
+
+#[internal_api]
+#[allow(unused)]
+pub(crate) fn selection_vector_workflow(
+    descriptor: DeletionVectorDescriptor,
+    table_root: Url,
+) -> StaticCoroutine<Vec<bool>> {
+    static_coroutine!(async move |channel| {
+        selection_vector_with_channel(channel, &descriptor, &table_root).await
+    })
+}
+
+async fn selection_vector_with_channel(
+    channel: &Channel,
+    descriptor: &DeletionVectorDescriptor,
+    table_root: &Url,
+) -> DeltaResult<Vec<bool>> {
+    let dv_treemap = descriptor.read_with_channel(channel, table_root).await?;
     Ok(deletion_treemap_to_bools(dv_treemap))
 }

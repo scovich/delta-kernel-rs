@@ -52,6 +52,7 @@ use std::sync::Arc;
 
 pub use actions::{CommitAction, DeltaAction};
 pub use builder::{CommitOrdering, CommitRangeBuilder};
+use delta_kernel_derive::internal_api;
 use url::Url;
 
 use crate::actions::{
@@ -59,6 +60,9 @@ use crate::actions::{
     DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD, SET_TRANSACTION_FIELD,
     SIDECAR_FIELD,
 };
+use crate::coroutine::engine::EngineConnector;
+use crate::coroutine::generator::{map_async, AsyncIntoIterator as _, GeneratorExt as _};
+use crate::coroutine::kernel::{Channel, StaticGeneratorCoroutine};
 use crate::path::ParsedLogPath;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
@@ -134,6 +138,17 @@ impl CommitRange {
         start_snapshot: Option<SnapshotRef>,
         actions: &[DeltaAction],
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<CommitAction>> + Send> {
+        let commits = self.commits_generator(start_snapshot, actions)?;
+        Ok(EngineConnector::new(engine.as_ref()).iterate_result_generator(commits))
+    }
+
+    /// Return a lazy generator over the commits in this range.
+    #[internal_api]
+    pub(crate) fn commits_generator(
+        &self,
+        start_snapshot: Option<SnapshotRef>,
+        actions: &[DeltaAction],
+    ) -> DeltaResult<StaticGeneratorCoroutine<DeltaResult<CommitAction>>> {
         if actions.is_empty() {
             return Err(Error::generic("at least one DeltaAction must be requested"));
         }
@@ -169,17 +184,18 @@ impl CommitRange {
 
         let read_schema = Arc::new(StructType::try_new(actions.iter().map(action_to_field))?);
 
-        let state = CommitActionState {
+        let mut state = CommitActionState {
             table_root: self.table_root.clone(),
             commit_ordering: self.commit_ordering,
             read_schema,
             latest_protocol,
             latest_metadata,
         };
-        let log_paths = self.commit_files.clone().into_iter();
-        Ok(log_paths.scan(state, move |state, log_path| {
-            Some(state.try_advance(engine.as_ref(), log_path))
-        }))
+        let commits = map_async!(
+            self.commit_files.clone().into_generator(),
+            async move |channel, log_path| state.try_advance(channel, log_path).await,
+        );
+        Ok(StaticGeneratorCoroutine::from_generator(commits))
     }
 }
 
@@ -201,20 +217,21 @@ impl CommitActionState {
     /// Commits below the anchor are validated/timestamped best-effort against only their own
     /// actions. Another solution is to walk the commit in ascending then reversing in the
     /// [`CommitOrdering::DescendingOrder`] scenario.
-    fn try_advance(
+    async fn try_advance(
         &mut self,
-        engine: &dyn Engine,
+        channel: &Channel,
         log_path: ParsedLogPath,
     ) -> DeltaResult<CommitAction> {
         let version = log_path.version;
-        let commit_action = CommitAction::try_new(
-            engine,
+        let commit_action = CommitAction::try_new_with_channel(
+            channel,
             self.table_root.clone(),
             log_path,
             self.read_schema.clone(),
             self.latest_protocol.clone(),
             self.latest_metadata.clone(),
         )
+        .await
         .map_err(|e| with_version_context(version, e))?;
 
         match self.commit_ordering {

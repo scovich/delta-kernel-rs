@@ -9,7 +9,6 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::actions::visitors::InCommitTimestampVisitor;
-use crate::coroutine::kernel::request::ReadJsonFiles;
 use crate::coroutine::kernel::Channel;
 use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _, GeneratorExt as _};
 use crate::engine_data::RowVisitor;
@@ -404,12 +403,8 @@ impl ParsedLogPath<FileMeta> {
         }
 
         let files = slice::from_ref(&self.location);
-        let files = files.to_vec();
-        let mut action_iter = channel.flattened(ReadJsonFiles::new(
-            files,
-            InCommitTimestampVisitor::schema(),
-            None,
-        ));
+        let mut action_iter =
+            channel.read_json_files(files, InCommitTimestampVisitor::schema(), None);
 
         // Process the actions to find inCommitTimestamp
         // According to protocol, CommitInfo MUST be the first action when ICT is enabled,

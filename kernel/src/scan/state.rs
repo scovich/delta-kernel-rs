@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use delta_kernel_derive::internal_api;
 use derive_more::From;
 use roaring::RoaringTreemap;
 use serde::Deserialize;
@@ -12,8 +13,10 @@ use super::log_replay::SCAN_ROW_SCHEMA;
 use super::ScanMetadata;
 use crate::actions::deletion_vector::{deletion_treemap_to_bools, DeletionVectorDescriptor};
 use crate::actions::visitors::visit_deletion_vector_at;
-use crate::coroutine::kernel::Channel;
-use crate::coroutine::{run_coroutine_with_engine, AsyncOption as _, ChannelExt as _};
+use crate::coroutine::kernel::{static_coroutine, Channel, StaticCoroutine};
+use crate::coroutine::{
+    run_coroutine_with_engine, run_coroutine_with_storage, AsyncOption as _, ChannelExt as _,
+};
 use crate::engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData};
 use crate::scan::get_transform_for_row;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};
@@ -45,16 +48,6 @@ impl DvInfo {
         self.deletion_vector.is_some()
     }
 
-    pub(crate) fn get_treemap(
-        &self,
-        engine: &dyn Engine,
-        table_root: &url::Url,
-    ) -> DeltaResult<Option<RoaringTreemap>> {
-        run_coroutine_with_engine!(engine, async move |channel| {
-            self.get_treemap_with_channel(channel, table_root).await
-        })
-    }
-
     pub(crate) async fn get_treemap_with_channel(
         &self,
         channel: &Channel,
@@ -72,7 +65,30 @@ impl DvInfo {
         engine: &dyn Engine,
         table_root: &url::Url,
     ) -> DeltaResult<Option<Vec<bool>>> {
-        let dv_treemap = self.get_treemap(engine, table_root)?;
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.get_selection_vector_with_channel(channel, table_root)
+                .await
+        })
+    }
+
+    #[internal_api]
+    #[allow(unused)]
+    pub(crate) fn get_selection_vector_workflow(
+        self,
+        table_root: url::Url,
+    ) -> StaticCoroutine<Option<Vec<bool>>> {
+        static_coroutine!(async move |channel| {
+            self.get_selection_vector_with_channel(channel, &table_root)
+                .await
+        })
+    }
+
+    pub(crate) async fn get_selection_vector_with_channel(
+        &self,
+        channel: &Channel,
+        table_root: &url::Url,
+    ) -> DeltaResult<Option<Vec<bool>>> {
+        let dv_treemap = self.get_treemap_with_channel(channel, table_root).await?;
         Ok(dv_treemap.map(deletion_treemap_to_bools))
     }
 
@@ -86,9 +102,32 @@ impl DvInfo {
             return Ok(None);
         }
         let storage = engine.storage_handler();
+        run_coroutine_with_storage!(storage.as_ref(), None, async move |channel| {
+            self.get_row_indexes_with_channel(channel, table_root).await
+        })
+    }
+
+    #[internal_api]
+    #[allow(unused)]
+    pub(crate) fn get_row_indexes_workflow(
+        self,
+        table_root: url::Url,
+    ) -> StaticCoroutine<Option<Vec<u64>>> {
+        static_coroutine!(async move |channel| {
+            self.get_row_indexes_with_channel(channel, &table_root)
+                .await
+        })
+    }
+
+    pub(crate) async fn get_row_indexes_with_channel(
+        &self,
+        channel: &Channel,
+        table_root: &url::Url,
+    ) -> DeltaResult<Option<Vec<u64>>> {
         self.deletion_vector
             .as_ref()
-            .map(|dv| dv.row_indexes(storage, table_root))
+            .map_async(|dv| dv.row_indexes_with_channel(channel, table_root))
+            .await
             .transpose()
     }
 }

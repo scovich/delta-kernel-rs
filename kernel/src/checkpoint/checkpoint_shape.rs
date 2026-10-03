@@ -9,6 +9,9 @@ use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::SIDECAR_NAME;
+use crate::coroutine::engine::drive_with_plan_executor;
+use crate::coroutine::kernel::{coroutine, Channel};
+use crate::coroutine::{ChannelExt as _, GeneratorExt as _};
 use crate::engine_data::RowVisitor;
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::FileType;
@@ -41,14 +44,25 @@ pub(crate) struct CheckpointShape {
 impl CheckpointShape {
     /// Resolve `snapshot`'s checkpoint shape. Determines the checkpoint type and, when
     /// `stats_schema` is `Some`, whether the checkpoint contains parsed stats compatible with it.
+    pub(crate) fn try_new(
+        exec: &dyn PlanExecutor,
+        snapshot: &Snapshot,
+        stats_schema: Option<&SchemaRef>,
+    ) -> DeltaResult<CheckpointShape> {
+        let try_new = coroutine!(async move |channel| {
+            Self::try_new_with_channel(channel, snapshot, stats_schema).await
+        });
+        drive_with_plan_executor(exec, try_new)
+    }
+
     #[tracing::instrument(
         name = "checkpoint_shape.try_new",
         skip_all,
         fields(enable_call_frame),
         err
     )]
-    pub(crate) fn try_new(
-        exec: &dyn PlanExecutor,
+    pub(crate) async fn try_new_with_channel(
+        channel: &Channel,
         snapshot: &Snapshot,
         stats_schema: Option<&SchemaRef>,
     ) -> DeltaResult<CheckpointShape> {
@@ -67,8 +81,14 @@ impl CheckpointShape {
 
         // Classify from a V2 checkpoint's `_last_checkpoint` hint when possible, else inspect the
         // file.
-        let shape =
-            Self::from_v2_checkpoint_hint(exec, segment, root_checkpoint, file_type, stats_schema)?;
+        let shape = Self::from_v2_checkpoint_hint_with_channel(
+            channel,
+            segment,
+            root_checkpoint,
+            file_type,
+            stats_schema,
+        )
+        .await?;
         if let Some(shape) = shape {
             return Ok(shape);
         }
@@ -78,7 +98,10 @@ impl CheckpointShape {
             FileType::Parquet => {
                 let cp_schema = match segment.checkpoint_hint_schema() {
                     Some(schema) => schema,
-                    None => read_parquet_footer_schema(exec, root_checkpoint.clone())?,
+                    None => {
+                        read_parquet_footer_schema_with_channel(channel, root_checkpoint.clone())
+                            .await?
+                    }
                 };
                 // No `sidecar` column means the file actions are inline, so this is a leaf.
                 if !cp_schema.contains(SIDECAR_NAME) {
@@ -86,15 +109,23 @@ impl CheckpointShape {
                 }
                 // The `sidecar` column may still be all-null (not a manifest), so scan it to
                 // confirm whether a sidecar is actually present.
-                let sidecar =
-                    collect_single_sidecar(exec, root_checkpoint, file_type, &segment.log_root)?;
+                let sidecar = collect_single_sidecar_with_channel(
+                    channel,
+                    root_checkpoint,
+                    file_type,
+                    &segment.log_root,
+                )
+                .await?;
                 match sidecar {
-                    Some(sidecar) => Self::try_new_manifest(
-                        exec,
-                        sidecar,
-                        stats_schema,
-                        segment.checkpoint_hint_sidecar_file_schema(),
-                    ),
+                    Some(sidecar) => {
+                        Self::try_new_manifest_with_channel(
+                            channel,
+                            sidecar,
+                            stats_schema,
+                            segment.checkpoint_hint_sidecar_file_schema(),
+                        )
+                        .await
+                    }
                     None => Ok(Self::try_new_leaf(Some(cp_schema), stats_schema)),
                 }
             }
@@ -102,15 +133,23 @@ impl CheckpointShape {
             // decide if it is a manifest or a leaf. A JSON leaf has no readable schema,
             // hence no parsed stats.
             FileType::Json => {
-                let sidecar =
-                    collect_single_sidecar(exec, root_checkpoint, file_type, &segment.log_root)?;
+                let sidecar = collect_single_sidecar_with_channel(
+                    channel,
+                    root_checkpoint,
+                    file_type,
+                    &segment.log_root,
+                )
+                .await?;
                 match sidecar {
-                    Some(sidecar) => Self::try_new_manifest(
-                        exec,
-                        sidecar,
-                        stats_schema,
-                        segment.checkpoint_hint_sidecar_file_schema(),
-                    ),
+                    Some(sidecar) => {
+                        Self::try_new_manifest_with_channel(
+                            channel,
+                            sidecar,
+                            stats_schema,
+                            segment.checkpoint_hint_sidecar_file_schema(),
+                        )
+                        .await
+                    }
                     None => Ok(Self::try_new_leaf(None, stats_schema)),
                 }
             }
@@ -122,14 +161,35 @@ impl CheckpointShape {
     /// caller to inspect the file. A non-empty sidecar list is a manifest; an empty list is a leaf
     /// (the writer emits an empty list only for a leaf, and trims an oversized manifest to absent,
     /// never to empty).
+    #[cfg(test)]
+    fn from_v2_checkpoint_hint(
+        exec: &dyn PlanExecutor,
+        segment: &LogSegment,
+        root_checkpoint: &FileMeta,
+        file_type: FileType,
+        stats_schema: Option<&SchemaRef>,
+    ) -> DeltaResult<Option<CheckpointShape>> {
+        let from_hint = coroutine!(async move |channel| {
+            Self::from_v2_checkpoint_hint_with_channel(
+                channel,
+                segment,
+                root_checkpoint,
+                file_type,
+                stats_schema,
+            )
+            .await
+        });
+        drive_with_plan_executor(exec, from_hint)
+    }
+
     #[tracing::instrument(
         name = "checkpoint_shape.from_v2_checkpoint_hint",
         skip_all,
         fields(enable_call_frame),
         err
     )]
-    fn from_v2_checkpoint_hint(
-        exec: &dyn PlanExecutor,
+    async fn from_v2_checkpoint_hint_with_channel(
+        channel: &Channel,
         segment: &LogSegment,
         root_checkpoint: &FileMeta,
         file_type: FileType,
@@ -138,12 +198,13 @@ impl CheckpointShape {
         match segment.checkpoint_hint_sidecars().map(Vec::as_slice) {
             Some([sidecar, ..]) => {
                 let sidecar_meta = sidecar.to_filemeta(&segment.log_root)?;
-                let result = Self::try_new_manifest(
-                    exec,
+                let result = Self::try_new_manifest_with_channel(
+                    channel,
                     sidecar_meta,
                     stats_schema,
                     segment.checkpoint_hint_sidecar_file_schema(),
-                )?;
+                )
+                .await?;
                 Ok(Some(result))
             }
             Some([]) => {
@@ -153,7 +214,13 @@ impl CheckpointShape {
                     FileType::Parquet if stats_schema.is_some() => {
                         Some(match segment.checkpoint_hint_schema() {
                             Some(schema) => schema,
-                            None => read_parquet_footer_schema(exec, root_checkpoint.clone())?,
+                            None => {
+                                read_parquet_footer_schema_with_channel(
+                                    channel,
+                                    root_checkpoint.clone(),
+                                )
+                                .await?
+                            }
                         })
                     }
                     _ => None,
@@ -171,14 +238,28 @@ impl CheckpointShape {
     ///
     /// If the `_last_checkpoint` hint carries a `sidecarFileSchema`, use it directly,
     /// Otherwise read the sidecar's footer to get the schema.
+    #[cfg(test)]
+    fn try_new_manifest(
+        exec: &dyn PlanExecutor,
+        sidecar: FileMeta,
+        stats_schema: Option<&SchemaRef>,
+        hint_sidecar_schema: Option<StructType>,
+    ) -> DeltaResult<CheckpointShape> {
+        let try_new = coroutine!(async move |channel| {
+            Self::try_new_manifest_with_channel(channel, sidecar, stats_schema, hint_sidecar_schema)
+                .await
+        });
+        drive_with_plan_executor(exec, try_new)
+    }
+
     #[tracing::instrument(
         name = "checkpoint_shape.try_new_manifest",
         skip_all,
         fields(enable_call_frame),
         err
     )]
-    fn try_new_manifest(
-        exec: &dyn PlanExecutor,
+    async fn try_new_manifest_with_channel(
+        channel: &Channel,
         sidecar: FileMeta,
         stats_schema: Option<&SchemaRef>,
         hint_sidecar_schema: Option<StructType>,
@@ -190,7 +271,8 @@ impl CheckpointShape {
                         LogSegment::schema_has_compatible_stats_parsed(&schema, stats_schema)
                     }
                     None => {
-                        let footer_schema = read_parquet_footer_schema(exec, sidecar)?;
+                        let footer_schema =
+                            read_parquet_footer_schema_with_channel(channel, sidecar).await?;
                         LogSegment::schema_has_compatible_stats_parsed(
                             footer_schema.as_ref(),
                             stats_schema,
@@ -231,8 +313,11 @@ impl CheckpointShape {
     fields(enable_call_frame),
     err
 )]
-fn read_parquet_footer_schema(exec: &dyn PlanExecutor, file: FileMeta) -> DeltaResult<SchemaRef> {
-    let footer = exec.read_parquet_footer(file)?;
+async fn read_parquet_footer_schema_with_channel(
+    channel: &Channel,
+    file: FileMeta,
+) -> DeltaResult<SchemaRef> {
+    let footer = channel.read_plan_parquet_footer(&file).await?;
     Ok(footer.schema)
 }
 
@@ -244,8 +329,8 @@ fn read_parquet_footer_schema(exec: &dyn PlanExecutor, file: FileMeta) -> DeltaR
     fields(enable_call_frame),
     err
 )]
-fn collect_single_sidecar(
-    exec: &dyn PlanExecutor,
+async fn collect_single_sidecar_with_channel(
+    channel: &Channel,
     file: &FileMeta,
     file_format: FileType,
     log_root: &Url,
@@ -257,10 +342,10 @@ fn collect_single_sidecar(
         FileType::Json => PlanBuilder::scan_json([file.clone()], &[], read_schema),
     }?
     .build()?;
-    let data = exec.execute_op(Operation::QueryPlan(plan))?.into_data()?;
+    let mut data = channel.flattened(Operation::QueryPlan(plan));
 
     let mut visitor = SidecarVisitor::default();
-    for batch in data {
+    while let Some(batch) = data.next().await? {
         visitor.visit_rows_of(batch?.as_ref())?;
         if !visitor.sidecars.is_empty() {
             break;
