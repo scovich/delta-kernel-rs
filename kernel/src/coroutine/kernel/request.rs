@@ -199,7 +199,7 @@ impl ForwardListing {
     }
 
     /// Default number of entries in one listing page.
-    pub const DEFAULT_PAGE_SIZE: usize = 1024;
+    pub const DEFAULT_PAGE_SIZE: usize = 1000;
 }
 
 impl PagedOperation for ForwardListing {
