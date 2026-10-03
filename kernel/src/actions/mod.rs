@@ -17,6 +17,10 @@ use self::deletion_vector::DeletionVectorDescriptor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::content_tree::resolve_amt_location;
 #[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::coroutine::kernel::Channel;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::coroutine::run_coroutine_with_engine;
+#[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::expressions::Scalar;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::expressions::{ArrayData, StructData};
@@ -33,7 +37,7 @@ use crate::table_features::{
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::{create_row, Engine};
+use crate::{create_row_with_channel, Engine};
 use crate::{DeltaResult, EngineData, Error, FileMeta, FileSize, RowVisitor as _};
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1488,11 +1492,21 @@ impl CheckpointAction {
     /// Serialize this checkpoint action into a single-row `EngineData`.
     #[internal_api]
     pub(crate) fn into_engine_data(self, engine: &dyn Engine) -> DeltaResult<Box<dyn EngineData>> {
-        create_row(
-            engine,
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.into_engine_data_with_channel(channel).await
+        })
+    }
+
+    pub(crate) async fn into_engine_data_with_channel(
+        self,
+        channel: &Channel,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        create_row_with_channel(
+            channel,
             LOG_CHECKPOINT_SCHEMA.clone(),
             self.try_into_scalar()?,
         )
+        .await
     }
 
     /// Parse the first `checkpoint` action in `data`, ignoring any later ones. Rows without a

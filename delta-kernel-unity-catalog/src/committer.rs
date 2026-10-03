@@ -4,6 +4,8 @@ use std::sync::Arc;
 use delta_kernel::committer::{
     Commit as KernelCommit, CommitMetadata, CommitResponse, CommitType, Committer, PublishMetadata,
 };
+use delta_kernel::coroutine::kernel::Channel;
+use delta_kernel::coroutine::{run_coroutine_with_engine, ChannelExt as _};
 use delta_kernel::{
     DeltaResult, DeltaResultIterator, Engine, Error as DeltaError, FileMeta, FilteredEngineData,
 };
@@ -284,6 +286,18 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
     }
 
     fn publish(&self, engine: &dyn Engine, publish_metadata: PublishMetadata) -> DeltaResult<()> {
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.publish_with_channel(channel, publish_metadata).await
+        })
+    }
+}
+
+impl<C: UpdateTableClient> UCCommitter<C> {
+    async fn publish_with_channel(
+        &self,
+        channel: &Channel,
+        publish_metadata: PublishMetadata,
+    ) -> DeltaResult<()> {
         if publish_metadata.commits_to_publish().is_empty() {
             return Ok(());
         }
@@ -291,7 +305,7 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
         for catalog_commit in publish_metadata.commits_to_publish() {
             let src = catalog_commit.location();
             let dest = catalog_commit.published_location();
-            match engine.storage_handler().copy_atomic(src, dest) {
+            match channel.copy_atomic(src, dest).await {
                 Ok(_) => (),
                 Err(DeltaError::FileAlreadyExists(_)) => (),
                 Err(e) => return Err(e),

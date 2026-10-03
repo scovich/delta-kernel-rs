@@ -218,8 +218,9 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
 
     /// Atomically copy `source` to a new `destination`.
     #[allow(unused)]
-    fn copy_atomic(&self, source: Url, destination: Url) -> impl DeltaFuture<()> {
-        self.exchange(CopyAtomic::new(source, destination), Request::CopyAtomic)
+    fn copy_atomic(&self, source: &Url, destination: &Url) -> impl DeltaFuture<()> {
+        let operation = CopyAtomic::new(source.clone(), destination.clone());
+        self.exchange(operation, Request::CopyAtomic)
     }
 
     /// Publish catalog commits through the connector's catalog committer.

@@ -12,6 +12,8 @@ use super::log_replay::SCAN_ROW_SCHEMA;
 use super::ScanMetadata;
 use crate::actions::deletion_vector::{deletion_treemap_to_bools, DeletionVectorDescriptor};
 use crate::actions::visitors::visit_deletion_vector_at;
+use crate::coroutine::kernel::Channel;
+use crate::coroutine::{run_coroutine_with_engine, AsyncOption as _, ChannelExt as _};
 use crate::engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData};
 use crate::scan::get_transform_for_row;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};
@@ -48,12 +50,20 @@ impl DvInfo {
         engine: &dyn Engine,
         table_root: &url::Url,
     ) -> DeltaResult<Option<RoaringTreemap>> {
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.get_treemap_with_channel(channel, table_root).await
+        })
+    }
+
+    pub(crate) async fn get_treemap_with_channel(
+        &self,
+        channel: &Channel,
+        table_root: &url::Url,
+    ) -> DeltaResult<Option<RoaringTreemap>> {
         self.deletion_vector
             .as_ref()
-            .map(|dv_descriptor| {
-                let storage = engine.storage_handler();
-                dv_descriptor.read(storage, table_root)
-            })
+            .map_async(|dv_descriptor| dv_descriptor.read_with_channel(channel, table_root))
+            .await
             .transpose()
     }
 
@@ -91,14 +101,35 @@ pub fn transform_to_logical(
     logical_schema: &Schema,
     transform: Option<ExpressionRef>,
 ) -> DeltaResult<Box<dyn EngineData>> {
+    run_coroutine_with_engine!(engine, async move |channel| {
+        transform_to_logical_with_channel(
+            channel,
+            physical_data,
+            physical_schema,
+            logical_schema,
+            transform,
+        )
+        .await
+    })
+}
+
+pub(crate) async fn transform_to_logical_with_channel(
+    channel: &Channel,
+    physical_data: Box<dyn EngineData>,
+    physical_schema: &SchemaRef,
+    logical_schema: &Schema,
+    transform: Option<ExpressionRef>,
+) -> DeltaResult<Box<dyn EngineData>> {
     match transform {
         Some(transform) => {
-            let evaluator = engine.evaluation_handler().new_expression_evaluator(
+            let evaluator = channel.create_expression_evaluator(
                 physical_schema.clone(),
                 transform,
                 logical_schema.clone().into(), // TODO: expensive deep clone!
-            )?;
-            evaluator.evaluate(physical_data.as_ref())
+            );
+            channel
+                .evaluate_expression(&evaluator.await?, physical_data)
+                .await
         }
         None => Ok(physical_data),
     }

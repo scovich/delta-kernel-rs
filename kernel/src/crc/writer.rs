@@ -3,6 +3,8 @@
 use url::Url;
 
 use super::Crc;
+use crate::coroutine::kernel::Channel;
+use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _};
 use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error};
@@ -19,6 +21,16 @@ use crate::{DeltaResult, Engine, Error};
 /// writes with `overwrite = false`. If the file already exists, returns
 /// `Err(Error::FileAlreadyExists)`.
 pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> DeltaResult<()> {
+    run_coroutine_with_engine!(engine, async move |channel| {
+        try_write_crc_file_with_channel(channel, path, crc).await
+    })
+}
+
+pub(crate) async fn try_write_crc_file_with_channel(
+    channel: &Channel,
+    path: &Url,
+    crc: &Crc,
+) -> DeltaResult<()> {
     require!(
         crc.file_stats_state.is_complete(),
         Error::ChecksumWriteUnsupported(format!(
@@ -41,9 +53,9 @@ pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> 
         )
     );
     let data = serde_json::to_vec(crc)?;
-    engine
-        .storage_handler()
-        .put(path, data.into(), false /* overwrite */)
+    channel
+        .write_bytes(path, data.into(), false /* overwrite */)
+        .await
 }
 
 #[cfg(test)]
