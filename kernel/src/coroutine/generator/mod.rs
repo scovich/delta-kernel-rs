@@ -59,7 +59,7 @@ use tracing::{error, Instrument as _, Span};
 
 pub use self::adapters::{
     empty, from_iter, unfold, BoxedDeltaResultGenerator, BoxedGenerator, Chain, Flatten, Generator,
-    GeneratorExt, GeneratorStep, IntoGenerator, Iter, Map, MapOk, Unfold,
+    GeneratorExt, GeneratorStep, IntoGenerator, Iter, Map, MapOk, Peekable, Unfold,
 };
 pub(crate) use self::adapters::{unfold_mut_with, unfold_mut_witness};
 use super::core::{noop_context, Channel, ChannelExchange, DeltaFuture, Reply, Step, Task};
