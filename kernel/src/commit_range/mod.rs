@@ -169,33 +169,30 @@ impl CommitRange {
 
         let read_schema = Arc::new(StructType::try_new(actions.iter().map(action_to_field))?);
 
-        Ok(CommitActionsIterator {
-            engine,
+        let state = CommitActionState {
             table_root: self.table_root.clone(),
-            log_path_iter: self.commit_files.clone().into_iter(),
             commit_ordering: self.commit_ordering,
             read_schema,
             latest_protocol,
             latest_metadata,
-        })
+        };
+        let log_paths = self.commit_files.clone().into_iter();
+        Ok(log_paths.scan(state, move |state, log_path| {
+            Some(state.try_advance(engine.as_ref(), log_path))
+        }))
     }
 }
 
-/// Iterator yielded by [`CommitRange::commits`]. Holds the iterator's accumulated
-/// `latest_protocol` / `latest_metadata` and
-/// constructs a fresh [`CommitAction`] for each commit, running per-commit protocol
-/// validation before yielding.
-pub(crate) struct CommitActionsIterator {
-    engine: Arc<dyn Engine>,
+/// Accumulated state for the commit action scan.
+struct CommitActionState {
     table_root: Url,
-    log_path_iter: std::vec::IntoIter<ParsedLogPath>,
     commit_ordering: CommitOrdering,
     read_schema: SchemaRef,
     latest_protocol: Option<Protocol>,
     latest_metadata: Option<Metadata>,
 }
 
-impl CommitActionsIterator {
+impl CommitActionState {
     /// Build and validate a `CommitAction` for `log_path` (seeded with the iterator's accumulated
     /// state), then advance that state for the next commit.
     ///
@@ -204,10 +201,14 @@ impl CommitActionsIterator {
     /// Commits below the anchor are validated/timestamped best-effort against only their own
     /// actions. Another solution is to walk the commit in ascending then reversing in the
     /// [`CommitOrdering::DescendingOrder`] scenario.
-    fn try_advance(&mut self, log_path: ParsedLogPath) -> DeltaResult<CommitAction> {
+    fn try_advance(
+        &mut self,
+        engine: &dyn Engine,
+        log_path: ParsedLogPath,
+    ) -> DeltaResult<CommitAction> {
         let version = log_path.version;
         let commit_action = CommitAction::try_new(
-            self.engine.as_ref(),
+            engine,
             self.table_root.clone(),
             log_path,
             self.read_schema.clone(),
@@ -238,15 +239,6 @@ fn with_version_context(version: Version, err: Error) -> Error {
         Error::Unsupported(msg) => Error::Unsupported(format!("commit v={version}: {msg}")),
         Error::InvalidProtocol(msg) => Error::InvalidProtocol(format!("commit v={version}: {msg}")),
         other => Error::generic(format!("commit v={version}: {other}")),
-    }
-}
-
-impl Iterator for CommitActionsIterator {
-    type Item = DeltaResult<CommitAction>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let log_path = self.log_path_iter.next()?;
-        Some(self.try_advance(log_path))
     }
 }
 
