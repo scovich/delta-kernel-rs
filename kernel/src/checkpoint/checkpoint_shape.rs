@@ -67,9 +67,9 @@ impl CheckpointShape {
 
         // Classify from a V2 checkpoint's `_last_checkpoint` hint when possible, else inspect the
         // file.
-        if let Some(shape) =
-            Self::from_v2_checkpoint_hint(exec, segment, root_checkpoint, file_type, stats_schema)?
-        {
+        let shape =
+            Self::from_v2_checkpoint_hint(exec, segment, root_checkpoint, file_type, stats_schema)?;
+        if let Some(shape) = shape {
             return Ok(shape);
         }
 
@@ -86,7 +86,9 @@ impl CheckpointShape {
                 }
                 // The `sidecar` column may still be all-null (not a manifest), so scan it to
                 // confirm whether a sidecar is actually present.
-                match collect_single_sidecar(exec, root_checkpoint, file_type, &segment.log_root)? {
+                let sidecar =
+                    collect_single_sidecar(exec, root_checkpoint, file_type, &segment.log_root)?;
+                match sidecar {
                     Some(sidecar) => Self::try_new_manifest(
                         exec,
                         sidecar,
@@ -100,7 +102,9 @@ impl CheckpointShape {
             // decide if it is a manifest or a leaf. A JSON leaf has no readable schema,
             // hence no parsed stats.
             FileType::Json => {
-                match collect_single_sidecar(exec, root_checkpoint, file_type, &segment.log_root)? {
+                let sidecar =
+                    collect_single_sidecar(exec, root_checkpoint, file_type, &segment.log_root)?;
+                match sidecar {
                     Some(sidecar) => Self::try_new_manifest(
                         exec,
                         sidecar,
@@ -228,7 +232,8 @@ impl CheckpointShape {
     err
 )]
 fn read_parquet_footer_schema(exec: &dyn PlanExecutor, file: FileMeta) -> DeltaResult<SchemaRef> {
-    Ok(exec.read_parquet_footer(file)?.schema)
+    let footer = exec.read_parquet_footer(file)?;
+    Ok(footer.schema)
 }
 
 /// Read the checkpoint `file`'s `sidecar` column, returning the first referenced sidecar's

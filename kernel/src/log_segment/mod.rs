@@ -1099,10 +1099,10 @@ impl LogSegment {
         file: &FileMeta,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<SchemaRef> {
-        Ok(engine
+        let footer = engine
             .parquet_handler()
-            .read_parquet_footer_with_cancellation(file, cancellation_token.cloned())?
-            .schema)
+            .read_parquet_footer_with_cancellation(file, cancellation_token.cloned())?;
+        Ok(footer.schema)
     }
 
     /// Returns the checkpoint's parquet schema, using the hint from `_last_checkpoint` if
