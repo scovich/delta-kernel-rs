@@ -1143,10 +1143,10 @@ impl<S> Transaction<S> {
         // must be the larger of:
         // - The time at which the writer attempted the commit
         // - One millisecond later than the previous commit's inCommitTimestamp
-        Ok(self
+        let previous_ict = self
             .read_snapshot()?
-            .get_in_commit_timestamp(engine)?
-            .map(|prev_ict| self.commit_timestamp.max(prev_ict + 1)))
+            .get_in_commit_timestamp(engine)?;
+        Ok(previous_ict.map(|prev_ict| self.commit_timestamp.max(prev_ict + 1)))
     }
 
     /// Returns the commit version for this transaction.
