@@ -17,8 +17,9 @@ use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::{CheckpointSpec, CheckpointWriter, V2CheckpointConfig};
 use crate::clustering::{parse_clustering_columns, ClusteringColumnInfo, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
-use crate::coroutine::kernel::Channel;
-use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::engine::EngineConnector;
+use crate::coroutine::kernel::{coroutine, static_coroutine, Channel, StaticCoroutine};
+use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _};
 use crate::crc::{
     try_write_crc_file, Crc, CrcDelta, DomainMetadataState, FileSizeHistogram, FileStats,
     SetTransactionState,
@@ -975,8 +976,21 @@ impl Snapshot {
     ///
     /// [`get_in_commit_timestamp`]: Self::get_in_commit_timestamp
     #[allow(unused)]
-    #[instrument(parent = &self.span, name = "snap.get_ts", skip_all, err)]
     pub fn get_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.get_timestamp_impl(channel).await
+        })
+    }
+
+    /// Return a lazy workflow that gets this snapshot's timestamp.
+    #[internal_api]
+    #[allow(unused)]
+    pub(crate) fn get_timestamp_workflow(self: Arc<Self>) -> StaticCoroutine<i64> {
+        static_coroutine!(async move |channel| self.get_timestamp_impl(channel).await)
+    }
+
+    #[instrument(parent = &self.span, name = "snap.get_ts", skip_all, err)]
+    async fn get_timestamp_impl(&self, channel: &Channel) -> DeltaResult<i64> {
         match self
             .table_configuration()
             .in_commit_timestamp_enablement()?
@@ -991,7 +1005,7 @@ impl Snapshot {
                 }
             }
             InCommitTimestampEnablement::Enabled { .. } => {
-                let ict = self.get_in_commit_timestamp(engine);
+                let ict = self.get_in_commit_timestamp_with_channel(channel).await;
                 ict?.ok_or_else(|| {
                     Error::internal_error(format!(
                         "Invalid state: version {}, ICT is enabled \
@@ -1405,11 +1419,35 @@ impl Snapshot {
     /// # See Also
     ///
     /// - [`Committer::publish`]
-    #[instrument(parent = &self.span, name = "snap.publish", skip_all, err)]
     pub fn publish(
         self: &SnapshotRef,
         engine: &dyn Engine,
         committer: &dyn Committer,
+    ) -> DeltaResult<SnapshotRef> {
+        let is_catalog_committer = committer.is_catalog_committer();
+        let publish = coroutine!(async move |channel| {
+            self.publish_impl(channel, is_catalog_committer).await
+        });
+        EngineConnector::new(engine).drive_with_committer(publish, engine, committer)
+    }
+
+    /// Return a lazy workflow that publishes this snapshot's catalog commits.
+    #[internal_api]
+    #[allow(unused)]
+    pub(crate) fn publish_workflow(
+        self: SnapshotRef,
+        is_catalog_committer: bool,
+    ) -> StaticCoroutine<SnapshotRef> {
+        static_coroutine!(async move |channel| {
+            self.publish_impl(channel, is_catalog_committer).await
+        })
+    }
+
+    #[instrument(parent = &self.span, name = "snap.publish", skip_all, err)]
+    async fn publish_impl(
+        self: &SnapshotRef,
+        channel: &Channel,
+        is_catalog_committer: bool,
     ) -> DeltaResult<SnapshotRef> {
         let unpublished_catalog_commits = self.log_segment().get_unpublished_catalog_commits()?;
 
@@ -1434,7 +1472,6 @@ impl Snapshot {
             )
         );
 
-        let is_catalog_committer = committer.is_catalog_committer();
         require!(
             is_catalog_committer,
             Error::generic(
@@ -1445,7 +1482,7 @@ impl Snapshot {
         let publish_metadata =
             PublishMetadata::try_new(self.version(), unpublished_catalog_commits)?;
 
-        committer.publish(engine, publish_metadata)?;
+        channel.publish(publish_metadata).await?;
 
         Ok(Arc::new(Snapshot::new_with_crc(
             self.log_segment().new_as_published()?,

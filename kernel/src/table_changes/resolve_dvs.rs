@@ -2,6 +2,8 @@ use url::Url;
 
 use super::scan_file::CdfScanFileType;
 use crate::actions::deletion_vector::{deletion_treemap_to_bools, selection_treemap_to_bools};
+use crate::coroutine::kernel::Channel;
+use crate::coroutine::{run_coroutine_with_engine, AsyncOption as _};
 use crate::table_changes::scan_file::CdfScanFile;
 use crate::{DeltaResult, Engine, Error};
 
@@ -38,11 +40,25 @@ pub(crate) fn resolve_scan_file_dv(
     table_root: &Url,
     scan_file: CdfScanFile,
 ) -> DeltaResult<impl Iterator<Item = ResolvedCdfScanFile>> {
-    let add_dv = scan_file.dv_info.get_treemap(engine, table_root)?;
+    run_coroutine_with_engine!(engine, async move |channel| {
+        resolve_scan_file_dv_with_channel(channel, table_root, scan_file).await
+    })
+}
+
+pub(crate) async fn resolve_scan_file_dv_with_channel(
+    channel: &Channel,
+    table_root: &Url,
+    scan_file: CdfScanFile,
+) -> DeltaResult<impl Iterator<Item = ResolvedCdfScanFile>> {
+    let add_dv = scan_file
+        .dv_info
+        .get_treemap_with_channel(channel, table_root)
+        .await?;
     let rm_dv = scan_file
         .remove_dv
         .as_ref()
-        .map(|rm_dv| rm_dv.get_treemap(engine, table_root))
+        .map_async(|rm_dv| rm_dv.get_treemap_with_channel(channel, table_root))
+        .await
         .transpose()?;
     let (add_dv, rm_dv) = match (add_dv, rm_dv, &scan_file.scan_type) {
         (_, Some(_), CdfScanFileType::Remove) => {

@@ -1,20 +1,21 @@
 use std::slice;
 use std::sync::LazyLock;
 
+use delta_kernel_derive::internal_api;
 use url::Url;
 
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::actions::{Metadata, Protocol, COMMIT_INFO_FIELD, METADATA_FIELD, PROTOCOL_FIELD};
 use crate::commit_range::with_version_context;
-use crate::coroutine::kernel::request::ReadJsonFiles;
-use crate::coroutine::kernel::Channel;
-use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _, GeneratorExt as _};
+use crate::coroutine::engine::EngineConnector;
+use crate::coroutine::kernel::{coroutine, Channel, Request};
+use crate::coroutine::{ChannelExt as _, GeneratorExt as _, IntoGenerator};
 use crate::engine_data::RowVisitor as _;
 use crate::path::ParsedLogPath;
 use crate::schema::{lazy_schema_ref, SchemaRef};
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{ensure_table_can_be_read, Operation};
-use crate::{DeltaResult, Engine, Error, FileDataReadResultIterator, Version};
+use crate::{DeltaResult, Engine, EngineData, Error, FileDataReadResultIterator, Version};
 
 /// A Delta log action kind.
 ///
@@ -66,8 +67,8 @@ impl CommitAction {
     /// (`[protocol, metadata, commitInfo]`), overlays any `Protocol` / `Metadata` the commit
     /// carries onto the seed, validates that the kernel can read the resulting configuration,
     /// and resolves the commit timestamp.
-    pub(crate) fn try_new(
-        engine: &dyn Engine,
+    pub(crate) async fn try_new_with_channel(
+        channel: &Channel,
         table_root: Url,
         log_path: ParsedLogPath,
         read_schema: SchemaRef,
@@ -83,7 +84,7 @@ impl CommitAction {
             metadata: seed_metadata,
             timestamp,
         };
-        let extracted_ict = this.read_commit_header(engine)?;
+        let extracted_ict = this.read_commit_header_with_channel(channel).await?;
         // Build the effective table configuration once (when both protocol and metadata are
         // known) and reuse it for both validation and timestamp resolution.
         let table_config = match (&this.protocol, &this.metadata) {
@@ -129,20 +130,12 @@ impl CommitAction {
     /// Read the commit header projected to `[protocol, metadata, commitInfo]`, overlay any
     /// `Protocol` / `Metadata` the commit carries onto `self` (a `None` extraction does NOT clear
     /// the inherited value), and return the commit's `inCommitTimestamp` if present.
-    fn read_commit_header(&mut self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
-        run_coroutine_with_engine!(engine, async move |channel| {
-            self.read_commit_header_with_channel(channel).await
-        })
-    }
-
     async fn read_commit_header_with_channel(
         &mut self,
         channel: &Channel,
     ) -> DeltaResult<Option<i64>> {
         let files = slice::from_ref(&self.log_path.location);
-        let files = files.to_vec();
-        let mut json_iter =
-            channel.flattened(ReadJsonFiles::new(files, HEADER_READ_SCHEMA.clone(), None));
+        let mut json_iter = channel.read_json_files(files, HEADER_READ_SCHEMA.clone(), None);
 
         let mut extracted_protocol: Option<Protocol> = None;
         let mut extracted_metadata: Option<Metadata> = None;
@@ -231,10 +224,29 @@ impl CommitAction {
     /// Batches contain raw actions exactly as recorded in the commit JSON; no column-mapping
     /// translation is applied.
     pub fn get_actions(&self, engine: &dyn Engine) -> DeltaResult<FileDataReadResultIterator> {
-        engine.json_handler().read_json_files(
-            slice::from_ref(&self.log_path.location),
-            self.read_schema.clone(),
-            None,
-        )
+        let connector = EngineConnector::new(engine).with_cancellation_token(None);
+        let actions =
+            connector.iterate_prepared_result_generator(coroutine!(async move |channel| {
+                self.get_actions_generator(channel).await
+            }))?;
+        Ok(Box::new(actions))
+    }
+
+    /// Return a generator over this commit's action batches.
+    #[internal_api]
+    pub(crate) async fn get_actions_generator(
+        &self,
+        channel: &Channel,
+    ) -> DeltaResult<
+        impl IntoGenerator<Request, Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + 'static,
+    > {
+        let pages = channel
+            .prepare_json_files(
+                slice::from_ref(&self.log_path.location),
+                self.read_schema.clone(),
+                None,
+            )
+            .await?;
+        Ok(pages.flatten())
     }
 }

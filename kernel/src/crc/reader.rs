@@ -6,10 +6,14 @@ use tracing::instrument;
 
 use super::Crc;
 use crate::coroutine::kernel::Channel;
-use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _};
+#[cfg(test)]
+use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::ChannelExt as _;
 use crate::metrics::events::CRC_READ_COMPLETED_SPAN;
 use crate::path::{AsUrl as _, ParsedLogPath};
-use crate::{DeltaResult, Engine, Error};
+#[cfg(test)]
+use crate::Engine;
+use crate::{DeltaResult, Error};
 
 /// Attempt to read and parse a CRC file.
 ///
@@ -44,18 +48,7 @@ pub(crate) async fn try_read_crc_file_with_channel(
 /// Read a CRC file, returning `None` if it cannot be read.
 ///
 /// CRC files are optional, so an unreadable one is not an error: the caller proceeds without
-/// it. The failure is logged and metered by [`try_read_crc_file`]'s instrumentation.
-pub(crate) fn read_crc_file_or_none(
-    engine: &dyn Engine,
-    crc_file: &ParsedLogPath,
-) -> Option<Arc<Crc>> {
-    run_coroutine_with_engine!(engine, async move |channel| {
-        Ok(read_crc_file_or_none_with_channel(channel, crc_file).await)
-    })
-    .ok()
-    .flatten()
-}
-
+/// it. The failure is logged and metered by [`try_read_crc_file_with_channel`]'s instrumentation.
 pub(crate) async fn read_crc_file_or_none_with_channel(
     channel: &Channel,
     crc_file: &ParsedLogPath,
