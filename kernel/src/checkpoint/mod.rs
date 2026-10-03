@@ -547,11 +547,10 @@ impl CheckpointWriter {
 
         // Write the `_last_checkpoint` file to `table/_delta_log/_last_checkpoint`
         let filtered_data = FilteredEngineData::with_all_rows_selected(data?);
-        engine.json_handler().write_json_file(
-            &last_checkpoint_path,
-            Box::new(std::iter::once(Ok(filtered_data))),
-            true,
-        )?;
+        let input = Box::new(std::iter::once(Ok(filtered_data)));
+        engine
+            .json_handler()
+            .write_json_file(&last_checkpoint_path, input, true)?;
 
         Ok(())
     }
@@ -780,16 +779,16 @@ pub(crate) fn create_last_checkpoint_data(
     add_actions_counter: i64,
     size_in_bytes: i64,
 ) -> DeltaResult<Box<dyn EngineData>> {
-    engine.evaluation_handler().create_many(
-        LAST_CHECKPOINT_SCHEMA.clone(),
-        vec![vec![
-            version.into(),
-            actions_counter.into(),
-            None::<i64>.into(), // parts = None since we only support single-part checkpoints
-            size_in_bytes.into(),
-            add_actions_counter.into(),
-        ]],
-    )
+    let rows = vec![vec![
+        version.into(),
+        actions_counter.into(),
+        None::<i64>.into(), // parts = None since we only support single-part checkpoints
+        size_in_bytes.into(),
+        add_actions_counter.into(),
+    ]];
+    engine
+        .evaluation_handler()
+        .create_many(LAST_CHECKPOINT_SCHEMA.clone(), rows)
 }
 
 fn build_written_checkpoint_info(

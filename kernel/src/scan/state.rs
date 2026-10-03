@@ -92,14 +92,14 @@ pub fn transform_to_logical(
     transform: Option<ExpressionRef>,
 ) -> DeltaResult<Box<dyn EngineData>> {
     match transform {
-        Some(transform) => engine
-            .evaluation_handler()
-            .new_expression_evaluator(
+        Some(transform) => {
+            let evaluator = engine.evaluation_handler().new_expression_evaluator(
                 physical_schema.clone(),
                 transform,
                 logical_schema.clone().into(), // TODO: expensive deep clone!
-            )?
-            .evaluate(physical_data.as_ref()),
+            )?;
+            evaluator.evaluate(physical_data.as_ref())
+        }
         None => Ok(physical_data),
     }
 }

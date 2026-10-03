@@ -1324,9 +1324,10 @@ impl LogSegment {
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Vec<FileMeta>> {
         // Read checkpoint with just the sidecar column
+        let files = std::slice::from_ref(&checkpoint.location);
         let batches = match checkpoint.extension.as_str() {
             "json" => engine.json_handler().read_json_files_with_cancellation(
-                std::slice::from_ref(&checkpoint.location),
+                files,
                 Self::sidecar_read_schema(),
                 None,
                 cancellation_token.cloned(),
@@ -1334,7 +1335,7 @@ impl LogSegment {
             "parquet" => engine
                 .parquet_handler()
                 .read_parquet_files_with_cancellation(
-                    std::slice::from_ref(&checkpoint.location),
+                    files,
                     Self::sidecar_read_schema(),
                     None,
                     cancellation_token.cloned(),
