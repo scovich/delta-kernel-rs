@@ -82,12 +82,13 @@ impl DvInfo {
         engine: &dyn Engine,
         table_root: &url::Url,
     ) -> DeltaResult<Option<Vec<u64>>> {
+        if self.deletion_vector.is_none() {
+            return Ok(None);
+        }
+        let storage = engine.storage_handler();
         self.deletion_vector
             .as_ref()
-            .map(|dv| {
-                let storage = engine.storage_handler();
-                dv.row_indexes(storage, table_root)
-            })
+            .map(|dv| dv.row_indexes(storage, table_root))
             .transpose()
     }
 }

@@ -991,7 +991,8 @@ impl Snapshot {
                 }
             }
             InCommitTimestampEnablement::Enabled { .. } => {
-                self.get_in_commit_timestamp(engine)?.ok_or_else(|| {
+                let ict = self.get_in_commit_timestamp(engine);
+                ict?.ok_or_else(|| {
                     Error::internal_error(format!(
                         "Invalid state: version {}, ICT is enabled \
                         but get_in_commit_timestamp returned None",
@@ -1433,8 +1434,9 @@ impl Snapshot {
             )
         );
 
+        let is_catalog_committer = committer.is_catalog_committer();
         require!(
-            committer.is_catalog_committer(),
+            is_catalog_committer,
             Error::generic(
                 "There are catalog commits that need publishing, but the committer is not a catalog committer.",
             )
