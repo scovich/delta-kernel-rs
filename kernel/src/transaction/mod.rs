@@ -18,6 +18,8 @@ use crate::committer::{
     Commit, CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
     FileSystemCommitter,
 };
+use crate::coroutine::kernel::Channel;
+use crate::coroutine::run_coroutine_with_engine;
 use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
@@ -1126,6 +1128,15 @@ impl<S> Transaction<S> {
     /// (`is_feature_supported`) is not sufficient -- the `delta.enableInCommitTimestamps`
     /// property must also be `true` (`is_feature_enabled`).
     fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.get_in_commit_timestamp_with_channel(channel).await
+        })
+    }
+
+    async fn get_in_commit_timestamp_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> DeltaResult<Option<i64>> {
         let has_ict = self
             .effective_table_config
             .is_feature_enabled(&TableFeature::InCommitTimestamp);
@@ -1145,7 +1156,8 @@ impl<S> Transaction<S> {
         // - One millisecond later than the previous commit's inCommitTimestamp
         let previous_ict = self
             .read_snapshot()?
-            .get_in_commit_timestamp(engine)?;
+            .get_in_commit_timestamp_with_channel(channel)
+            .await?;
         Ok(previous_ict.map(|prev_ict| self.commit_timestamp.max(prev_ict + 1)))
     }
 
