@@ -207,6 +207,16 @@ pub(crate) fn drive_with_engine<O>(
     }))
 }
 
+/// Drive a coroutine through `engine`, delegating commit and publish requests to `committer`.
+#[internal_api]
+pub(crate) fn drive_with_engine_and_committer<O>(
+    engine: &dyn Engine,
+    committer: &dyn Committer,
+    coroutine: Coroutine<'_, O>,
+) -> DeltaResult<O> {
+    EngineConnector::new(engine).drive_with_committer(coroutine, engine, committer)
+}
+
 #[cfg(feature = "declarative-plans")]
 pub(crate) fn drive_with_plan_executor<O>(
     executor: &dyn PlanExecutor,

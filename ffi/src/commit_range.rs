@@ -1,8 +1,14 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use delta_kernel::commit_range::{CommitAction, CommitRange, DeltaAction as KernelDeltaAction};
+use delta_kernel::coroutine::kernel::coroutine;
+use delta_kernel::coroutine::{
+    iterate_prepared_result_generator_with_engine, iterate_result_generator_with_engine,
+};
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, Error, LogPath, Version};
+use delta_kernel::{
+    DeltaResult, DeltaResultIteratorStatic, Error, FileDataReadResultIterator, LogPath, Version,
+};
 use delta_kernel_ffi_macros::handle_descriptor;
 use url::Url;
 
@@ -310,7 +316,13 @@ fn commit_action_get_actions_impl(
     commit_action: &CommitAction,
     engine: Arc<dyn ExternEngine>,
 ) -> DeltaResult<Handle<ExclusiveFileReadResultIterator>> {
-    let actions = commit_action.get_actions(engine.engine().as_ref())?;
+    let kernel_engine = engine.engine();
+    let actions = iterate_prepared_result_generator_with_engine(
+        kernel_engine.as_ref(),
+        None,
+        coroutine!(async move |channel| { commit_action.get_actions_generator(channel).await }),
+    )?;
+    let actions: FileDataReadResultIterator = Box::new(actions);
     Ok(FileReadResultIterator::into_handle(actions, engine))
 }
 
@@ -409,7 +421,9 @@ fn commit_range_commits_impl(
     start_snapshot: Option<SnapshotRef>,
     actions: Vec<KernelDeltaAction>,
 ) -> DeltaResult<Handle<SharedCommitActionsIterator>> {
-    let inner = commit_range.commits(engine.engine(), start_snapshot, &actions)?;
+    let kernel_engine = engine.engine();
+    let commits = commit_range.commits_generator(start_snapshot, &actions)?;
+    let inner = iterate_result_generator_with_engine(kernel_engine.as_ref(), commits);
     let boxed: CommitActionIter = Box::new(inner);
     let iter = FfiCommitActionsIterator {
         data: Mutex::new(boxed),

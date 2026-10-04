@@ -978,7 +978,7 @@ impl Snapshot {
     #[allow(unused)]
     pub fn get_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
         run_coroutine_with_engine!(engine, async move |channel| {
-            self.get_timestamp_impl(channel).await
+            self.get_timestamp_with_channel(channel).await
         })
     }
 
@@ -986,11 +986,12 @@ impl Snapshot {
     #[internal_api]
     #[allow(unused)]
     pub(crate) fn get_timestamp_workflow(self: Arc<Self>) -> StaticCoroutine<i64> {
-        static_coroutine!(async move |channel| self.get_timestamp_impl(channel).await)
+        static_coroutine!(async move |channel| self.get_timestamp_with_channel(channel).await)
     }
 
     #[instrument(parent = &self.span, name = "snap.get_ts", skip_all, err)]
-    async fn get_timestamp_impl(&self, channel: &Channel) -> DeltaResult<i64> {
+    #[internal_api]
+    pub(crate) async fn get_timestamp_with_channel(&self, channel: &Channel) -> DeltaResult<i64> {
         match self
             .table_configuration()
             .in_commit_timestamp_enablement()?
@@ -1426,7 +1427,8 @@ impl Snapshot {
     ) -> DeltaResult<SnapshotRef> {
         let is_catalog_committer = committer.is_catalog_committer();
         let publish = coroutine!(async move |channel| {
-            self.publish_impl(channel, is_catalog_committer).await
+            self.publish_with_channel(channel, is_catalog_committer)
+                .await
         });
         EngineConnector::new(engine).drive_with_committer(publish, engine, committer)
     }
@@ -1439,12 +1441,14 @@ impl Snapshot {
         is_catalog_committer: bool,
     ) -> StaticCoroutine<SnapshotRef> {
         static_coroutine!(async move |channel| {
-            self.publish_impl(channel, is_catalog_committer).await
+            self.publish_with_channel(channel, is_catalog_committer)
+                .await
         })
     }
 
     #[instrument(parent = &self.span, name = "snap.publish", skip_all, err)]
-    async fn publish_impl(
+    #[internal_api]
+    pub(crate) async fn publish_with_channel(
         self: &SnapshotRef,
         channel: &Channel,
         is_catalog_committer: bool,

@@ -12,6 +12,8 @@ pub use deletion_vector::{
     ExclusiveDvDescriptorMap, KernelDvStorageType,
 };
 use delta_kernel::committer::Committer;
+use delta_kernel::coroutine::drive_with_engine_and_committer;
+use delta_kernel::coroutine::kernel::coroutine;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::transaction::create_table::CreateTableTransactionBuilder;
 use delta_kernel::transaction::data_layout::DataLayout;
@@ -605,7 +607,16 @@ pub unsafe extern "C" fn committed_transaction_publish(
         .ok_or_else(|| {
             delta_kernel::Error::generic("Cannot publish without a post-commit snapshot")
         })
-        .and_then(|snapshot| snapshot.publish(engine.engine().as_ref(), txn.committer.as_ref()))
+        .and_then(|snapshot| {
+            let kernel_engine = engine.engine();
+            let is_catalog_committer = txn.committer.is_catalog_committer();
+            let publish = coroutine!(async move |channel| {
+                snapshot
+                    .publish_with_channel(channel, is_catalog_committer)
+                    .await
+            });
+            drive_with_engine_and_committer(kernel_engine.as_ref(), txn.committer.as_ref(), publish)
+        })
         .map(Into::into)
         .into_extern_result(&engine)
 }
