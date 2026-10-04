@@ -109,8 +109,8 @@ pub trait CancellationToken: AsAny {
 /// [`Error::Cancelled`] rather than silent truncation.
 ///
 /// Before each pull, the token is polled: if cancelled, one `Err(Error::Cancelled)` is yielded
-/// and every subsequent call returns `None`. Any error or normal exhaustion also terminates the
-/// iterator. With no token, or before cancellation, inner items pass through unchanged.
+/// and every subsequent call returns `None`. Otherwise, inner items pass through unchanged,
+/// including errors and exhaustion.
 pub(crate) struct CancellableIterator<I> {
     inner: I,
     token: Option<CancellationTokenRef>,
@@ -137,12 +137,13 @@ where
         if self.done {
             return None;
         }
-        let item = match self.token.as_ref() {
-            Some(token) if token.is_cancelled() => Some(Err(Error::Cancelled)),
-            _ => self.inner.next(),
-        };
-        self.done = !matches!(&item, Some(Ok(_)));
-        item
+        if let Some(token) = self.token.as_ref() {
+            if token.is_cancelled() {
+                self.done = true;
+                return Some(Err(Error::Cancelled));
+            }
+        }
+        self.inner.next()
     }
 }
 
@@ -179,10 +180,12 @@ mod tests {
 
     #[test]
     fn no_token_passes_through_unchanged() {
-        let out: Vec<_> = CancellableIterator::new(ok_iter(3), None)
-            .map(Result::unwrap)
-            .collect();
-        assert_eq!(out, vec![0, 1, 2]);
+        let inner = vec![Ok(0), Err(Error::generic("boom")), Ok(2)].into_iter();
+        let mut iter = CancellableIterator::new(inner, None);
+        assert!(matches!(iter.next(), Some(Ok(0))));
+        assert!(matches!(iter.next(), Some(Err(Error::Generic(_)))));
+        assert!(matches!(iter.next(), Some(Ok(2))));
+        assert!(iter.next().is_none());
     }
 
     #[test]
@@ -220,13 +223,13 @@ mod tests {
     }
 
     #[test]
-    fn inner_error_terminates_iteration() {
+    fn inner_error_passes_through_without_terminating_iteration() {
         let token: CancellationTokenRef = Arc::new(TestToken::default());
         let inner = vec![Ok(0), Err(Error::generic("boom")), Ok(99)].into_iter();
         let mut iter = CancellableIterator::new(inner, Some(token));
         assert!(matches!(iter.next(), Some(Ok(0))));
         assert!(matches!(iter.next(), Some(Err(Error::Generic(_)))));
-        // Fused on the inner error: the trailing Ok is never yielded.
+        assert!(matches!(iter.next(), Some(Ok(99))));
         assert!(iter.next().is_none());
     }
 
