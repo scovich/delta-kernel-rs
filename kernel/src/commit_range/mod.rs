@@ -65,7 +65,7 @@ use crate::coroutine::generator::{map_async, AsyncIntoIterator as _, GeneratorEx
 use crate::coroutine::kernel::{Channel, StaticGeneratorCoroutine};
 use crate::path::ParsedLogPath;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
-use crate::snapshot::SnapshotRef;
+use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_features::Operation;
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::{DeltaResult, Engine, Error, Version};
@@ -138,7 +138,7 @@ impl CommitRange {
         start_snapshot: Option<SnapshotRef>,
         actions: &[DeltaAction],
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<CommitAction>> + Send> {
-        let commits = self.commits_generator(start_snapshot, actions)?;
+        let commits = self.commits_generator(start_snapshot.as_deref(), actions)?;
         Ok(EngineConnector::new(engine.as_ref()).iterate_result_generator(commits))
     }
 
@@ -146,14 +146,14 @@ impl CommitRange {
     #[internal_api]
     pub(crate) fn commits_generator(
         &self,
-        start_snapshot: Option<SnapshotRef>,
+        start_snapshot: Option<&Snapshot>,
         actions: &[DeltaAction],
     ) -> DeltaResult<StaticGeneratorCoroutine<DeltaResult<CommitAction>>> {
         if actions.is_empty() {
             return Err(Error::generic("at least one DeltaAction must be requested"));
         }
 
-        let (latest_protocol, latest_metadata) = match &start_snapshot {
+        let (latest_protocol, latest_metadata) = match start_snapshot {
             Some(snapshot) => {
                 if snapshot.table_root() != &self.table_root {
                     return Err(Error::generic(format!(

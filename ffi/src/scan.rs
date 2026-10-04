@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
-use delta_kernel::coroutine::{run_coroutine_with_engine, run_coroutine_with_storage};
+use delta_kernel::coroutine::drive_with_storage;
 use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::scan::{PartitionValuesOptions, Scan, ScanBuilder, ScanMetadata, StatsOptions};
 use delta_kernel::schema::MetadataValue;
@@ -23,10 +23,10 @@ use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressi
 use crate::expressions::SharedExpression;
 use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
 use crate::{
-    kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn, ExternEngine,
-    ExternResult, IntoExternResult, KernelBoolSlice, KernelRowIndexArray, KernelStringSlice,
-    NullableCvoid, OptionalValue, SharedExternEngine, SharedSchema, SharedSnapshot,
-    TryFromStringSlice,
+    drive_kernel, kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn,
+    ExternEngine, ExternResult, IntoExternResult, KernelBoolSlice, KernelRowIndexArray,
+    KernelStringSlice, NullableCvoid, OptionalValue, SharedExternEngine, SharedSchema,
+    SharedSnapshot, TryFromStringSlice,
 };
 
 #[handle_descriptor(target=Scan, mutable=false, sized=true)]
@@ -456,22 +456,17 @@ pub unsafe extern "C" fn scan_declarative_metadata_plan(
     scan: Handle<SharedScan>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<OptionalValue<crate::KernelOwnedBytes>> {
-    let scan = unsafe { scan.as_ref() };
+    let scan = unsafe { scan.clone_as_arc() };
     let extern_engine = unsafe { engine.as_ref() };
-    let inner_engine = extern_engine.engine();
-    scan_declarative_metadata_plan_impl(scan, inner_engine.as_ref())
-        .into_extern_result(&extern_engine)
+    scan_declarative_metadata_plan_impl(&scan, extern_engine).into_extern_result(&extern_engine)
 }
 
 #[cfg(feature = "declarative-plans")]
 fn scan_declarative_metadata_plan_impl(
-    scan: &Scan,
-    engine: &dyn delta_kernel::Engine,
+    scan: &Arc<Scan>,
+    engine: &dyn ExternEngine,
 ) -> DeltaResult<OptionalValue<crate::KernelOwnedBytes>> {
-    let plan = run_coroutine_with_engine!(engine, async move |channel| {
-        scan.declarative_metadata_scan_plan_with_channel(channel)
-            .await
-    })?;
+    let plan = drive_kernel(engine, scan.declarative_metadata_scan_plan_workflow())?;
     Ok(plan
         .map(|plan| {
             delta_kernel::Operation::QueryPlan(plan)
@@ -894,13 +889,8 @@ fn selection_vector_from_dv_impl(
     extern_engine: &dyn ExternEngine,
     root_url: DeltaResult<Url>,
 ) -> DeltaResult<KernelBoolSlice> {
-    let engine = extern_engine.engine();
-    let root_url = root_url?;
-    let selection_vector = run_coroutine_with_engine!(engine.as_ref(), async move |channel| {
-        dv_info
-            .get_selection_vector_with_channel(channel, &root_url)
-            .await
-    })?;
+    let workflow = dv_info.get_selection_vector_workflow(&root_url?);
+    let selection_vector = drive_kernel(extern_engine, workflow)?;
     match selection_vector {
         Some(v) => Ok(v.into()),
         None => Ok(KernelBoolSlice::empty()),
@@ -930,12 +920,8 @@ fn row_indexes_from_dv_impl(
     let engine = extern_engine.engine();
     let root_url = root_url?;
     let row_indexes = if dv_info.has_vector() {
-        let storage = engine.storage_handler();
-        run_coroutine_with_storage!(storage.as_ref(), None, async move |channel| {
-            dv_info
-                .get_row_indexes_with_channel(channel, &root_url)
-                .await
-        })?
+        let workflow = dv_info.get_row_indexes_workflow(&root_url);
+        drive_with_storage(engine.storage_handler().as_ref(), None, workflow)?
     } else {
         None
     };

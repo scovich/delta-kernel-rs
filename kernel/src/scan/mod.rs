@@ -1150,10 +1150,11 @@ impl Scan {
     #[internal_api]
     #[allow(unused)]
     pub(crate) fn declarative_metadata_scan_plan_workflow(
-        self: Arc<Self>,
+        self: &Arc<Self>,
     ) -> StaticCoroutine<Option<Plan>> {
+        let scan = Arc::clone(self);
         static_coroutine!(async move |channel| {
-            self.declarative_metadata_scan_plan_with_channel(channel)
+            scan.declarative_metadata_scan_plan_with_channel(channel)
                 .await
         })
     }
@@ -1536,9 +1537,11 @@ pub fn selection_vector(
 #[internal_api]
 #[allow(unused)]
 pub(crate) fn selection_vector_workflow(
-    descriptor: DeletionVectorDescriptor,
-    table_root: Url,
+    descriptor: &DeletionVectorDescriptor,
+    table_root: &Url,
 ) -> StaticCoroutine<Vec<bool>> {
+    let descriptor = descriptor.clone();
+    let table_root = table_root.clone();
     static_coroutine!(async move |channel| {
         selection_vector_with_channel(channel, &descriptor, &table_root).await
     })
