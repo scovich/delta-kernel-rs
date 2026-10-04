@@ -52,6 +52,23 @@ pub trait GeneratorExt {
         )
     }
 
+    /// Counterpart of `Itertools::try_collect`: collects successful yielded items, stopping at the
+    /// first item or generator error.
+    fn try_collect<T, C>(mut self) -> impl Future<Output = DeltaResult<C>> + Send
+    where
+        Self: Generator<Item = DeltaResult<T>, Output = ()> + Sized + Unpin,
+        T: Send + 'static,
+        C: Default + Extend<T> + Send,
+    {
+        async move {
+            let mut output = C::default();
+            while let Some(item) = self.next().await? {
+                output.extend([item?]);
+            }
+            Ok(output)
+        }
+    }
+
     /// Counterpart of [`Iterator::map`]: transforms each yielded item.
     fn map<F>(self, map: F) -> Map<Self, F>
     where
@@ -66,6 +83,18 @@ pub trait GeneratorExt {
         Self: Sized,
     {
         MapOk { inner: self, map }
+    }
+
+    /// Counterpart of `Itertools::filter_ok`: retains successful yielded items matching
+    /// `predicate`.
+    fn filter_ok<F>(self, predicate: F) -> FilterOk<Self, F>
+    where
+        Self: Sized,
+    {
+        FilterOk {
+            inner: self,
+            predicate,
+        }
     }
 
     /// Counterpart of [`Iterator::peekable`]: allows inspecting the next item before consuming it.
@@ -173,6 +202,7 @@ impl<P: Send + 'static, Y: Send + 'static, O: Send + 'static> GeneratorExt
 impl<'a, Y: Send + 'static, O: Send + 'static> GeneratorExt for BoxedGenerator<'a, Y, O> {}
 impl<G, F> GeneratorExt for Map<G, F> {}
 impl<G, F> GeneratorExt for MapOk<G, F> {}
+impl<G, F> GeneratorExt for FilterOk<G, F> {}
 impl<G, I> GeneratorExt for Peekable<G, I> {}
 impl<A, B> GeneratorExt for Chain<A, B> {}
 impl<I> GeneratorExt for Iter<I> {}
@@ -339,6 +369,73 @@ where
             Poll::Ready(Ok(GeneratorStep::Done(()))) => Poll::Ready(Ok(GeneratorStep::Done(()))),
             Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
             Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Generator returned by [`GeneratorExt::filter_ok`].
+pub struct FilterOk<G, F> {
+    inner: G,
+    predicate: F,
+}
+
+impl<P, G, T, F> IntoGenerator<P> for FilterOk<G, F>
+where
+    P: Send + 'static,
+    G: IntoGenerator<P, Item = DeltaResult<T>, Output = ()>,
+    T: Send + 'static,
+    F: FnMut(&T) -> bool + Send + Unpin + 'static,
+{
+    type Item = DeltaResult<T>;
+    type Output = ();
+
+    fn bind_to<'a>(
+        self,
+        channel: ChannelBinding<'a, P>,
+    ) -> impl Generator<Item = DeltaResult<T>, Output = ()> + Unpin + 'a {
+        FilterOk {
+            inner: self.inner.bind_to(channel),
+            predicate: self.predicate,
+        }
+    }
+
+    fn bind_boxed<'a>(
+        self: Box<Self>,
+        channel: ChannelBinding<'a, P>,
+    ) -> BoxedGenerator<'a, DeltaResult<T>> {
+        Box::new((*self).bind_to(channel))
+    }
+}
+
+impl<G, T, F> Generator for FilterOk<G, F>
+where
+    G: Generator<Item = DeltaResult<T>, Output = ()> + Unpin,
+    T: Send + 'static,
+    F: FnMut(&T) -> bool + Send + Unpin,
+{
+    type Item = DeltaResult<T>;
+    type Output = ();
+
+    fn poll_step(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<DeltaResult<GeneratorStep<DeltaResult<T>, ()>>> {
+        let this = self.get_mut();
+        loop {
+            match Pin::new(&mut this.inner).poll_step(context) {
+                Poll::Ready(Ok(GeneratorStep::Yield(Ok(item)))) if (this.predicate)(&item) => {
+                    return Poll::Ready(Ok(GeneratorStep::Yield(Ok(item))));
+                }
+                Poll::Ready(Ok(GeneratorStep::Yield(Ok(_)))) => {}
+                Poll::Ready(Ok(GeneratorStep::Yield(Err(err)))) => {
+                    return Poll::Ready(Ok(GeneratorStep::Yield(Err(err))));
+                }
+                Poll::Ready(Ok(GeneratorStep::Done(()))) => {
+                    return Poll::Ready(Ok(GeneratorStep::Done(())));
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
         }
     }
 }

@@ -527,6 +527,46 @@ fn map_passes_through_errors_after_mapping_earlier_items() {
 }
 
 #[test]
+fn filter_ok_retains_matches_and_passes_through_item_errors() {
+    let items = vec![Ok(1), Ok(2), Err(Error::generic("item failed")), Ok(4)];
+    let items = from_iter(items).filter_ok(|item: &i32| item % 2 == 0);
+    let mut coroutine = coroutine!(async move |channel| {
+        let mut items = items.bind(channel);
+        assert_eq!(items.next().await?.transpose()?, Some(2));
+        let error = items.next().await?.unwrap().unwrap_err();
+        assert!(error.to_string().contains("item failed"));
+        assert_eq!(items.next().await?.transpose()?, Some(4));
+        assert!(items.next().await?.is_none());
+        Ok(())
+    });
+
+    assert!(matches!(
+        coroutine.try_advance().unwrap(),
+        CoroutineStep::Done(())
+    ));
+}
+
+#[test]
+fn try_collect_collects_successes_and_short_circuits_item_errors() {
+    let items: Vec<DeltaResult<_>> = vec![Ok(1), Ok(2)];
+    let mut coroutine = coroutine!(async move |channel| {
+        let collected: Vec<_> = from_iter(items).bind(channel).try_collect().await?;
+        Ok(collected)
+    });
+    let CoroutineStep::Done(collected) = coroutine.try_advance().unwrap() else {
+        panic!("generator did not complete");
+    };
+    assert_eq!(collected, [1, 2]);
+
+    let items = vec![Ok(1), Err(Error::generic("item failed")), Ok(3)];
+    let mut coroutine = coroutine!(async move |channel| {
+        let collected: Vec<_> = from_iter(items).bind(channel).try_collect().await?;
+        Ok(collected)
+    });
+    assert_result_error_with_message(coroutine.try_advance(), "item failed");
+}
+
+#[test]
 fn channel_taking_generator_supports_static_and_borrowed_state() {
     fn operation<'a>(
         channel: impl Deref<Target = Channel> + Send + 'a,
