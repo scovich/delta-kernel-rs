@@ -24,7 +24,7 @@ use crate::path::LogPathFileType::*;
 use crate::path::{
     may_begin_listable_log_path, CheckpointInstance, LogPathFileType, ParsedLogPath,
 };
-use crate::{DeltaResult, Error, StorageHandler, Version};
+use crate::{DeltaResult, Error, FileMeta, StorageHandler, Version};
 
 #[cfg(test)]
 mod tests;
@@ -77,9 +77,18 @@ pub(crate) fn list_delta_log_from_storage(
     cancellation_token: Option<&CancellationTokenRef>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ParsedLogPath>>> {
     let start_from = log_root.join(&format!("{start_version:020}"))?;
+    let files = storage.list_from_with_cancellation(&start_from, cancellation_token.cloned())?;
+    Ok(parse_delta_log_listing(files, log_root, end_version))
+}
+
+/// Parse and filter one ascending Delta log listing.
+fn parse_delta_log_listing(
+    files: impl Iterator<Item = DeltaResult<FileMeta>>,
+    log_root: &Url,
+    end_version: Version,
+) -> impl Iterator<Item = DeltaResult<ParsedLogPath>> {
     let log_root_str = log_root.to_string();
-    let files = storage
-        .list_from_with_cancellation(&start_from, cancellation_token.cloned())?
+    files
         // The listing is sorted by full path, so nothing relevant follows the first relative path
         // past the version-named region (see `may_begin_listable_log_path`). Stopping there avoids
         // paging through `_staged_commits/` and `_sidecars/`, which can hold thousands of files.
@@ -105,8 +114,7 @@ pub(crate) fn list_delta_log_from_storage(
             // discard any path with too-large version; keep errors
             Ok(path) => path.version <= end_version,
             Err(_) => true,
-        });
-    Ok(files)
+        })
 }
 
 /// Groups all checkpoint parts according to the checkpoint they belong to.
