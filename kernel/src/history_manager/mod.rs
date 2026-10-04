@@ -24,13 +24,14 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
 
 use error::{LogHistoryError, NearestTimestamp};
-use itertools::Itertools;
 use search::{binary_search_by_key_with_bounds, Bound, SearchError};
 use tracing::{info, trace, warn};
 use url::Url;
 
+use crate::coroutine::kernel::Channel;
+use crate::coroutine::{run_coroutine_with_engine, GeneratorExt as _};
 use crate::log_segment::LogSegment;
-use crate::log_segment_files::{list_delta_log_from_storage, should_process_log_file};
+use crate::log_segment_files::{list_delta_log_generator, should_process_log_file};
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::InCommitTimestampEnablement;
@@ -712,23 +713,38 @@ pub fn timestamp_range_to_versions(
 ///   before the catalog exposes the table. Otherwise a filesystem-only client could list an empty
 ///   `_delta_log/` and "create" a table at the same location. An empty listing here therefore
 ///   indicates a broken invariant rather than a normal missing version.
-#[tracing::instrument(skip(engine), ret, err)]
 fn get_earliest_published_commit_version(
     engine: &dyn Engine,
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
 ) -> DeltaResult<Version> {
+    run_coroutine_with_engine!(engine, async move |channel| {
+        get_earliest_published_commit_version_with_channel(
+            channel,
+            log_root,
+            earliest_ratified_commit_version,
+        )
+        .await
+    })
+}
+
+#[tracing::instrument(
+    name = "get_earliest_published_commit_version",
+    skip(channel),
+    ret,
+    err
+)]
+async fn get_earliest_published_commit_version_with_channel(
+    channel: &Channel,
+    log_root: &Url,
+    earliest_ratified_commit_version: Option<Version>,
+) -> DeltaResult<Version> {
     // TODO(#3188): thread a cancellation token through the history-manager entry points.
-    let listing = list_delta_log_from_storage(
-        engine.storage_handler().as_ref(),
-        log_root,
-        0,
-        Version::MAX,
-        None,
-    )?;
+    let listing = list_delta_log_generator(channel, log_root, 0, Version::MAX)?;
     listing
-        .filter_ok(|f| f.file_type == LogPathFileType::Commit)
+        .filter_ok(|f: &ParsedLogPath| f.file_type == LogPathFileType::Commit)
         .next()
+        .await?
         .transpose()?
         .map(|f| f.version)
         .ok_or_else(|| {
@@ -764,9 +780,25 @@ fn get_earliest_published_commit_version(
 /// broken CCv2 invariant (ratified commit 0 with no published filesystem commit).
 /// - [`LogHistoryError::NoRecreatableCommit`] if commits exist but neither
 /// `00...00.json` nor a complete checkpoint that anchors the smallest commit is present.
-#[tracing::instrument(skip(engine), err, ret)]
+#[allow(clippy::doc_lazy_continuation)]
 fn get_earliest_recreatable_commit(
     engine: &dyn Engine,
+    log_root: &Url,
+    earliest_ratified_commit_version: Option<Version>,
+) -> DeltaResult<Version> {
+    run_coroutine_with_engine!(engine, async move |channel| {
+        get_earliest_recreatable_commit_with_channel(
+            channel,
+            log_root,
+            earliest_ratified_commit_version,
+        )
+        .await
+    })
+}
+
+#[tracing::instrument(name = "get_earliest_recreatable_commit", skip(channel), err, ret)]
+async fn get_earliest_recreatable_commit_with_channel(
+    channel: &Channel,
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
 ) -> DeltaResult<Version> {
@@ -777,14 +809,8 @@ fn get_earliest_recreatable_commit(
     let mut earliest_commit_version: Option<Version> = None;
 
     // TODO(#3188): thread a cancellation token through the history-manager entry points.
-    let listing = list_delta_log_from_storage(
-        engine.storage_handler().as_ref(),
-        log_root,
-        0,
-        Version::MAX,
-        None,
-    )?;
-    for parsed_result in listing {
+    let mut listing = list_delta_log_generator(channel, log_root, 0, Version::MAX)?;
+    while let Some(parsed_result) = listing.next().await? {
         let parsed_log_path = parsed_result?;
         if !should_process_log_file(&parsed_log_path) {
             continue;
