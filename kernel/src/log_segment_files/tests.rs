@@ -1869,7 +1869,11 @@ fn precancelled_token_stops_listing_before_any_storage_call() {
 
     let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
 
-    let result = list_delta_log_from_storage(&storage, &log_root, 0, Version::MAX, Some(&token));
+    let result = run_coroutine_with_storage!(&storage, Some(token), async move |channel| {
+        let listing = list_delta_log_generator(channel, &log_root, 0, Version::MAX)?;
+        let listed: Vec<_> = listing.try_collect().await?;
+        Ok(listed)
+    });
     assert!(matches!(result, Err(Error::Cancelled)));
     assert_eq!(pulled.load(Ordering::Relaxed), 0);
 }
@@ -1882,16 +1886,16 @@ fn mid_listing_cancellation_yields_terminal_error_not_silent_truncation() {
 
     let token = Arc::new(TestCancellationToken::default());
     let token_ref: CancellationTokenRef = token.clone();
-    let mut iter =
-        list_delta_log_from_storage(&storage, &log_root, 0, Version::MAX, Some(&token_ref))
-            .unwrap();
 
-    assert!(matches!(iter.next(), Some(Ok(p)) if p.version == 0));
-    assert!(matches!(iter.next(), Some(Ok(p)) if p.version == 1));
-
-    token.cancel();
-
-    assert!(matches!(iter.next(), Some(Err(Error::Cancelled))));
+    let result = run_coroutine_with_storage!(&storage, Some(token_ref), async move |channel| {
+        let mut listing = list_delta_log_generator(channel, &log_root, 0, Version::MAX)?;
+        assert!(matches!(listing.next().await?, Some(Ok(p)) if p.version == 0));
+        assert!(matches!(listing.next().await?, Some(Ok(p)) if p.version == 1));
+        token.cancel();
+        listing.next().await?;
+        Ok(())
+    });
+    assert!(matches!(result, Err(Error::Cancelled)));
     // The listing stopped early rather than draining all 100 entries.
     assert!(pulled.load(Ordering::Relaxed) < 100);
 }
@@ -1901,9 +1905,10 @@ fn mid_listing_cancellation_yields_terminal_error_not_silent_truncation() {
 fn listing_without_token_is_unchanged() {
     let (log_root, _pulled, storage) = finite_listing_handler(5);
 
-    let listed: Vec<_> = list_delta_log_from_storage(&storage, &log_root, 0, Version::MAX, None)
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
+    let listed: Vec<_> = run_coroutine_with_storage!(&storage, None, async move |channel| {
+        let listing = list_delta_log_generator(channel, &log_root, 0, Version::MAX)?;
+        listing.try_collect().await
+    })
+    .unwrap();
     assert_eq!(listed.len(), 5);
 }
