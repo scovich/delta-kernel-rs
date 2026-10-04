@@ -224,6 +224,16 @@ pub(crate) fn drive_with_engine<O>(
     }))
 }
 
+/// Drive a coroutine through `engine`, delegating commit and publish requests to `committer`.
+#[internal_api]
+pub(crate) fn drive_with_engine_and_committer<O>(
+    engine: &dyn Engine,
+    committer: &dyn Committer,
+    coroutine: Coroutine<'_, O>,
+) -> DeltaResult<O> {
+    EngineConnector::new(engine).drive_with_committer(coroutine, engine, committer)
+}
+
 #[cfg(feature = "declarative-plans")]
 pub(crate) fn drive_with_plan_executor<O>(
     executor: &dyn PlanExecutor,
@@ -550,6 +560,30 @@ impl EngineConnector {
         )?;
         Ok((locations, output))
     }
+}
+
+/// Return an iterator that drives a fallible generator through `engine`.
+#[internal_api]
+pub(crate) fn iterate_result_generator_with_engine<Item: Send + 'static, O: Send + 'static>(
+    engine: &dyn Engine,
+    generator: impl Into<StaticGeneratorCoroutine<DeltaResult<Item>, O>>,
+) -> impl Iterator<Item = DeltaResult<Item>> + Send {
+    EngineConnector::new(engine).iterate_result_generator(generator)
+}
+
+/// Prepare and iterate a fallible generator through one connector captured from `engine`.
+#[internal_api]
+pub(crate) fn iterate_prepared_result_generator_with_engine<G, Item>(
+    engine: &dyn Engine,
+    coroutine: Coroutine<'_, G>,
+) -> DeltaResult<impl Iterator<Item = DeltaResult<Item>> + Send>
+where
+    G: IntoGenerator<Request, Item = DeltaResult<Item>, Output = ()>,
+    Item: Send + 'static,
+{
+    let connector = EngineConnector::new(engine);
+    let generator = connector.prepare_generator(coroutine)?;
+    Ok(connector.iterate_result_generator(generator))
 }
 
 /// Construct and drive a coroutine through an [`Engine`].

@@ -83,6 +83,7 @@ impl DvInfo {
         })
     }
 
+    #[internal_api]
     pub(crate) async fn get_selection_vector_with_channel(
         &self,
         channel: &Channel,
@@ -119,6 +120,7 @@ impl DvInfo {
         })
     }
 
+    #[internal_api]
     pub(crate) async fn get_row_indexes_with_channel(
         &self,
         channel: &Channel,

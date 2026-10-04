@@ -663,10 +663,13 @@ impl<'a, C: ?Sized, Op: PagedOperation> Pages<'a, C, Op> {
 
 #[doc(inline)]
 #[internal_api]
-pub(crate) use self::engine::drive_with_engine;
+pub(crate) use self::engine::drive_with_storage;
 #[doc(inline)]
 #[internal_api]
-pub(crate) use self::engine::drive_with_storage;
+pub(crate) use self::engine::{
+    drive_with_engine, drive_with_engine_and_committer,
+    iterate_prepared_result_generator_with_engine, iterate_result_generator_with_engine,
+};
 #[doc(inline)]
 #[internal_api]
 pub(crate) use self::engine::{run_coroutine_with_engine, run_coroutine_with_storage};

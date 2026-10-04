@@ -1165,7 +1165,8 @@ impl Scan {
         fields(enable_call_frame),
         err
     )]
-    async fn declarative_metadata_scan_plan_with_channel(
+    #[internal_api]
+    pub(crate) async fn declarative_metadata_scan_plan_with_channel(
         &self,
         channel: &Channel,
     ) -> DeltaResult<Option<Plan>> {
