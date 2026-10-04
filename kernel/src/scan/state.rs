@@ -74,11 +74,14 @@ impl DvInfo {
     #[internal_api]
     #[allow(unused)]
     pub(crate) fn get_selection_vector_workflow(
-        self,
-        table_root: url::Url,
+        &self,
+        table_root: &url::Url,
     ) -> StaticCoroutine<Option<Vec<bool>>> {
+        let dv_info = self.clone();
+        let table_root = table_root.clone();
         static_coroutine!(async move |channel| {
-            self.get_selection_vector_with_channel(channel, &table_root)
+            dv_info
+                .get_selection_vector_with_channel(channel, &table_root)
                 .await
         })
     }
@@ -111,11 +114,14 @@ impl DvInfo {
     #[internal_api]
     #[allow(unused)]
     pub(crate) fn get_row_indexes_workflow(
-        self,
-        table_root: url::Url,
+        &self,
+        table_root: &url::Url,
     ) -> StaticCoroutine<Option<Vec<u64>>> {
+        let dv_info = self.clone();
+        let table_root = table_root.clone();
         static_coroutine!(async move |channel| {
-            self.get_row_indexes_with_channel(channel, &table_root)
+            dv_info
+                .get_row_indexes_with_channel(channel, &table_root)
                 .await
         })
     }

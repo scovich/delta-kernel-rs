@@ -1,14 +1,11 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use delta_kernel::commit_range::{CommitAction, CommitRange, DeltaAction as KernelDeltaAction};
-use delta_kernel::coroutine::kernel::coroutine;
 use delta_kernel::coroutine::{
     iterate_prepared_result_generator_with_engine, iterate_result_generator_with_engine,
 };
-use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{
-    DeltaResult, DeltaResultIteratorStatic, Error, FileDataReadResultIterator, LogPath, Version,
-};
+use delta_kernel::snapshot::Snapshot;
+use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, Error, LogPath, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use url::Url;
 
@@ -317,12 +314,9 @@ fn commit_action_get_actions_impl(
     engine: Arc<dyn ExternEngine>,
 ) -> DeltaResult<Handle<ExclusiveFileReadResultIterator>> {
     let kernel_engine = engine.engine();
-    let actions = iterate_prepared_result_generator_with_engine(
-        kernel_engine.as_ref(),
-        None,
-        coroutine!(async move |channel| { commit_action.get_actions_generator(channel).await }),
-    )?;
-    let actions: FileDataReadResultIterator = Box::new(actions);
+    let workflow = commit_action.get_actions_coroutine();
+    let actions =
+        iterate_prepared_result_generator_with_engine(kernel_engine.as_ref(), None, workflow)?;
     Ok(FileReadResultIterator::into_handle(actions, engine))
 }
 
@@ -409,7 +403,7 @@ pub unsafe extern "C" fn commit_range_commits_with_snapshot(
     let engine_ref = unsafe { engine.as_ref() };
     let commit_range = unsafe { commit_range.as_ref() };
     let engine_arc = unsafe { engine.clone_as_arc() };
-    let start_snapshot = unsafe { start_snapshot.clone_as_arc() };
+    let start_snapshot = unsafe { start_snapshot.as_ref() };
     let actions = unsafe { parse_actions(actions, actions_len) };
     commit_range_commits_impl(commit_range, engine_arc, Some(start_snapshot), actions)
         .into_extern_result(&engine_ref)
@@ -418,7 +412,7 @@ pub unsafe extern "C" fn commit_range_commits_with_snapshot(
 fn commit_range_commits_impl(
     commit_range: &CommitRange,
     engine: Arc<dyn ExternEngine>,
-    start_snapshot: Option<SnapshotRef>,
+    start_snapshot: Option<&Snapshot>,
     actions: Vec<KernelDeltaAction>,
 ) -> DeltaResult<Handle<SharedCommitActionsIterator>> {
     let kernel_engine = engine.engine();

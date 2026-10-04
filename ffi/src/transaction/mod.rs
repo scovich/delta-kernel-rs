@@ -12,8 +12,6 @@ pub use deletion_vector::{
     ExclusiveDvDescriptorMap, KernelDvStorageType,
 };
 use delta_kernel::committer::Committer;
-use delta_kernel::coroutine::drive_with_engine_and_committer;
-use delta_kernel::coroutine::kernel::coroutine;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::transaction::create_table::CreateTableTransactionBuilder;
 use delta_kernel::transaction::data_layout::DataLayout;
@@ -39,8 +37,8 @@ use crate::handle::Handle;
 use crate::scan::EngineSchema;
 use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
 use crate::{
-    unwrap_and_parse_path_as_url, DeltaResult, ExclusiveEngineData, ExternEngine,
-    KernelStringSlice, OptionalValue, SharedExternEngine, SharedSnapshot, Snapshot,
+    drive_kernel_with_committer, unwrap_and_parse_path_as_url, DeltaResult, ExclusiveEngineData,
+    ExternEngine, KernelStringSlice, OptionalValue, SharedExternEngine, SharedSnapshot, Snapshot,
     TryFromStringSlice, Url,
 };
 
@@ -608,14 +606,8 @@ pub unsafe extern "C" fn committed_transaction_publish(
             delta_kernel::Error::generic("Cannot publish without a post-commit snapshot")
         })
         .and_then(|snapshot| {
-            let kernel_engine = engine.engine();
-            let is_catalog_committer = txn.committer.is_catalog_committer();
-            let publish = coroutine!(async move |channel| {
-                snapshot
-                    .publish_with_channel(channel, is_catalog_committer)
-                    .await
-            });
-            drive_with_engine_and_committer(kernel_engine.as_ref(), txn.committer.as_ref(), publish)
+            let workflow = snapshot.publish_workflow(txn.committer.is_catalog_committer());
+            drive_kernel_with_committer(engine, txn.committer.as_ref(), workflow)
         })
         .map(Into::into)
         .into_extern_result(&engine)

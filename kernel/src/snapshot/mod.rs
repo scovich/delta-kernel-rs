@@ -985,8 +985,11 @@ impl Snapshot {
     /// Return a lazy workflow that gets this snapshot's timestamp.
     #[internal_api]
     #[allow(unused)]
-    pub(crate) fn get_timestamp_workflow(self: Arc<Self>) -> StaticCoroutine<i64> {
-        static_coroutine!(async move |channel| self.get_timestamp_with_channel(channel).await)
+    pub(crate) fn get_timestamp_workflow(self: &Arc<Self>) -> StaticCoroutine<i64> {
+        let snapshot = Arc::clone(self);
+        static_coroutine!(async move |channel| {
+            snapshot.get_timestamp_with_channel(channel).await
+        })
     }
 
     #[instrument(parent = &self.span, name = "snap.get_ts", skip_all, err)]
@@ -1437,11 +1440,13 @@ impl Snapshot {
     #[internal_api]
     #[allow(unused)]
     pub(crate) fn publish_workflow(
-        self: SnapshotRef,
+        self: &SnapshotRef,
         is_catalog_committer: bool,
     ) -> StaticCoroutine<SnapshotRef> {
+        let snapshot = Arc::clone(self);
         static_coroutine!(async move |channel| {
-            self.publish_with_channel(channel, is_catalog_committer)
+            snapshot
+                .publish_with_channel(channel, is_catalog_committer)
                 .await
         })
     }

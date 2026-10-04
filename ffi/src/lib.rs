@@ -14,8 +14,9 @@ use std::sync::Arc;
 
 use delta_kernel::actions::{Metadata, Protocol};
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
-use delta_kernel::coroutine::kernel::coroutine;
-use delta_kernel::coroutine::{drive_with_engine_and_committer, run_coroutine_with_engine};
+use delta_kernel::committer::Committer;
+use delta_kernel::coroutine::kernel::Coroutine;
+use delta_kernel::coroutine::{drive_with_engine, drive_with_engine_and_committer};
 use delta_kernel::history_manager::{
     first_version_after as kernel_first_version_after,
     get_earliest_commit as kernel_get_earliest_commit,
@@ -747,6 +748,25 @@ pub unsafe extern "C" fn free_engine_data(engine_data: Handle<ExclusiveEngineDat
 pub trait ExternEngine: Send + Sync {
     fn engine(&self) -> Arc<dyn Engine>;
     fn error_allocator(&self) -> &dyn AllocateError;
+}
+
+/// Drive a kernel workflow through the engine exposed by `extern_engine`.
+pub(crate) fn drive_kernel<O: Send + 'static>(
+    extern_engine: &dyn ExternEngine,
+    workflow: Coroutine<'_, O>,
+) -> DeltaResult<O> {
+    let engine = extern_engine.engine();
+    drive_with_engine(engine.as_ref(), None, workflow)
+}
+
+/// Drive a kernel workflow through `extern_engine` and delegate catalog requests to `committer`.
+pub(crate) fn drive_kernel_with_committer<O: Send + 'static>(
+    extern_engine: &dyn ExternEngine,
+    committer: &dyn Committer,
+    workflow: Coroutine<'_, O>,
+) -> DeltaResult<O> {
+    let engine = extern_engine.engine();
+    drive_with_engine_and_committer(engine.as_ref(), committer, workflow)
 }
 
 #[handle_descriptor(target=dyn ExternEngine, mutable=false)]
@@ -1571,14 +1591,8 @@ pub unsafe extern "C" fn snapshot_publish_with_committer(
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot_ref: SnapshotRef = unsafe { snapshot.clone_as_arc() };
     let committer = unsafe { committer.into_inner() };
-    let kernel_engine = engine_ref.engine();
-    let is_catalog_committer = committer.is_catalog_committer();
-    let publish = coroutine!(async move |channel| {
-        snapshot_ref
-            .publish_with_channel(channel, is_catalog_committer)
-            .await
-    });
-    drive_with_engine_and_committer(kernel_engine.as_ref(), committer.as_ref(), publish)
+    let publish = snapshot_ref.publish_workflow(committer.is_catalog_committer());
+    drive_kernel_with_committer(engine_ref, committer.as_ref(), publish)
         .map(|updated| updated.into())
         .into_extern_result(&engine_ref)
 }
@@ -1612,12 +1626,8 @@ pub unsafe extern "C" fn snapshot_timestamp(
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<i64> {
     let engine_ref = unsafe { engine.as_ref() };
-    let snapshot = unsafe { snapshot.as_ref() };
-    let kernel_engine = engine_ref.engine();
-    run_coroutine_with_engine!(kernel_engine.as_ref(), async move |channel| {
-        snapshot.get_timestamp_with_channel(channel).await
-    })
-    .into_extern_result(&engine_ref)
+    let snapshot: SnapshotRef = unsafe { snapshot.clone_as_arc() };
+    drive_kernel(engine_ref, snapshot.get_timestamp_workflow()).into_extern_result(&engine_ref)
 }
 
 /// File-level statistics for a snapshot, sourced from the snapshot's CRC.

@@ -8,8 +8,8 @@ use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::actions::{Metadata, Protocol, COMMIT_INFO_FIELD, METADATA_FIELD, PROTOCOL_FIELD};
 use crate::commit_range::with_version_context;
 use crate::coroutine::engine::EngineConnector;
-use crate::coroutine::kernel::{coroutine, Channel, Request};
-use crate::coroutine::{ChannelExt as _, GeneratorExt as _, IntoGenerator};
+use crate::coroutine::kernel::{coroutine, Channel, Coroutine, DeltaResultGenerator};
+use crate::coroutine::{ChannelExt as _, GeneratorExt as _};
 use crate::engine_data::RowVisitor as _;
 use crate::path::ParsedLogPath;
 use crate::schema::{lazy_schema_ref, SchemaRef};
@@ -225,11 +225,16 @@ impl CommitAction {
     /// translation is applied.
     pub fn get_actions(&self, engine: &dyn Engine) -> DeltaResult<FileDataReadResultIterator> {
         let connector = EngineConnector::new(engine).with_cancellation_token(None);
-        let actions =
-            connector.iterate_prepared_result_generator(coroutine!(async move |channel| {
-                self.get_actions_generator(channel).await
-            }))?;
+        let actions = connector.iterate_prepared_result_generator(self.get_actions_coroutine())?;
         Ok(Box::new(actions))
+    }
+
+    /// Return a lazy workflow that prepares this commit's action generator.
+    #[internal_api]
+    pub(crate) fn get_actions_coroutine(
+        &self,
+    ) -> Coroutine<'_, impl DeltaResultGenerator<Box<dyn EngineData>> + 'static> {
+        coroutine!(async move |channel| self.get_actions_generator(channel).await)
     }
 
     /// Return a generator over this commit's action batches.
@@ -237,9 +242,7 @@ impl CommitAction {
     pub(crate) async fn get_actions_generator(
         &self,
         channel: &Channel,
-    ) -> DeltaResult<
-        impl IntoGenerator<Request, Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + 'static,
-    > {
+    ) -> DeltaResult<impl DeltaResultGenerator<Box<dyn EngineData>> + 'static> {
         let pages = channel
             .prepare_json_files(
                 slice::from_ref(&self.log_path.location),

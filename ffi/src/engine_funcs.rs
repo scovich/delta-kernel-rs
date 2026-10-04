@@ -49,9 +49,10 @@ impl FileReadResultIterator {
     /// Wrap a kernel `EngineData` iterator (paired with the engine that produced it) into a handle
     /// the engine can drain via [`read_result_next`] and release with [`free_read_result_iter`].
     pub(crate) fn into_handle(
-        data: FileDataReadResultIterator,
+        data: impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'static,
         engine: Arc<dyn ExternEngine>,
     ) -> Handle<ExclusiveFileReadResultIterator> {
+        let data: FileDataReadResultIterator = Box::new(data);
         Box::new(FileReadResultIterator { data, engine }).into()
     }
 }
