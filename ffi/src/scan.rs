@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
+use delta_kernel::coroutine::{run_coroutine_with_engine, run_coroutine_with_storage};
 use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::scan::{PartitionValuesOptions, Scan, ScanBuilder, ScanMetadata, StatsOptions};
 use delta_kernel::schema::MetadataValue;
@@ -467,7 +468,10 @@ fn scan_declarative_metadata_plan_impl(
     scan: &Scan,
     engine: &dyn delta_kernel::Engine,
 ) -> DeltaResult<OptionalValue<crate::KernelOwnedBytes>> {
-    let plan = scan.declarative_metadata_scan_plan(engine)?;
+    let plan = run_coroutine_with_engine!(engine, async move |channel| {
+        scan.declarative_metadata_scan_plan_with_channel(channel)
+            .await
+    })?;
     Ok(plan
         .map(|plan| {
             delta_kernel::Operation::QueryPlan(plan)
@@ -890,7 +894,14 @@ fn selection_vector_from_dv_impl(
     extern_engine: &dyn ExternEngine,
     root_url: DeltaResult<Url>,
 ) -> DeltaResult<KernelBoolSlice> {
-    match dv_info.get_selection_vector(extern_engine.engine().as_ref(), &root_url?)? {
+    let engine = extern_engine.engine();
+    let root_url = root_url?;
+    let selection_vector = run_coroutine_with_engine!(engine.as_ref(), async move |channel| {
+        dv_info
+            .get_selection_vector_with_channel(channel, &root_url)
+            .await
+    })?;
+    match selection_vector {
         Some(v) => Ok(v.into()),
         None => Ok(KernelBoolSlice::empty()),
     }
@@ -916,7 +927,19 @@ fn row_indexes_from_dv_impl(
     extern_engine: &dyn ExternEngine,
     root_url: DeltaResult<Url>,
 ) -> DeltaResult<KernelRowIndexArray> {
-    match dv_info.get_row_indexes(extern_engine.engine().as_ref(), &root_url?)? {
+    let engine = extern_engine.engine();
+    let root_url = root_url?;
+    let row_indexes = if dv_info.has_vector() {
+        let storage = engine.storage_handler();
+        run_coroutine_with_storage!(storage.as_ref(), None, async move |channel| {
+            dv_info
+                .get_row_indexes_with_channel(channel, &root_url)
+                .await
+        })?
+    } else {
+        None
+    };
+    match row_indexes {
         Some(v) => Ok(v.into()),
         None => Ok(KernelRowIndexArray::empty()),
     }

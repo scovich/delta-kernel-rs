@@ -14,6 +14,8 @@ use std::sync::Arc;
 
 use delta_kernel::actions::{Metadata, Protocol};
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
+use delta_kernel::coroutine::kernel::coroutine;
+use delta_kernel::coroutine::{drive_with_engine_and_committer, run_coroutine_with_engine};
 use delta_kernel::history_manager::{
     first_version_after as kernel_first_version_after,
     get_earliest_commit as kernel_get_earliest_commit,
@@ -1569,8 +1571,14 @@ pub unsafe extern "C" fn snapshot_publish_with_committer(
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot_ref: SnapshotRef = unsafe { snapshot.clone_as_arc() };
     let committer = unsafe { committer.into_inner() };
-    snapshot_ref
-        .publish(engine_ref.engine().as_ref(), committer.as_ref())
+    let kernel_engine = engine_ref.engine();
+    let is_catalog_committer = committer.is_catalog_committer();
+    let publish = coroutine!(async move |channel| {
+        snapshot_ref
+            .publish_with_channel(channel, is_catalog_committer)
+            .await
+    });
+    drive_with_engine_and_committer(kernel_engine.as_ref(), committer.as_ref(), publish)
         .map(|updated| updated.into())
         .into_extern_result(&engine_ref)
 }
@@ -1605,9 +1613,11 @@ pub unsafe extern "C" fn snapshot_timestamp(
 ) -> ExternResult<i64> {
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot = unsafe { snapshot.as_ref() };
-    snapshot
-        .get_timestamp(engine_ref.engine().as_ref())
-        .into_extern_result(&engine_ref)
+    let kernel_engine = engine_ref.engine();
+    run_coroutine_with_engine!(kernel_engine.as_ref(), async move |channel| {
+        snapshot.get_timestamp_with_channel(channel).await
+    })
+    .into_extern_result(&engine_ref)
 }
 
 /// File-level statistics for a snapshot, sourced from the snapshot's CRC.
