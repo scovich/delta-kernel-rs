@@ -96,8 +96,8 @@ impl CheckpointReadInfo {
 ///
 /// This struct provides named access to the return values instead of tuple indexing.
 #[internal_api]
-pub(crate) struct ActionsWithCheckpointInfo<A: Iterator<Item = DeltaResult<ActionsBatch>>> {
-    /// Iterator over action batches read from the log segment.
+pub(crate) struct ActionsWithCheckpointInfo<A> {
+    /// Source of action batches read from the log segment.
     pub actions: A,
     /// Metadata about checkpoint reading, including the schema used.
     #[allow(unused)]
