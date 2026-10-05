@@ -11,6 +11,11 @@ use super::resolve_dvs::{resolve_scan_file_dv, ResolvedCdfScanFile};
 use super::scan_file::scan_metadata_to_scan_file;
 use super::{CdfMode, TableChanges};
 use crate::actions::deletion_vector::split_vector;
+use crate::coroutine::generator::{map_async_witness, GeneratorExt as _};
+use crate::coroutine::kernel::{Channel, DeltaResultGenerator};
+use crate::coroutine::{
+    iterate_prepared_result_generator_with_engine, AsyncOption as _, ChannelExt as _,
+};
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
 use crate::scan::state_info::StateInfo;
 use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions};
@@ -258,6 +263,25 @@ fn read_scan_file(
     state_info: &StateInfo,
     _physical_predicate: Option<PredicateRef>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
+    iterate_prepared_result_generator_with_engine!(engine, None, async move |channel| {
+        read_scan_file_with_channel(
+            channel,
+            resolved_scan_file,
+            table_root,
+            state_info,
+            _physical_predicate,
+        )
+        .await
+    })
+}
+
+async fn read_scan_file_with_channel(
+    channel: &Channel,
+    resolved_scan_file: ResolvedCdfScanFile,
+    table_root: &Url,
+    state_info: &StateInfo,
+    _physical_predicate: Option<PredicateRef>,
+) -> DeltaResult<impl DeltaResultGenerator<Box<dyn EngineData>> + 'static> {
     let ResolvedCdfScanFile {
         scan_file,
         mut selection_vector,
@@ -269,13 +293,14 @@ fn read_scan_file(
 
     // Only create an evaluator if transformation is needed
     let phys_to_logical_eval = transform_expr
-        .map(|expr| {
-            engine.evaluation_handler().new_expression_evaluator(
+        .map_async(|expr| {
+            channel.create_expression_evaluator(
                 physical_schema.clone(),
                 expr,
                 state_info.logical_schema.clone().into(),
             )
         })
+        .await
         .transpose()?;
     // Determine if the scan file was derived from a deletion vector pair
     let is_dv_resolved_pair = scan_file.remove_dv.is_some();
@@ -292,16 +317,14 @@ fn read_scan_file(
         location,
     };
     // TODO(#860): we disable predicate pushdown until we support row indexes.
-    let read_result_iter =
-        engine
-            .parquet_handler()
-            .read_parquet_files(&[file], physical_schema, None)?;
+    let read_result_iter = channel.prepare_parquet_files([file], physical_schema, None);
+    let read_result_iter = read_result_iter.await?.flatten();
 
-    let result = read_result_iter.map(move |batch| -> DeltaResult<_> {
+    let result = read_result_iter.map_async(map_async_witness, async move |channel, batch| {
         let batch = batch?;
         // Transform the physical data into the correct logical form, or pass through unchanged.
         let logical = if let Some(ref eval) = phys_to_logical_eval {
-            eval.evaluate(batch.as_ref())
+            channel.evaluate_expression(eval, batch).await
         } else {
             // No transformation needed - pass through the batch as-is
             Ok(batch)

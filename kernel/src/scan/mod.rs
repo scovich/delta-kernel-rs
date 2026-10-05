@@ -19,10 +19,11 @@ use crate::actions::{Add, ADD_FIELD, ADD_NAME, NULL_COUNT, REMOVE_FIELD, SIDECAR
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
-use crate::coroutine::kernel::{static_coroutine, Channel, StaticCoroutine};
-use crate::coroutine::run_coroutine_with_storage;
+use crate::coroutine::engine::EngineConnector;
+use crate::coroutine::kernel::{coroutine, static_coroutine, Channel, Request, StaticCoroutine};
 #[cfg(feature = "declarative-plans")]
 use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _};
+use crate::coroutine::{run_coroutine_with_storage, IntoGenerator};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef};
 use crate::kernel_predicates::{
@@ -1190,14 +1191,38 @@ impl Scan {
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
+        let connector =
+            EngineConnector::new(engine).with_cancellation_token(self.cancellation_token.clone());
+        let coroutine = coroutine!(async move |channel| {
+            self.replay_for_scan_metadata_with_channel(channel).await
+        });
+        let (actions, checkpoint_info) = connector
+            .iterate_prepared_result_generator_with_companion(
+                coroutine,
+                ActionsWithCheckpointInfo::into_parts,
+            )?;
+        Ok(ActionsWithCheckpointInfo {
+            actions,
+            checkpoint_info,
+        })
+    }
+
+    async fn replay_for_scan_metadata_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> DeltaResult<
+        ActionsWithCheckpointInfo<
+            impl IntoGenerator<Request, Item = DeltaResult<ActionsBatch>, Output = ()>,
+        >,
+    > {
         let (checkpoint_schema, meta_predicate, physical_stats_schema) =
             self.checkpoint_read_options();
         // Checkpoints already represent reconciled state, so scans project only Add actions. This
         // derives `add.path IS NOT NULL` and allows readers to skip non-Add row groups.
         self.snapshot
             .log_segment()
-            .read_actions_with_projected_checkpoint_actions(
-                engine,
+            .read_actions_with_projected_checkpoint_actions_with_channel(
+                channel,
                 COMMIT_READ_SCHEMA.clone(),
                 checkpoint_schema,
                 meta_predicate,
@@ -1206,8 +1231,8 @@ impl Scan {
                     .physical_partition_schema
                     .as_ref()
                     .map(|s| s.as_ref()),
-                self.cancellation_token.as_ref(),
             )
+            .await
     }
 
     /// Builds a predicate for row group skipping in checkpoint and sidecar parquet files.

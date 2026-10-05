@@ -13,8 +13,8 @@ use crate::engine_funcs::{ExclusiveFileReadResultIterator, FileReadResultIterato
 use crate::handle::Handle;
 use crate::log_path::LogPathArray;
 use crate::{
-    unwrap_and_parse_path_as_url, ExternEngine, ExternResult, IntoExternResult, KernelStringSlice,
-    NullableCvoid, SharedExternEngine, SharedSnapshot,
+    drive_kernel, unwrap_and_parse_path_as_url, ExternEngine, ExternResult, IntoExternResult,
+    KernelStringSlice, NullableCvoid, SharedExternEngine, SharedSnapshot,
 };
 
 /// An opaque, shared handle owning a [`CommitRange`] produced by
@@ -152,7 +152,6 @@ pub unsafe extern "C" fn commit_range_builder_build(
 fn commit_range_builder_build_impl(
     builder: FfiCommitRangeBuilder,
 ) -> DeltaResult<Handle<SharedCommitRange>> {
-    let engine = builder.engine.engine();
     let mut kernel_builder = CommitRange::builder_for(builder.table_root, builder.start_version);
     if let Some(end_version) = builder.end_version {
         kernel_builder = kernel_builder.with_end_version(end_version);
@@ -168,7 +167,8 @@ fn commit_range_builder_build_impl(
             "Max catalog version is required when providing staged commits.".to_string(),
         ));
     }
-    let range = kernel_builder.build(engine.as_ref())?;
+    let workflow = kernel_builder.build_workflow();
+    let range = drive_kernel(builder.engine.as_ref(), workflow)?;
     Ok(Arc::new(range).into())
 }
 

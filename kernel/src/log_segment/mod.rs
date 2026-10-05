@@ -20,9 +20,10 @@ use crate::coroutine::generator::{empty, BoxedDeltaResultGenerator};
 use crate::coroutine::kernel::request::ReadParquetFiles;
 use crate::coroutine::kernel::{coroutine, Channel, Request};
 #[cfg(test)]
-use crate::coroutine::{run_coroutine_with_engine, run_coroutine_with_storage};
+use crate::coroutine::run_coroutine_with_engine;
 use crate::coroutine::{
-    iterate_prepared_result_generator_with_engine, ChannelExt as _, GeneratorExt as _, IntoGenerator,
+    iterate_prepared_result_generator_with_engine, run_coroutine_with_storage, ChannelExt as _,
+    GeneratorExt as _, IntoGenerator,
 };
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
@@ -604,18 +605,38 @@ impl LogSegment {
         start_version: Version,
         end_version: impl Into<Option<Version>>,
     ) -> DeltaResult<Self> {
-        Self::for_table_changes_with_log_tail(storage, log_root, start_version, end_version, vec![])
+        let end_version = end_version.into();
+        run_coroutine_with_storage!(storage, None, async move |channel| {
+            Self::for_table_changes_with_channel(channel, log_root, start_version, end_version)
+                .await
+        })
     }
 
-    /// Constructs a table-changes log segment with a caller-provided authoritative commit tail.
-    pub(crate) fn for_table_changes_with_log_tail(
-        storage: &dyn StorageHandler,
+    /// Constructs a table-changes log segment through `channel`.
+    pub(crate) async fn for_table_changes_with_channel(
+        channel: &Channel,
         log_root: Url,
         start_version: Version,
-        end_version: impl Into<Option<Version>>,
+        end_version: Option<Version>,
+    ) -> DeltaResult<Self> {
+        Self::for_table_changes_with_log_tail_with_channel(
+            channel,
+            log_root,
+            start_version,
+            end_version,
+            vec![],
+        )
+        .await
+    }
+
+    /// Constructs a table-changes log segment through `channel`.
+    pub(crate) async fn for_table_changes_with_log_tail_with_channel(
+        channel: &Channel,
+        log_root: Url,
+        start_version: Version,
+        end_version: Option<Version>,
         log_tail: Vec<ParsedLogPath>,
     ) -> DeltaResult<Self> {
-        let end_version = end_version.into();
         if let Some(end_version) = end_version {
             if start_version > end_version {
                 return Err(Error::generic(
@@ -625,14 +646,14 @@ impl LogSegment {
         }
 
         // TODO: compactions?
-        let listed_files = LogSegmentFiles::list_commits(
-            storage,
+        let listed_files = LogSegmentFiles::list_commits_with_channel(
+            channel,
             &log_root,
             log_tail,
             Some(start_version),
             end_version,
-            None, // table-changes does not thread a cancellation token
-        )?;
+        )
+        .await?;
         // - Here check that the start version is correct.
         // - [`LogSegment::try_new`] will verify that the `end_version` is correct if present.
         // - [`LogSegment::try_new`] also checks that there are no gaps between commits.
@@ -985,15 +1006,28 @@ impl LogSegment {
         engine: &dyn Engine,
         action_schema: SchemaRef,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        let result = self.read_actions_with_projected_checkpoint_actions(
-            engine,
-            action_schema.clone(),
-            action_schema,
-            None,
-            None,
-            None,
-            None,
-        )?;
+        iterate_prepared_result_generator_with_engine!(engine, None, async move |channel| {
+            self.read_actions_with_channel(channel, action_schema).await
+        })
+    }
+
+    /// Generate this segment's action batches using one schema for checkpoints and commits.
+    pub(crate) async fn read_actions_with_channel(
+        &self,
+        channel: &Channel,
+        action_schema: SchemaRef,
+    ) -> DeltaResult<impl IntoGenerator<Request, Item = DeltaResult<ActionsBatch>, Output = ()>>
+    {
+        let result = self
+            .read_actions_with_projected_checkpoint_actions_with_channel(
+                channel,
+                action_schema.clone(),
+                action_schema,
+                None,
+                None,
+                None,
+            )
+            .await?;
         Ok(result.actions)
     }
 
@@ -1286,6 +1320,7 @@ impl LogSegment {
     /// 3. Reads checkpoint and sidecar data using cached sidecar refs
     ///
     /// Returns a tuple of the actions iterator and [`CheckpointReadInfo`].
+    #[cfg(test)]
     fn create_checkpoint_stream(
         &self,
         engine: &dyn Engine,

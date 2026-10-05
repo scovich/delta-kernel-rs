@@ -1,6 +1,8 @@
 use url::Url;
 
 use crate::commit_range::CommitRange;
+use crate::coroutine::kernel::{static_coroutine, Channel, StaticCoroutine};
+use crate::coroutine::run_coroutine_with_engine;
 use crate::log_segment::{validate_catalog_managed_log_tail, LogSegment};
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::SnapshotRef;
@@ -88,6 +90,17 @@ impl CommitRangeBuilder {
     /// non-contiguous, or the requested start version is unavailable from both the filesystem and
     /// the supplied catalog tail.
     pub fn build(&self, engine: &dyn Engine) -> DeltaResult<CommitRange> {
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.build_with_channel(channel).await
+        })
+    }
+
+    /// Return a lazy workflow that builds this commit range.
+    pub fn build_workflow(self) -> StaticCoroutine<CommitRange> {
+        static_coroutine!(async move |channel| self.build_with_channel(channel).await)
+    }
+
+    async fn build_with_channel(&self, channel: &Channel) -> DeltaResult<CommitRange> {
         let table_root = Self::parse_table_root(&self.table_root)?;
         let log_root = table_root.join("_delta_log/")?;
 
@@ -124,13 +137,14 @@ impl CommitRangeBuilder {
             }
             (commit_files, end_version)
         } else {
-            let log_segment = LogSegment::for_table_changes_with_log_tail(
-                engine.storage_handler().as_ref(),
+            let log_segment = LogSegment::for_table_changes_with_log_tail_with_channel(
+                channel,
                 log_root,
                 start_version,
                 configured_end_version,
                 log_tail,
-            )?;
+            );
+            let log_segment = log_segment.await?;
             let end_version = configured_end_version.unwrap_or(log_segment.end_version);
             let commit_files = log_segment
                 .listed

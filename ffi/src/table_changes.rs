@@ -17,9 +17,9 @@ use crate::engine_data::ArrowFFIData;
 use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
 use crate::scan::EnginePredicate;
 use crate::{
-    kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn, ExternEngine,
-    ExternResult, IntoExternResult, KernelStringSlice, NullableCvoid, SharedExternEngine,
-    SharedSchema,
+    drive_kernel, kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn,
+    ExternEngine, ExternResult, IntoExternResult, KernelStringSlice, NullableCvoid,
+    SharedExternEngine, SharedSchema,
 };
 
 #[handle_descriptor(target=TableChanges, mutable=true, sized=true)]
@@ -74,12 +74,8 @@ fn table_changes_impl(
     start_version: Version,
     end_version: Option<Version>,
 ) -> DeltaResult<Handle<ExclusiveTableChanges>> {
-    let table_changes = TableChanges::try_new(
-        url?,
-        extern_engine.engine().as_ref(),
-        start_version,
-        end_version,
-    );
+    let workflow = TableChanges::try_new_workflow(url?, start_version, end_version);
+    let table_changes = drive_kernel(extern_engine, workflow);
     Ok(Box::new(table_changes?).into())
 }
 

@@ -18,16 +18,21 @@ use itertools::Itertools;
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 
+#[cfg(test)]
 use crate::cancellation::CancellationTokenRef;
 use crate::coroutine::kernel::request::{log_listing_bounds, ForwardListing};
 use crate::coroutine::kernel::Channel;
-use crate::coroutine::{run_coroutine_with_storage, ChannelExt as _, Generator, GeneratorExt as _};
+#[cfg(test)]
+use crate::coroutine::run_coroutine_with_storage;
+use crate::coroutine::{ChannelExt as _, Generator, GeneratorExt as _};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
 use crate::path::{
     may_begin_listable_log_path, CheckpointInstance, LogPathFileType, ParsedLogPath,
 };
-use crate::{DeltaResult, Error, FileMeta, StorageHandler, Version};
+#[cfg(test)]
+use crate::StorageHandler;
+use crate::{DeltaResult, Error, FileMeta, Version};
 
 #[cfg(test)]
 mod tests;
@@ -575,6 +580,7 @@ impl LogSegmentFiles {
     /// `log_tail` is a contiguous run of commits ending at the table's latest version. It takes
     /// precedence over the filesystem listing, and is required for catalog-managed tables, whose
     /// unbackfilled staged commits exist only here.
+    #[cfg(test)]
     pub(crate) fn list_commits(
         storage: &dyn StorageHandler,
         log_root: &Url,
