@@ -10,6 +10,7 @@ use std::task::{Context, Poll};
 
 use super::{BoundGenerator, ChannelBinding};
 use crate::coroutine::Channel;
+use crate::utils::PhantomType;
 use crate::DeltaResult;
 
 /// Yield or completion produced by polling a bound [`Generator`].
@@ -28,7 +29,7 @@ pub trait GeneratorExt {
         channel: &'a Channel<P>,
     ) -> impl Generator<Item = Self::Item, Output = Self::Output> + Unpin + 'a
     where
-        Self: IntoGenerator<P> + Sized,
+        Self: IntoGenerator<P> + Sized + 'a,
     {
         self.bind_to(ChannelBinding::Borrowed(channel))
     }
@@ -69,12 +70,45 @@ pub trait GeneratorExt {
         }
     }
 
+    /// Counterpart of [`Iterator::collect`]: collects every yielded item.
+    fn collect<C>(mut self) -> impl Future<Output = DeltaResult<C>> + Send
+    where
+        Self: Generator<Output = ()> + Sized + Unpin,
+        C: Default + Extend<Self::Item> + Send,
+    {
+        async move {
+            let mut output = C::default();
+            while let Some(item) = self.next().await? {
+                output.extend([item]);
+            }
+            Ok(output)
+        }
+    }
+
     /// Counterpart of [`Iterator::map`]: transforms each yielded item.
     fn map<F>(self, map: F) -> Map<Self, F>
     where
         Self: Sized,
     {
         Map { inner: self, map }
+    }
+
+    /// Maps items asynchronously using the supplied call-future witness.
+    fn map_async<P, U, F, W>(self, witness: W, mapper: F) -> MapAsync<Self, P, F, W, U>
+    where
+        Self: IntoGenerator<P, Output = ()> + Sized,
+        P: Send + 'static,
+        U: Send + 'static,
+        F: for<'a> AsyncFnMut(&'a Channel<P>, Self::Item) -> U + Send,
+        W: Send,
+        for<'a> W: MapAsyncWitness<'a, P, F, Self::Item, U>,
+    {
+        MapAsync {
+            inner: self,
+            mapper,
+            witness,
+            _types: PhantomType::default(),
+        }
     }
 
     /// Counterpart of `Itertools::map_ok`: transforms each successful yielded item.
@@ -140,7 +174,7 @@ pub trait GeneratorExt {
 ///
 /// Functions return `impl IntoGenerator<P, Item = ...>`. Call [`GeneratorExt`] combinators before
 /// [`GeneratorExt::bind`].
-pub trait IntoGenerator<P: Send + 'static>: GeneratorExt + Send + 'static {
+pub trait IntoGenerator<P: Send + 'static>: GeneratorExt + Send {
     /// Type of the yielded items.
     type Item: Send + 'static;
 
@@ -148,9 +182,11 @@ pub trait IntoGenerator<P: Send + 'static>: GeneratorExt + Send + 'static {
     type Output: Send + 'static;
 
     /// Type-erases this generator as `Box<dyn IntoGenerator<...>>`.
-    fn into_boxed(self) -> Box<dyn IntoGenerator<P, Item = Self::Item, Output = Self::Output>>
+    fn into_boxed<'a>(
+        self,
+    ) -> Box<dyn IntoGenerator<P, Item = Self::Item, Output = Self::Output> + 'a>
     where
-        Self: Sized,
+        Self: Sized + 'a,
     {
         Box::new(self)
     }
@@ -161,13 +197,15 @@ pub trait IntoGenerator<P: Send + 'static>: GeneratorExt + Send + 'static {
         channel: ChannelBinding<'a, P>,
     ) -> impl Generator<Item = Self::Item, Output = Self::Output> + Unpin + 'a
     where
-        Self: Sized;
+        Self: Sized + 'a;
 
     /// Object-safe binding used after type erasure.
     fn bind_boxed<'a>(
         self: Box<Self>,
         channel: ChannelBinding<'a, P>,
-    ) -> BoxedGenerator<'a, Self::Item, Self::Output>;
+    ) -> BoxedGenerator<'a, Self::Item, Self::Output>
+    where
+        Self: 'a;
 }
 
 /// Pollable generator bound to a request channel.
@@ -195,12 +233,13 @@ pub type BoxedGenerator<'a, Y, O = ()> = Box<dyn Generator<Item = Y, Output = O>
 pub type BoxedDeltaResultGenerator<'a, T, O = ()> = BoxedGenerator<'a, DeltaResult<T>, O>;
 
 impl<Y: Send + 'static, O: Send + 'static> GeneratorExt for BoundGenerator<'_, Y, O> {}
-impl<P: Send + 'static, Y: Send + 'static, O: Send + 'static> GeneratorExt
-    for Box<dyn IntoGenerator<P, Item = Y, Output = O>>
+impl<'g, P: Send + 'static, Y: Send + 'static, O: Send + 'static> GeneratorExt
+    for Box<dyn IntoGenerator<P, Item = Y, Output = O> + 'g>
 {
 }
 impl<'a, Y: Send + 'static, O: Send + 'static> GeneratorExt for BoxedGenerator<'a, Y, O> {}
 impl<G, F> GeneratorExt for Map<G, F> {}
+impl<G, P, F, W, U> GeneratorExt for MapAsync<G, P, F, W, U> {}
 impl<G, F> GeneratorExt for MapOk<G, F> {}
 impl<G, F> GeneratorExt for FilterOk<G, F> {}
 impl<G, I> GeneratorExt for Peekable<G, I> {}
@@ -233,8 +272,8 @@ impl<'a, Y: Send + 'static, O: Send + 'static> Generator for BoxedGenerator<'a, 
     }
 }
 
-impl<P: Send + 'static, Y: Send + 'static, O: Send + 'static> IntoGenerator<P>
-    for Box<dyn IntoGenerator<P, Item = Y, Output = O>>
+impl<'g, P: Send + 'static, Y: Send + 'static, O: Send + 'static> IntoGenerator<P>
+    for Box<dyn IntoGenerator<P, Item = Y, Output = O> + 'g>
 {
     type Item = Y;
     type Output = O;
@@ -242,31 +281,44 @@ impl<P: Send + 'static, Y: Send + 'static, O: Send + 'static> IntoGenerator<P>
     fn bind_to<'a>(
         self,
         channel: ChannelBinding<'a, P>,
-    ) -> impl Generator<Item = Y, Output = O> + Unpin + 'a {
+    ) -> impl Generator<Item = Y, Output = O> + Unpin + 'a
+    where
+        Self: 'a,
+    {
         IntoGenerator::bind_boxed(self, channel)
     }
 
-    fn into_boxed(self) -> Box<dyn IntoGenerator<P, Item = Y, Output = O>> {
+    fn into_boxed<'a>(self) -> Box<dyn IntoGenerator<P, Item = Y, Output = O> + 'a>
+    where
+        Self: 'a,
+    {
         self
     }
 
-    fn bind_boxed<'a>(self: Box<Self>, channel: ChannelBinding<'a, P>) -> BoxedGenerator<'a, Y, O> {
+    fn bind_boxed<'a>(self: Box<Self>, channel: ChannelBinding<'a, P>) -> BoxedGenerator<'a, Y, O>
+    where
+        Self: 'a,
+    {
         (*self).bind_boxed(channel)
     }
 }
 
 /// Generator returned by [`GeneratorExt::map`].
+// WARNING: We manually impl `Unpin` for `Map` so `F` need not be `Unpin`. This is sound only
+// because `Map` does not structurally pin `map`; it is accessed only through `&mut F`.
 pub struct Map<G, F> {
     inner: G,
     map: F,
 }
+
+impl<G: Unpin, F> Unpin for Map<G, F> {}
 
 impl<P, G, U, F> IntoGenerator<P> for Map<G, F>
 where
     P: Send + 'static,
     G: IntoGenerator<P, Output = ()>,
     U: Send + 'static,
-    F: FnMut(G::Item) -> U + Send + Unpin + 'static,
+    F: FnMut(G::Item) -> U + Send + 'static,
 {
     type Item = U;
     type Output = ();
@@ -274,14 +326,20 @@ where
     fn bind_to<'a>(
         self,
         channel: ChannelBinding<'a, P>,
-    ) -> impl Generator<Item = U, Output = ()> + Unpin + 'a {
+    ) -> impl Generator<Item = U, Output = ()> + Unpin + 'a
+    where
+        Self: 'a,
+    {
         Map {
             inner: self.inner.bind_to(channel),
             map: self.map,
         }
     }
 
-    fn bind_boxed<'a>(self: Box<Self>, channel: ChannelBinding<'a, P>) -> BoxedGenerator<'a, U> {
+    fn bind_boxed<'a>(self: Box<Self>, channel: ChannelBinding<'a, P>) -> BoxedGenerator<'a, U>
+    where
+        Self: 'a,
+    {
         Box::new((*self).bind_to(channel))
     }
 }
@@ -290,7 +348,7 @@ impl<G, U, F> Generator for Map<G, F>
 where
     G: Generator<Output = ()> + Unpin,
     U: Send + 'static,
-    F: FnMut(G::Item) -> U + Send + Unpin,
+    F: FnMut(G::Item) -> U + Send,
 {
     type Item = U;
     type Output = ();
@@ -311,11 +369,136 @@ where
     }
 }
 
+/// Witnesses one call to an asynchronous mapper and returns its state for the next item.
+pub async fn map_async_witness<P, F, I, U>(
+    mut mapper: F,
+    (channel, item): (ChannelBinding<'_, P>, I),
+) -> (F, U)
+where
+    P: Send + 'static,
+    F: for<'a> AsyncFnMut(&'a Channel<P>, I) -> U,
+{
+    let item = mapper(&channel, item).await;
+    (mapper, item)
+}
+
+/// Exposes one concrete asynchronous mapper call future for a channel lifetime.
+#[doc(hidden)]
+pub trait MapAsyncWitness<'a, P: 'static, F, I, U> {
+    /// Future returned by this witness invocation.
+    type Future: Future<Output = (F, U)> + Send + 'a;
+
+    /// Invoke the witness for `mapper` and its channel-bound item.
+    fn invoke(&self, mapper: F, argument: (ChannelBinding<'a, P>, I)) -> Self::Future;
+}
+
+impl<'a, P, F, I, U, W, Fut> MapAsyncWitness<'a, P, F, I, U> for W
+where
+    P: 'static,
+    W: Fn(F, (ChannelBinding<'a, P>, I)) -> Fut,
+    Fut: Future<Output = (F, U)> + Send + 'a,
+{
+    type Future = Fut;
+
+    fn invoke(&self, mapper: F, argument: (ChannelBinding<'a, P>, I)) -> Self::Future {
+        self(mapper, argument)
+    }
+}
+
+/// Generator returned by [`GeneratorExt::map_async`].
+pub struct MapAsync<G, P, F, W, U> {
+    inner: G,
+    mapper: F,
+    witness: W,
+    _types: PhantomType<(P, U)>,
+}
+
+impl<P, G, F, W, U> IntoGenerator<P> for MapAsync<G, P, F, W, U>
+where
+    P: Send + 'static,
+    G: IntoGenerator<P, Output = ()>,
+    F: for<'a> AsyncFnMut(&'a Channel<P>, G::Item) -> U + Send,
+    W: Send,
+    for<'a> W: MapAsyncWitness<'a, P, F, G::Item, U>,
+    U: Send + 'static,
+{
+    type Item = U;
+    type Output = ();
+
+    fn bind_to<'a>(
+        self,
+        channel: ChannelBinding<'a, P>,
+    ) -> impl Generator<Item = U, Output = ()> + Unpin + 'a
+    where
+        Self: 'a,
+    {
+        let state = BoundMapAsync {
+            inner: self.inner.bind_to(channel.clone()),
+            channel,
+            mapper: self.mapper,
+            witness: self.witness,
+            _output: PhantomType::default(),
+        };
+        unfold(state, BoundMapAsync::<'a, P, _, _, _, U>::next)
+    }
+
+    fn bind_boxed<'a>(self: Box<Self>, channel: ChannelBinding<'a, P>) -> BoxedGenerator<'a, U>
+    where
+        Self: 'a,
+    {
+        Box::new((*self).bind_to(channel))
+    }
+}
+
+struct BoundMapAsync<'a, P: 'static, G, F, W, U> {
+    inner: G,
+    channel: ChannelBinding<'a, P>,
+    mapper: F,
+    witness: W,
+    _output: PhantomType<U>,
+}
+
+impl<'channel, P, G, F, W, U> BoundMapAsync<'channel, P, G, F, W, U>
+where
+    P: Send + 'static,
+    G: Generator<Output = ()> + Unpin,
+    F: for<'a> AsyncFnMut(&'a Channel<P>, G::Item) -> U + Send,
+    W: MapAsyncWitness<'channel, P, F, G::Item, U> + Send,
+    U: Send + 'static,
+{
+    async fn next(self) -> DeltaResult<Option<(Self, U)>> {
+        let Self {
+            mut inner,
+            channel,
+            mapper,
+            witness,
+            _output,
+        } = self;
+        let Some(item) = inner.next().await? else {
+            return Ok(None);
+        };
+        let argument = (channel.clone(), item);
+        let (mapper, item) = witness.invoke(mapper, argument).await;
+        let state = Self {
+            inner,
+            channel,
+            mapper,
+            witness,
+            _output,
+        };
+        Ok(Some((state, item)))
+    }
+}
+
 /// Generator returned by [`GeneratorExt::map_ok`].
+// WARNING: We manually impl `Unpin` for `MapOk` so `F` need not be `Unpin`. This is sound only
+// because `MapOk` does not structurally pin `map`; it is accessed only through `&mut F`.
 pub struct MapOk<G, F> {
     inner: G,
     map: F,
 }
+
+impl<G: Unpin, F> Unpin for MapOk<G, F> {}
 
 impl<P, G, T, U, F> IntoGenerator<P> for MapOk<G, F>
 where
@@ -323,7 +506,7 @@ where
     G: IntoGenerator<P, Item = DeltaResult<T>, Output = ()>,
     T: Send + 'static,
     U: Send + 'static,
-    F: FnMut(T) -> U + Send + Unpin + 'static,
+    F: FnMut(T) -> U + Send + 'static,
 {
     type Item = DeltaResult<U>;
     type Output = ();
@@ -331,7 +514,10 @@ where
     fn bind_to<'a>(
         self,
         channel: ChannelBinding<'a, P>,
-    ) -> impl Generator<Item = DeltaResult<U>, Output = ()> + Unpin + 'a {
+    ) -> impl Generator<Item = DeltaResult<U>, Output = ()> + Unpin + 'a
+    where
+        Self: 'a,
+    {
         MapOk {
             inner: self.inner.bind_to(channel),
             map: self.map,
@@ -341,7 +527,10 @@ where
     fn bind_boxed<'a>(
         self: Box<Self>,
         channel: ChannelBinding<'a, P>,
-    ) -> BoxedGenerator<'a, DeltaResult<U>> {
+    ) -> BoxedGenerator<'a, DeltaResult<U>>
+    where
+        Self: 'a,
+    {
         Box::new((*self).bind_to(channel))
     }
 }
@@ -351,7 +540,7 @@ where
     G: Generator<Item = DeltaResult<T>, Output = ()> + Unpin,
     T: Send + 'static,
     U: Send + 'static,
-    F: FnMut(T) -> U + Send + Unpin,
+    F: FnMut(T) -> U + Send,
 {
     type Item = DeltaResult<U>;
     type Output = ();
@@ -374,17 +563,21 @@ where
 }
 
 /// Generator returned by [`GeneratorExt::filter_ok`].
+// WARNING: We manually impl `Unpin` for `FilterOk` so `F` need not be `Unpin`. This is sound only
+// because `FilterOk` does not structurally pin `predicate`; it is accessed only through `&mut F`.
 pub struct FilterOk<G, F> {
     inner: G,
     predicate: F,
 }
+
+impl<G: Unpin, F> Unpin for FilterOk<G, F> {}
 
 impl<P, G, T, F> IntoGenerator<P> for FilterOk<G, F>
 where
     P: Send + 'static,
     G: IntoGenerator<P, Item = DeltaResult<T>, Output = ()>,
     T: Send + 'static,
-    F: FnMut(&T) -> bool + Send + Unpin + 'static,
+    F: FnMut(&T) -> bool + Send + 'static,
 {
     type Item = DeltaResult<T>;
     type Output = ();
@@ -392,7 +585,10 @@ where
     fn bind_to<'a>(
         self,
         channel: ChannelBinding<'a, P>,
-    ) -> impl Generator<Item = DeltaResult<T>, Output = ()> + Unpin + 'a {
+    ) -> impl Generator<Item = DeltaResult<T>, Output = ()> + Unpin + 'a
+    where
+        Self: 'a,
+    {
         FilterOk {
             inner: self.inner.bind_to(channel),
             predicate: self.predicate,
@@ -402,7 +598,10 @@ where
     fn bind_boxed<'a>(
         self: Box<Self>,
         channel: ChannelBinding<'a, P>,
-    ) -> BoxedGenerator<'a, DeltaResult<T>> {
+    ) -> BoxedGenerator<'a, DeltaResult<T>>
+    where
+        Self: 'a,
+    {
         Box::new((*self).bind_to(channel))
     }
 }
@@ -411,7 +610,7 @@ impl<G, T, F> Generator for FilterOk<G, F>
 where
     G: Generator<Item = DeltaResult<T>, Output = ()> + Unpin,
     T: Send + 'static,
-    F: FnMut(&T) -> bool + Send + Unpin,
+    F: FnMut(&T) -> bool + Send,
 {
     type Item = DeltaResult<T>;
     type Output = ();
@@ -441,11 +640,16 @@ where
 }
 
 /// Generator returned by [`GeneratorExt::peekable`].
+// WARNING: We manually impl `Unpin` for `Peekable` so `I` need not be `Unpin`. This is sound only
+// because `Peekable` does not structurally pin `peeked`; it is only moved through ordinary `Option`
+// operations.
 pub struct Peekable<G, I> {
     inner: G,
     peeked: Option<I>,
     done: bool,
 }
+
+impl<G: Unpin, I> Unpin for Peekable<G, I> {}
 
 impl<G, I> Peekable<G, I>
 where
@@ -472,7 +676,7 @@ impl<P, G, I> IntoGenerator<P> for Peekable<G, I>
 where
     P: Send + 'static,
     G: IntoGenerator<P, Item = I, Output = ()>,
-    I: Send + Unpin + 'static,
+    I: Send + 'static,
 {
     type Item = I;
     type Output = ();
@@ -480,7 +684,10 @@ where
     fn bind_to<'a>(
         self,
         channel: ChannelBinding<'a, P>,
-    ) -> impl Generator<Item = I, Output = ()> + Unpin + 'a {
+    ) -> impl Generator<Item = I, Output = ()> + Unpin + 'a
+    where
+        Self: 'a,
+    {
         Peekable {
             inner: self.inner.bind_to(channel),
             peeked: self.peeked,
@@ -488,7 +695,10 @@ where
         }
     }
 
-    fn bind_boxed<'a>(self: Box<Self>, channel: ChannelBinding<'a, P>) -> BoxedGenerator<'a, I> {
+    fn bind_boxed<'a>(self: Box<Self>, channel: ChannelBinding<'a, P>) -> BoxedGenerator<'a, I>
+    where
+        Self: 'a,
+    {
         Box::new((*self).bind_to(channel))
     }
 }
@@ -496,7 +706,7 @@ where
 impl<G, I> Generator for Peekable<G, I>
 where
     G: Generator<Item = I, Output = ()> + Unpin,
-    I: Send + Unpin + 'static,
+    I: Send + 'static,
 {
     type Item = I;
     type Output = ();
@@ -541,7 +751,10 @@ where
     fn bind_to<'a>(
         self,
         channel: ChannelBinding<'a, P>,
-    ) -> impl Generator<Item = A::Item, Output = ()> + Unpin + 'a {
+    ) -> impl Generator<Item = A::Item, Output = ()> + Unpin + 'a
+    where
+        Self: 'a,
+    {
         Chain {
             first: self.first.map(|first| first.bind_to(channel.clone())),
             second: self.second.bind_to(channel),
@@ -551,7 +764,10 @@ where
     fn bind_boxed<'a>(
         self: Box<Self>,
         channel: ChannelBinding<'a, P>,
-    ) -> BoxedGenerator<'a, A::Item> {
+    ) -> BoxedGenerator<'a, A::Item>
+    where
+        Self: 'a,
+    {
         Box::new((*self).bind_to(channel))
     }
 }
@@ -580,10 +796,15 @@ where
 }
 
 /// Generator returned by [`GeneratorExt::flatten`].
+// WARNING: We manually impl `Unpin` for `Flatten` so `I` need not be `Unpin`. This is sound only
+// because `Flatten` does not structurally pin `rest`; it is accessed only through
+// `Iterator::next(&mut self)` and moved by ordinary `Option` operations.
 pub struct Flatten<G, I> {
     inner: G,
     rest: Option<I>,
 }
+
+impl<G: Unpin, I> Unpin for Flatten<G, I> {}
 
 impl<G, I> GeneratorExt for Flatten<G, I> {}
 
@@ -592,7 +813,7 @@ where
     P: Send + 'static,
     G: IntoGenerator<P>,
     G::Item: IntoIterator<IntoIter = I>,
-    I: Iterator + Send + Unpin + 'static,
+    I: Iterator + Send + 'static,
     I::Item: Send + 'static,
 {
     type Item = I::Item;
@@ -601,7 +822,10 @@ where
     fn bind_to<'a>(
         self,
         channel: ChannelBinding<'a, P>,
-    ) -> impl Generator<Item = I::Item, Output = G::Output> + Unpin + 'a {
+    ) -> impl Generator<Item = I::Item, Output = G::Output> + Unpin + 'a
+    where
+        Self: 'a,
+    {
         Flatten {
             inner: self.inner.bind_to(channel),
             rest: None,
@@ -611,7 +835,10 @@ where
     fn bind_boxed<'a>(
         self: Box<Self>,
         channel: ChannelBinding<'a, P>,
-    ) -> BoxedGenerator<'a, I::Item, G::Output> {
+    ) -> BoxedGenerator<'a, I::Item, G::Output>
+    where
+        Self: 'a,
+    {
         Box::new((*self).bind_to(channel))
     }
 }
@@ -620,7 +847,7 @@ impl<G, I> Generator for Flatten<G, I>
 where
     G: Generator + Unpin,
     G::Item: IntoIterator<IntoIter = I>,
-    I: Iterator + Send + Unpin,
+    I: Iterator + Send,
     I::Item: Send + 'static,
 {
     type Item = I::Item;
@@ -659,16 +886,21 @@ pub fn empty<Y: Send + 'static>() -> Iter<std::iter::Empty<Y>> {
 pub fn from_iter<T>(iter: T) -> Iter<T::IntoIter>
 where
     T: IntoIterator,
-    T::IntoIter: Send + Unpin,
+    T::IntoIter: Send,
     T::Item: Send + 'static,
 {
     Iter(iter.into_iter())
 }
 
 /// Generator returned by [`from_iter`].
+// WARNING: We manually impl `Unpin` for `Iter`, so pinning the generator will not structurally pin
+// `I`, even if `I: !Unpin`. This is sound only because `Iter` does not structurally pin its inner
+// value; it is accessed only through `Iterator::next(&mut self)`.
 pub struct Iter<I>(I);
 
-impl<I: Iterator + Send + Unpin + 'static, P: Send + 'static> IntoGenerator<P> for Iter<I>
+impl<I> Unpin for Iter<I> {}
+
+impl<I: Iterator + Send, P: Send + 'static> IntoGenerator<P> for Iter<I>
 where
     I::Item: Send + 'static,
 {
@@ -678,19 +910,25 @@ where
     fn bind_to<'a>(
         self,
         _channel: ChannelBinding<'a, P>,
-    ) -> impl Generator<Item = I::Item, Output = ()> + Unpin + 'a {
+    ) -> impl Generator<Item = I::Item, Output = ()> + Unpin + 'a
+    where
+        Self: 'a,
+    {
         self
     }
 
     fn bind_boxed<'a>(
         self: Box<Self>,
         channel: ChannelBinding<'a, P>,
-    ) -> BoxedGenerator<'a, I::Item> {
+    ) -> BoxedGenerator<'a, I::Item>
+    where
+        Self: 'a,
+    {
         self
     }
 }
 
-impl<I: Iterator + Send + Unpin> Generator for Iter<I>
+impl<I: Iterator + Send> Generator for Iter<I>
 where
     I::Item: Send + 'static,
 {
@@ -734,12 +972,12 @@ where
 pub(crate) fn unfold_mut_with<'s, S, I, F, Fut>(
     state: S,
     next: F,
-    mut witness: impl FnMut(S, F) -> Fut + Send + Unpin + 's,
+    mut witness: impl FnMut(S, F) -> Fut + Send + 's,
 ) -> impl Generator<Item = I, Output = ()> + Unpin + 's
 where
-    S: Send + Unpin + 's,
+    S: Send + 's,
     I: Send + 'static,
-    F: Send + Unpin + 's,
+    F: Send + 's,
     Fut: Future<Output = DeltaResult<Option<((S, F), I)>>> + Send + 's,
 {
     unfold((state, next), move |(state, next)| witness(state, next))
@@ -761,17 +999,22 @@ where
 }
 
 /// Generator returned by [`unfold`].
+// WARNING: We manually impl `Unpin` for `Unfold`, even when its inputs are not `Unpin`. This is
+// sound only because `idle` and `step` are not structurally pinned; the pending future remains
+// pinned by its `Pin<Box<Fut>>` when `Unfold` moves.
 pub struct Unfold<S, F, Fut> {
     idle: Option<S>,
     pending: Option<Pin<Box<Fut>>>,
     step: F,
 }
 
+impl<S, F, Fut> Unpin for Unfold<S, F, Fut> {}
+
 impl<S, I, F, Fut> Generator for Unfold<S, F, Fut>
 where
-    S: Send + Unpin,
+    S: Send,
     I: Send + 'static,
-    F: FnMut(S) -> Fut + Send + Unpin,
+    F: FnMut(S) -> Fut + Send,
     Fut: Future<Output = DeltaResult<Option<(S, I)>>> + Send,
 {
     type Item = I;

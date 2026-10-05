@@ -224,9 +224,9 @@ impl CommitAction {
     /// Batches contain raw actions exactly as recorded in the commit JSON; no column-mapping
     /// translation is applied.
     pub fn get_actions(&self, engine: &dyn Engine) -> DeltaResult<FileDataReadResultIterator> {
-        let connector = EngineConnector::new(engine);
-        let actions = connector.prepare_generator(self.get_actions_coroutine())?;
-        Ok(Box::new(connector.iterate_result_generator(actions)))
+        let connector = EngineConnector::new(engine).with_cancellation_token(None);
+        let actions = connector.iterate_prepared_result_generator(self.get_actions_coroutine())?;
+        Ok(Box::new(actions))
     }
 
     /// Return a lazy workflow that prepares this commit's action generator.

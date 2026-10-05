@@ -17,13 +17,14 @@ use super::kernel::request::{
     WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
 };
 use super::kernel::{
-    coroutine, ChannelExt as _, Coroutine, GeneratorCoroutineStep, StaticCoroutine,
-    StaticGeneratorCoroutine,
+    coroutine, ChannelExt as _, Coroutine, GeneratorCoroutine, GeneratorCoroutineStep,
+    StaticCoroutine, StaticGeneratorCoroutine,
 };
 #[cfg(feature = "declarative-plans")]
 use super::PlanOperation;
 use super::{
-    drive_coroutine, Cursor, IntoGenerator, Page, PageRequest, PagedOperation, PlanRequest, Request,
+    drive_coroutine, Cursor, GeneratorExt as _, IntoGenerator, Page, PageGenerator, PageRequest,
+    PagedOperation, PlanRequest, Request,
 };
 use crate::cancellation::{check_cancelled, CancellationTokenRef};
 use crate::committer::Committer;
@@ -117,35 +118,37 @@ struct PlanExecutorConnector<'a> {
 
 /// Iterator over yielded items that serves the generator's connector requests.
 pub(crate) struct EngineGeneratorIterator<
+    'a,
     Item: Send + 'static,
     O: Send + 'static = (),
     C = EngineConnector,
 > {
     connector: C,
-    state: GeneratorState<Item, O>,
+    state: GeneratorState<'a, Item, O>,
 }
 
 /// Iterator over fallible yielded items that also serves generator requests.
 pub(crate) struct EngineResultGeneratorIterator<
+    'a,
     Item: Send + 'static,
     O: Send + 'static = (),
     C = EngineConnector,
 > {
-    inner: EngineGeneratorIterator<DeltaResult<Item>, O, C>,
+    inner: EngineGeneratorIterator<'a, DeltaResult<Item>, O, C>,
 }
 
-enum GeneratorState<Item: Send + 'static, O: Send + 'static> {
-    Active(StaticGeneratorCoroutine<Item, O>),
+enum GeneratorState<'a, Item: Send + 'static, O: Send + 'static> {
+    Active(GeneratorCoroutine<'a, Item, O>),
     Complete(O),
     Failed,
 }
 
-struct OutputTrackingIterator<Item: Send + 'static, O: Send + 'static> {
-    inner: EngineGeneratorIterator<Item, O>,
+struct OutputTrackingIterator<'a, Item: Send + 'static, O: Send + 'static> {
+    inner: EngineGeneratorIterator<'a, Item, O>,
     output: Arc<Mutex<Option<O>>>,
 }
 
-impl<Item: Send + 'static, O: Send + 'static> Iterator for OutputTrackingIterator<Item, O> {
+impl<Item: Send + 'static, O: Send + 'static> Iterator for OutputTrackingIterator<'_, Item, O> {
     type Item = DeltaResult<Item>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -340,17 +343,17 @@ impl EngineConnector {
         }))
     }
 
-    /// Drive generator preparation and bind the resulting generator to an owned request channel.
-    pub(crate) fn prepare_generator<G>(
-        &self,
+    /// Prepare a fallible generator and return an iterator that drives it and its requests.
+    pub(crate) fn iterate_prepared_result_generator<'a, G, Item>(
+        self,
         coroutine: Coroutine<'_, G>,
-    ) -> DeltaResult<StaticGeneratorCoroutine<G::Item, G::Output>>
+    ) -> DeltaResult<EngineResultGeneratorIterator<'a, Item>>
     where
-        G: IntoGenerator<Request>,
+        G: IntoGenerator<Request, Item = DeltaResult<Item>, Output = ()> + 'a,
+        Item: Send + 'static,
     {
-        Ok(StaticGeneratorCoroutine::from_generator(
-            self.drive(coroutine)?,
-        ))
+        let generator = GeneratorCoroutine::from_generator(self.drive(coroutine)?);
+        Ok(self.iterate_result_generator(generator))
     }
 
     /// Drive a coroutine whose catalog requests are handled by `committer`.
@@ -372,10 +375,10 @@ impl EngineConnector {
     }
 
     /// Return an iterator that drives `generator` and its connector requests.
-    pub(crate) fn iterate_generator<Item: Send + 'static, O: Send + 'static>(
+    pub(crate) fn iterate_generator<'a, Item: Send + 'static, O: Send + 'static>(
         self,
-        generator: impl Into<StaticGeneratorCoroutine<Item, O>>,
-    ) -> EngineGeneratorIterator<Item, O> {
+        generator: impl Into<GeneratorCoroutine<'a, Item, O>>,
+    ) -> EngineGeneratorIterator<'a, Item, O> {
         EngineGeneratorIterator {
             connector: self,
             state: GeneratorState::Active(generator.into()),
@@ -383,10 +386,10 @@ impl EngineConnector {
     }
 
     /// Like [`iterate_generator`], but for generators that yield [`DeltaResult`] items.
-    pub(crate) fn iterate_result_generator<Item: Send + 'static, O: Send + 'static>(
+    pub(crate) fn iterate_result_generator<'a, Item: Send + 'static, O: Send + 'static>(
         self,
-        generator: impl Into<StaticGeneratorCoroutine<DeltaResult<Item>, O>>,
-    ) -> EngineResultGeneratorIterator<Item, O> {
+        generator: impl Into<GeneratorCoroutine<'a, DeltaResult<Item>, O>>,
+    ) -> EngineResultGeneratorIterator<'a, Item, O> {
         EngineResultGeneratorIterator {
             inner: self.iterate_generator(generator),
         }
@@ -401,6 +404,24 @@ impl EngineConnector {
         self.drive(coroutine!(async move |channel| {
             channel.prepare_paged(operation).await
         }))
+    }
+
+    /// Prepare `operation` and flatten its remaining pages into an independently driven generator.
+    pub(crate) fn prepare_flattened_generator<Op>(
+        &self,
+        operation: Op,
+    ) -> DeltaResult<StaticGeneratorCoroutine<<Op::Page as IntoIterator>::Item>>
+    where
+        Op: PagedOperation,
+        Op::Page: IntoIterator,
+        <Op::Page as IntoIterator>::IntoIter: Send + 'static,
+        <Op::Page as IntoIterator>::Item: Send + 'static,
+        PageRequest<Op>: Into<Request>,
+    {
+        let cursor = self.prepare_paged(operation)?;
+        Ok(StaticGeneratorCoroutine::from_generator(
+            PageGenerator::resume(cursor).flatten(),
+        ))
     }
 
     fn storage_connector(&self) -> StorageConnector<'_> {
@@ -564,26 +585,22 @@ impl EngineConnector {
 
 /// Return an iterator that drives a fallible generator through `engine`.
 #[internal_api]
-pub(crate) fn iterate_result_generator_with_engine<Item: Send + 'static, O: Send + 'static>(
+pub(crate) fn iterate_result_generator_with_engine<'a, Item: Send + 'static, O: Send + 'static>(
     engine: &dyn Engine,
-    generator: impl Into<StaticGeneratorCoroutine<DeltaResult<Item>, O>>,
-) -> impl Iterator<Item = DeltaResult<Item>> + Send {
+    generator: impl Into<GeneratorCoroutine<'a, DeltaResult<Item>, O>>,
+) -> impl Iterator<Item = DeltaResult<Item>> + Send + 'a {
     EngineConnector::new(engine).iterate_result_generator(generator)
 }
 
 /// Prepare and iterate a fallible generator through one connector captured from `engine`.
 #[internal_api]
-pub(crate) fn iterate_prepared_result_generator_with_engine<G, Item>(
-    engine: &dyn Engine,
-    coroutine: Coroutine<'_, G>,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<Item>> + Send>
-where
-    G: IntoGenerator<Request, Item = DeltaResult<Item>, Output = ()>,
-    Item: Send + 'static,
-{
-    let connector = EngineConnector::new(engine);
-    let generator = connector.prepare_generator(coroutine)?;
-    Ok(connector.iterate_result_generator(generator))
+macro_rules! iterate_prepared_result_generator_with_engine {
+    ($engine:expr, $cancellation_token:expr, $body:expr) => {{
+        let connector = $crate::coroutine::EngineConnector::new($engine)
+            .with_cancellation_token($cancellation_token);
+        let coroutine = $crate::coroutine::kernel::coroutine!($body);
+        connector.iterate_prepared_result_generator(coroutine)
+    }};
 }
 
 /// Construct and drive a coroutine through an [`Engine`].
@@ -771,7 +788,7 @@ impl EnginePagination<PlanOperation> for PlanExecutorConnector<'_> {
     }
 }
 
-impl<Item: Send + 'static, O: Send + 'static, C> EngineGeneratorIterator<Item, O, C> {
+impl<Item: Send + 'static, O: Send + 'static, C> EngineGeneratorIterator<'_, Item, O, C> {
     /// Return whether the generator completed and stored its terminal output.
     pub(crate) fn is_complete(&self) -> bool {
         matches!(self.state, GeneratorState::Complete(_))
@@ -791,7 +808,7 @@ impl<Item: Send + 'static, O: Send + 'static, C> EngineGeneratorIterator<Item, O
     }
 }
 
-impl<Item: Send + 'static, O: Send + 'static, C> EngineResultGeneratorIterator<Item, O, C> {
+impl<Item: Send + 'static, O: Send + 'static, C> EngineResultGeneratorIterator<'_, Item, O, C> {
     /// Return whether the generator completed and stored its terminal output.
     pub(crate) fn is_complete(&self) -> bool {
         self.inner.is_complete()
@@ -804,7 +821,7 @@ impl<Item: Send + 'static, O: Send + 'static, C> EngineResultGeneratorIterator<I
 }
 
 impl<C: Borrow<EngineConnector>, Item: Send + 'static, O: Send + 'static> Iterator
-    for EngineGeneratorIterator<Item, O, C>
+    for EngineGeneratorIterator<'_, Item, O, C>
 {
     type Item = DeltaResult<Item>;
 
@@ -814,7 +831,7 @@ impl<C: Borrow<EngineConnector>, Item: Send + 'static, O: Send + 'static> Iterat
 }
 
 impl<C: Borrow<EngineConnector>, Item: Send + 'static, O: Send + 'static> Iterator
-    for EngineResultGeneratorIterator<Item, O, C>
+    for EngineResultGeneratorIterator<'_, Item, O, C>
 {
     type Item = DeltaResult<Item>;
 
@@ -825,7 +842,7 @@ impl<C: Borrow<EngineConnector>, Item: Send + 'static, O: Send + 'static> Iterat
 
 fn next_generator<Item: Send + 'static, O: Send + 'static>(
     connector: &EngineConnector,
-    state: &mut GeneratorState<Item, O>,
+    state: &mut GeneratorState<'_, Item, O>,
 ) -> Option<DeltaResult<Item>> {
     let GeneratorState::Active(generator) = state else {
         return None;

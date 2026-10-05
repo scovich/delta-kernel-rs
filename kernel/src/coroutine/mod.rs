@@ -528,7 +528,7 @@ impl<Op: PagedOperation> GeneratorExt for PageGenerator<Op> {}
 impl<P, Op> IntoGenerator<P> for PageGenerator<Op>
 where
     P: Send + 'static,
-    Op: PagedOperation + Unpin,
+    Op: PagedOperation,
     PageRequest<Op>: Into<P>,
 {
     type Item = Op::Page;
@@ -537,14 +537,20 @@ where
     fn bind_to<'a>(
         self,
         channel: ChannelBinding<'a, P>,
-    ) -> impl Generator<Item = Op::Page, Output = ()> + Unpin + 'a {
+    ) -> impl Generator<Item = Op::Page, Output = ()> + Unpin + 'a
+    where
+        Self: 'a,
+    {
         unfold_mut!(BoundPages::new(channel, self), BoundPages::next)
     }
 
     fn bind_boxed<'a>(
         self: Box<Self>,
         channel: ChannelBinding<'a, P>,
-    ) -> BoxedGenerator<'a, Op::Page> {
+    ) -> BoxedGenerator<'a, Op::Page>
+    where
+        Self: 'a,
+    {
         Box::new((*self).bind_to(channel))
     }
 }
@@ -614,7 +620,6 @@ impl<'a, C: ?Sized, Op: PagedOperation> Pages<'a, C, Op> {
     where
         PageRequest<Op>: Into<P>,
         C: ChannelExchange<P> + Sync + 'static,
-        Op: Unpin,
         P: Send + 'static,
     {
         unfold_mut!(self, Pages::next)
@@ -626,9 +631,8 @@ impl<'a, C: ?Sized, Op: PagedOperation> Pages<'a, C, Op> {
         self,
     ) -> impl Generator<Item = <Op::Page as IntoIterator>::Item, Output = ()> + Unpin + 'a
     where
-        Op: Unpin,
         Op::Page: IntoIterator,
-        <Op::Page as IntoIterator>::IntoIter: Send + Unpin,
+        <Op::Page as IntoIterator>::IntoIter: Send,
         <Op::Page as IntoIterator>::Item: Send + 'static,
         PageRequest<Op>: Into<P>,
         C: ChannelExchange<P> + Sync + 'static,
@@ -664,15 +668,18 @@ impl<'a, C: ?Sized, Op: PagedOperation> Pages<'a, C, Op> {
 #[doc(inline)]
 #[internal_api]
 pub(crate) use self::engine::drive_with_storage;
+pub(crate) use self::engine::EngineConnector;
 #[doc(inline)]
 #[internal_api]
 pub(crate) use self::engine::{
-    drive_with_engine, drive_with_engine_and_committer,
-    iterate_prepared_result_generator_with_engine, iterate_result_generator_with_engine,
+    drive_with_engine, drive_with_engine_and_committer, iterate_result_generator_with_engine,
 };
 #[doc(inline)]
 #[internal_api]
-pub(crate) use self::engine::{run_coroutine_with_engine, run_coroutine_with_storage};
+pub(crate) use self::engine::{
+    iterate_prepared_result_generator_with_engine, run_coroutine_with_engine,
+    run_coroutine_with_storage,
+};
 
 #[cfg(test)]
 mod tests;

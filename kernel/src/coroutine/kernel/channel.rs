@@ -124,9 +124,9 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
         operation: Op,
     ) -> impl Generator<Item = <Op::Page as IntoIterator>::Item, Output = ()> + Unpin + '_
     where
-        Op: PagedOperation + Unpin,
+        Op: PagedOperation,
         Op::Page: IntoIterator,
-        <Op::Page as IntoIterator>::IntoIter: Send + Unpin,
+        <Op::Page as IntoIterator>::IntoIter: Send,
         <Op::Page as IntoIterator>::Item: Send + 'static,
         PageRequest<Op>: Into<Request>,
         Self: Sync + 'static,

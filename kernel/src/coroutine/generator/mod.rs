@@ -58,8 +58,9 @@ use delta_kernel_derive::internal_api;
 use tracing::{error, Instrument as _, Span};
 
 pub use self::adapters::{
-    empty, from_iter, unfold, BoxedDeltaResultGenerator, BoxedGenerator, Chain, FilterOk, Flatten,
-    Generator, GeneratorExt, GeneratorStep, IntoGenerator, Iter, Map, MapOk, Peekable, Unfold,
+    empty, from_iter, map_async_witness, unfold, BoxedDeltaResultGenerator, BoxedGenerator, Chain,
+    FilterOk, Flatten, Generator, GeneratorExt, GeneratorStep, IntoGenerator, Iter, Map, MapAsync,
+    MapAsyncWitness, MapOk, Peekable, Unfold,
 };
 pub(crate) use self::adapters::{unfold_mut_with, unfold_mut_witness};
 use super::core::{noop_context, Channel, ChannelExchange, DeltaFuture, Reply, Step, Task};
@@ -295,6 +296,18 @@ macro_rules! generator_fn {
     };
 }
 
+/// Maps generator items asynchronously through the bound request channel.
+#[internal_api]
+macro_rules! map_async {
+    ($generator:expr, |$channel:ident, $item:ident| $body:block) => {
+        $crate::coroutine::generator::GeneratorExt::map_async(
+            $generator,
+            $crate::coroutine::generator::map_async_witness,
+            async move |$channel, $item| $body,
+        )
+    };
+}
+
 /// Builds a [`Generator`] from owned state and an async `next(&mut state)` callback.
 ///
 /// Supplies the [`Send`] witness the same way [`generator!`] does. Each step boxes the
@@ -310,9 +323,9 @@ macro_rules! unfold_mut {
     };
 }
 
-impl<P: Send + 'static, Y: Send + 'static, O: Send + 'static> StaticGeneratorCoroutine<P, Y, O> {
+impl<'a, P: Send + 'static, Y: Send + 'static, O: Send + 'static> GeneratorCoroutine<'a, P, Y, O> {
     /// Bind an unbound generator to an owned request channel.
-    pub fn from_generator(generator: impl IntoGenerator<P, Item = Y, Output = O>) -> Self {
+    pub fn from_generator(generator: impl IntoGenerator<P, Item = Y, Output = O> + 'a) -> Self {
         let requests = Arc::new(Channel::default());
         let generator = generator.bind_to(ChannelBinding::Owned(Arc::clone(&requests)));
         Self {
@@ -413,19 +426,25 @@ where
     fn bind_to<'a>(
         self,
         channel: ChannelBinding<'a, P>,
-    ) -> impl Generator<Item = Y, Output = O> + Unpin + 'a {
+    ) -> impl Generator<Item = Y, Output = O> + Unpin + 'a
+    where
+        Self: 'a,
+    {
         (self.bind)(channel)
     }
 
-    fn bind_boxed<'a>(self: Box<Self>, channel: ChannelBinding<'a, P>) -> BoxedGenerator<'a, Y, O> {
+    fn bind_boxed<'a>(self: Box<Self>, channel: ChannelBinding<'a, P>) -> BoxedGenerator<'a, Y, O>
+    where
+        Self: 'a,
+    {
         Box::new((*self).bind_to(channel))
     }
 }
 
-impl<P: Send + 'static, Y: Send + 'static, O: Send + 'static>
-    From<Box<dyn IntoGenerator<P, Item = Y, Output = O>>> for StaticGeneratorCoroutine<P, Y, O>
+impl<'a, P: Send + 'static, Y: Send + 'static, O: Send + 'static>
+    From<Box<dyn IntoGenerator<P, Item = Y, Output = O> + 'a>> for GeneratorCoroutine<'a, P, Y, O>
 {
-    fn from(generator: Box<dyn IntoGenerator<P, Item = Y, Output = O>>) -> Self {
+    fn from(generator: Box<dyn IntoGenerator<P, Item = Y, Output = O> + 'a>) -> Self {
         let requests = Arc::new(Channel::default());
         Self {
             generator: generator.bind_boxed(ChannelBinding::Owned(Arc::clone(&requests))),

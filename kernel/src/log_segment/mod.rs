@@ -19,8 +19,8 @@ use crate::coroutine::engine::EngineConnector;
 use crate::coroutine::kernel::request::ReadParquetFiles;
 use crate::coroutine::kernel::{coroutine, Channel, Request};
 use crate::coroutine::{
-    run_coroutine_with_engine, ChannelExt as _, DeltaResultGenerator, GeneratorExt as _,
-    IntoGenerator,
+    iterate_prepared_result_generator_with_engine, run_coroutine_with_engine, ChannelExt as _,
+    DeltaResultGenerator, GeneratorExt as _, IntoGenerator,
 };
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
@@ -896,12 +896,11 @@ impl LogSegment {
         schema: SchemaRef,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        let connector =
-            EngineConnector::new(engine).with_cancellation_token(cancellation_token.cloned());
-        let actions = connector.prepare_generator(coroutine!(async move |channel| {
-            self.read_commit_actions_generator(channel, schema).await
-        }))?;
-        Ok(connector.iterate_result_generator(actions))
+        iterate_prepared_result_generator_with_engine!(
+            engine,
+            cancellation_token.cloned(),
+            async move |channel| { self.read_commit_actions_generator(channel, schema).await }
+        )
     }
 
     /// Generate this segment's commit-cover action batches in descending version order.
