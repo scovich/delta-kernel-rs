@@ -10,10 +10,14 @@ use uuid::Uuid;
 
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::coroutine::kernel::Channel;
-use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _, GeneratorExt as _};
+#[cfg(test)]
+use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::{ChannelExt as _, GeneratorExt as _};
 use crate::engine_data::RowVisitor;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, FileMeta, ParquetMultiFileWrite, Version};
+#[cfg(test)]
+use crate::Engine;
+use crate::{DeltaResult, Error, FileMeta, ParquetMultiFileWrite, Version};
 
 /// How many characters a version tag has
 const VERSION_LEN: usize = 20;
@@ -383,6 +387,7 @@ impl ParsedLogPath<FileMeta> {
     ///
     /// Returns the inCommitTimestamp value, or an error if ICT is not found or cannot be read.
     /// Callers should handle enablement version checks before calling this method.
+    #[cfg(test)]
     pub(crate) fn read_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
         run_coroutine_with_engine!(engine, async move |channel| {
             self.read_in_commit_timestamp_with_channel(channel).await

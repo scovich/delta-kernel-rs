@@ -656,8 +656,29 @@ impl LogSegment {
     /// listing.
     // This lists all files starting from `end-limit` if `limit` is defined. For large tables,
     // listing with a `limit` can be a significant speedup over listing _all_ the files in the log.
+    #[cfg(test)]
     pub(crate) fn for_timestamp_conversion(
         storage: &dyn StorageHandler,
+        log_root: Url,
+        end_version: Version,
+        limit: Option<NonZero<usize>>,
+        log_tail: Vec<ParsedLogPath>,
+    ) -> DeltaResult<Self> {
+        run_coroutine_with_storage!(storage, None, async move |channel| {
+            Self::for_timestamp_conversion_with_channel(
+                channel,
+                log_root,
+                end_version,
+                limit,
+                log_tail,
+            )
+            .await
+        })
+    }
+
+    /// Construct a timestamp-conversion log segment through `channel`.
+    pub(crate) async fn for_timestamp_conversion_with_channel(
+        channel: &Channel,
         log_root: Url,
         end_version: Version,
         limit: Option<NonZero<usize>>,
@@ -675,14 +696,14 @@ impl LogSegment {
 
         // this is a list of commits with possible gaps, we want to take the latest contiguous
         // chunk of commits
-        let mut listed_commits = LogSegmentFiles::list_commits(
-            storage,
+        let mut listed_commits = LogSegmentFiles::list_commits_with_channel(
+            channel,
             &log_root,
             log_tail,
             start_from,
             Some(end_version),
-            None, // timestamp conversion does not thread a cancellation token
-        )?;
+        )
+        .await?;
         if listed_commits.ascending_commit_files().is_empty() {
             return Err(Error::EmptyLog);
         }
