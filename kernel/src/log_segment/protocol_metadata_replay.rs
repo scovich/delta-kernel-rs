@@ -213,19 +213,18 @@ impl LogSegment {
 
         let batches = executor
             .execute_op(Operation::QueryPlan(plan))?
-            .into_data()?
-            .map(|batch| {
-                // Mark as a log batch so the checkpoint action is read from it.
-                let batch = ActionsBatch::new(batch?, true);
-                let (protocol_version, metadata_version) =
-                    pm_versions_from_plan_output(batch.actions.as_ref())?;
-                Ok(VersionedBatch {
-                    protocol_version,
-                    metadata_version,
-                    batch,
-                })
-            });
-        Ok(batches)
+            .into_data()?;
+        Ok(batches.map(|batch| {
+            // Mark as a log batch so the checkpoint action is read from it.
+            let batch = ActionsBatch::new(batch?, true);
+            let (protocol_version, metadata_version) =
+                pm_versions_from_plan_output(batch.actions.as_ref())?;
+            Ok(VersionedBatch {
+                protocol_version,
+                metadata_version,
+                batch,
+            })
+        }))
     }
 
     /// Reads the P&M commit cover and checkpoint, tagging each batch with its version.
