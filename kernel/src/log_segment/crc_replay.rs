@@ -70,18 +70,6 @@ impl LogSegment {
     /// - Case 2: base CRC at `end_version` -> return it as-is
     /// - Case 3: stale base CRC older than `end_version` -> advance it to `end_version` when
     ///   `incremental_replay` permits, else fall back to normal log replay (return None)
-    pub(crate) fn try_build_crc_within_budget(
-        &self,
-        engine: &dyn Engine,
-        base: Option<&Arc<Crc>>,
-        incremental_replay: IncrementalReplay,
-    ) -> DeltaResult<Option<(Arc<Crc>, ProtocolMetadataSource)>> {
-        run_coroutine_with_engine!(engine, async move |channel| {
-            self.try_build_crc_within_budget_with_channel(channel, base, incremental_replay)
-                .await
-        })
-    }
-
     pub(crate) async fn try_build_crc_within_budget_with_channel(
         &self,
         channel: &Channel,
@@ -107,6 +95,7 @@ impl LogSegment {
     /// Pick the latest CRC to use as an advance base: this segment's on-disk CRC or
     /// `in_memory_base`, whichever is newer, falling back to `in_memory_base` on a failed on-disk
     /// read. Drops a base below the checkpoint; returns None when no candidate remains.
+    #[cfg(test)]
     pub(crate) fn pick_latest_base_crc(
         &self,
         engine: &dyn Engine,
@@ -144,14 +133,6 @@ impl LogSegment {
     /// Read this segment's latest on-disk CRC (`latest_crc_file`), at whatever version it sits.
     /// Returns None when there is no CRC file or the read fails. The returned CRC may be stale
     /// (older than `end_version`).
-    pub(crate) fn read_latest_crc(&self, engine: &dyn Engine) -> Option<Arc<Crc>> {
-        run_coroutine_with_engine!(engine, async move |channel| {
-            Ok(self.read_latest_crc_with_channel(channel).await)
-        })
-        .ok()
-        .flatten()
-    }
-
     pub(crate) async fn read_latest_crc_with_channel(&self, channel: &Channel) -> Option<Arc<Crc>> {
         self.pick_latest_base_crc_with_channel(channel, /* in_memory_base */ None)
             .await

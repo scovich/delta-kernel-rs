@@ -12,12 +12,17 @@ use url::Url;
 use crate::actions::{
     CheckpointMetadata, DomainMetadata, Metadata, Protocol, SetTransaction, Sidecar,
 };
+#[cfg(test)]
 use crate::cancellation::CancellationTokenRef;
 use crate::coroutine::kernel::Channel;
-use crate::coroutine::{run_coroutine_with_storage, ChannelExt as _};
+#[cfg(test)]
+use crate::coroutine::run_coroutine_with_storage;
+use crate::coroutine::ChannelExt as _;
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, Error, FileMeta, StorageHandler, Version};
+#[cfg(test)]
+use crate::StorageHandler;
+use crate::{DeltaResult, Error, FileMeta, Version};
 
 /// Name of the _last_checkpoint file that provides metadata about the last checkpoint
 /// created for the table. This file is used as a hint for the engine to quickly locate
@@ -232,6 +237,7 @@ impl LastCheckpointHint {
     /// are assumed to cause failure.
     // TODO(#1047): weird that we propagate FileNotFound as part of the iterator instead of top-
     // level result coming from storage.read_files
+    #[cfg(test)]
     pub(crate) fn try_read(
         storage: &dyn StorageHandler,
         log_root: &Url,
@@ -248,7 +254,8 @@ impl LastCheckpointHint {
         fields(enable_call_frame),
         err
     )]
-    async fn try_read_with_channel(
+    #[internal_api]
+    pub(crate) async fn try_read_with_channel(
         channel: &Channel,
         log_root: &Url,
     ) -> DeltaResult<Option<LastCheckpointHint>> {

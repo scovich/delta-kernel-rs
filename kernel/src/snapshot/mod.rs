@@ -234,10 +234,10 @@ impl Snapshot {
     /// from the latest on-disk CRC, advanced to the segment's end version when `incremental_replay`
     /// permits, or used to root Protocol and Metadata log replay otherwise. Falls back to full log
     /// replay when no CRC is present.
-    fn try_new_from_log_segment(
+    async fn try_new_from_log_segment(
         location: Url,
         log_segment: LogSegment,
-        engine: &dyn Engine,
+        channel: &Channel,
         metric_context: SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
@@ -245,11 +245,12 @@ impl Snapshot {
         let (table_configuration, crc) = Self::prepare_new_from_log_segment(
             &location,
             &log_segment,
-            engine,
+            channel,
             &metric_context,
             incremental_replay,
             built_as_latest,
-        )?;
+        )
+        .await?;
 
         Ok(Self::new_with_validated_crc(
             log_segment,
@@ -261,10 +262,10 @@ impl Snapshot {
     }
 
     #[instrument(name = "try_new_from_log_segment", skip_all, fields(path = %location, enable_call_frame, version = log_segment.end_version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or(""), incremental_replay = ?incremental_replay, built_as_latest = built_as_latest))]
-    fn prepare_new_from_log_segment(
+    async fn prepare_new_from_log_segment(
         location: &Url,
         log_segment: &LogSegment,
-        engine: &dyn Engine,
+        channel: &Channel,
         metric_context: &SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
@@ -272,10 +273,11 @@ impl Snapshot {
         let result = Self::resolve_table_configuration_and_crc(
             location,
             log_segment,
-            engine,
+            channel,
             metric_context,
             incremental_replay,
         )
+        .await
         .and_then(|(table_configuration, crc)| {
             let crc = Self::validate_configuration_and_crc(log_segment, &table_configuration, crc)?;
             Ok((table_configuration, crc))
@@ -293,10 +295,10 @@ impl Snapshot {
         })
     }
 
-    fn resolve_table_configuration_and_crc(
+    async fn resolve_table_configuration_and_crc(
         location: &Url,
         log_segment: &LogSegment,
-        engine: &dyn Engine,
+        channel: &Channel,
         metric_context: &SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
     ) -> DeltaResult<(TableConfiguration, Option<Arc<Crc>>)> {
@@ -304,9 +306,14 @@ impl Snapshot {
 
         // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
         //         (or use it as-is when already there) per `incremental_replay`.
-        let base_crc = log_segment.read_latest_crc(engine);
+        let base_crc = log_segment.read_latest_crc_with_channel(channel).await;
         let crc_at_version = log_segment
-            .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
+            .try_build_crc_within_budget_with_channel(
+                channel,
+                base_crc.as_ref(),
+                incremental_replay,
+            )
+            .await
             .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
 
         // Step 2: P&M from that CRC, else log replay rooted at the base CRC, checkpoint, or
@@ -314,7 +321,8 @@ impl Snapshot {
         let (metadata, protocol, source) = match &crc_at_version {
             Some((crc, source)) => (crc.metadata.clone(), crc.protocol.clone(), *source),
             None => log_segment
-                .read_protocol_metadata(engine, base_crc.as_ref())
+                .read_protocol_metadata_with_channel(channel, base_crc.as_ref())
+                .await
                 .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?,
         };
         emit_protocol_metadata_load(metric_context, source, pm_start.elapsed());

@@ -655,7 +655,7 @@ impl LogSegmentFiles {
     // - SortedCommitFiles: Vec<ParsedLogPath>, is_ascending: bool, end_version: Version
     // - CheckpointParts: Vec<ParsedLogPath>, checkpoint_version: Version (guarantee all same
     //   version)
-    #[instrument(name = "log.list", skip_all, fields(enable_call_frame, start = ?start_version, end = ?end_version), err)]
+    #[cfg(test)]
     pub(crate) fn list(
         storage: &dyn StorageHandler,
         log_root: &Url,
@@ -664,17 +664,32 @@ impl LogSegmentFiles {
         end_version: Option<Version>,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
-        Self::list_with_checkpoint_handling(
-            storage,
+        run_coroutine_with_storage!(storage, cancellation_token.cloned(), async move |channel| {
+            Self::list_with_channel(channel, log_root, log_tail, start_version, end_version).await
+        })
+    }
+
+    /// List commit and checkpoint files using connector requests sent through `channel`.
+    #[instrument(name = "log.list", skip_all, fields(enable_call_frame, start = ?start_version, end = ?end_version), err)]
+    pub(crate) async fn list_with_channel(
+        channel: &Channel,
+        log_root: &Url,
+        log_tail: Vec<ParsedLogPath>,
+        start_version: Option<Version>,
+        end_version: Option<Version>,
+    ) -> DeltaResult<Self> {
+        Self::list_with_checkpoint_handling_with_channel(
+            channel,
             log_root,
             log_tail,
             start_version,
             end_version,
             CheckpointHandling::Adopt,
-            cancellation_token,
         )
+        .await
     }
 
+    #[cfg(test)]
     pub(crate) fn list_with_checkpoint_handling(
         storage: &dyn StorageHandler,
         log_root: &Url,
@@ -723,6 +738,7 @@ impl LogSegmentFiles {
     /// The hint only tells us where to start listing; it never influences which checkpoint is
     /// selected at a version. A hint that turns out to describe a different checkpoint than the one
     /// selected is logged and ignored, not an error.
+    #[cfg(test)]
     pub(crate) fn list_with_checkpoint_hint(
         checkpoint_metadata: &LastCheckpointHint,
         storage: &dyn StorageHandler,
@@ -731,14 +747,34 @@ impl LogSegmentFiles {
         end_version: Option<Version>,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
-        let listed_files = Self::list(
-            storage,
+        run_coroutine_with_storage!(storage, cancellation_token.cloned(), async move |channel| {
+            Self::list_with_checkpoint_hint_with_channel(
+                checkpoint_metadata,
+                channel,
+                log_root,
+                log_tail,
+                end_version,
+            )
+            .await
+        })
+    }
+
+    /// List log files from a checkpoint hint through `channel`.
+    pub(crate) async fn list_with_checkpoint_hint_with_channel(
+        checkpoint_metadata: &LastCheckpointHint,
+        channel: &Channel,
+        log_root: &Url,
+        log_tail: Vec<ParsedLogPath>,
+        end_version: Option<Version>,
+    ) -> DeltaResult<Self> {
+        let listed_files = Self::list_with_channel(
+            channel,
             log_root,
             log_tail,
             Some(checkpoint_metadata.version),
             end_version,
-            cancellation_token,
-        )?;
+        )
+        .await?;
 
         let Some(latest_checkpoint) = listed_files.checkpoint_parts.last() else {
             // The hint names a checkpoint that no longer exists, and because the listing started
@@ -803,6 +839,7 @@ impl LogSegmentFiles {
     ///
     /// All files from windows 1-4 are combined with `log_tail` to produce a log segment
     /// rooted at the checkpoint at v8900 with all commits from v8901 to v12500.
+    #[cfg(test)]
     pub(crate) fn list_with_backward_checkpoint_scan(
         storage: &dyn StorageHandler,
         log_root: &Url,
