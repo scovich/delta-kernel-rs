@@ -933,7 +933,8 @@ impl Snapshot {
         domain: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<String>> {
-        let mut map = self.get_domain_metadatas_internal(engine, Some(&HashSet::from([domain])))?;
+        let domains = HashSet::from([domain]);
+        let mut map = self.get_domain_metadatas_internal(engine, Some(&domains))?;
         Ok(map.remove(domain).map(|dm| dm.configuration().to_owned()))
     }
 
