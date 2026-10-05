@@ -7,8 +7,8 @@ use crate::error::ExternResult;
 use crate::handle::Handle;
 use crate::transaction::ExclusiveTransaction;
 use crate::{
-    ExternEngine, IntoExternResult, KernelStringSlice, OptionalValue, SharedExternEngine,
-    SharedSnapshot, TryFromStringSlice,
+    drive_kernel, ExternEngine, IntoExternResult, KernelStringSlice, OptionalValue,
+    SharedExternEngine, SharedSnapshot, TryFromStringSlice,
 };
 
 /// Associates an app_id and version with a transaction. These will be applied to the table on
@@ -69,7 +69,8 @@ fn get_app_id_version_impl(
     app_id_res: DeltaResult<String>,
     extern_engine: &dyn ExternEngine,
 ) -> DeltaResult<Option<i64>> {
-    snapshot.get_app_id_version(&app_id_res?, extern_engine.engine().as_ref())
+    let workflow = snapshot.get_app_id_version_workflow(app_id_res?);
+    drive_kernel(extern_engine, workflow)
 }
 
 #[cfg(test)]

@@ -697,13 +697,39 @@ impl Snapshot {
         domain: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<String>> {
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.get_domain_metadata_with_channel(domain, channel).await
+        })
+    }
+
+    async fn get_domain_metadata_with_channel(
+        &self,
+        domain: &str,
+        channel: &Channel,
+    ) -> DeltaResult<Option<String>> {
         if domain.starts_with(INTERNAL_DOMAIN_PREFIX) {
             return Err(Error::generic(
                 "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain",
             ));
         }
+        self.get_domain_metadata_internal_with_channel(domain, channel)
+            .await
+    }
 
-        self.get_domain_metadata_internal(domain, engine)
+    /// Return a lazy workflow that fetches domain metadata for `domain`.
+    ///
+    /// The workflow returns an error if `domain` is reserved for internal use.
+    pub fn get_domain_metadata_workflow(
+        self: &Arc<Self>,
+        domain: impl Into<String>,
+    ) -> StaticCoroutine<Option<String>> {
+        let domain = domain.into();
+        let snapshot = Arc::clone(self);
+        static_coroutine!(async move |channel| {
+            snapshot
+                .get_domain_metadata_with_channel(&domain, channel)
+                .await
+        })
     }
 
     /// Get the row-tracking high-water mark for this snapshot.
@@ -718,9 +744,35 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<i64>> {
-        self.get_domain_metadata_internal(ROW_TRACKING_DOMAIN_NAME, engine)?
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.get_row_tracking_high_water_mark_with_channel(channel)
+                .await
+        })
+    }
+
+    /// Get the row-tracking high-water mark through `channel`.
+    pub(crate) async fn get_row_tracking_high_water_mark_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> DeltaResult<Option<i64>> {
+        let config =
+            self.get_domain_metadata_internal_with_channel(ROW_TRACKING_DOMAIN_NAME, channel);
+        config
+            .await?
             .map(|config| parse_row_tracking_high_water_mark(&config))
             .transpose()
+    }
+
+    /// Return a lazy workflow that gets the row-tracking high-water mark.
+    pub fn get_row_tracking_high_water_mark_workflow(
+        self: &Arc<Self>,
+    ) -> StaticCoroutine<Option<i64>> {
+        let snapshot = Arc::clone(self);
+        static_coroutine!(async move |channel| {
+            snapshot
+                .get_row_tracking_high_water_mark_with_channel(channel)
+                .await
+        })
     }
 
     /// Get per-clustering-column descriptors for this snapshot, if clustering is enabled.
@@ -740,13 +792,23 @@ impl Snapshot {
     ///
     /// Returns an error if the clustering domain metadata is malformed, or if a physical
     /// column name cannot be resolved to a logical name in the schema.
-    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[cfg_attr(not(feature = "internal-api"), cfg(test))]
     #[internal_api]
     pub(crate) fn get_clustering_column_infos(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<Vec<ClusteringColumnInfo>>> {
-        let Some(physical_columns) = self.get_physical_clustering_columns(engine)? else {
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.get_clustering_column_infos_with_channel(channel).await
+        })
+    }
+
+    async fn get_clustering_column_infos_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> DeltaResult<Option<Vec<ClusteringColumnInfo>>> {
+        let physical_columns = self.get_physical_clustering_columns_with_channel(channel);
+        let Some(physical_columns) = physical_columns.await? else {
             return Ok(None);
         };
         let column_mapping_mode = self.table_configuration.column_mapping_mode();
@@ -769,6 +831,20 @@ impl Snapshot {
         Ok(Some(infos))
     }
 
+    /// Return a lazy workflow that gets clustering-column descriptors.
+    #[internal_api]
+    #[allow(unused)]
+    pub(crate) fn get_clustering_column_infos_workflow(
+        self: &Arc<Self>,
+    ) -> StaticCoroutine<Option<Vec<ClusteringColumnInfo>>> {
+        let snapshot = Arc::clone(self);
+        static_coroutine!(async move |channel| {
+            snapshot
+                .get_clustering_column_infos_with_channel(channel)
+                .await
+        })
+    }
+
     /// Get the clustering columns for this snapshot, if the table has clustering enabled.
     ///
     /// Returns `Ok(Some(columns))` when the ClusteredTable feature is enabled and the
@@ -778,12 +854,25 @@ impl Snapshot {
     ///
     /// The columns are returned as physical column names, respecting the column mapping mode.
     /// Note that this method performs log replay (fetches and processes metadata from storage).
+    #[cfg_attr(not(feature = "internal-api"), cfg(test))]
     #[internal_api]
     pub(crate) fn get_physical_clustering_columns(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<Vec<ColumnName>>> {
-        match self.get_clustering_domain_metadata(engine)? {
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.get_physical_clustering_columns_with_channel(channel)
+                .await
+        })
+    }
+
+    /// Get physical clustering columns through `channel`.
+    pub(crate) async fn get_physical_clustering_columns_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> DeltaResult<Option<Vec<ColumnName>>> {
+        let config = self.get_clustering_domain_metadata_with_channel(channel);
+        match config.await? {
             Some(config) => Ok(Some(parse_clustering_columns(&config)?)),
             None => Ok(None),
         }
@@ -794,9 +883,9 @@ impl Snapshot {
     /// Returns `Ok(None)` when the `ClusteredTable` feature is absent on the protocol, or when
     /// the domain has no current entry. The JSON has the shape
     /// `{"clusteringColumns":[["col1"],["addr","city"], ...]}` with physical column names.
-    pub(crate) fn get_clustering_domain_metadata(
+    async fn get_clustering_domain_metadata_with_channel(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
     ) -> DeltaResult<Option<String>> {
         if !self
             .table_configuration
@@ -805,7 +894,8 @@ impl Snapshot {
         {
             return Ok(None);
         }
-        self.get_domain_metadata_internal(CLUSTERING_DOMAIN_NAME, engine)
+        self.get_domain_metadata_internal_with_channel(CLUSTERING_DOMAIN_NAME, channel)
+            .await
     }
 
     /// Load domain metadata: if Complete in the CRC, answer from the cache; else if every
@@ -814,6 +904,7 @@ impl Snapshot {
     /// replay. `domains == None` means load all.
     ///
     /// Reports metrics: `DomainMetadataLoadSuccess` or `DomainMetadataLoadFailure`.
+    #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(dead_code))]
     #[internal_api]
     pub(crate) fn get_domain_metadatas_internal(
         &self,
@@ -933,8 +1024,23 @@ impl Snapshot {
         domain: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<String>> {
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.get_domain_metadata_internal_with_channel(domain, channel)
+                .await
+        })
+    }
+
+    /// Fetch domain metadata for `domain` through `channel`.
+    #[internal_api]
+    pub(crate) async fn get_domain_metadata_internal_with_channel(
+        &self,
+        domain: &str,
+        channel: &Channel,
+    ) -> DeltaResult<Option<String>> {
         let domains = HashSet::from([domain]);
-        let mut map = self.get_domain_metadatas_internal(engine, Some(&domains))?;
+        let mut map = self
+            .get_domain_metadatas_internal_with_channel(channel, Some(&domains))
+            .await?;
         Ok(map.remove(domain).map(|dm| dm.configuration().to_owned()))
     }
 
@@ -947,11 +1053,36 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Vec<DomainMetadata>> {
-        let all_metadata = self.get_domain_metadatas_internal(engine, None)?;
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.get_all_domain_metadata_with_channel(channel).await
+        })
+    }
+
+    /// Fetch all non-internal domain metadata through `channel`.
+    #[internal_api]
+    pub(crate) async fn get_all_domain_metadata_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> DeltaResult<Vec<DomainMetadata>> {
+        let all_metadata = self
+            .get_domain_metadatas_internal_with_channel(channel, None)
+            .await?;
         Ok(all_metadata
             .into_values()
             .filter(|domain| !domain.is_internal())
             .collect())
+    }
+
+    /// Return a lazy workflow that gets all non-internal domain metadata.
+    #[internal_api]
+    #[allow(unused)]
+    pub(crate) fn get_all_domain_metadata_workflow(
+        self: &Arc<Self>,
+    ) -> StaticCoroutine<Vec<DomainMetadata>> {
+        let snapshot = Arc::clone(self);
+        static_coroutine!(async move |channel| {
+            snapshot.get_all_domain_metadata_with_channel(channel).await
+        })
     }
 
     /// Returns file-level statistics, or `None` if this snapshot has no CRC at its version (none
@@ -1161,6 +1292,18 @@ impl Snapshot {
         engine: &dyn Engine,
     ) -> DeltaResult<CheckpointWriter> {
         CheckpointWriter::try_new(self, engine)
+    }
+
+    /// Return a lazy workflow that creates a checkpoint writer for this snapshot.
+    ///
+    /// # Errors
+    ///
+    /// When driven, returns the validation errors described by
+    /// [`Self::create_checkpoint_writer`], or connector errors while loading clustering metadata.
+    pub fn create_checkpoint_writer_workflow(self: Arc<Self>) -> StaticCoroutine<CheckpointWriter> {
+        static_coroutine!(async move |channel| {
+            CheckpointWriter::try_new_with_channel(self, channel).await
+        })
     }
 
     /// Creates a [`LogCompactionWriter`] for generating a log compaction file.

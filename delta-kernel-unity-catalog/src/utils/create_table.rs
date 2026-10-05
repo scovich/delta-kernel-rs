@@ -28,7 +28,9 @@
 use std::collections::{HashMap, HashSet};
 
 use delta_kernel::actions::Protocol;
-use delta_kernel::{DeltaResult, Engine, Error, Snapshot};
+use delta_kernel::coroutine::kernel::{static_coroutine, Channel, StaticCoroutine};
+use delta_kernel::coroutine::run_coroutine_with_engine;
+use delta_kernel::{DeltaResult, Engine, Error, Snapshot, SnapshotRef};
 use unity_catalog_delta_client_api::{
     CreateTableRequest, Protocol as WireProtocol, StorageCredential,
 };
@@ -117,6 +119,28 @@ pub fn build_uc_create_table_request(
     engine: &dyn Engine,
     table_name: impl Into<String>,
 ) -> DeltaResult<CreateTableRequest> {
+    let table_name = table_name.into();
+    run_coroutine_with_engine!(engine, async move |channel| {
+        build_uc_create_table_request_impl(snapshot, channel, table_name).await
+    })
+}
+
+/// Return a lazy workflow that builds a UC create-table request from a version-zero snapshot.
+pub fn build_uc_create_table_request_workflow(
+    snapshot: SnapshotRef,
+    table_name: impl Into<String>,
+) -> StaticCoroutine<CreateTableRequest> {
+    let table_name = table_name.into();
+    static_coroutine!(async move |channel| {
+        build_uc_create_table_request_impl(snapshot.as_ref(), channel, table_name).await
+    })
+}
+
+async fn build_uc_create_table_request_impl(
+    snapshot: &Snapshot,
+    channel: &Channel,
+    table_name: String,
+) -> DeltaResult<CreateTableRequest> {
     if snapshot.version() != 0 {
         return Err(Error::generic(format!(
             "build_uc_create_table_request is only valid for version 0 (table creation) \
@@ -143,18 +167,19 @@ pub fn build_uc_create_table_request(
     // UC only recognizes the `delta.clustering` and `delta.rowTracking` domain metadatas.
     let uc_recognized_domains = HashSet::from([CLUSTERING_DOMAIN_NAME, ROW_TRACKING_DOMAIN_NAME]);
     let mut domain_metadata: HashMap<String, serde_json::Value> = HashMap::new();
-    for (domain, dm) in
-        snapshot.get_domain_metadatas_internal(engine, Some(&uc_recognized_domains))?
+    for (domain, dm) in snapshot
+        .get_domain_metadatas_internal_with_channel(channel, Some(&uc_recognized_domains))
+        .await?
     {
         let value = serde_json::from_str(dm.configuration())
             .map_err(|e| Error::generic(format!("malformed {domain} domain metadata: {e}")))?;
         domain_metadata.insert(domain, value);
     }
 
-    let in_commit_timestamp_ms = snapshot.get_timestamp(engine)?;
+    let in_commit_timestamp_ms = snapshot.get_timestamp_with_channel(channel).await?;
 
     Ok(CreateTableRequest {
-        name: table_name.into(),
+        name: table_name,
         location: snapshot.table_root().to_string(),
         table_type: "MANAGED".to_string(),
         comment: None,
