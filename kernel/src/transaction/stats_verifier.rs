@@ -34,7 +34,7 @@ impl StatsColumnVerifier {
 
     /// Verify that all files in the provided batches have required statistics.
     #[cfg_attr(not(feature = "internal-api"), allow(unreachable_pub))]
-    pub fn verify(&self, add_files: &[Box<dyn crate::EngineData>]) -> DeltaResult<()> {
+    pub fn verify(&self, add_files: &[impl AsRef<dyn crate::EngineData>]) -> DeltaResult<()> {
         if self.required_columns.is_empty() {
             return Ok(());
         }
@@ -47,7 +47,7 @@ impl StatsColumnVerifier {
 
         for batch in add_files {
             for (column_names, validator) in &mut validators {
-                batch.visit_rows(column_names, validator)?;
+                batch.as_ref().visit_rows(column_names, validator)?;
             }
         }
 
@@ -308,14 +308,16 @@ impl RowVisitor for ColumnStatsValidator {
 /// Verify that every `add` action has `stats.numRecords` populated. Short-circuits on the first
 /// violation and returns an error containing the `add.path`.
 #[cfg_attr(not(feature = "internal-api"), allow(unreachable_pub))]
-pub fn verify_num_records_present(add_files: &[Box<dyn crate::EngineData>]) -> DeltaResult<()> {
+pub fn verify_num_records_present(
+    add_files: &[impl AsRef<dyn crate::EngineData>],
+) -> DeltaResult<()> {
     let column_names = vec![column_name!("path"), column_name!("stats", NUM_RECORDS)];
     let mut first_missing: Option<String> = None;
     for batch in add_files {
         let mut visitor = NumRecordsValidator {
             first_missing: &mut first_missing,
         };
-        batch.visit_rows(&column_names, &mut visitor)?;
+        batch.as_ref().visit_rows(&column_names, &mut visitor)?;
         if first_missing.is_some() {
             break;
         }

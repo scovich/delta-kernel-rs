@@ -227,9 +227,9 @@ pub struct Transaction<S = ExistingTable> {
     should_emit_metadata: bool,
     operation: Option<String>,
     engine_info: Option<String>,
-    engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
-    add_files_metadata: Vec<Box<dyn EngineData>>,
-    remove_files_metadata: Vec<FilteredEngineData>,
+    engine_commit_info: Option<(Arc<dyn EngineData>, SchemaRef)>,
+    add_files_metadata: Vec<Arc<dyn EngineData>>,
+    remove_files_metadata: Vec<Arc<FilteredEngineData>>,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
     // key/payload. HashSet requires Borrow<&str> with matching Eq, Ord, and Hash. Plus,
     // HashSet::insert drops the to-be-inserted value without returning the existing one, which
@@ -261,7 +261,7 @@ pub struct Transaction<S = ExistingTable> {
     is_blind_append: bool,
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
     // to generate remove/add action pairs during commit, ensuring file statistics are preserved.
-    dv_matched_files: Vec<FilteredEngineData>,
+    dv_matched_files: Vec<Arc<FilteredEngineData>>,
     // Count of files whose deletion vector was updated.
     num_dv_updates: usize,
     // Caller-supplied root manifest file to commit, set via with_root_manifest_file().
@@ -826,7 +826,7 @@ impl<S> Transaction<S> {
         engine_commit_info: Box<dyn EngineData>,
         commit_info_schema: SchemaRef,
     ) -> Self {
-        self.engine_commit_info = Some((engine_commit_info, commit_info_schema));
+        self.engine_commit_info = Some((engine_commit_info.into(), commit_info_schema));
         self
     }
 
@@ -1022,7 +1022,7 @@ impl<S> Transaction<S> {
             .remove_files_metadata
             .iter()
             .chain(&self.dv_matched_files)
-            .any(HasSelectionVector::has_selected_rows);
+            .any(|batch| batch.has_selected_rows());
         require!(
             !removes_data,
             Error::invalid_transaction_state(
@@ -1344,7 +1344,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
     ///
     /// The expected schema for `add_metadata` is given by [`Transaction::add_files_schema`].
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
-        self.add_files_metadata.push(add_metadata);
+        self.add_files_metadata.push(add_metadata.into());
     }
 }
 
@@ -1365,7 +1365,10 @@ impl<S> Transaction<S> {
     /// Only add files are validated(remove files do not carry statistics).
     ///
     /// [`requires_stats_num_records`]: crate::table_configuration::TableConfiguration::requires_stats_num_records
-    fn validate_add_files_stats(&self, add_files: &[Box<dyn EngineData>]) -> DeltaResult<()> {
+    fn validate_add_files_stats(
+        &self,
+        add_files: &[impl AsRef<dyn EngineData>],
+    ) -> DeltaResult<()> {
         if add_files.is_empty() {
             return Ok(());
         }
@@ -1433,7 +1436,7 @@ impl<S> Transaction<S> {
         } else {
             let add_actions = build_add_actions(
                 engine,
-                self.add_files_metadata.iter().map(|a| Ok(a.deref())),
+                self.add_files_metadata.iter().map(|a| Ok(a.as_ref())),
                 self.add_files_schema().clone(),
                 self.data_change,
             )?;
@@ -1466,7 +1469,7 @@ impl<S> Transaction<S> {
         // Assign base row IDs starting from the current high water mark.
         let mut row_tracking_visitor = RowTrackingVisitor::new(row_id_high_water_mark);
         let extended_add_files = self.add_files_metadata.iter().map(move |add_files_batch| {
-            row_tracking_visitor.visit_rows_of(add_files_batch.deref())?;
+            row_tracking_visitor.visit_rows_of(add_files_batch.as_ref())?;
             let base_row_ids = row_tracking_visitor.take_base_row_ids();
             let commit_versions = vec![commit_version; base_row_ids.len()];
             let base_row_ids_array =
@@ -1493,7 +1496,7 @@ impl<S> Transaction<S> {
         // tracking calculation above happens only lazily as our caller drives the iterator.
         let mut dry_run = RowTrackingVisitor::dry_run(row_id_high_water_mark);
         for add_files_batch in &self.add_files_metadata {
-            dry_run.visit_rows_of(add_files_batch.deref())?;
+            dry_run.visit_rows_of(add_files_batch.as_ref())?;
         }
         let row_tracking_domain_metadata =
             RowTrackingDomainMetadata::new(dry_run.row_id_high_water_mark);
@@ -1637,7 +1640,7 @@ impl<S> Transaction<S> {
     fn generate_remove_actions<'a>(
         &'a self,
         engine: &dyn Engine,
-        remove_files_metadata: impl Iterator<Item = &'a FilteredEngineData> + Send + 'a,
+        remove_files_metadata: impl Iterator<Item = &'a Arc<FilteredEngineData>> + Send + 'a,
         has_dv_update_columns: bool,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
         // Create-table transactions should not have any remove actions.
@@ -3037,9 +3040,9 @@ mod tests {
         let (engine, snapshot) = setup_dv_enabled_table();
         let mut txn = create_dv_transaction(snapshot.clone(), &engine)?;
         txn.dv_matched_files
-            .push(FilteredEngineData::with_all_rows_selected(
+            .push(Arc::new(FilteredEngineData::with_all_rows_selected(
                 string_array_to_engine_data(StringArray::from(vec!["sentinel"])),
-            ));
+            )));
         let staged_len_before = txn.dv_matched_files.len();
         let scan = snapshot.scan_builder().build()?;
         let scan_metadata = scan
@@ -3184,7 +3187,7 @@ mod tests {
         let data = make_scan_files(selection_vector);
         match removal {
             DataRemoval::RemoveFile => txn.remove_files(data),
-            DataRemoval::DeletionVectorUpdate => txn.dv_matched_files.push(data),
+            DataRemoval::DeletionVectorUpdate => txn.dv_matched_files.push(Arc::new(data)),
         }
     }
 
@@ -3309,7 +3312,7 @@ mod tests {
         let dv_data = FilteredEngineData::with_all_rows_selected(string_array_to_engine_data(
             StringArray::from(vec!["dv"]),
         ));
-        txn.dv_matched_files.push(dv_data);
+        txn.dv_matched_files.push(Arc::new(dv_data));
         let result = txn.validate_blind_append_semantics();
         assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
         Ok(())

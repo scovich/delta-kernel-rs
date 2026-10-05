@@ -306,7 +306,7 @@ impl Transaction {
     /// # }
     /// ```
     pub fn remove_files(&mut self, remove_metadata: FilteredEngineData) {
-        self.remove_files_metadata.push(remove_metadata);
+        self.remove_files_metadata.push(Arc::new(remove_metadata));
     }
 
     // -------------------------------------------------------------------------
@@ -457,7 +457,8 @@ impl Transaction {
             )));
         }
 
-        self.dv_matched_files.extend(matched_files);
+        self.dv_matched_files
+            .extend(matched_files.into_iter().map(Arc::new));
         self.num_dv_updates += matched_dv_files;
         Ok(())
     }
@@ -613,7 +614,7 @@ impl<S> Transaction<S> {
     fn generate_adds_for_dv_update<'a>(
         &'a self,
         engine: &'a dyn Engine,
-        file_metadata_batch: impl Iterator<Item = &'a FilteredEngineData> + Send + 'a,
+        file_metadata_batch: impl Iterator<Item = &'a Arc<FilteredEngineData>> + Send + 'a,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
         let evaluation_handler = engine.evaluation_handler();
         // Struct patch to replace the deletionVector field with the new DV/stats from

@@ -2,6 +2,8 @@
 //!
 //! [`Transaction`]: super::Transaction
 
+use std::borrow::Borrow;
+
 // TODO(#2869): Add the remaining write-side validations:
 // - No duplicate (path, DvId) in `txn.add_files_metadata`, `txn.remove_files_metadata`,
 //   `txn.dv_matched_files`
@@ -37,7 +39,7 @@ pub(crate) struct StagedDataValidator {
 
 impl StagedDataValidator {
     /// Run every validation against each batch. Returns the first validation error encountered.
-    pub(crate) fn validate(mut self, batches: &[Box<dyn EngineData>]) -> DeltaResult<()> {
+    pub(crate) fn validate(mut self, batches: &[impl AsRef<dyn EngineData>]) -> DeltaResult<()> {
         for batch in batches {
             RowVisitor::visit_rows_of(&mut self, batch.as_ref())?;
         }
@@ -45,9 +47,12 @@ impl StagedDataValidator {
     }
 
     /// Runs every validation against each selected staged-data row.
-    pub(crate) fn validate_filtered(mut self, batches: &[FilteredEngineData]) -> DeltaResult<()> {
+    pub(crate) fn validate_filtered(
+        mut self,
+        batches: &[impl Borrow<FilteredEngineData>],
+    ) -> DeltaResult<()> {
         for batch in batches {
-            FilteredRowVisitor::visit_rows_of(&mut self, batch)?;
+            FilteredRowVisitor::visit_rows_of(&mut self, batch.borrow())?;
         }
         Ok(())
     }
