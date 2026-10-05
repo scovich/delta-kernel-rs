@@ -6,6 +6,8 @@ use itertools::Itertools;
 use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
+use crate::coroutine::engine::EngineConnector;
+use crate::coroutine::kernel::request::{ReadJsonFiles, ReadParquetFiles};
 use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
 use crate::schema::SchemaRef;
@@ -42,24 +44,25 @@ impl CheckpointManifestReader {
         log_root: Url,
         read_schema: SchemaRef,
     ) -> DeltaResult<Self> {
+        let connector = EngineConnector::new(engine.as_ref());
         let actions = match manifest.extension.as_str() {
-            "json" => engine.json_handler().read_json_files(
+            "json" => connector.prepare_flattened_generator(ReadJsonFiles::new(
                 std::slice::from_ref(&manifest.location),
                 read_schema.clone(),
                 None,
-            )?,
-            "parquet" => engine.parquet_handler().read_parquet_files(
+            ))?,
+            "parquet" => connector.prepare_flattened_generator(ReadParquetFiles::new(
                 std::slice::from_ref(&manifest.location),
                 read_schema,
                 None,
-            )?,
+            ))?,
             extension => {
                 return Err(Error::generic(format!(
                     "Unsupported checkpoint extension: {extension}",
                 )));
             }
         };
-
+        let actions = connector.iterate_result_generator(actions);
         let actions = Box::new(actions.map_ok(|batch_res| ActionsBatch::new(batch_res, false)));
         Ok(Self {
             actions,
