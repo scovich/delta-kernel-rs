@@ -439,11 +439,10 @@ impl LogSegment {
         storage: &dyn StorageHandler,
         log_root: Url,
         log_tail: Vec<ParsedLogPath>,
-        time_travel_version: impl Into<Option<Version>>,
+        time_travel_version: Option<Version>,
         metric_context: SnapshotLoadMetricContext,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
-        let time_travel_version = time_travel_version.into();
         let start = std::time::Instant::now();
         let build = || {
             let checkpoint_hint =

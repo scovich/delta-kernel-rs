@@ -106,14 +106,13 @@ impl Snapshot {
         existing_snapshot: Arc<Snapshot>,
         log_tail: Vec<ParsedLogPath>,
         engine: &dyn Engine,
-        target_version: impl Into<Option<Version>>,
+        requested_version: Option<Version>,
         metric_context: SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
         checkpoint_handling: CheckpointHandling,
         built_as_latest: bool,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Arc<Self>> {
-        let requested_version = target_version.into();
         let mut current_segment = None;
         let result = Self::try_new_from_impl(
             existing_snapshot.clone(),
