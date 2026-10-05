@@ -50,6 +50,7 @@ use std::task::{Context, Poll, Waker};
 
 use delta_kernel_derive::internal_api;
 
+use super::invoke_witness;
 use crate::utils::PhantomType;
 use crate::{DeltaResult, Error};
 
@@ -274,43 +275,14 @@ pub(crate) struct Task<'a, P: Send + 'static, O> {
 impl<'a, P: Send + 'static, O> Task<'a, P, O> {
     /// Create a task using the concrete future type exposed by `witness`.
     ///
-    /// A task must satisfy `Send + 'a`, where `'a` is the lifetime bound the task's owner imposes.
-    /// The task owns the underlying [`Future`] produced by calling the [`AsyncFnOnce`] `F` stored
-    /// in `State`, and that future has an unnamed lifetime for whatever state it closes over (call
-    /// it `'f` for explanatory purposes). In order for the task to satisfy `Send + 'a`, we must
-    /// constrain the underlying future to also satisfy `Send + 'a`, which in turn requires `'f:
-    /// 'a`. This is problematic, because stable Rust cannot name or constrain the type or lifetime
-    /// of the future an `AsyncFnOnce` produces. This method uses `state` and `witness` together to
-    /// overcome that limitation as follows:
-    ///
-    /// * `State` preserves `F` as a type parameter; when instantiated with a concrete type, the
-    ///   compiler can determine the concrete type of the future `F` produces when invoked, along
-    ///   with the (unnamed) lifetime `'f` of any borrowed references that future captures.
-    /// * [`Self::new_with_witness`] consumes `state` to produce a `Task<'a, _, _>`. It also
-    ///   receives a generic [`FnOnce`] that consumes `State` and the task's channel to produce a
-    ///   `Fut: DeltaFuture<O> + 'a`.
-    /// * The form-specific witness satisfies the `FnOnce` type bound. It is important that the
-    ///   witness' own signature imposes neither lifetime nor type bounds on that future, other than
-    ///   its return type, because return type is the only bound the compiler can unconditionally
-    ///   enforce against `F: AsyncFnOnce`.
-    /// * When this method is invoked with the form-specific witness, type inference unifies the
-    ///   latter's opaque return type with `Fut`. The `Fut: DeltaFuture<O> + 'a` bound now
-    ///   constrains the concrete future `F` produces, including `'f: 'a`. Any unsatisfied bound
-    ///   fails compilation.
-    ///
-    /// NOTE: This witness incantation could be removed if either of the [`return_type_notation`] or
-    /// [`async_fn_traits`] language features were to stabilize.
-    ///
-    /// [`AsyncFnOnce`]: std::ops::AsyncFnOnce
-    /// [`return_type_notation`]: https://doc.rust-lang.org/beta/unstable-book/language-features/return-type-notation.html
-    /// [`async_fn_traits`]: https://doc.rust-lang.org/beta/unstable-book/library-features/async-fn-traits.html
+    /// See [`invoke_witness`] for why the witness must remain separate from the async callable.
     pub(crate) fn new_with_witness<State, F, Fut>(state: State, witness: F) -> Self
     where
         F: FnOnce(State, Arc<Channel<P>>) -> Fut,
         Fut: DeltaFuture<O> + 'a,
     {
         let channel = Arc::default();
-        let body = Some(Box::pin(witness(state, Arc::clone(&channel))) as _);
+        let body = Some(Box::pin(invoke_witness(witness, state, Arc::clone(&channel))) as _);
         Self { body, channel }
     }
 
