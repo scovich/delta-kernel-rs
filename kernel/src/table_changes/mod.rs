@@ -44,6 +44,8 @@ use scan::TableChangesScanBuilder;
 use scan_file::scan_metadata_to_scan_file;
 use url::Url;
 
+use crate::coroutine::kernel::{static_coroutine, Channel, StaticCoroutine};
+use crate::coroutine::run_coroutine_with_engine;
 use crate::log_segment::LogSegment;
 use crate::path::AsUrl;
 use crate::schema::compare::SchemaComparison as _;
@@ -262,6 +264,24 @@ impl TableChanges {
         )
     }
 
+    /// Return a lazy workflow that creates change data feed for the given version range.
+    pub fn try_new_workflow(
+        table_root: Url,
+        start_version: Version,
+        end_version: Option<Version>,
+    ) -> StaticCoroutine<Self> {
+        static_coroutine!(async move |channel| {
+            Self::try_new_internal_with_channel(
+                table_root,
+                channel,
+                start_version,
+                end_version,
+                CdfMode::ChangeDataFeed,
+            )
+            .await
+        })
+    }
+
     /// Creates a listing-only change feed from row-tracking metadata.
     ///
     /// This path requires `delta.enableRowTracking` and ignores `_change_data` files.
@@ -286,7 +306,7 @@ impl TableChanges {
     /// Returns an error if the range cannot be loaded or a boundary has unavailable row tracking,
     /// unsupported reader features, or an incompatible schema. Errors from intermediate versions
     /// are returned by [`TableChanges::scan_file_listing`].
-    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[cfg_attr(not(feature = "internal-api"), cfg(test))]
     #[internal_api]
     pub(crate) fn try_new_row_tracking_cdf_listing(
         table_root: Url,
@@ -310,17 +330,38 @@ impl TableChanges {
         end_version: Option<Version>,
         mode: CdfMode,
     ) -> DeltaResult<Self> {
+        run_coroutine_with_engine!(engine, async move |channel| {
+            Self::try_new_internal_with_channel(
+                table_root,
+                channel,
+                start_version,
+                end_version,
+                mode,
+            )
+            .await
+        })
+    }
+
+    async fn try_new_internal_with_channel(
+        table_root: Url,
+        channel: &Channel,
+        start_version: Version,
+        end_version: Option<Version>,
+        mode: CdfMode,
+    ) -> DeltaResult<Self> {
         let log_root = table_root.join("_delta_log/")?;
-        let log_segment = LogSegment::for_table_changes(
-            engine.storage_handler().as_ref(),
+        let log_segment = LogSegment::for_table_changes_with_channel(
+            channel,
             log_root,
             start_version,
             end_version,
-        )?;
+        )
+        .await?;
 
         let start_snapshot = Snapshot::builder_for(table_root.as_url().clone())
             .at_version(start_version)
-            .build(engine)?;
+            .build_with_channel(channel)
+            .await?;
         start_snapshot
             .table_configuration()
             .ensure_operation_supported(Operation::Cdf)?;
@@ -328,10 +369,10 @@ impl TableChanges {
         let end_snapshot = match end_version {
             Some(version) => Snapshot::builder_from(start_snapshot.clone())
                 .at_version(version)
-                .build(engine),
-            None => Snapshot::builder_from(start_snapshot.clone()).build(engine),
+                .build_with_channel(channel),
+            None => Snapshot::builder_from(start_snapshot.clone()).build_with_channel(channel),
         };
-        let end_snapshot = end_snapshot?;
+        let end_snapshot = end_snapshot.await?;
         end_snapshot
             .table_configuration()
             .ensure_operation_supported(Operation::Cdf)?;

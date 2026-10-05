@@ -37,9 +37,9 @@ use crate::handle::Handle;
 use crate::scan::EngineSchema;
 use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
 use crate::{
-    drive_kernel_with_committer, unwrap_and_parse_path_as_url, DeltaResult, ExclusiveEngineData,
-    ExternEngine, KernelStringSlice, OptionalValue, SharedExternEngine, SharedSnapshot, Snapshot,
-    TryFromStringSlice, Url,
+    drive_kernel, drive_kernel_with_committer, unwrap_and_parse_path_as_url, DeltaResult,
+    ExclusiveEngineData, ExternEngine, KernelStringSlice, OptionalValue, SharedExternEngine,
+    SharedSnapshot, Snapshot, TryFromStringSlice, Url,
 };
 
 /// A handle for an existing-table transaction with a bound committer.
@@ -840,8 +840,8 @@ fn create_table_builder_build_impl(
     builder: CreateTableTransactionBuilder,
     extern_engine: &dyn ExternEngine,
 ) -> DeltaResult<Handle<ExclusiveCreateTransaction>> {
-    let engine = extern_engine.engine();
-    let create_txn = builder.build_with_filesystem_committer(engine.as_ref())?;
+    let create_txn = drive_kernel(extern_engine, builder.build_workflow())?;
+    let create_txn = create_txn.with_filesystem_committer();
     Ok(Box::new(create_txn).into())
 }
 
@@ -850,8 +850,8 @@ fn create_table_builder_build_with_committer_impl(
     committer: Box<dyn Committer>,
     extern_engine: &dyn ExternEngine,
 ) -> DeltaResult<Handle<ExclusiveCreateTransaction>> {
-    let engine = extern_engine.engine();
-    let create_txn = builder.build_with_committer(engine.as_ref(), committer)?;
+    let create_txn = drive_kernel(extern_engine, builder.build_workflow())?;
+    let create_txn = create_txn.with_committer(committer);
     Ok(Box::new(create_txn).into())
 }
 

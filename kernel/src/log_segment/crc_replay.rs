@@ -190,6 +190,15 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<Crc>> {
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.build_crc_from_checkpoint_with_channel(channel).await
+        })
+    }
+
+    pub(crate) async fn build_crc_from_checkpoint_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> DeltaResult<Option<Crc>> {
         let Some(version) = self.checkpoint_version else {
             return Ok(None);
         };
@@ -198,16 +207,17 @@ impl LogSegment {
         let mut acc = CrcReplayAccumulator::new(Some(FileSizeHistogram::create_default()));
         // Read only the checkpoint parquet plus any V2 sidecars via `create_checkpoint_stream`.
         let batches = self
-            .create_checkpoint_stream(
-                engine,
+            .create_checkpoint_stream_with_channel(
+                channel,
                 CHECKPOINT_CRC_SCHEMA.clone(),
                 None,
                 None,
                 None,
-                None,
-            )?
+            )
+            .await?
             .actions;
-        for batch in batches {
+        let mut batches = batches.bind(channel);
+        while let Some(batch) = batches.next().await? {
             let batch = batch?;
             let mut visitor = CheckpointCrcVisitor { acc: &mut acc };
             visitor.visit_rows_of(batch.actions())?;

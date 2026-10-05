@@ -1460,7 +1460,7 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
     } = builder;
     let engine = engine.engine();
 
-    fn build<Mode>(
+    fn build<Mode: 'static>(
         mut builder: delta_kernel::snapshot::SnapshotBuilder<Mode>,
         engine: &dyn Engine,
         version: Option<Version>,
@@ -1485,7 +1485,7 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
         if let Some(snapshot_hint) = snapshot_hint {
             builder = apply_snapshot_hint(builder, snapshot_hint)?;
         }
-        builder.build(engine)
+        drive_with_engine(engine, None, builder.build_workflow())
     }
 
     let snapshot = match source {

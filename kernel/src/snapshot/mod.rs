@@ -559,6 +559,17 @@ impl Snapshot {
     /// replay.
     ///
     /// Reports metrics: `SetTransactionLoadSuccess` or `SetTransactionLoadFailure`.
+    pub fn get_app_id_version(
+        &self,
+        application_id: &str,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<i64>> {
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.get_app_id_version_with_channel(application_id, channel)
+                .await
+        })
+    }
+
     #[instrument(
         parent = &self.span,
         name = SET_TRANSACTION_LOADED_SPAN,
@@ -566,10 +577,10 @@ impl Snapshot {
         err,
         fields(report, from_cache, found)
     )]
-    pub fn get_app_id_version(
+    async fn get_app_id_version_with_channel(
         &self,
         application_id: &str,
-        engine: &dyn Engine,
+        channel: &Channel,
     ) -> DeltaResult<Option<i64>> {
         fn record_metric(from_cache: bool, found: bool) {
             let span = tracing::Span::current();
@@ -608,13 +619,14 @@ impl Snapshot {
         // scan and falls through to the full replay below.
         if let Some(base) = self.base_crc() {
             if let SetTransactionState::Complete(base_active) = &base.set_transaction_state {
-                let txn = SetTransactionScanner::get_one_rooted_in_crc(
+                let txn = SetTransactionScanner::get_one_rooted_in_crc_with_channel(
                     self.log_segment(),
                     application_id,
                     base_active,
                     base.version,
-                    engine,
-                )?;
+                    channel,
+                )
+                .await?;
                 let version = txn.and_then(|txn| txn.non_expired_version(expiration_timestamp));
                 // TODO: report a distinct metric source here. A rooted tail scan is neither a
                 //       cache hit nor a full replay, yet `from_cache = false` buckets it with
@@ -627,10 +639,29 @@ impl Snapshot {
 
         // Fallback: full log replay. Scan for the newest txn and apply expiration to it, like the
         // CRC paths above.
-        let txn = SetTransactionScanner::get_one(self.log_segment(), application_id, engine)?;
+        let txn = SetTransactionScanner::get_one_with_channel(
+            self.log_segment(),
+            application_id,
+            channel,
+        )
+        .await?;
         let version = txn.and_then(|txn| txn.non_expired_version(expiration_timestamp));
         record_metric(false, version.is_some());
         Ok(version)
+    }
+
+    /// Return a lazy workflow that fetches the latest version for `application_id`.
+    pub fn get_app_id_version_workflow(
+        self: &Arc<Self>,
+        application_id: impl Into<String>,
+    ) -> StaticCoroutine<Option<i64>> {
+        let snapshot = Arc::clone(self);
+        let application_id = application_id.into();
+        static_coroutine!(async move |channel| {
+            snapshot
+                .get_app_id_version_with_channel(&application_id, channel)
+                .await
+        })
     }
 
     /// Fetch the latest transaction version for every application id in this snapshot.
@@ -639,12 +670,22 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<SetTransactionMap> {
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.get_app_id_versions_with_channel(channel).await
+        })
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    async fn get_app_id_versions_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> DeltaResult<SetTransactionMap> {
         if let Some(crc) = self.crc_at_version() {
             if let SetTransactionState::Complete(map) = &crc.set_transaction_state {
                 return Ok(map.clone());
             }
         }
-        SetTransactionScanner::get_all(self.log_segment(), engine)
+        SetTransactionScanner::get_all_with_channel(self.log_segment(), channel).await
     }
 
     /// Fetch the domainMetadata for a specific domain in this snapshot. This returns the latest
@@ -773,6 +814,19 @@ impl Snapshot {
     /// replay. `domains == None` means load all.
     ///
     /// Reports metrics: `DomainMetadataLoadSuccess` or `DomainMetadataLoadFailure`.
+    #[internal_api]
+    pub(crate) fn get_domain_metadatas_internal(
+        &self,
+        engine: &dyn Engine,
+        domains: Option<&HashSet<&str>>,
+    ) -> DeltaResult<DomainMetadataMap> {
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.get_domain_metadatas_internal_with_channel(channel, domains)
+                .await
+        })
+    }
+
+    /// Load domain metadata through `channel`.
     #[instrument(
         parent = &self.span,
         name = DOMAIN_METADATA_LOADED_SPAN,
@@ -781,9 +835,9 @@ impl Snapshot {
         fields(report, from_cache, num_domains_returned)
     )]
     #[internal_api]
-    pub(crate) fn get_domain_metadatas_internal(
+    pub(crate) async fn get_domain_metadatas_internal_with_channel(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         domains: Option<&HashSet<&str>>,
     ) -> DeltaResult<DomainMetadataMap> {
         fn record_metric(from_cache: bool, num_domains_returned: usize) {
@@ -835,12 +889,15 @@ impl Snapshot {
         // scan and falls through to the full replay below.
         if let Some(base) = self.base_crc() {
             if let DomainMetadataState::Complete(base_active) = &base.domain_metadata_state {
-                let rooted = self.log_segment().scan_domain_metadatas_rooted_in_crc(
-                    base.version,
-                    base_active,
-                    domains,
-                    engine,
-                )?;
+                let rooted = self
+                    .log_segment()
+                    .scan_domain_metadatas_rooted_in_crc_with_channel(
+                        base.version,
+                        base_active,
+                        domains,
+                        channel,
+                    )
+                    .await?;
                 // TODO: report a distinct metric source here. A rooted tail scan is neither a
                 //       cache hit nor a full replay, yet `from_cache = false` buckets it with
                 //       full replay, hiding the checkpoint-skipping win. A 3-variant source enum
@@ -855,7 +912,10 @@ impl Snapshot {
         //       miss search could skip that range and only scan the older commits, then
         //       union those results with the Partial cache's entries to produce the final
         //       answer.
-        let replayed = self.log_segment().scan_domain_metadatas(domains, engine)?;
+        let replayed = self
+            .log_segment()
+            .scan_domain_metadatas_with_channel(domains, channel)
+            .await?;
         record_metric(false, replayed.len());
         Ok(replayed)
     }

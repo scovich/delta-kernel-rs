@@ -16,6 +16,9 @@ use uuid::Uuid;
 use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
+use crate::coroutine::kernel::request::DirectoryListing;
+use crate::coroutine::kernel::{static_coroutine, Channel, StaticCoroutine};
+use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _, GeneratorExt as _, Pages};
 use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
 use crate::schema::variant_utils::schema_contains_variant_type;
@@ -46,7 +49,7 @@ use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
 use crate::transaction::{CreateTable, Transaction, TransactionWithCommitter};
 use crate::utils::{current_time_ms, try_parse_uri};
-use crate::{DeltaResult, Engine, Error, StorageHandler};
+use crate::{DeltaResult, Engine, Error};
 
 /// Table features allowed to be enabled via `delta.feature.*=supported` during CREATE TABLE.
 ///
@@ -145,22 +148,24 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
 /// - For other errors (permissions, network), propagates the error
 ///
 /// # Arguments
-/// * `storage` - The storage handler to use for listing
+/// * `channel` - The channel to use for listing
 /// * `delta_log_url` - URL to the `_delta_log` directory
 /// * `table_path` - Original table path (for error messages)
-fn ensure_table_does_not_exist(
-    storage: &dyn StorageHandler,
+async fn ensure_table_does_not_exist_with_channel(
+    channel: &Channel,
     delta_log_url: &Url,
     table_path: &str,
 ) -> DeltaResult<()> {
-    match storage.list_from(delta_log_url) {
-        Ok(mut files) => {
-            // files.next() returns Option<DeltaResult<FileMeta>>
+    let listing = DirectoryListing::try_new(delta_log_url.clone())?;
+    match channel.prepare_paged(listing).await {
+        Ok(cursor) => {
+            let mut files = Pages::resume(channel, cursor).flatten();
+            // files.next().await? returns Option<DeltaResult<FileMeta>>
             // - Some(Ok(_)) means a file exists -> table exists
             // - Some(Err(FileNotFound)) means path doesn't exist -> OK for new table
             // - Some(Err(other)) means real error -> propagate
             // - None means empty iterator -> OK for new table
-            match files.next() {
+            match files.next().await? {
                 Some(Ok(_)) => Err(Error::generic(format!(
                     "Table already exists at path: {table_path}"
                 ))),
@@ -944,13 +949,23 @@ impl CreateTableTransactionBuilder {
     /// - The data layout is invalid
     /// - Unsupported delta properties or feature flags are specified
     pub fn build(self, engine: &dyn Engine) -> DeltaResult<CreateTableTransaction> {
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.build_with_channel(channel).await
+        })
+    }
+
+    /// Return a lazy workflow that builds this create-table transaction.
+    pub fn build_workflow(self) -> StaticCoroutine<CreateTableTransaction> {
+        static_coroutine!(async move |channel| self.build_with_channel(channel).await)
+    }
+
+    async fn build_with_channel(self, channel: &Channel) -> DeltaResult<CreateTableTransaction> {
         // Validate path
         let table_url = try_parse_uri(&self.path)?;
 
         // Check if table already exists by looking for _delta_log directory
         let delta_log_url = table_url.join("_delta_log/")?;
-        let storage = engine.storage_handler();
-        ensure_table_does_not_exist(storage.as_ref(), &delta_log_url, &self.path)?;
+        ensure_table_does_not_exist_with_channel(channel, &delta_log_url, &self.path).await?;
 
         // Validate and transform table properties
         // - Extracts and validates feature signals
