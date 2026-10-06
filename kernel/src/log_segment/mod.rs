@@ -18,7 +18,7 @@ use crate::committer::CatalogCommit;
 use crate::coroutine::engine::EngineConnector;
 use crate::coroutine::generator::empty;
 use crate::coroutine::kernel::request::ReadParquetFiles;
-use crate::coroutine::kernel::{coroutine, Channel, Request, StaticGeneratorCoroutine};
+use crate::coroutine::kernel::{coroutine, Channel, Request};
 #[cfg(test)]
 use crate::coroutine::run_coroutine_with_engine;
 use crate::coroutine::{
@@ -105,6 +105,13 @@ pub(crate) struct ActionsWithCheckpointInfo<A> {
     /// Metadata about checkpoint reading, including the schema used.
     #[allow(unused)]
     pub checkpoint_info: CheckpointReadInfo,
+}
+
+impl<A> ActionsWithCheckpointInfo<A> {
+    /// Split the action source from its eagerly prepared checkpoint information.
+    pub(crate) fn into_parts(self) -> (A, CheckpointReadInfo) {
+        (self.actions, self.checkpoint_info)
+    }
 }
 
 /// A [`LogSegment`] represents a contiguous section of the log and is made of checkpoint files
@@ -927,7 +934,7 @@ impl LogSegment {
     > {
         let connector =
             EngineConnector::new(engine).with_cancellation_token(cancellation_token.cloned());
-        let result = connector.drive(coroutine!(async move |channel| {
+        let coroutine = coroutine!(async move |channel| {
             self.read_actions_with_projected_checkpoint_actions_with_channel(
                 channel,
                 commit_read_schema,
@@ -937,11 +944,15 @@ impl LogSegment {
                 partition_schema,
             )
             .await
-        }))?;
+        });
+        let (actions, checkpoint_info) = connector
+            .iterate_prepared_result_generator_with_companion(
+                coroutine,
+                ActionsWithCheckpointInfo::into_parts,
+            )?;
         Ok(ActionsWithCheckpointInfo {
-            actions: connector
-                .iterate_result_generator(StaticGeneratorCoroutine::from_generator(result.actions)),
-            checkpoint_info: result.checkpoint_info,
+            actions,
+            checkpoint_info,
         })
     }
 
@@ -1323,7 +1334,7 @@ impl LogSegment {
     > {
         let connector =
             EngineConnector::new(engine).with_cancellation_token(cancellation_token.cloned());
-        let result = connector.drive(coroutine!(async move |channel| {
+        let coroutine = coroutine!(async move |channel| {
             self.create_checkpoint_stream_with_channel(
                 channel,
                 action_schema,
@@ -1332,11 +1343,15 @@ impl LogSegment {
                 partition_schema,
             )
             .await
-        }))?;
+        });
+        let (actions, checkpoint_info) = connector
+            .iterate_prepared_result_generator_with_companion(
+                coroutine,
+                ActionsWithCheckpointInfo::into_parts,
+            )?;
         Ok(ActionsWithCheckpointInfo {
-            actions: connector
-                .iterate_result_generator(StaticGeneratorCoroutine::from_generator(result.actions)),
-            checkpoint_info: result.checkpoint_info,
+            actions,
+            checkpoint_info,
         })
     }
 

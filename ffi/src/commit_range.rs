@@ -315,7 +315,8 @@ fn commit_action_get_actions_impl(
 ) -> DeltaResult<Handle<ExclusiveFileReadResultIterator>> {
     let kernel_engine = engine.engine();
     let workflow = commit_action.get_actions_coroutine();
-    let actions = iterate_prepared_result_generator_with_engine(kernel_engine.as_ref(), workflow)?;
+    let actions =
+        iterate_prepared_result_generator_with_engine(kernel_engine.as_ref(), None, workflow)?;
     Ok(FileReadResultIterator::into_handle(actions, engine))
 }
 

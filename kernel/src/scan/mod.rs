@@ -20,9 +20,7 @@ use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
 use crate::coroutine::engine::EngineConnector;
-use crate::coroutine::kernel::{
-    coroutine, static_coroutine, Channel, Request, StaticCoroutine, StaticGeneratorCoroutine,
-};
+use crate::coroutine::kernel::{coroutine, static_coroutine, Channel, Request, StaticCoroutine};
 #[cfg(feature = "declarative-plans")]
 use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _};
 use crate::coroutine::{run_coroutine_with_storage, IntoGenerator};
@@ -1195,13 +1193,17 @@ impl Scan {
     > {
         let connector =
             EngineConnector::new(engine).with_cancellation_token(self.cancellation_token.clone());
-        let result = connector.drive(coroutine!(async move |channel| {
+        let coroutine = coroutine!(async move |channel| {
             self.replay_for_scan_metadata_with_channel(channel).await
-        }))?;
+        });
+        let (actions, checkpoint_info) = connector
+            .iterate_prepared_result_generator_with_companion(
+                coroutine,
+                ActionsWithCheckpointInfo::into_parts,
+            )?;
         Ok(ActionsWithCheckpointInfo {
-            actions: connector
-                .iterate_result_generator(StaticGeneratorCoroutine::from_generator(result.actions)),
-            checkpoint_info: result.checkpoint_info,
+            actions,
+            checkpoint_info,
         })
     }
 

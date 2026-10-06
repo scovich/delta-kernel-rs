@@ -356,6 +356,21 @@ impl EngineConnector {
         Ok(self.iterate_result_generator(generator))
     }
 
+    /// Prepare a fallible generator and return its iterator and eager companion value.
+    pub(crate) fn iterate_prepared_result_generator_with_companion<'a, R, G, Item, Companion>(
+        self,
+        coroutine: Coroutine<'_, R>,
+        into_parts: impl FnOnce(R) -> (G, Companion),
+    ) -> DeltaResult<(EngineResultGeneratorIterator<'a, Item>, Companion)>
+    where
+        G: IntoGenerator<Request, Item = DeltaResult<Item>, Output = ()> + 'a,
+        Item: Send + 'static,
+    {
+        let (generator, companion) = into_parts(self.drive(coroutine)?);
+        let generator = GeneratorCoroutine::from_generator(generator);
+        Ok((self.iterate_result_generator(generator), companion))
+    }
+
     /// Drive a coroutine whose catalog requests are handled by `committer`.
     pub(crate) fn drive_with_committer<O>(
         &self,
@@ -593,13 +608,31 @@ pub(crate) fn iterate_result_generator_with_engine<'a, Item: Send + 'static, O: 
 }
 
 /// Prepare and iterate a fallible generator through one connector captured from `engine`.
+#[doc(hidden)]
+#[internal_api]
+pub(crate) fn iterate_prepared_result_generator_with_engine<'a, G, Item>(
+    engine: &dyn Engine,
+    cancellation_token: impl Into<Option<CancellationTokenRef>>,
+    coroutine: Coroutine<'_, G>,
+) -> DeltaResult<impl Iterator<Item = DeltaResult<Item>> + Send + 'a>
+where
+    G: IntoGenerator<Request, Item = DeltaResult<Item>, Output = ()> + 'a,
+    Item: Send + 'static,
+{
+    let connector = EngineConnector::new(engine).with_cancellation_token(cancellation_token);
+    connector.iterate_prepared_result_generator(coroutine)
+}
+
+/// Construct, prepare, and iterate a fallible generator through `engine`.
 #[internal_api]
 macro_rules! iterate_prepared_result_generator_with_engine {
     ($engine:expr, $cancellation_token:expr, $body:expr) => {{
-        let connector = $crate::coroutine::EngineConnector::new($engine)
-            .with_cancellation_token($cancellation_token);
         let coroutine = $crate::coroutine::kernel::coroutine!($body);
-        connector.iterate_prepared_result_generator(coroutine)
+        $crate::coroutine::iterate_prepared_result_generator_with_engine(
+            $engine,
+            $cancellation_token,
+            coroutine,
+        )
     }};
 }
 

@@ -773,7 +773,6 @@ impl<'a, C: ?Sized, Op: PagedOperation> Pages<'a, C, Op> {
 #[doc(inline)]
 #[internal_api]
 pub(crate) use self::engine::drive_with_storage;
-pub(crate) use self::engine::EngineConnector;
 #[doc(inline)]
 #[internal_api]
 pub(crate) use self::engine::{
