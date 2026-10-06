@@ -18,8 +18,13 @@ use crate::committer::{
     Commit, CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
     FileSystemCommitter,
 };
-use crate::coroutine::kernel::Channel;
-use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::generator::{map_async_witness, AsyncIntoIterator as _, GeneratorExt as _};
+use crate::coroutine::kernel::request::EvaluationInput;
+use crate::coroutine::kernel::{Channel, Request};
+use crate::coroutine::{
+    iterate_prepared_result_generator_with_engine, run_coroutine_with_engine, ChannelExt as _,
+    DeltaResultGenerator, IntoGenerator,
+};
 use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
@@ -441,26 +446,43 @@ fn build_add_action_projection(
 
 /// Transforms add file metadata into commit-ready add actions by converting stats to JSON and
 /// setting the `dataChange` field.
-fn build_add_actions<I, T>(
+fn build_add_actions<T>(
     engine: &dyn Engine,
-    add_files_metadata: I,
+    add_files_metadata: impl DeltaResultGenerator<T> + 'static,
     input_schema: SchemaRef,
     data_change: bool,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'static>
 where
-    I: Iterator<Item = DeltaResult<T>> + Send + 'static,
-    T: Deref<Target = dyn EngineData> + Send + 'static,
+    T: Into<EvaluationInput> + Send + 'static,
 {
-    let evaluation_handler = engine.evaluation_handler();
+    iterate_prepared_result_generator_with_engine!(engine, None, async move |channel| {
+        build_add_actions_with_channel(channel, add_files_metadata, input_schema, data_change).await
+    })
+}
+
+async fn build_add_actions_with_channel<'a, T>(
+    channel: &Channel,
+    add_files_metadata: impl DeltaResultGenerator<T> + 'a,
+    input_schema: SchemaRef,
+    data_change: bool,
+) -> DeltaResult<impl DeltaResultGenerator<Box<dyn EngineData>> + 'a>
+where
+    T: Into<EvaluationInput> + Send + 'static,
+{
     let (output_schema, adds_expr) = build_add_action_projection(&input_schema, data_change)?;
     let adds_expr = Arc::new(adds_expr);
-    let adds_evaluator = evaluation_handler.new_expression_evaluator(
+    let adds_evaluator = channel.create_expression_evaluator(
         input_schema,
         adds_expr,
         as_log_add_schema(output_schema).into(),
-    )?;
-    let add_actions = add_files_metadata
-        .map(move |add_files_batch| adds_evaluator.evaluate(add_files_batch?.deref()));
+    );
+    let adds_evaluator = adds_evaluator.await?;
+    let add_actions =
+        add_files_metadata.map_async(map_async_witness, async move |channel, add_files_batch| {
+            channel
+                .evaluate_expression(&adds_evaluator, add_files_batch?)
+                .await
+        });
     Ok(add_actions)
 }
 
@@ -1447,7 +1469,7 @@ impl<S> Transaction<S> {
             let add_files_metadata = self.add_files_metadata.clone();
             let add_actions = build_add_actions(
                 engine,
-                add_files_metadata.into_iter().map(Ok),
+                add_files_metadata.into_iter().map(Ok).into_generator(),
                 self.add_files_schema().clone(),
                 self.data_change,
             )?;
@@ -1496,7 +1518,7 @@ impl<S> Transaction<S> {
         // Generate add actions including row tracking metadata
         let add_actions = build_add_actions(
             engine,
-            extended_add_files,
+            extended_add_files.into_generator(),
             with_row_tracking_cols(self.add_files_schema())?,
             self.data_change,
         )?;
@@ -1645,13 +1667,29 @@ impl<S> Transaction<S> {
     ///
     /// [`remove_files`]: Transaction::remove_files
     /// [`update_deletion_vectors`]: Transaction::update_deletion_vectors
-    #[instrument(name = "txn.gen_removes", skip_all, err)]
     fn generate_remove_actions(
         &self,
         engine: &dyn Engine,
         remove_files_metadata: impl Iterator<Item = Arc<FilteredEngineData>> + Send + 'static,
         has_dv_update_columns: bool,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'static> {
+        iterate_prepared_result_generator_with_engine!(engine, None, async move |channel| {
+            self.generate_remove_actions_with_channel(
+                channel,
+                remove_files_metadata,
+                has_dv_update_columns,
+            )
+            .await
+        })
+    }
+
+    #[instrument(name = "txn.gen_removes", skip_all, err)]
+    async fn generate_remove_actions_with_channel(
+        &self,
+        channel: &Channel,
+        remove_files_metadata: impl Iterator<Item = Arc<FilteredEngineData>> + Send + 'static,
+        has_dv_update_columns: bool,
+    ) -> DeltaResult<impl DeltaResultGenerator<FilteredEngineData> + 'static> {
         // Create-table transactions should not have any remove actions.
         // Only error if there are actually files queued for removal.
         if self.is_create_table() && !self.remove_files_metadata.is_empty() {
@@ -1661,7 +1699,6 @@ impl<S> Transaction<S> {
         }
 
         let target_schema = schema_with_all_fields_nullable(&LOG_REMOVE_SCHEMA);
-        let evaluation_handler = engine.evaluation_handler();
         // TODO(#3263): `remove_files_metadata` may contain `stats_parsed` and
         // `partitionValues_parsed`; provide its full schema to both evaluators.
         let input_schema = if has_dv_update_columns {
@@ -1681,7 +1718,7 @@ impl<S> Transaction<S> {
             .effective_table_config
             .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview);
 
-        let make_eval = |coalesce_stats_with_parsed: bool| {
+        let make_eval = async |coalesce_stats_with_parsed: bool| {
             let columns_to_drop: Vec<_> = columns_to_drop.iter().map(String::as_str).collect();
             let patch = build_remove_struct_patch(
                 self.commit_timestamp,
@@ -1691,12 +1728,12 @@ impl<S> Transaction<S> {
                 adaptive_metadata_enabled,
             )?;
             let expr = Arc::new(Expression::struct_from([Expression::struct_patch(patch)?]));
-            let evaluator = evaluation_handler.new_expression_evaluator(
+            let evaluator = channel.create_expression_evaluator(
                 input_schema.clone(),
                 expr,
                 target_schema.clone().into(),
             );
-            evaluator
+            evaluator.await
         };
 
         // Build two evaluators: one for the common case where scan files do not include a
@@ -1704,23 +1741,28 @@ impl<S> Transaction<S> {
         // The stats_parsed evaluator coalesces stats with ToJson(stats_parsed) to handle the
         // case where stats is null (e.g., on V2 checkpoints with writeStatsAsJson=false) and
         // then drops the stats_parsed column.
-        let base_eval = make_eval(false /* coalesce_stats_with_parsed */)?;
-        let stats_parsed_eval = make_eval(true /* coalesce_stats_with_parsed */)?;
+        let base_eval = make_eval(false /* coalesce_stats_with_parsed */).await?;
+        let stats_parsed_eval = make_eval(true /* coalesce_stats_with_parsed */).await?;
         let stats_parsed_col = column_name!(STATS_PARSED_NAME);
-
-        let remove_actions = remove_files_metadata.map(move |file_metadata_batch| {
-            let data = file_metadata_batch.data();
-            let evaluator = if data.has_field(&stats_parsed_col) {
-                &stats_parsed_eval
-            } else {
-                &base_eval
-            };
-            let updated_engine_data = evaluator.evaluate(data)?;
-            FilteredEngineData::try_new(
-                updated_engine_data,
-                file_metadata_batch.selection_vector().to_vec(),
-            )
-        });
+        let remove_files_metadata = remove_files_metadata.into_generator();
+        let remove_actions = remove_files_metadata.map_async(
+            map_async_witness,
+            async move |channel, file_metadata_batch| {
+                let data = file_metadata_batch.data();
+                let evaluator = if data.has_field(&stats_parsed_col) {
+                    &stats_parsed_eval
+                } else {
+                    &base_eval
+                };
+                let updated_engine_data = channel
+                    .evaluate_expression(evaluator, file_metadata_batch.data().clone_data())
+                    .await?;
+                FilteredEngineData::try_new(
+                    updated_engine_data,
+                    file_metadata_batch.selection_vector().to_vec(),
+                )
+            },
+        );
         Ok(remove_actions)
     }
 }

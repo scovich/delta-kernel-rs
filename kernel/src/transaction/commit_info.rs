@@ -3,12 +3,14 @@ use std::sync::{Arc, LazyLock};
 
 use super::Transaction;
 use crate::actions::{CommitInfo, COMMIT_INFO_NAME, LOG_COMMIT_INFO_SCHEMA};
+use crate::coroutine::kernel::Channel;
+use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _};
 use crate::engine_data::{GetData, MapItem, RowVisitor, TypedGetData as _};
 use crate::expressions::{lit, null_lit, MapData, Scalar};
 use crate::schema::{column_name, schema_ref, ColumnName, MapType, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::utils::require;
-use crate::{create_row, DataType, Engine, EngineData, Error, Expression, ExpressionRef};
+use crate::{DataType, Engine, EngineData, Error, Expression, ExpressionRef};
 
 /// Builds a list of `(field_name, literal_expression)` pairs covering every [`CommitInfo`]
 /// field. Field names match the camelCase schema names produced by the `ToSchema` derive macro.
@@ -71,6 +73,17 @@ impl<S> Transaction<S> {
         engine: &dyn Engine,
         kernel_commit_info: CommitInfo,
     ) -> Result<Box<dyn EngineData>, Error> {
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.generate_commit_info_with_channel(channel, kernel_commit_info)
+                .await
+        })
+    }
+
+    pub(super) async fn generate_commit_info_with_channel(
+        &self,
+        channel: &Channel,
+        kernel_commit_info: CommitInfo,
+    ) -> Result<Box<dyn EngineData>, Error> {
         match &self.engine_commit_info {
             Some((engine_commit_info, engine_commit_info_schema)) => {
                 let kernel_schema = CommitInfo::to_schema();
@@ -115,14 +128,21 @@ impl<S> Transaction<S> {
                 // with the None branch which uses `LOG_COMMIT_INFO_SCHEMA`.
                 let wrapped_expr = Expression::struct_from([patch]);
                 let wrapped_schema = schema_ref! { nullable COMMIT_INFO_NAME: (output_schema) };
-                let evaluator = engine.evaluation_handler().new_expression_evaluator(
+                let evaluator = channel.create_expression_evaluator(
                     engine_commit_info_schema.clone(),
                     Arc::new(wrapped_expr),
                     wrapped_schema.into(),
-                )?;
-                evaluator.evaluate(engine_commit_info.as_ref())
+                );
+                let evaluator = evaluator.await?;
+                channel
+                    .evaluate_expression(&evaluator, engine_commit_info.clone())
+                    .await
             }
-            None => create_row(engine, LOG_COMMIT_INFO_SCHEMA.clone(), kernel_commit_info),
+            None => {
+                channel
+                    .create_row(LOG_COMMIT_INFO_SCHEMA.clone(), kernel_commit_info)
+                    .await
+            }
         }
     }
 }

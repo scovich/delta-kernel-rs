@@ -2,6 +2,8 @@ use std::collections::HashSet;
 
 use super::Transaction;
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
+use crate::coroutine::kernel::Channel;
+use crate::coroutine::run_coroutine_with_engine;
 use crate::error::Error;
 use crate::row_tracking::{
     RowTrackingDomainMetadata, ROW_TRACKING_DOMAIN_NAME, ROW_TRACKING_INITIAL_HIGH_WATER_MARK,
@@ -158,9 +160,9 @@ impl<S> Transaction<S> {
     /// This performs an expensive log replay operation to fetch the previous configuration
     /// value for each domain being removed, as required by the Delta spec for tombstones.
     /// Returns an empty vector if there are no domain removals.
-    pub(super) fn generate_user_domain_removal_actions(
+    async fn generate_user_domain_removal_actions_with_channel(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
     ) -> DeltaResult<Vec<DomainMetadata>> {
         if self.user_domain_removals.is_empty() {
             return Ok(vec![]);
@@ -176,7 +178,8 @@ impl<S> Transaction<S> {
             .collect();
         let existing_domains = self
             .read_snapshot()?
-            .get_domain_metadatas_internal(engine, Some(&domains))?;
+            .get_domain_metadatas_internal_with_channel(channel, Some(&domains))
+            .await?;
 
         // Create removal tombstones with pre-image configurations
         Ok(self
@@ -204,6 +207,17 @@ impl<S> Transaction<S> {
         engine: &dyn Engine,
         row_tracking_high_watermark: Option<RowTrackingDomainMetadata>,
     ) -> DeltaResult<Vec<DomainMetadata>> {
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.generate_domain_metadata_actions_with_channel(channel, row_tracking_high_watermark)
+                .await
+        })
+    }
+
+    async fn generate_domain_metadata_actions_with_channel(
+        &self,
+        channel: &Channel,
+        row_tracking_high_watermark: Option<RowTrackingDomainMetadata>,
+    ) -> DeltaResult<Vec<DomainMetadata>> {
         let is_create = self.is_create_table();
 
         // Validate domain operations (includes feature validation)
@@ -215,7 +229,9 @@ impl<S> Transaction<S> {
         }
 
         // Generate removal actions (empty for create-table due to validation above)
-        let removal_actions = self.generate_user_domain_removal_actions(engine)?;
+        let removal_actions = self
+            .generate_user_domain_removal_actions_with_channel(channel)
+            .await?;
 
         let row_tracking_high_watermark =
             if let Some(provided) = self.provided_row_tracking_high_water_mark {
@@ -223,7 +239,8 @@ impl<S> Transaction<S> {
                     Some(metadata) => metadata.high_water_mark(),
                     None => self
                         .read_snapshot()?
-                        .get_row_tracking_high_water_mark(engine)?
+                        .get_row_tracking_high_water_mark_with_channel(channel)
+                        .await?
                         .unwrap_or(ROW_TRACKING_INITIAL_HIGH_WATER_MARK),
                 };
                 if provided < calculated {
