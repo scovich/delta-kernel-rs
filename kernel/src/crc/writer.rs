@@ -4,10 +4,14 @@ use url::Url;
 
 use super::Crc;
 use crate::coroutine::kernel::Channel;
-use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _};
+#[cfg(test)]
+use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::ChannelExt as _;
 use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error};
+#[cfg(test)]
+use crate::Engine;
+use crate::{DeltaResult, Error};
 
 /// Serialize and write a CRC file to storage.
 ///
@@ -20,6 +24,7 @@ use crate::{DeltaResult, Engine, Error};
 /// Per the Delta protocol, writers MUST NOT overwrite existing CRC files, so this always
 /// writes with `overwrite = false`. If the file already exists, returns
 /// `Err(Error::FileAlreadyExists)`.
+#[cfg(test)]
 pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> DeltaResult<()> {
     run_coroutine_with_engine!(engine, async move |channel| {
         try_write_crc_file_with_channel(channel, path, crc).await

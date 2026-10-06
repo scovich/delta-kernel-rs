@@ -38,8 +38,7 @@ pub(crate) use reader::try_read_crc_file;
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 pub use state::{DomainMetadataState, FileStatsState, SetTransactionState};
-#[allow(unused)]
-pub(crate) use writer::try_write_crc_file;
+pub(crate) use writer::try_write_crc_file_with_channel;
 
 use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
 use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;

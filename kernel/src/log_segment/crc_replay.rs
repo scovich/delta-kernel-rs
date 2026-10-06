@@ -24,9 +24,9 @@ use crate::actions::{
     METADATA_FIELD, PROTOCOL_FIELD, REMOVE_NAME, SET_TRANSACTION_FIELD,
 };
 use crate::coroutine::kernel::Channel;
-use crate::coroutine::{
-    run_coroutine_with_engine, AsyncOption as _, ChannelExt as _, DeltaFuture, GeneratorExt as _,
-};
+#[cfg(test)]
+use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::{AsyncOption as _, ChannelExt as _, DeltaFuture, GeneratorExt as _};
 use crate::crc::{
     is_incremental_safe_operation, read_crc_file_or_none_with_channel, size_to_u64, Crc, CrcDelta,
     FileSizeHistogram, FileStatsDelta,
@@ -40,7 +40,9 @@ use crate::schema::{
 };
 use crate::snapshot::IncrementalReplay;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, FileMeta, RowVisitor, Version};
+#[cfg(test)]
+use crate::Engine;
+use crate::{DeltaResult, Error, FileMeta, RowVisitor, Version};
 
 static REPLAY_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     // size is the only Add leaf the visitor reads, and it is required, so its presence marks
@@ -141,6 +143,7 @@ impl LogSegment {
     /// Produce a fresh `Crc` at `self.end_version` by reverse-replaying the commits in
     /// `(base_crc.version, self.end_version]` and applying the resulting delta to
     /// `base_crc` via [`Crc::apply`].
+    #[cfg(test)]
     pub(crate) fn build_crc_from_base(
         &self,
         engine: &dyn Engine,
@@ -186,15 +189,6 @@ impl LogSegment {
     /// [`Complete`](DomainMetadataState::Complete) since a checkpoint is authoritative.
     /// `in_commit_timestamp_opt` is left `None`: a checkpoint carries no `commitInfo`, so the
     /// caller sets the ICT on the returned CRC afterward.
-    pub(crate) fn build_crc_from_checkpoint(
-        &self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Option<Crc>> {
-        run_coroutine_with_engine!(engine, async move |channel| {
-            self.build_crc_from_checkpoint_with_channel(channel).await
-        })
-    }
-
     pub(crate) async fn build_crc_from_checkpoint_with_channel(
         &self,
         channel: &Channel,
@@ -231,6 +225,7 @@ impl LogSegment {
     ///
     /// Returns `None` if protocol or metadata could not be recovered. File stats degrade to
     /// [`Indeterminate`](FileStatsState::Indeterminate) if the replay is not incremental-safe.
+    #[cfg(test)]
     pub(crate) fn build_crc_from_version_zero(
         &self,
         engine: &dyn Engine,
@@ -270,6 +265,7 @@ impl LogSegment {
     ///
     /// Errors if `base_version >= self.end_version` or if the segment is missing the
     /// commit at `base_version + 1` (i.e. has a gap above `base_version`).
+    #[cfg(test)]
     pub(crate) fn build_crc_delta_from_base(
         &self,
         engine: &dyn Engine,
