@@ -657,7 +657,7 @@ impl<S> Transaction<S> {
             with_data_change_expr,
             nullable_add_log_schema().clone().into(),
         )?;
-        Ok(file_metadata_batch.map(
+        let add_actions = file_metadata_batch.map(
             move |file_metadata_batch| -> DeltaResult<FilteredEngineData> {
                 let with_new_dv_data = with_new_dv_eval.evaluate(file_metadata_batch.data())?;
 
@@ -671,7 +671,8 @@ impl<S> Transaction<S> {
                     file_metadata_batch.selection_vector().to_vec(),
                 )
             },
-        ))
+        );
+        Ok(add_actions)
     }
 }
 
