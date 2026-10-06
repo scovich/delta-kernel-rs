@@ -21,6 +21,8 @@ use crate::committer::{
 use crate::coroutine::generator::{from_iter, map_async};
 use crate::coroutine::kernel::request::EvaluationInput;
 use crate::coroutine::kernel::{Channel, Request};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::coroutine::AsyncOption as _;
 use crate::coroutine::{
     iterate_prepared_result_generator_with_engine, run_coroutine_with_engine, ChannelExt as _,
     DeltaResultGenerator, IntoGenerator,
@@ -1017,18 +1019,32 @@ impl<S> Transaction<S> {
         commit_version: Version,
         dm_changes: &[DomainMetadata],
     ) -> DeltaResult<Option<Box<dyn EngineData>>> {
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.generate_checkpoint_action_with_channel(channel, commit_version, dm_changes)
+                .await
+        })
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    async fn generate_checkpoint_action_with_channel(
+        &self,
+        channel: &Channel,
+        commit_version: Version,
+        dm_changes: &[DomainMetadata],
+    ) -> DeltaResult<Option<Box<dyn EngineData>>> {
         self.root_manifest_file
             .as_ref()
-            .map(|root_manifest_file| {
-                let action = root_manifest_file.compute_checkpoint_action(
-                    engine,
+            .map_async(|root_manifest_file| async move {
+                let action = root_manifest_file.compute_checkpoint_action_with_channel(
+                    channel,
                     commit_version,
                     &self.effective_table_config,
                     dm_changes,
                     &self.set_transactions,
-                )?;
-                action.into_engine_data(engine)
+                );
+                action.await?.into_engine_data_with_channel(channel).await
             })
+            .await
             .transpose()
     }
 

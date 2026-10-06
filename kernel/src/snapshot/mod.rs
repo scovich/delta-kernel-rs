@@ -666,17 +666,7 @@ impl Snapshot {
 
     /// Fetch the latest transaction version for every application id in this snapshot.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    pub(crate) fn get_app_id_versions(
-        &self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<SetTransactionMap> {
-        run_coroutine_with_engine!(engine, async move |channel| {
-            self.get_app_id_versions_with_channel(channel).await
-        })
-    }
-
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    async fn get_app_id_versions_with_channel(
+    pub(crate) async fn get_app_id_versions_with_channel(
         &self,
         channel: &Channel,
     ) -> DeltaResult<SetTransactionMap> {
