@@ -5,6 +5,10 @@ use crate::actions::visitors::SetTransactionMap;
 use crate::actions::{
     CheckpointAction, ContentRoot, DomainMetadata, SetTransaction, CHECKPOINT_ACTION_FIELD,
 };
+use crate::coroutine::kernel::Channel;
+#[cfg(test)]
+use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::GeneratorExt as _;
 use crate::crc::{merge_domain_metadata, DomainMetadataState, SetTransactionState};
 use crate::error::Error;
 use crate::log_segment::DomainMetadataMap;
@@ -12,7 +16,9 @@ use crate::schema::StructType;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
-use crate::{version_as_i64, DeltaResult, Engine, FileMeta, Version};
+#[cfg(test)]
+use crate::Engine;
+use crate::{version_as_i64, DeltaResult, FileMeta, Version};
 
 /// A pointer to an on-disk root manifest file to be committed as the table's content root via a
 /// `checkpoint` action.
@@ -38,6 +44,7 @@ impl RootManifestFile {
     ///
     /// Errors if an existing checkpoint does not already cover the read snapshot's version, meaning
     /// delta log commits are still pending replay since it.
+    #[cfg(test)]
     pub(super) fn compute_checkpoint_action(
         &self,
         engine: &dyn Engine,
@@ -46,8 +53,29 @@ impl RootManifestFile {
         dm_changes: &[DomainMetadata],
         set_transactions: &[SetTransaction],
     ) -> DeltaResult<CheckpointAction> {
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.compute_checkpoint_action_with_channel(
+                channel,
+                commit_version,
+                table_config,
+                dm_changes,
+                set_transactions,
+            )
+            .await
+        })
+    }
+
+    /// Builds the self-contained checkpoint action through `channel`.
+    pub(super) async fn compute_checkpoint_action_with_channel(
+        &self,
+        channel: &Channel,
+        commit_version: Version,
+        table_config: &TableConfiguration,
+        dm_changes: &[DomainMetadata],
+        set_transactions: &[SetTransaction],
+    ) -> DeltaResult<CheckpointAction> {
         let (mut domain_metadata, mut transactions, existing_checkpoint) =
-            self.scan_non_content_metadata(engine)?;
+            self.scan_non_content_metadata_with_channel(channel).await?;
 
         // Domains can be tombstoned, so merging applies removals. The transactions map is keyed by
         // app id, so extend overwrites with the newest entry per app.
@@ -98,9 +126,23 @@ impl RootManifestFile {
 
     /// Returns the read snapshot's active domain metadata, set transactions, and latest checkpoint
     /// action.
+    #[cfg(test)]
     fn scan_non_content_metadata(
         &self,
         engine: &dyn Engine,
+    ) -> DeltaResult<(
+        DomainMetadataMap,
+        SetTransactionMap,
+        Option<CheckpointAction>,
+    )> {
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.scan_non_content_metadata_with_channel(channel).await
+        })
+    }
+
+    async fn scan_non_content_metadata_with_channel(
+        &self,
+        channel: &Channel,
     ) -> DeltaResult<(
         DomainMetadataMap,
         SetTransactionMap,
@@ -119,7 +161,11 @@ impl RootManifestFile {
 
         let schema = StructType::try_new([CHECKPOINT_ACTION_FIELD.clone()])?.into();
         let mut checkpoint_action = None;
-        for batch in snapshot.log_segment().read_actions(engine, schema)? {
+        let actions = snapshot
+            .log_segment()
+            .read_actions_with_channel(channel, schema);
+        let mut actions = actions.await?.bind(channel);
+        while let Some(batch) = actions.next().await? {
             if let Some(checkpoint) = CheckpointAction::try_new_from_data(batch?.actions.as_ref())?
             {
                 checkpoint_action = Some(checkpoint);
@@ -153,7 +199,11 @@ impl RootManifestFile {
                 );
                 domain_metadata
             }
-            _ => snapshot.get_domain_metadatas_internal(engine, None)?,
+            _ => {
+                snapshot
+                    .get_domain_metadatas_internal_with_channel(channel, None)
+                    .await?
+            }
         };
         let transactions = match &checkpoint_action {
             Some(checkpoint) if !transactions_complete_in_crc => checkpoint
@@ -162,7 +212,7 @@ impl RootManifestFile {
                 .cloned()
                 .map(|txn| (txn.app_id.clone(), txn))
                 .collect(),
-            _ => snapshot.get_app_id_versions(engine)?,
+            _ => snapshot.get_app_id_versions_with_channel(channel).await?,
         };
 
         Ok((domain_metadata, transactions, checkpoint_action))
