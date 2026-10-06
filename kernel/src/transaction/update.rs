@@ -22,6 +22,11 @@ use crate::actions::deletion_vector::DeletionVectorDescriptor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::BackReference;
 use crate::actions::{LOG_ADD_SCHEMA, NUM_RECORDS, TIGHT_BOUNDS};
+use crate::coroutine::generator::{from_iter, map_async_witness, GeneratorExt as _};
+use crate::coroutine::kernel::{Channel, Request};
+use crate::coroutine::{
+    iterate_prepared_result_generator_with_engine, ChannelExt as _, IntoGenerator,
+};
 use crate::engine_data::{
     FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData,
 };
@@ -618,7 +623,19 @@ impl<S> Transaction<S> {
         engine: &dyn Engine,
         file_metadata_batch: impl Iterator<Item = Arc<FilteredEngineData>> + Send + 'static,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'static> {
-        let evaluation_handler = engine.evaluation_handler();
+        iterate_prepared_result_generator_with_engine!(engine, None, async move |channel| {
+            self.generate_adds_for_dv_update_with_channel(channel, file_metadata_batch)
+                .await
+        })
+    }
+
+    async fn generate_adds_for_dv_update_with_channel(
+        &self,
+        channel: &Channel,
+        file_metadata_batch: impl Iterator<Item = Arc<FilteredEngineData>> + Send + 'static,
+    ) -> DeltaResult<
+        impl IntoGenerator<Request, Item = DeltaResult<FilteredEngineData>, Output = ()> + 'static,
+    > {
         // Struct patch to replace the deletionVector field with the new DV/stats from
         // NEW_DELETION_VECTOR_NAME/NEW_STATS_NAME, then drop the
         // NEW_DELETION_VECTOR_NAME/NEW_STATS_NAME columns.
@@ -631,16 +648,18 @@ impl<S> Transaction<S> {
         )?;
         // TODO(#3263): `file_metadata_batch` may contain `stats_parsed` and
         // `partitionValues_parsed`; provide its full schema to both evaluators.
-        let with_new_dv_eval = evaluation_handler.new_expression_evaluator(
+        let with_new_dv_eval = channel.create_expression_evaluator(
             intermediate_dv_schema().clone(),
             Arc::new(with_new_dv_expr),
             nullable_scan_rows_schema().clone().into(),
-        )?;
-        let restored_add_eval = evaluation_handler.new_expression_evaluator(
+        );
+        let with_new_dv_eval = with_new_dv_eval.await?;
+        let restored_add_eval = channel.create_expression_evaluator(
             nullable_scan_rows_schema().clone(),
             get_scan_metadata_transform_expr(),
             nullable_restored_add_schema().clone().into(),
-        )?;
+        );
+        let restored_add_eval = restored_add_eval.await?;
         #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_mut))]
         let mut add_patch = ExpressionStructPatchBuilder::new_nested(["add"])
             .insert_after("modificationTime", lit(self.data_change));
@@ -652,20 +671,25 @@ impl<S> Transaction<S> {
         }
         let with_data_change_patch = Expression::struct_patch(add_patch)?;
         let with_data_change_expr = Arc::new(Expression::struct_from([with_data_change_patch]));
-        let with_data_change_eval = evaluation_handler.new_expression_evaluator(
+        let with_data_change_eval = channel.create_expression_evaluator(
             nullable_restored_add_schema().clone(),
             with_data_change_expr,
             nullable_add_log_schema().clone().into(),
-        )?;
-        let add_actions = file_metadata_batch.map(
-            move |file_metadata_batch| -> DeltaResult<FilteredEngineData> {
-                let with_new_dv_data = with_new_dv_eval.evaluate(file_metadata_batch.data())?;
-
-                let as_partial_add_data = restored_add_eval.evaluate(with_new_dv_data.as_ref())?;
-
-                let with_data_change_data =
-                    with_data_change_eval.evaluate(as_partial_add_data.as_ref())?;
-
+        );
+        let with_data_change_eval = with_data_change_eval.await?;
+        let file_metadata_batch = from_iter(file_metadata_batch);
+        let add_actions = file_metadata_batch.map_async(
+            map_async_witness,
+            async move |channel, file_metadata_batch| {
+                let with_new_dv_data = channel
+                    .evaluate_expression(&with_new_dv_eval, file_metadata_batch.data().clone_data())
+                    .await?;
+                let as_partial_add_data = channel
+                    .evaluate_expression(&restored_add_eval, with_new_dv_data)
+                    .await?;
+                let with_data_change_data = channel
+                    .evaluate_expression(&with_data_change_eval, as_partial_add_data)
+                    .await?;
                 FilteredEngineData::try_new(
                     with_data_change_data,
                     file_metadata_batch.selection_vector().to_vec(),
