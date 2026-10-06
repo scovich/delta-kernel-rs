@@ -66,12 +66,10 @@ impl Transaction {
     /// Instead of using this API, the more typical (user-facing) API is
     /// [Snapshot::transaction](crate::snapshot::Snapshot::transaction) to create a transaction from
     /// a snapshot.
-    pub(crate) fn try_new_existing_table(
-        snapshot: impl Into<SnapshotRef>,
-        engine: &dyn Engine,
+    pub(crate) async fn try_new_existing_table_with_channel(
+        read_snapshot: SnapshotRef,
+        channel: &Channel,
     ) -> DeltaResult<Self> {
-        let read_snapshot = snapshot.into();
-
         // important! before writing to the table we must check it is supported
         read_snapshot
             .table_configuration()
@@ -82,7 +80,9 @@ impl Transaction {
         // collide with physical data columns.
 
         // Read clustering columns from snapshot (returns None if clustering not enabled)
-        let clustering_columns = read_snapshot.get_physical_clustering_columns(engine)?;
+        let clustering_columns = read_snapshot
+            .get_physical_clustering_columns_with_channel(channel)
+            .await?;
 
         let commit_timestamp = current_time_ms()?;
 
@@ -596,6 +596,18 @@ impl<S> Transaction<S> {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'static> {
+        iterate_prepared_result_generator_with_engine!(engine, None, async move |channel| {
+            self.generate_dv_update_actions_with_channel(channel).await
+        })
+    }
+
+    /// Generate remove/add action pairs for DV updates through `channel`.
+    pub(super) async fn generate_dv_update_actions_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> DeltaResult<
+        impl IntoGenerator<Request, Item = DeltaResult<FilteredEngineData>, Output = ()> + 'static,
+    > {
         // Create-table transactions should not have any DV update actions
         if self.is_create_table() && !self.dv_matched_files.is_empty() {
             return Err(crate::error::Error::internal_error(
@@ -604,13 +616,16 @@ impl<S> Transaction<S> {
         }
 
         let remove_files_metadata = self.dv_matched_files.clone().into_iter();
-        let remove_actions = self.generate_remove_actions(
-            engine,
+        let remove_actions = self.generate_remove_actions_with_channel(
+            channel,
             remove_files_metadata,
             true, /* has_dv_update_columns */
-        )?;
+        );
+        let remove_actions = remove_actions.await?;
         let file_metadata_batch = self.dv_matched_files.clone().into_iter();
-        let add_actions = self.generate_adds_for_dv_update(engine, file_metadata_batch)?;
+        let add_actions = self
+            .generate_adds_for_dv_update_with_channel(channel, file_metadata_batch)
+            .await?;
         Ok(remove_actions.chain(add_actions))
     }
 
@@ -618,17 +633,6 @@ impl<S> Transaction<S> {
     ///
     /// This transforms scan file metadata with new DV descriptors (appended as a temporary column)
     /// into Add actions for the Delta log.
-    fn generate_adds_for_dv_update(
-        &self,
-        engine: &dyn Engine,
-        file_metadata_batch: impl Iterator<Item = Arc<FilteredEngineData>> + Send + 'static,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'static> {
-        iterate_prepared_result_generator_with_engine!(engine, None, async move |channel| {
-            self.generate_adds_for_dv_update_with_channel(channel, file_metadata_batch)
-                .await
-        })
-    }
-
     async fn generate_adds_for_dv_update_with_channel(
         &self,
         channel: &Channel,
