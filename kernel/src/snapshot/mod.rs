@@ -21,8 +21,8 @@ use crate::coroutine::engine::EngineConnector;
 use crate::coroutine::kernel::{coroutine, static_coroutine, Channel, StaticCoroutine};
 use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _};
 use crate::crc::{
-    try_write_crc_file, Crc, CrcDelta, DomainMetadataState, FileSizeHistogram, FileStats,
-    SetTransactionState,
+    try_write_crc_file_with_channel, Crc, CrcDelta, DomainMetadataState, FileSizeHistogram,
+    FileStats, SetTransactionState,
 };
 use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
@@ -1092,6 +1092,7 @@ impl Snapshot {
     /// - `Ok(Some(timestamp))` - ICT is enabled and available for this version
     /// - `Ok(None)` - ICT is not enabled
     /// - `Err(...)` - ICT is enabled but cannot be read, or enablement version is invalid
+    #[cfg_attr(not(feature = "internal-api"), cfg(test))]
     #[internal_api]
     pub(crate) fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
         run_coroutine_with_engine!(engine, async move |channel| {
@@ -1353,10 +1354,29 @@ impl Snapshot {
     /// - The underlying read error if in-commit timestamps are enabled but the timestamp cannot be
     ///   read from the commit file.
     /// - I/O errors from the engine's storage handler if the write fails.
-    #[instrument(parent = &self.span, name = "snap.write_checksum", skip_all, err)]
     pub fn write_checksum(
         self: &SnapshotRef,
         engine: &dyn Engine,
+    ) -> DeltaResult<(ChecksumWriteResult, SnapshotRef)> {
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.write_checksum_with_channel(channel).await
+        })
+    }
+
+    /// Return a lazy workflow that writes this snapshot's version checksum.
+    pub fn write_checksum_workflow(
+        self: &SnapshotRef,
+    ) -> StaticCoroutine<(ChecksumWriteResult, SnapshotRef)> {
+        let snapshot = Arc::clone(self);
+        static_coroutine!(async move |channel| {
+            snapshot.write_checksum_with_channel(channel).await
+        })
+    }
+
+    #[instrument(parent = &self.span, name = "snap.write_checksum", skip_all, err)]
+    pub(crate) async fn write_checksum_with_channel(
+        self: &SnapshotRef,
+        channel: &Channel,
     ) -> DeltaResult<(ChecksumWriteResult, SnapshotRef)> {
         let has_crc_on_disk = self
             .log_segment
@@ -1375,11 +1395,12 @@ impl Snapshot {
 
         self.table_configuration().ensure_read_write_supported()?;
 
-        let crc = self.resolve_crc_for_write(engine)?;
+        let crc = self.resolve_crc_for_write_with_channel(channel).await?;
 
         let crc_path = ParsedLogPath::new_crc(self.table_root(), self.version())?;
 
-        match try_write_crc_file(engine, &crc_path.location, &crc) {
+        let write_result = try_write_crc_file_with_channel(channel, &crc_path.location, &crc);
+        match write_result.await {
             Ok(()) => {
                 info!("Wrote CRC file at {}", crc_path.location);
                 let new_log_segment = self.log_segment.try_new_with_crc_file(crc_path)?;
@@ -1419,7 +1440,7 @@ impl Snapshot {
     ///
     /// The `root` span field records which root resolved the CRC.
     #[instrument(parent = &self.span, name = "snap.resolve_crc_for_write", skip_all, err, fields(root))]
-    fn resolve_crc_for_write(&self, engine: &dyn Engine) -> DeltaResult<Arc<Crc>> {
+    async fn resolve_crc_for_write_with_channel(&self, channel: &Channel) -> DeltaResult<Arc<Crc>> {
         let span = tracing::Span::current();
         // Case 1: an in-memory CRC at this version is ready to write as-is.
         if let Some(crc) = self.crc_at_version() {
@@ -1434,7 +1455,9 @@ impl Snapshot {
         // tail commits (a held base is always at or above the checkpoint, so a tail exists).
         if let Some(base) = self.base_crc() {
             span.record("root", "stale_crc");
-            let crc = log_segment.build_crc_from_base(engine, base)?;
+            let crc = log_segment
+                .build_crc_from_base_with_channel(channel, base)
+                .await?;
             return Ok(Arc::new(crc));
         }
 
@@ -1447,24 +1470,28 @@ impl Snapshot {
                 // at the checkpoint version and returns None when ICT is disabled, or errors when
                 // it is enabled but unreadable.
                 let mut crc = log_segment
-                    .build_crc_from_checkpoint(engine)?
+                    .build_crc_from_checkpoint_with_channel(channel)
+                    .await?
                     .ok_or_else(|| unresolved_crc("checkpoint is missing protocol or metadata"))?;
-                crc.in_commit_timestamp_opt = self.get_in_commit_timestamp(engine)?;
+                crc.in_commit_timestamp_opt =
+                    self.get_in_commit_timestamp_with_channel(channel).await?;
                 return Ok(Arc::new(crc));
             }
             // Replay the tail commits first: a non-incremental tail dooms file stats no matter
             // what the checkpoint holds, so skip the larger checkpoint read in that case.
-            let delta = log_segment.build_crc_delta_from_base(
-                engine,
+            let delta = log_segment.build_crc_delta_from_base_with_channel(
+                channel,
                 checkpoint_version,
                 Some(FileSizeHistogram::create_default()),
-            )?;
+            );
+            let delta = delta.await?;
             require!(
                 delta.is_incremental_safe,
                 unresolved_crc("commits after the checkpoint are not incremental-safe")
             );
             let base = log_segment
-                .build_crc_from_checkpoint(engine)?
+                .build_crc_from_checkpoint_with_channel(channel)
+                .await?
                 .ok_or_else(|| unresolved_crc("checkpoint is missing protocol or metadata"))?;
             // The tail delta carries v_end's ICT, which `apply` sets on the result.
             return Ok(Arc::new(base.apply(delta, end)));
@@ -1473,7 +1500,8 @@ impl Snapshot {
         // Case 4: neither CRC nor checkpoint, so reverse-replay the full commit history.
         span.record("root", "version_zero");
         let crc = log_segment
-            .build_crc_from_version_zero(engine)?
+            .build_crc_from_version_zero_with_channel(channel)
+            .await?
             .ok_or_else(|| unresolved_crc("commit history is missing protocol or metadata"))?;
         Ok(Arc::new(crc))
     }
