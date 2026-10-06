@@ -1236,7 +1236,16 @@ impl Snapshot {
     /// Note: For tables with clustering enabled, this performs log replay to read clustering
     /// columns from domain metadata, which may have a performance cost.
     pub fn transaction(self: Arc<Self>, engine: &dyn Engine) -> DeltaResult<Transaction> {
-        Transaction::try_new_existing_table(self, engine)
+        run_coroutine_with_engine!(engine, async move |channel| {
+            Transaction::try_new_existing_table_with_channel(self, channel).await
+        })
+    }
+
+    /// Return a lazy workflow that creates a [`Transaction`] for this snapshot.
+    pub fn transaction_workflow(self: Arc<Self>) -> StaticCoroutine<Transaction> {
+        static_coroutine!(async move |channel| {
+            Transaction::try_new_existing_table_with_channel(self, channel).await
+        })
     }
 
     /// Binds `committer` to the transaction produced by [`Self::transaction`].
