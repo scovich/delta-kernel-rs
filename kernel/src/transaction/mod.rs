@@ -454,14 +454,14 @@ where
     let evaluation_handler = engine.evaluation_handler();
     let (output_schema, adds_expr) = build_add_action_projection(&input_schema, data_change)?;
     let adds_expr = Arc::new(adds_expr);
-    Ok(add_files_metadata.map(move |add_files_batch| {
-        let adds_evaluator = evaluation_handler.new_expression_evaluator(
-            input_schema.clone(),
-            adds_expr.clone(),
-            as_log_add_schema(output_schema.clone()).into(),
-        )?;
-        adds_evaluator.evaluate(add_files_batch?.deref())
-    }))
+    let adds_evaluator = evaluation_handler.new_expression_evaluator(
+        input_schema,
+        adds_expr,
+        as_log_add_schema(output_schema).into(),
+    )?;
+    let add_actions = add_files_metadata
+        .map(move |add_files_batch| adds_evaluator.evaluate(add_files_batch?.deref()));
+    Ok(add_actions)
 }
 
 // =============================================================================
@@ -1691,11 +1691,12 @@ impl<S> Transaction<S> {
                 adaptive_metadata_enabled,
             )?;
             let expr = Arc::new(Expression::struct_from([Expression::struct_patch(patch)?]));
-            evaluation_handler.new_expression_evaluator(
+            let evaluator = evaluation_handler.new_expression_evaluator(
                 input_schema.clone(),
                 expr,
                 target_schema.clone().into(),
-            )
+            );
+            evaluator
         };
 
         // Build two evaluators: one for the common case where scan files do not include a
@@ -1707,7 +1708,7 @@ impl<S> Transaction<S> {
         let stats_parsed_eval = make_eval(true /* coalesce_stats_with_parsed */)?;
         let stats_parsed_col = column_name!(STATS_PARSED_NAME);
 
-        Ok(remove_files_metadata.map(move |file_metadata_batch| {
+        let remove_actions = remove_files_metadata.map(move |file_metadata_batch| {
             let data = file_metadata_batch.data();
             let evaluator = if data.has_field(&stats_parsed_col) {
                 &stats_parsed_eval
@@ -1719,7 +1720,8 @@ impl<S> Transaction<S> {
                 updated_engine_data,
                 file_metadata_batch.selection_vector().to_vec(),
             )
-        }))
+        });
+        Ok(remove_actions)
     }
 }
 
