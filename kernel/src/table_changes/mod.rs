@@ -328,9 +328,10 @@ impl TableChanges {
         let end_snapshot = match end_version {
             Some(version) => Snapshot::builder_from(start_snapshot.clone())
                 .at_version(version)
-                .build(engine)?,
-            None => Snapshot::builder_from(start_snapshot.clone()).build(engine)?,
+                .build(engine),
+            None => Snapshot::builder_from(start_snapshot.clone()).build(engine),
         };
+        let end_snapshot = end_snapshot?;
         end_snapshot
             .table_configuration()
             .ensure_operation_supported(Operation::Cdf)?;
