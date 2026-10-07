@@ -11,9 +11,9 @@ use url::Url;
 
 use super::request::{
     CopyAtomic, CreateEngineData, CreateExpressionEvaluator, CreatePredicateEvaluator,
-    EvaluateExpression, EvaluatePredicate, EvaluationInput, EvaluatorHandle, FileWriteMode,
-    PredicateEvaluatorHandle, ReadJsonFiles, ReadParquetFiles, WriteBytes, WriteJsonFile,
-    WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
+    EvaluateExpression, EvaluatePredicate, EvaluationInput, ExpressionEvaluatorHandle,
+    FileWriteMode, PredicateEvaluatorHandle, ReadJsonFiles, ReadParquetFiles, WriteBytes,
+    WriteJsonFile, WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
 };
 #[cfg(feature = "declarative-plans")]
 use super::PlanRequest;
@@ -253,7 +253,7 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
         input_schema: SchemaRef,
         expression: ExpressionRef,
         output_type: DataType,
-    ) -> impl DeltaFuture<EvaluatorHandle> {
+    ) -> impl DeltaFuture<ExpressionEvaluatorHandle> {
         let outbound = CreateExpressionEvaluator::new(input_schema, expression, output_type);
         self.exchange(outbound, Request::CreateExpressionEvaluator)
     }
@@ -271,7 +271,7 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
     /// Evaluate a prepared expression against `input`.
     fn evaluate_expression(
         &self,
-        evaluator: &EvaluatorHandle,
+        evaluator: &ExpressionEvaluatorHandle,
         input: impl Into<EvaluationInput>,
     ) -> impl DeltaFuture<Box<dyn EngineData>> {
         let outbound = EvaluateExpression::new(evaluator.clone(), input.into());

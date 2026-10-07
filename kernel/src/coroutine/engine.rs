@@ -12,9 +12,9 @@ use delta_kernel_derive::internal_api;
 use derive_more::Constructor;
 
 use super::kernel::request::{
-    BackwardListing, BackwardListingResult, DirectoryListing, EvaluatorHandle, ForwardListing,
-    ListingBounds, PredicateEvaluatorHandle, ReadJsonFiles, ReadParquetFiles, WriteJsonFile,
-    WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
+    BackwardListing, BackwardListingResult, DirectoryListing, ExpressionEvaluatorHandle,
+    ForwardListing, ListingBounds, PredicateEvaluatorHandle, ReadJsonFiles, ReadParquetFiles,
+    WriteJsonFile, WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
 };
 use super::kernel::{
     coroutine, ChannelExt as _, Coroutine, GeneratorCoroutine, GeneratorCoroutineStep,
@@ -678,7 +678,9 @@ macro_rules! run_coroutine_with_connector {
 }
 pub(crate) use run_coroutine_with_connector;
 
-fn expression_evaluator(handle: &EvaluatorHandle) -> DeltaResult<&Arc<dyn ExpressionEvaluator>> {
+fn expression_evaluator(
+    handle: &ExpressionEvaluatorHandle,
+) -> DeltaResult<&Arc<dyn ExpressionEvaluator>> {
     handle
         .downcast_ref()
         .ok_or_else(|| Error::internal_error("invalid Engine expression evaluator handle"))

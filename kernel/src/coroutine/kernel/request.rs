@@ -51,7 +51,7 @@ pub enum Request {
     /// Materialize scalar rows as one [`EngineData`] batch.
     CreateEngineData(CreateEngineData, Reply<Box<dyn EngineData>>),
     /// Prepare an expression evaluator for repeated use.
-    CreateExpressionEvaluator(CreateExpressionEvaluator, Reply<EvaluatorHandle>),
+    CreateExpressionEvaluator(CreateExpressionEvaluator, Reply<ExpressionEvaluatorHandle>),
     /// Prepare a predicate evaluator for repeated use.
     CreatePredicateEvaluator(CreatePredicateEvaluator, Reply<PredicateEvaluatorHandle>),
     /// Evaluate a prepared expression against one [`EngineData`] batch.
@@ -388,7 +388,7 @@ pub struct CreateEngineData {
 }
 
 /// Type-erased, shared connector state for a prepared expression evaluator.
-pub type EvaluatorHandle = Arc<dyn Any + Send + Sync>;
+pub type ExpressionEvaluatorHandle = Arc<dyn Any + Send + Sync>;
 
 /// Type-erased, shared connector state for a prepared predicate evaluator.
 pub type PredicateEvaluatorHandle = Arc<dyn Any + Send + Sync>;
@@ -417,7 +417,7 @@ pub struct CreatePredicateEvaluator {
 #[derive(Constructor)]
 pub struct EvaluateExpression {
     /// Connector-provided prepared evaluator.
-    pub evaluator: EvaluatorHandle,
+    pub evaluator: ExpressionEvaluatorHandle,
     /// Input batch.
     pub input: EvaluationInput,
 }

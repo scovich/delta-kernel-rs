@@ -24,9 +24,9 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::coroutine::kernel::request::{
-    BackwardListing, BackwardListingResult, DirectoryListing, EvaluatorHandle, FileWriteMode,
-    ForwardListing, ListingBounds, PredicateEvaluatorHandle, ReadJsonFiles, ReadParquetFiles,
-    WriteJsonFile, WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
+    BackwardListing, BackwardListingResult, DirectoryListing, ExpressionEvaluatorHandle,
+    FileWriteMode, ForwardListing, ListingBounds, PredicateEvaluatorHandle, ReadJsonFiles,
+    ReadParquetFiles, WriteJsonFile, WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
 };
 use delta_kernel::coroutine::kernel::{
     GeneratorCoroutineStep, StaticCoroutine, StaticGeneratorCoroutine,
@@ -662,7 +662,9 @@ impl AsyncPagination<ReadParquetFiles> for AsyncEngineConnector {
     }
 }
 
-fn expression_evaluator(handle: &EvaluatorHandle) -> DeltaResult<&Arc<dyn ExpressionEvaluator>> {
+fn expression_evaluator(
+    handle: &ExpressionEvaluatorHandle,
+) -> DeltaResult<&Arc<dyn ExpressionEvaluator>> {
     handle
         .downcast_ref()
         .ok_or_else(|| Error::internal_error("invalid async engine expression evaluator handle"))
