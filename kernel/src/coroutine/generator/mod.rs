@@ -6,8 +6,8 @@
 //! [`Channel`] exists: [`GeneratorExt::map`] transforms items, [`GeneratorExt::map_ok`] transforms
 //! successful result items, [`GeneratorExt::chain`] concatenates two generators, [`empty`] yields
 //! nothing, and [`from_iter`] wraps an iterator. [`unfold`] and [`unfold_mut`] build a bound
-//! generator from owned state and a step future. Combinators require `Output = ()`; they have
-//! nowhere to keep a non-unit completion.
+//! generator from owned state and a step future. Item-transforming combinators preserve terminal
+//! output; consuming helpers such as [`GeneratorExt::next`] require `Output = ()`.
 //! [`generator_fn!`] builds an erased pipeline from an async body that later receives its channel.
 //!
 //! # Binding

@@ -1,6 +1,7 @@
 use std::borrow::Borrow;
-use std::future::pending;
+use std::future::{pending, poll_fn};
 use std::ops::Deref;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -14,7 +15,8 @@ use url::Url;
 
 use super::engine::{drive_with_engine, run_coroutine_with_connector, EngineConnector};
 use super::generator::{
-    empty, from_iter, generator, static_generator_coroutine, GeneratorExt as _,
+    empty, from_iter, generator, map_async, static_generator_coroutine, GeneratorExt as _,
+    GeneratorStep,
 };
 use super::kernel::request::{BackwardListing, ForwardListing, ListingBounds};
 use super::kernel::{
@@ -544,6 +546,65 @@ fn filter_ok_retains_matches_and_passes_through_item_errors() {
         coroutine.try_advance().unwrap(),
         CoroutineStep::Done(())
     ));
+}
+
+#[test]
+fn compatible_adapters_preserve_terminal_output() {
+    let tail = generator_fn!(async move |channel| -> DeltaResult<i32> {
+        channel.yield_item(Ok(1)).await?;
+        channel.yield_item(Ok(2)).await?;
+        Ok(42)
+    });
+    let first: [DeltaResult<i32>; 1] = [Ok(0)];
+    let items = from_iter(first)
+        .chain(tail)
+        .map(|item: DeltaResult<i32>| item.map(|value| value + 1))
+        .map_ok(|value| value * 2);
+    let items = map_async!(items, |_channel, item| { item.map(|value| value + 1) });
+    let items = items.filter_ok(|value: &i32| *value >= 5).peekable();
+    let mut generator: StaticGeneratorCoroutine<DeltaResult<i32>, i32> =
+        static_generator_coroutine!(Request, async move |channel| {
+            channel.yield_from(items.into_boxed()).await
+        });
+
+    let GeneratorCoroutineStep::Yield(first) = generator.try_advance().unwrap() else {
+        panic!("expected first item");
+    };
+    assert_eq!(first.unwrap(), 5);
+    let GeneratorCoroutineStep::Yield(second) = generator.try_advance().unwrap() else {
+        panic!("expected second item");
+    };
+    assert_eq!(second.unwrap(), 7);
+    let GeneratorCoroutineStep::Done(output) = generator.try_advance().unwrap() else {
+        panic!("expected completion");
+    };
+    assert_eq!(output, 42);
+}
+
+#[test]
+fn peekable_preserves_output_after_peeking_at_completion() {
+    let items = generator_fn!(async move |channel| {
+        channel.yield_item(1).await?;
+        Ok(42)
+    });
+    let mut coroutine = coroutine!(async move |channel| {
+        let mut items = items.bind(channel).peekable();
+        assert_eq!(items.peek().await?, Some(&1));
+        assert!(matches!(
+            poll_fn(|context| Pin::new(&mut items).poll_step(context)).await?,
+            GeneratorStep::Yield(1)
+        ));
+        assert_eq!(items.peek().await?, None);
+        match poll_fn(|context| Pin::new(&mut items).poll_step(context)).await? {
+            GeneratorStep::Done(output) => Ok(output),
+            GeneratorStep::Yield(_) => Err(Error::internal_error("expected completion")),
+        }
+    });
+
+    let CoroutineStep::Done(output) = coroutine.try_advance().unwrap() else {
+        panic!("expected completion");
+    };
+    assert_eq!(output, 42);
 }
 
 #[test]

@@ -4,14 +4,14 @@
 //! combinators first, then attach a request channel.
 
 use std::future::{poll_fn, Future};
-use std::ops::AsyncFnMut;
+use std::ops::{AsyncFnMut, ControlFlow};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use super::{BoundGenerator, ChannelBinding};
 use crate::coroutine::Channel;
 use crate::utils::PhantomType;
-use crate::DeltaResult;
+use crate::{DeltaResult, Error};
 
 /// Yield or completion produced by polling a bound [`Generator`].
 pub enum GeneratorStep<Y, O> {
@@ -19,6 +19,19 @@ pub enum GeneratorStep<Y, O> {
     Yield(Y),
     /// The generator completed.
     Done(O),
+}
+
+/// Extract a yielded item from the provided poll, propagating pending, failure, or completion.
+macro_rules! ready_yield {
+    ($poll:expr) => {
+        match std::task::ready!($poll) {
+            Ok(GeneratorStep::Yield(item)) => item,
+            Ok(GeneratorStep::Done(output)) => {
+                return Poll::Ready(Ok(GeneratorStep::Done(output)));
+            }
+            Err(err) => return Poll::Ready(Err(err)),
+        }
+    };
 }
 
 /// Consume helpers and combinators for [`IntoGenerator`] and [`Generator`].
@@ -96,7 +109,7 @@ pub trait GeneratorExt {
     /// Maps items asynchronously using the supplied call-future witness.
     fn map_async<P, U, F, W>(self, witness: W, mapper: F) -> MapAsync<Self, P, F, W, U>
     where
-        Self: IntoGenerator<P, Output = ()> + Sized,
+        Self: IntoGenerator<P> + Sized,
         P: Send + 'static,
         U: Send + 'static,
         F: for<'a> AsyncFnMut(&'a Channel<P>, Self::Item) -> U + Send,
@@ -132,14 +145,14 @@ pub trait GeneratorExt {
     }
 
     /// Counterpart of [`Iterator::peekable`]: allows inspecting the next item before consuming it.
-    fn peekable<I>(self) -> Peekable<Self, I>
+    fn peekable<I, O>(self) -> Peekable<Self, I, O>
     where
         Self: Sized,
     {
         Peekable {
             inner: self,
             peeked: None,
-            done: false,
+            done: None,
         }
     }
 
@@ -242,7 +255,7 @@ impl<G, F> GeneratorExt for Map<G, F> {}
 impl<G, P, F, W, U> GeneratorExt for MapAsync<G, P, F, W, U> {}
 impl<G, F> GeneratorExt for MapOk<G, F> {}
 impl<G, F> GeneratorExt for FilterOk<G, F> {}
-impl<G, I> GeneratorExt for Peekable<G, I> {}
+impl<G, I, O> GeneratorExt for Peekable<G, I, O> {}
 impl<A, B> GeneratorExt for Chain<A, B> {}
 impl<I> GeneratorExt for Iter<I> {}
 impl<S, F, Fut> GeneratorExt for Unfold<S, F, Fut> {}
@@ -316,17 +329,17 @@ impl<G: Unpin, F> Unpin for Map<G, F> {}
 impl<P, G, U, F> IntoGenerator<P> for Map<G, F>
 where
     P: Send + 'static,
-    G: IntoGenerator<P, Output = ()>,
+    G: IntoGenerator<P>,
     U: Send + 'static,
     F: FnMut(G::Item) -> U + Send + 'static,
 {
     type Item = U;
-    type Output = ();
+    type Output = G::Output;
 
     fn bind_to<'a>(
         self,
         channel: ChannelBinding<'a, P>,
-    ) -> impl Generator<Item = U, Output = ()> + Unpin + 'a
+    ) -> impl Generator<Item = U, Output = G::Output> + Unpin + 'a
     where
         Self: 'a,
     {
@@ -336,7 +349,10 @@ where
         }
     }
 
-    fn bind_boxed<'a>(self: Box<Self>, channel: ChannelBinding<'a, P>) -> BoxedGenerator<'a, U>
+    fn bind_boxed<'a>(
+        self: Box<Self>,
+        channel: ChannelBinding<'a, P>,
+    ) -> BoxedGenerator<'a, U, G::Output>
     where
         Self: 'a,
     {
@@ -346,61 +362,54 @@ where
 
 impl<G, U, F> Generator for Map<G, F>
 where
-    G: Generator<Output = ()> + Unpin,
+    G: Generator + Unpin,
     U: Send + 'static,
     F: FnMut(G::Item) -> U + Send,
 {
     type Item = U;
-    type Output = ();
+    type Output = G::Output;
 
     fn poll_step(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
-    ) -> Poll<DeltaResult<GeneratorStep<U, ()>>> {
+    ) -> Poll<DeltaResult<GeneratorStep<U, G::Output>>> {
         let this = self.get_mut();
-        match Pin::new(&mut this.inner).poll_step(context) {
-            Poll::Ready(Ok(GeneratorStep::Yield(item))) => {
-                Poll::Ready(Ok(GeneratorStep::Yield((this.map)(item))))
-            }
-            Poll::Ready(Ok(GeneratorStep::Done(()))) => Poll::Ready(Ok(GeneratorStep::Done(()))),
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-            Poll::Pending => Poll::Pending,
-        }
+        let item = ready_yield!(Pin::new(&mut this.inner).poll_step(context));
+        Poll::Ready(Ok(GeneratorStep::Yield((this.map)(item))))
     }
 }
 
-/// Witnesses one call to an asynchronous mapper and returns its state for the next item.
-pub async fn map_async_witness<P, F, I, U>(
-    mut mapper: F,
-    (channel, item): (ChannelBinding<'_, P>, I),
-) -> (F, U)
+/// Witnesses one call to an asynchronous mapper.
+pub async fn map_async_witness<'a, P, F, I, U>(
+    mapper: &'a mut F,
+    (channel, item): (ChannelBinding<'a, P>, I),
+) -> U
 where
     P: Send + 'static,
-    F: for<'a> AsyncFnMut(&'a Channel<P>, I) -> U,
+    F: for<'b> AsyncFnMut(&'b Channel<P>, I) -> U,
 {
-    let item = mapper(&channel, item).await;
-    (mapper, item)
+    mapper(&channel, item).await
 }
 
 /// Exposes one concrete asynchronous mapper call future for a channel lifetime.
 #[doc(hidden)]
 pub trait MapAsyncWitness<'a, P: 'static, F, I, U> {
     /// Future returned by this witness invocation.
-    type Future: Future<Output = (F, U)> + Send + 'a;
+    type Future: Future<Output = U> + Send + 'a;
 
     /// Invoke the witness for `mapper` and its channel-bound item.
-    fn invoke(&self, mapper: F, argument: (ChannelBinding<'a, P>, I)) -> Self::Future;
+    fn invoke(&self, mapper: &'a mut F, argument: (ChannelBinding<'a, P>, I)) -> Self::Future;
 }
 
-impl<'a, P, F, I, U, W, Fut> MapAsyncWitness<'a, P, F, I, U> for W
+impl<'a, P, F: 'a, I, U, W, Fut> MapAsyncWitness<'a, P, F, I, U> for W
 where
     P: 'static,
-    W: Fn(F, (ChannelBinding<'a, P>, I)) -> Fut,
-    Fut: Future<Output = (F, U)> + Send + 'a,
+    W: Fn(&'a mut F, (ChannelBinding<'a, P>, I)) -> Fut,
+    Fut: Future<Output = U> + Send + 'a,
 {
     type Future = Fut;
 
-    fn invoke(&self, mapper: F, argument: (ChannelBinding<'a, P>, I)) -> Self::Future {
+    fn invoke(&self, mapper: &'a mut F, argument: (ChannelBinding<'a, P>, I)) -> Self::Future {
         self(mapper, argument)
     }
 }
@@ -416,19 +425,19 @@ pub struct MapAsync<G, P, F, W, U> {
 impl<P, G, F, W, U> IntoGenerator<P> for MapAsync<G, P, F, W, U>
 where
     P: Send + 'static,
-    G: IntoGenerator<P, Output = ()>,
+    G: IntoGenerator<P>,
     F: for<'a> AsyncFnMut(&'a Channel<P>, G::Item) -> U + Send,
     W: Send,
     for<'a> W: MapAsyncWitness<'a, P, F, G::Item, U>,
     U: Send + 'static,
 {
     type Item = U;
-    type Output = ();
+    type Output = G::Output;
 
     fn bind_to<'a>(
         self,
         channel: ChannelBinding<'a, P>,
-    ) -> impl Generator<Item = U, Output = ()> + Unpin + 'a
+    ) -> impl Generator<Item = U, Output = G::Output> + Unpin + 'a
     where
         Self: 'a,
     {
@@ -442,7 +451,10 @@ where
         unfold(state, BoundMapAsync::<'a, P, _, _, _, U>::next)
     }
 
-    fn bind_boxed<'a>(self: Box<Self>, channel: ChannelBinding<'a, P>) -> BoxedGenerator<'a, U>
+    fn bind_boxed<'a>(
+        self: Box<Self>,
+        channel: ChannelBinding<'a, P>,
+    ) -> BoxedGenerator<'a, U, G::Output>
     where
         Self: 'a,
     {
@@ -461,32 +473,20 @@ struct BoundMapAsync<'a, P: 'static, G, F, W, U> {
 impl<'channel, P, G, F, W, U> BoundMapAsync<'channel, P, G, F, W, U>
 where
     P: Send + 'static,
-    G: Generator<Output = ()> + Unpin,
+    G: Generator + Unpin,
     F: for<'a> AsyncFnMut(&'a Channel<P>, G::Item) -> U + Send,
-    W: MapAsyncWitness<'channel, P, F, G::Item, U> + Send,
+    W: for<'a> MapAsyncWitness<'a, P, F, G::Item, U> + Send,
     U: Send + 'static,
 {
-    async fn next(self) -> DeltaResult<Option<(Self, U)>> {
-        let Self {
-            mut inner,
-            channel,
-            mapper,
-            witness,
-            _output,
-        } = self;
-        let Some(item) = inner.next().await? else {
-            return Ok(None);
-        };
-        let argument = (channel.clone(), item);
-        let (mapper, item) = witness.invoke(mapper, argument).await;
-        let state = Self {
-            inner,
-            channel,
-            mapper,
-            witness,
-            _output,
-        };
-        Ok(Some((state, item)))
+    async fn next(mut self) -> DeltaResult<ControlFlow<G::Output, (Self, U)>> {
+        match poll_fn(|context| Pin::new(&mut self.inner).poll_step(context)).await? {
+            GeneratorStep::Yield(item) => {
+                let argument = (self.channel.clone(), item);
+                let item = self.witness.invoke(&mut self.mapper, argument).await;
+                Ok(ControlFlow::Continue((self, item)))
+            }
+            GeneratorStep::Done(output) => Ok(ControlFlow::Break(output)),
+        }
     }
 }
 
@@ -503,18 +503,18 @@ impl<G: Unpin, F> Unpin for MapOk<G, F> {}
 impl<P, G, T, U, F> IntoGenerator<P> for MapOk<G, F>
 where
     P: Send + 'static,
-    G: IntoGenerator<P, Item = DeltaResult<T>, Output = ()>,
+    G: IntoGenerator<P, Item = DeltaResult<T>>,
     T: Send + 'static,
     U: Send + 'static,
     F: FnMut(T) -> U + Send + 'static,
 {
     type Item = DeltaResult<U>;
-    type Output = ();
+    type Output = G::Output;
 
     fn bind_to<'a>(
         self,
         channel: ChannelBinding<'a, P>,
-    ) -> impl Generator<Item = DeltaResult<U>, Output = ()> + Unpin + 'a
+    ) -> impl Generator<Item = DeltaResult<U>, Output = G::Output> + Unpin + 'a
     where
         Self: 'a,
     {
@@ -527,7 +527,7 @@ where
     fn bind_boxed<'a>(
         self: Box<Self>,
         channel: ChannelBinding<'a, P>,
-    ) -> BoxedGenerator<'a, DeltaResult<U>>
+    ) -> BoxedGenerator<'a, DeltaResult<U>, G::Output>
     where
         Self: 'a,
     {
@@ -537,28 +537,22 @@ where
 
 impl<G, T, U, F> Generator for MapOk<G, F>
 where
-    G: Generator<Item = DeltaResult<T>, Output = ()> + Unpin,
+    G: Generator<Item = DeltaResult<T>> + Unpin,
     T: Send + 'static,
     U: Send + 'static,
     F: FnMut(T) -> U + Send,
 {
     type Item = DeltaResult<U>;
-    type Output = ();
+    type Output = G::Output;
 
     fn poll_step(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
-    ) -> Poll<DeltaResult<GeneratorStep<DeltaResult<U>, ()>>> {
+    ) -> Poll<DeltaResult<GeneratorStep<DeltaResult<U>, G::Output>>> {
         let this = self.get_mut();
-        match Pin::new(&mut this.inner).poll_step(context) {
-            Poll::Ready(Ok(GeneratorStep::Yield(item))) => {
-                let item = item.map(|item| (this.map)(item));
-                Poll::Ready(Ok(GeneratorStep::Yield(item)))
-            }
-            Poll::Ready(Ok(GeneratorStep::Done(()))) => Poll::Ready(Ok(GeneratorStep::Done(()))),
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-            Poll::Pending => Poll::Pending,
-        }
+        let item = ready_yield!(Pin::new(&mut this.inner).poll_step(context));
+        let item = item.map(|item| (this.map)(item));
+        Poll::Ready(Ok(GeneratorStep::Yield(item)))
     }
 }
 
@@ -575,17 +569,17 @@ impl<G: Unpin, F> Unpin for FilterOk<G, F> {}
 impl<P, G, T, F> IntoGenerator<P> for FilterOk<G, F>
 where
     P: Send + 'static,
-    G: IntoGenerator<P, Item = DeltaResult<T>, Output = ()>,
+    G: IntoGenerator<P, Item = DeltaResult<T>>,
     T: Send + 'static,
     F: FnMut(&T) -> bool + Send + 'static,
 {
     type Item = DeltaResult<T>;
-    type Output = ();
+    type Output = G::Output;
 
     fn bind_to<'a>(
         self,
         channel: ChannelBinding<'a, P>,
-    ) -> impl Generator<Item = DeltaResult<T>, Output = ()> + Unpin + 'a
+    ) -> impl Generator<Item = DeltaResult<T>, Output = G::Output> + Unpin + 'a
     where
         Self: 'a,
     {
@@ -598,7 +592,7 @@ where
     fn bind_boxed<'a>(
         self: Box<Self>,
         channel: ChannelBinding<'a, P>,
-    ) -> BoxedGenerator<'a, DeltaResult<T>>
+    ) -> BoxedGenerator<'a, DeltaResult<T>, G::Output>
     where
         Self: 'a,
     {
@@ -608,33 +602,26 @@ where
 
 impl<G, T, F> Generator for FilterOk<G, F>
 where
-    G: Generator<Item = DeltaResult<T>, Output = ()> + Unpin,
+    G: Generator<Item = DeltaResult<T>> + Unpin,
     T: Send + 'static,
     F: FnMut(&T) -> bool + Send,
 {
     type Item = DeltaResult<T>;
-    type Output = ();
+    type Output = G::Output;
 
     fn poll_step(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
-    ) -> Poll<DeltaResult<GeneratorStep<DeltaResult<T>, ()>>> {
+    ) -> Poll<DeltaResult<GeneratorStep<DeltaResult<T>, G::Output>>> {
         let this = self.get_mut();
         loop {
-            match Pin::new(&mut this.inner).poll_step(context) {
-                Poll::Ready(Ok(GeneratorStep::Yield(Ok(item)))) if (this.predicate)(&item) => {
-                    return Poll::Ready(Ok(GeneratorStep::Yield(Ok(item))));
-                }
-                Poll::Ready(Ok(GeneratorStep::Yield(Ok(_)))) => {}
-                Poll::Ready(Ok(GeneratorStep::Yield(Err(err)))) => {
-                    return Poll::Ready(Ok(GeneratorStep::Yield(Err(err))));
-                }
-                Poll::Ready(Ok(GeneratorStep::Done(()))) => {
-                    return Poll::Ready(Ok(GeneratorStep::Done(())));
-                }
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                Poll::Pending => return Poll::Pending,
-            }
+            let item = ready_yield!(Pin::new(&mut this.inner).poll_step(context));
+            let item = match item {
+                Err(err) => Err(err),
+                Ok(item) if (this.predicate)(&item) => Ok(item),
+                Ok(_) => continue,
+            };
+            return Poll::Ready(Ok(GeneratorStep::Yield(item)));
         }
     }
 }
@@ -643,48 +630,50 @@ where
 // WARNING: We manually impl `Unpin` for `Peekable` so `I` need not be `Unpin`. This is sound only
 // because `Peekable` does not structurally pin `peeked`; it is only moved through ordinary `Option`
 // operations.
-pub struct Peekable<G, I> {
+pub struct Peekable<G, I, O> {
     inner: G,
     peeked: Option<I>,
-    done: bool,
+    done: Option<O>,
 }
 
-impl<G: Unpin, I> Unpin for Peekable<G, I> {}
+impl<G: Unpin, I, O> Unpin for Peekable<G, I, O> {}
 
-impl<G, I> Peekable<G, I>
+impl<G, I, O> Peekable<G, I, O>
 where
-    G: Generator<Item = I, Output = ()> + Unpin,
+    G: Generator<Item = I, Output = O> + Unpin,
     I: Send + 'static,
+    O: Send + 'static,
 {
-    fn poll_inner(&mut self, context: &mut Context<'_>) -> Poll<DeltaResult<GeneratorStep<I, ()>>> {
+    fn poll_inner(&mut self, context: &mut Context<'_>) -> Poll<DeltaResult<GeneratorStep<I, O>>> {
         Pin::new(&mut self.inner).poll_step(context)
     }
 
     /// Return the next item without consuming it, or `None` at completion.
     pub async fn peek(&mut self) -> DeltaResult<Option<&I>> {
-        if self.peeked.is_none() && !self.done {
+        if self.peeked.is_none() && self.done.is_none() {
             match poll_fn(|context| self.poll_inner(context)).await? {
                 GeneratorStep::Yield(item) => self.peeked = Some(item),
-                GeneratorStep::Done(()) => self.done = true,
+                GeneratorStep::Done(output) => self.done = Some(output),
             }
         }
         Ok(self.peeked.as_ref())
     }
 }
 
-impl<P, G, I> IntoGenerator<P> for Peekable<G, I>
+impl<P, G, I, O> IntoGenerator<P> for Peekable<G, I, O>
 where
     P: Send + 'static,
-    G: IntoGenerator<P, Item = I, Output = ()>,
+    G: IntoGenerator<P, Item = I, Output = O>,
     I: Send + 'static,
+    O: Send + 'static,
 {
     type Item = I;
-    type Output = ();
+    type Output = O;
 
     fn bind_to<'a>(
         self,
         channel: ChannelBinding<'a, P>,
-    ) -> impl Generator<Item = I, Output = ()> + Unpin + 'a
+    ) -> impl Generator<Item = I, Output = O> + Unpin + 'a
     where
         Self: 'a,
     {
@@ -695,7 +684,7 @@ where
         }
     }
 
-    fn bind_boxed<'a>(self: Box<Self>, channel: ChannelBinding<'a, P>) -> BoxedGenerator<'a, I>
+    fn bind_boxed<'a>(self: Box<Self>, channel: ChannelBinding<'a, P>) -> BoxedGenerator<'a, I, O>
     where
         Self: 'a,
     {
@@ -703,29 +692,29 @@ where
     }
 }
 
-impl<G, I> Generator for Peekable<G, I>
+impl<G, I, O> Generator for Peekable<G, I, O>
 where
-    G: Generator<Item = I, Output = ()> + Unpin,
+    G: Generator<Item = I, Output = O> + Unpin,
     I: Send + 'static,
+    O: Send + 'static,
 {
     type Item = I;
-    type Output = ();
+    type Output = O;
 
     fn poll_step(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
-    ) -> Poll<DeltaResult<GeneratorStep<I, ()>>> {
+    ) -> Poll<DeltaResult<GeneratorStep<I, O>>> {
         let this = self.get_mut();
         if let Some(item) = this.peeked.take() {
             return Poll::Ready(Ok(GeneratorStep::Yield(item)));
         }
-        if this.done {
-            return Poll::Ready(Ok(GeneratorStep::Done(())));
+        if let Some(output) = this.done.take() {
+            return Poll::Ready(Ok(GeneratorStep::Done(output)));
         }
         match this.poll_inner(context) {
-            Poll::Ready(Ok(GeneratorStep::Done(()))) => {
-                this.done = true;
-                Poll::Ready(Ok(GeneratorStep::Done(())))
+            Poll::Ready(Ok(GeneratorStep::Done(output))) => {
+                Poll::Ready(Ok(GeneratorStep::Done(output)))
             }
             step => step,
         }
@@ -743,15 +732,15 @@ impl<P, A, B> IntoGenerator<P> for Chain<A, B>
 where
     P: Send + 'static,
     A: IntoGenerator<P, Output = ()>,
-    B: IntoGenerator<P, Item = A::Item, Output = ()>,
+    B: IntoGenerator<P, Item = A::Item>,
 {
     type Item = A::Item;
-    type Output = ();
+    type Output = B::Output;
 
     fn bind_to<'a>(
         self,
         channel: ChannelBinding<'a, P>,
-    ) -> impl Generator<Item = A::Item, Output = ()> + Unpin + 'a
+    ) -> impl Generator<Item = A::Item, Output = B::Output> + Unpin + 'a
     where
         Self: 'a,
     {
@@ -764,7 +753,7 @@ where
     fn bind_boxed<'a>(
         self: Box<Self>,
         channel: ChannelBinding<'a, P>,
-    ) -> BoxedGenerator<'a, A::Item>
+    ) -> BoxedGenerator<'a, A::Item, B::Output>
     where
         Self: 'a,
     {
@@ -775,20 +764,24 @@ where
 impl<A, B> Generator for Chain<A, B>
 where
     A: Generator<Output = ()> + Unpin,
-    B: Generator<Item = A::Item, Output = ()> + Unpin,
+    B: Generator<Item = A::Item> + Unpin,
 {
     type Item = A::Item;
-    type Output = ();
+    type Output = B::Output;
 
     fn poll_step(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
-    ) -> Poll<DeltaResult<GeneratorStep<A::Item, ()>>> {
+    ) -> Poll<DeltaResult<GeneratorStep<A::Item, B::Output>>> {
         let this = self.get_mut();
         if let Some(first) = &mut this.first {
             match Pin::new(first).poll_step(context) {
                 Poll::Ready(Ok(GeneratorStep::Done(()))) => this.first = None,
-                poll => return poll,
+                Poll::Ready(Ok(GeneratorStep::Yield(item))) => {
+                    return Poll::Ready(Ok(GeneratorStep::Yield(item)));
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
             }
         }
         Pin::new(&mut this.second).poll_step(context)
@@ -863,16 +856,8 @@ where
                 return Poll::Ready(Ok(GeneratorStep::Yield(item)));
             }
             this.rest = None;
-            match Pin::new(&mut this.inner).poll_step(context) {
-                Poll::Ready(Ok(GeneratorStep::Yield(page))) => {
-                    this.rest = Some(page.into_iter());
-                }
-                Poll::Ready(Ok(GeneratorStep::Done(output))) => {
-                    return Poll::Ready(Ok(GeneratorStep::Done(output)));
-                }
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                Poll::Pending => return Poll::Pending,
-            }
+            let page = ready_yield!(Pin::new(&mut this.inner).poll_step(context));
+            this.rest = Some(page.into_iter());
         }
     }
 }
@@ -948,13 +933,14 @@ where
 
 /// Builds a [`Generator`] by repeatedly passing owned state through `step`.
 ///
-/// `step` consumes the current state and returns a future that yields `Some((next_state, item))`
-/// or `None` at exhaustion. The future owns the state while pending. Each step future is pinned
-/// in a box so this adapter is [`Unpin`] even when the step future is not.
-pub fn unfold<S, I, F, Fut>(state: S, step: F) -> Unfold<S, F, Fut>
+/// `step` consumes the current state and returns a future that either yields
+/// `Continue((next_state, item))` or completes with `Break(output)`. The future owns the state
+/// while pending. Each step future is pinned in a box so this adapter is [`Unpin`] even when the
+/// step future is not.
+pub fn unfold<S, I, O, F, Fut>(state: S, step: F) -> Unfold<S, F, Fut>
 where
     F: FnMut(S) -> Fut,
-    Fut: Future<Output = DeltaResult<Option<(S, I)>>>,
+    Fut: Future<Output = DeltaResult<ControlFlow<O, (S, I)>>>,
 {
     Unfold {
         idle: Some(state),
@@ -978,7 +964,7 @@ where
     S: Send + 's,
     I: Send + 'static,
     F: Send + 's,
-    Fut: Future<Output = DeltaResult<Option<((S, F), I)>>> + Send + 's,
+    Fut: Future<Output = DeltaResult<ControlFlow<(), ((S, F), I)>>> + Send + 's,
 {
     unfold((state, next), move |(state, next)| witness(state, next))
 }
@@ -990,12 +976,15 @@ where
 pub(crate) async fn unfold_mut_witness<S, I, F>(
     mut state: S,
     mut next: F,
-) -> DeltaResult<Option<((S, F), I)>>
+) -> DeltaResult<ControlFlow<(), ((S, F), I)>>
 where
     F: for<'s> AsyncFnMut(&'s mut S) -> DeltaResult<Option<I>>,
 {
     let item = next(&mut state).await?;
-    Ok(item.map(|item| ((state, next), item)))
+    Ok(match item {
+        Some(item) => ControlFlow::Continue(((state, next), item)),
+        None => ControlFlow::Break(()),
+    })
 }
 
 /// Generator returned by [`unfold`].
@@ -1010,26 +999,29 @@ pub struct Unfold<S, F, Fut> {
 
 impl<S, F, Fut> Unpin for Unfold<S, F, Fut> {}
 
-impl<S, I, F, Fut> Generator for Unfold<S, F, Fut>
+impl<S, I, O, F, Fut> Generator for Unfold<S, F, Fut>
 where
     S: Send,
     I: Send + 'static,
+    O: Send + 'static,
     F: FnMut(S) -> Fut + Send,
-    Fut: Future<Output = DeltaResult<Option<(S, I)>>> + Send,
+    Fut: Future<Output = DeltaResult<ControlFlow<O, (S, I)>>> + Send,
 {
     type Item = I;
-    type Output = ();
+    type Output = O;
 
     fn poll_step(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
-    ) -> Poll<DeltaResult<GeneratorStep<I, ()>>> {
+    ) -> Poll<DeltaResult<GeneratorStep<I, O>>> {
         let this = self.get_mut();
         let mut pending = match this.pending.take() {
             Some(pending) => pending,
             None => {
                 let Some(state) = this.idle.take() else {
-                    return Poll::Ready(Ok(GeneratorStep::Done(())));
+                    return Poll::Ready(Err(Error::internal_error(
+                        "unfold generator advanced after completion",
+                    )));
                 };
                 Box::pin((this.step)(state))
             }
@@ -1039,11 +1031,11 @@ where
             return Poll::Pending;
         };
         match result {
-            Ok(Some((state, item))) => {
+            Ok(ControlFlow::Continue((state, item))) => {
                 this.idle = Some(state);
                 Poll::Ready(Ok(GeneratorStep::Yield(item)))
             }
-            Ok(None) => Poll::Ready(Ok(GeneratorStep::Done(()))),
+            Ok(ControlFlow::Break(output)) => Poll::Ready(Ok(GeneratorStep::Done(output))),
             Err(err) => Poll::Ready(Err(err)),
         }
     }
