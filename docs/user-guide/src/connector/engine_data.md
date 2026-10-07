@@ -23,6 +23,8 @@ pub trait EngineData: AsAny {
         self.len() == 0
     }
 
+    fn clone_data(&self) -> Box<dyn EngineData>;
+
     fn append_columns(
         &self,
         schema: SchemaRef,
@@ -38,9 +40,9 @@ pub trait EngineData: AsAny {
 }
 ```
 
-The five required methods to implement are `visit_rows`, `len`, `append_columns`,
-`apply_selection_vector`, and `has_field`. The `is_empty` method has a default
-implementation that delegates to `len`.
+Implement `visit_rows`, `len`, `clone_data`, `append_columns`, `apply_selection_vector`,
+and `has_field`. `is_empty` has a default implementation that delegates to `len`.
+`Box<dyn EngineData>` then implements [`Clone`] by calling `clone_data`.
 
 `has_field` returns `true` if a field at the given (possibly nested) path exists in the
 data's schema. For a top-level field named `"foo"`, pass `column_name!("foo")`. For
@@ -149,6 +151,13 @@ that the requested columns exist and have compatible types before creating gette
 `RowVisitor` also provides a convenience method `visit_rows_of(&mut self, data: &dyn EngineData)`.
 This calls `data.visit_rows(...)` with the column names from
 `selected_column_names_and_types()`, saving you from extracting them manually.
+
+## clone_data
+
+`clone_data` returns a new `EngineData` that shares this batch's column buffers. Clone is
+cheap: copy a small header and increment per-column refcounts. Do not deep-copy array
+payloads. If your native format is not already reference-counted, wrap it in `Arc` (or
+equivalent) and implement `EngineData` for that wrapper.
 
 ## append_columns
 

@@ -32,7 +32,7 @@ use crate::{DeltaResult, Error};
 /// WARNING: Row visitors require that all leaf columns of the record batch have correctly computed
 /// NULL masks. The arrow parquet reader is known to produce incomplete NULL masks, for
 /// example. When in doubt, call [`fix_nested_null_masks`] first.
-#[derive(From)]
+#[derive(Clone, From)]
 #[from(RecordBatch, StructArray)]
 pub struct ArrowEngineData {
     data: RecordBatch,
@@ -254,6 +254,10 @@ impl EngineData for ArrowEngineData {
             )));
         }
         visitor.visit(self.len(), &getters)
+    }
+
+    fn clone_data(&self) -> Box<dyn EngineData> {
+        Box::new(self.clone())
     }
 
     fn append_columns(
