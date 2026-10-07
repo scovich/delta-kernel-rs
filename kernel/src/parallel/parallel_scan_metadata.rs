@@ -33,7 +33,7 @@ pub enum AfterSequentialScanMetadata {
 /// After exhaustion, call `finish()` to get the result which indicates whether
 /// a distributed phase is needed.
 pub struct SequentialScanMetadata {
-    pub(crate) sequential: SequentialPhase<ScanLogReplayProcessor>,
+    pub(crate) sequential: SequentialPhase,
     operation_id: MetricId,
     /// Opaque, caller-supplied correlation id propagated to both phases' metric events.
     correlation_id: Option<Arc<str>>,
@@ -42,10 +42,7 @@ pub struct SequentialScanMetadata {
 }
 
 impl SequentialScanMetadata {
-    pub(crate) fn new(
-        sequential: SequentialPhase<ScanLogReplayProcessor>,
-        correlation_id: Option<Arc<str>>,
-    ) -> Self {
+    pub(crate) fn new(sequential: SequentialPhase, correlation_id: Option<Arc<str>>) -> Self {
         let operation_id = MetricId::new();
         Self {
             sequential,
