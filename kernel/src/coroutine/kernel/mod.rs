@@ -53,7 +53,8 @@ pub type StaticGeneratorCoroutine<Y, O = ()> = generator::StaticGeneratorCorouti
 
 /// Yield, request, or completion from a kernel [`StaticGeneratorCoroutine`].
 ///
-/// Yielded items are acknowledged before this step returns. Requests carry their own replies.
+/// Yielded items are removed from the pending queue before this step returns. Requests carry their
+/// own replies.
 pub type GeneratorCoroutineStep<Y, O = ()> = generator::GeneratorCoroutineStep<Request, Y, O>;
 
 /// Independently driven kernel operation with an owned request channel.

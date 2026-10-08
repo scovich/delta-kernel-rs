@@ -43,6 +43,7 @@ pub trait GeneratorExt {
     ) -> impl Generator<Item = Self::Item, Output = Self::Output> + Unpin + 'a
     where
         Self: IntoGenerator<P> + Sized + 'a,
+        Self::Item: 'a,
     {
         self.bind_to(ChannelBinding::Borrowed(channel))
     }
@@ -200,7 +201,7 @@ pub trait GeneratorExt {
 /// [`GeneratorExt::bind`].
 pub trait IntoGenerator<P: Send + 'static>: GeneratorExt + Send {
     /// Type of the yielded items.
-    type Item: Send + 'static;
+    type Item: Send;
 
     /// Type of the completion value.
     type Output: Send + 'static;
@@ -211,6 +212,7 @@ pub trait IntoGenerator<P: Send + 'static>: GeneratorExt + Send {
     ) -> Box<dyn IntoGenerator<P, Item = Self::Item, Output = Self::Output> + 'a>
     where
         Self: Sized + 'a,
+        Self::Item: 'a,
     {
         Box::new(self)
     }
@@ -221,7 +223,8 @@ pub trait IntoGenerator<P: Send + 'static>: GeneratorExt + Send {
         channel: ChannelBinding<'a, P>,
     ) -> impl Generator<Item = Self::Item, Output = Self::Output> + Unpin + 'a
     where
-        Self: Sized + 'a;
+        Self: Sized + 'a,
+        Self::Item: 'a;
 
     /// Object-safe binding used after type erasure.
     fn bind_boxed<'a>(
@@ -229,13 +232,14 @@ pub trait IntoGenerator<P: Send + 'static>: GeneratorExt + Send {
         channel: ChannelBinding<'a, P>,
     ) -> BoxedGenerator<'a, Self::Item, Self::Output>
     where
-        Self: 'a;
+        Self: 'a,
+        Self::Item: 'a;
 }
 
 /// Pollable generator bound to a request channel.
 pub trait Generator: GeneratorExt + Send {
     /// Type of the yielded items.
-    type Item: Send + 'static;
+    type Item: Send;
 
     /// Type of the completion value.
     type Output: Send + 'static;
@@ -256,12 +260,12 @@ pub type BoxedGenerator<'a, Y, O = ()> = Box<dyn Generator<Item = Y, Output = O>
 /// be an [`Err`](Result::Err).
 pub type BoxedDeltaResultGenerator<'a, T, O = ()> = BoxedGenerator<'a, DeltaResult<T>, O>;
 
-impl<Y: Send + 'static, O: Send + 'static> GeneratorExt for BoundGenerator<'_, Y, O> {}
-impl<'g, P: Send + 'static, Y: Send + 'static, O: Send + 'static> GeneratorExt
+impl<'a, Y: Send + 'a, O: Send + 'static> GeneratorExt for BoundGenerator<'a, Y, O> {}
+impl<'g, P: Send + 'static, Y: Send + 'g, O: Send + 'static> GeneratorExt
     for Box<dyn IntoGenerator<P, Item = Y, Output = O> + 'g>
 {
 }
-impl<'a, Y: Send + 'static, O: Send + 'static> GeneratorExt for BoxedGenerator<'a, Y, O> {}
+impl<'a, Y: Send + 'a, O: Send + 'static> GeneratorExt for BoxedGenerator<'a, Y, O> {}
 impl<G, F> GeneratorExt for Map<G, F> {}
 impl<G, P, F, W, U> GeneratorExt for MapAsync<G, P, F, W, U> {}
 impl<G, F> GeneratorExt for MapOk<G, F> {}
@@ -272,7 +276,7 @@ impl<A, B> GeneratorExt for Chain<A, B> {}
 impl<I> GeneratorExt for Iter<I> {}
 impl<S, F, Fut> GeneratorExt for Unfold<S, F, Fut> {}
 
-impl<Y: Send + 'static, O: Send + 'static> Generator for BoundGenerator<'_, Y, O> {
+impl<'a, Y: Send + 'a, O: Send + 'static> Generator for BoundGenerator<'a, Y, O> {
     type Item = Y;
     type Output = O;
 
@@ -284,7 +288,7 @@ impl<Y: Send + 'static, O: Send + 'static> Generator for BoundGenerator<'_, Y, O
     }
 }
 
-impl<'a, Y: Send + 'static, O: Send + 'static> Generator for BoxedGenerator<'a, Y, O> {
+impl<'a, Y: Send + 'a, O: Send + 'static> Generator for BoxedGenerator<'a, Y, O> {
     type Item = Y;
     type Output = O;
 
@@ -296,7 +300,7 @@ impl<'a, Y: Send + 'static, O: Send + 'static> Generator for BoxedGenerator<'a, 
     }
 }
 
-impl<'g, P: Send + 'static, Y: Send + 'static, O: Send + 'static> IntoGenerator<P>
+impl<'g, P: Send + 'static, Y: Send + 'g, O: Send + 'static> IntoGenerator<P>
     for Box<dyn IntoGenerator<P, Item = Y, Output = O> + 'g>
 {
     type Item = Y;
@@ -308,6 +312,7 @@ impl<'g, P: Send + 'static, Y: Send + 'static, O: Send + 'static> IntoGenerator<
     ) -> impl Generator<Item = Y, Output = O> + Unpin + 'a
     where
         Self: 'a,
+        Y: 'a,
     {
         IntoGenerator::bind_boxed(self, channel)
     }
@@ -315,6 +320,7 @@ impl<'g, P: Send + 'static, Y: Send + 'static, O: Send + 'static> IntoGenerator<
     fn into_boxed<'a>(self) -> Box<dyn IntoGenerator<P, Item = Y, Output = O> + 'a>
     where
         Self: 'a,
+        Y: 'a,
     {
         self
     }
@@ -322,6 +328,7 @@ impl<'g, P: Send + 'static, Y: Send + 'static, O: Send + 'static> IntoGenerator<
     fn bind_boxed<'a>(self: Box<Self>, channel: ChannelBinding<'a, P>) -> BoxedGenerator<'a, Y, O>
     where
         Self: 'a,
+        Y: 'a,
     {
         (*self).bind_boxed(channel)
     }
@@ -962,7 +969,7 @@ where
 }
 
 /// Counterpart of [`std::iter::empty`]: a generator that yields nothing.
-pub fn empty<Y: Send + 'static>() -> Iter<std::iter::Empty<Y>> {
+pub fn empty<Y: Send>() -> Iter<std::iter::Empty<Y>> {
     from_iter(std::iter::empty())
 }
 
@@ -971,7 +978,7 @@ pub fn from_iter<T>(iter: T) -> Iter<T::IntoIter>
 where
     T: IntoIterator,
     T::IntoIter: Send,
-    T::Item: Send + 'static,
+    T::Item: Send,
 {
     Iter(iter.into_iter())
 }
@@ -986,7 +993,7 @@ impl<I> Unpin for Iter<I> {}
 
 impl<I: Iterator + Send, P: Send + 'static> IntoGenerator<P> for Iter<I>
 where
-    I::Item: Send + 'static,
+    I::Item: Send,
 {
     type Item = I::Item;
     type Output = ();
@@ -997,6 +1004,7 @@ where
     ) -> impl Generator<Item = I::Item, Output = ()> + Unpin + 'a
     where
         Self: 'a,
+        I::Item: 'a,
     {
         self
     }
@@ -1007,6 +1015,7 @@ where
     ) -> BoxedGenerator<'a, I::Item>
     where
         Self: 'a,
+        I::Item: 'a,
     {
         self
     }
@@ -1014,7 +1023,7 @@ where
 
 impl<I: Iterator + Send> Generator for Iter<I>
 where
-    I::Item: Send + 'static,
+    I::Item: Send,
 {
     type Item = I::Item;
     type Output = ();

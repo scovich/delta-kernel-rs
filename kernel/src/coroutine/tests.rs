@@ -800,6 +800,29 @@ fn channel_taking_generator_supports_static_and_borrowed_state() {
 }
 
 #[test]
+fn channel_taking_generator_can_yield_borrowed_items() {
+    fn borrowed<'a>(channel: &'a Channel, value: &'a str) -> BoundGenerator<'a, &'a str> {
+        generator!(channel, async move |channel| {
+            channel.yield_item(value).await
+        })
+    }
+
+    async fn parent(channel: &Channel) -> DeltaResult<()> {
+        let value = String::from("borrowed");
+        let mut child = borrowed(channel, &value);
+        assert_eq!(child.next().await?, Some("borrowed"));
+        assert_eq!(child.next().await?, None);
+        Ok(())
+    }
+
+    let mut coroutine = coroutine!(parent);
+    assert!(matches!(
+        coroutine.try_advance().unwrap(),
+        CoroutineStep::Done(())
+    ));
+}
+
+#[test]
 fn static_generator_coroutine_returns_terminal_output() {
     let mut generator: StaticGeneratorCoroutine<&'static str, usize> =
         static_generator_coroutine!(Request, async move |channel| {

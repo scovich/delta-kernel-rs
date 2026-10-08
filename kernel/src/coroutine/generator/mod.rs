@@ -79,16 +79,16 @@ mod adapters;
 ///
 /// Use [`GeneratorCoroutine`] for an independently driven generator that exposes requests, yielded
 /// items, and completion to its driver.
-pub struct BoundGenerator<'a, Y: Send + 'static, O = ()> {
+pub struct BoundGenerator<'a, Y: Send + 'a, O = ()> {
     body: Option<Pin<Box<dyn DeltaFuture<O> + 'a>>>,
     yields: Arc<YieldQueue<Y>>,
     terminal: Option<DeltaResult<O>>,
 }
 
 // The body has its own stable heap address; no other field is structurally pinned.
-impl<Y: Send + 'static, O> Unpin for BoundGenerator<'_, Y, O> {}
+impl<'a, Y: Send + 'a, O> Unpin for BoundGenerator<'a, Y, O> {}
 
-impl<'a, Y: Send + 'static> BoundGenerator<'a, Y> {
+impl<'a, Y: Send + 'a> BoundGenerator<'a, Y> {
     /// Waits for the next item, returning `None` if the generator is exhausted.
     ///
     /// Connector requests made while producing the item flow through the generator's channel.
@@ -99,7 +99,7 @@ impl<'a, Y: Send + 'static> BoundGenerator<'a, Y> {
     }
 }
 
-impl<'a, Y: Send + 'static, O> BoundGenerator<'a, Y, O> {
+impl<'a, Y: Send + 'a, O> BoundGenerator<'a, Y, O> {
     fn new_with_witness<State, F, Fut>(state: State, witness: F) -> Self
     where
         F: FnOnce(State, Arc<YieldQueue<Y>>) -> Fut,
@@ -142,8 +142,9 @@ impl<'a, Y: Send + 'static, O> BoundGenerator<'a, Y, O> {
 
 /// Yield, request, or completion produced by advancing a [`GeneratorCoroutine`].
 ///
-/// Yielded items are acknowledged before this step returns. Requests carry their own replies.
-pub enum GeneratorCoroutineStep<P: Send + 'static, Y: Send + 'static, O: Send + 'static = ()> {
+/// Yielded items are removed from the pending queue before this step returns. Requests carry their
+/// own replies.
+pub enum GeneratorCoroutineStep<P: Send + 'static, Y: Send, O: Send + 'static = ()> {
     /// A yielded item.
     Yield(Y),
     /// Connector work offered by the generator.
@@ -155,7 +156,7 @@ pub enum GeneratorCoroutineStep<P: Send + 'static, Y: Send + 'static, O: Send + 
 /// Independently driven generator with owned request state.
 ///
 /// The generator owns its request channel and may borrow captured operation state for `'a`.
-pub struct GeneratorCoroutine<'a, P: Send + 'static, Y: Send + 'static, O: Send + 'static = ()> {
+pub struct GeneratorCoroutine<'a, P: Send + 'static, Y: Send + 'a, O: Send + 'static = ()> {
     requests: Arc<Channel<P>>,
     generator: BoxedGenerator<'a, Y, O>,
 }
@@ -163,7 +164,7 @@ pub struct GeneratorCoroutine<'a, P: Send + 'static, Y: Send + 'static, O: Send 
 /// Independently driven generator that owns all captured state.
 pub type StaticGeneratorCoroutine<P, Y, O = ()> = GeneratorCoroutine<'static, P, Y, O>;
 
-impl<'a, P: Send + 'static, Y: Send + 'static, O: Send + 'static> GeneratorCoroutine<'a, P, Y, O> {
+impl<'a, P: Send + 'static, Y: Send + 'a, O: Send + 'static> GeneratorCoroutine<'a, P, Y, O> {
     /// Constructs a generator around an infallible channel-taking operation.
     ///
     /// `make_generator` runs immediately with the owned request channel. The returned generator
@@ -353,7 +354,7 @@ macro_rules! unfold_mut {
     };
 }
 
-impl<'a, P: Send + 'static, Y: Send + 'static, O: Send + 'static> GeneratorCoroutine<'a, P, Y, O> {
+impl<'a, P: Send + 'static, Y: Send + 'a, O: Send + 'static> GeneratorCoroutine<'a, P, Y, O> {
     /// Bind an unbound generator to an owned request channel.
     pub fn from_generator(generator: impl IntoGenerator<P, Item = Y, Output = O> + 'a) -> Self {
         let requests = Arc::new(Channel::default());
@@ -471,7 +472,7 @@ where
     }
 }
 
-impl<'a, P: Send + 'static, Y: Send + 'static, O: Send + 'static>
+impl<'a, P: Send + 'static, Y: Send + 'a, O: Send + 'static>
     From<Box<dyn IntoGenerator<P, Item = Y, Output = O> + 'a>> for GeneratorCoroutine<'a, P, Y, O>
 {
     fn from(generator: Box<dyn IntoGenerator<P, Item = Y, Output = O> + 'a>) -> Self {
@@ -486,10 +487,10 @@ impl<'a, P: Send + 'static, Y: Send + 'static, O: Send + 'static>
 /// Generator access to connector requests and yielded output.
 #[derive(derive_more::Deref)]
 #[internal_api]
-pub(crate) struct GeneratorChannel<'a, P: Send + 'static, Y: Send + 'static> {
+pub(crate) struct GeneratorChannel<'a, P: Send + 'static, Y: Send> {
     #[deref]
     channel: &'a Channel<P>,
-    yields: &'a YieldQueue<Y>,
+    yields: Arc<YieldQueue<Y>>,
 }
 
 /// Queue of items committed by generator yield futures.
@@ -520,8 +521,8 @@ impl<Y> YieldQueue<Y> {
     }
 }
 
-impl<'a, P: Send + 'static, Y: Send + 'static> GeneratorChannel<'a, P, Y> {
-    fn new(channel: &'a Channel<P>, yields: &'a YieldQueue<Y>) -> Self {
+impl<'a, P: Send + 'static, Y: Send> GeneratorChannel<'a, P, Y> {
+    fn new(channel: &'a Channel<P>, yields: Arc<YieldQueue<Y>>) -> Self {
         Self { channel, yields }
     }
 
@@ -588,7 +589,7 @@ pub(crate) struct BodyFn<F, P, Y, O> {
 // `Self::into_generator_with` passes `self`, `channel`, and `Self::witness` to
 // `BoundGenerator::new_with_witness`; [`invoke_witness`] explains why the witness must remain
 // separate. The returned future is instrumented with the captured span.
-impl<F, P: Send + 'static, Y: Send + 'static, O> BodyFn<F, P, Y, O> {
+impl<F, P: Send + 'static, Y: Send, O> BodyFn<F, P, Y, O> {
     /// Stores `body` without choosing its call-future proof path.
     #[internal_api]
     pub(crate) fn new(body: F) -> Self
@@ -612,6 +613,7 @@ impl<F, P: Send + 'static, Y: Send + 'static, O> BodyFn<F, P, Y, O> {
     where
         C: Deref<Target = Channel<P>> + Send + 'generator,
         Fut: DeltaFuture<O> + 'generator,
+        Y: 'generator,
         O: 'generator,
     {
         let witness = move |(this, channel), yields| witness(this, channel, yields);
@@ -629,7 +631,7 @@ impl<F, P: Send + 'static, Y: Send + 'static, O> BodyFn<F, P, Y, O> {
         F: for<'channel> AsyncFnOnce(GeneratorChannel<'channel, P, Y>) -> DeltaResult<O>,
     {
         let future = async move {
-            let channel = GeneratorChannel::new(&channel, yields.as_ref());
+            let channel = GeneratorChannel::new(&channel, yields);
             let output = (self.body)(channel).await;
             output.inspect_err(|err| error!(error = %err, "coroutine generator failed"))
         };
