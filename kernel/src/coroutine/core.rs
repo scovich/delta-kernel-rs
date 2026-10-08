@@ -1,46 +1,37 @@
 //! Transport primitives for connector-driven coroutines.
 //!
-//! A [`Task`] is the backing primitive both [`Coroutine`](super::Coroutine) and
-//! [`GeneratorCoroutine`](super::generator::GeneratorCoroutine) build on. It is comprised of a
-//! [`Channel`] and a [`Future`] that holds an [`Arc`] reference to that same channel. When
-//! connectors start either tyep of coroutine, it triggers a call to [`Task::poll_step`], which
-//! polls the future so it can start running.
+//! A connector-driven coroutine owns a [`Channel`] alongside the future or generator that posts
+//! requests through it. Advancing the coroutine polls its body so it can start or resume running,
+//! then checks the channel for requests offered by that poll.
 //!
-//! The task body can offload a request to the connector by invoking [`ChannelExchange::exchange`],
-//! which creates a new [`Exchange`] in the [`Outbound`](ExchangeState::Outbound) state and returns
-//! a [`Wait`] future that wraps it. Polling that future for the first time [pushes](Channel::push)
-//! a [`Weak`] reference to the `Exchange` onto the `Channel` FIFO (upcast as dyn [`Accept`]) and
-//! returns [`Poll::Pending`]. Subsequent polls see the non-zero weak reference count and do not
-//! push it to the channel a second time.
+//! The coroutine body can offload a request to the connector by invoking
+//! [`ChannelExchange::exchange`], which creates a new [`Exchange`] in the
+//! [`Outbound`](ExchangeState::Outbound) state and returns a [`Wait`] future that wraps it. Polling
+//! that future for the first time [pushes](Channel::push) a [`Weak`] reference to the `Exchange`
+//! onto the `Channel` FIFO (upcast as dyn [`Accept`]) and returns [`Poll::Pending`]. Subsequent
+//! polls see the non-zero weak reference count and do not push it to the channel a second time.
 //!
-//! Once the async poll stack unwinds back to `Task::poll_step`, the latter [pops](Channel::pop) the
+//! Once the async poll stack unwinds back to the driver, the latter [pops](Channel::pop) the
 //! `Exchange` out of the `Channel` and invokes [`Accept::accept`] to produce a vocabulary-specific
 //! request payload, plus a [`Reply`] that holds a `Weak<Exchange>` reference (now upcast as dyn
-//! [`Complete`]). It uses a caller-provided constructor to convert that `(request, reply)` pair to
-//! a [`Step::Request`]. At this point the `Exchange` is in the [`Waiting`](ExchangeState::Waiting)
-//! state.
+//! [`Complete`]). At this point the `Exchange` is in the [`Waiting`](ExchangeState::Waiting) state.
 //!
 //! The connector chooses how to process the request and communicates the result back to the
-//! suspended task by invoking [`Reply::send`], which puts the exchange in the
+//! suspended coroutine by invoking [`Reply::send`], which puts the exchange in the
 //! [`Inbound`](ExchangeState::Inbound) state. Dropping an unused `Reply` rejects the request, and
-//! the task receives [`Error::RequestRejected`].
+//! the coroutine receives [`Error::RequestRejected`].
 //!
 //! If an async connector provided a [`Context`], sending a reply notifies the appropriate [`Waker`]
-//! so the connector's async runtime knows to poll the task again. Otherwise, a [no-op
-//! waker](Waker::noop) is used and the task's driver must manually invoke `poll_step` again. Either
+//! so the connector's async runtime knows to poll the coroutine again. Otherwise, a [no-op
+//! waker](Waker::noop) is used and a synchronous driver must advance the coroutine again. Either
 //! way, polling the `Wait` again allows it to retrieve the inbound response from the `Exchange` and
-//! return it as [`Poll::Ready`]. The task then resumes execution from its `await` point.
+//! return it as [`Poll::Ready`]. The coroutine then resumes execution from its `await` point.
 //!
-//! Tasks are allowed to create and wait on multiple requests concurrently; such requests can be
-//! fetched by invoking `Task::poll_step` repeatedly as long as it continues to return
-//! [`Poll::Ready`], without waiting for replies to previously-received requests. Tasks are also
-//! allowed to abandon requests (failed speculative execution, unneeded prefetching, etc). If the
-//! task abandons a request while it is still in the `Channel`, the weak reference becomes empty and
-//! `Task::poll_step` ignores it. If the task abandons a request that was already delivered to the
-//! connector, [`Reply::send`] will silently drop the connector's response.
-//!
-//! Eventually, the task completes and the poll stack unwinds one last time with a [`Poll::Ready`]
-//! containing the task's output [`DeltaResult`], which `Task::poll_step` returns as [`Step::Done`].
+//! Coroutines may create and wait on multiple requests concurrently. Drivers can fetch those
+//! requests without waiting for replies to previously received requests. Coroutines may also
+//! abandon requests through failed speculative execution or unneeded prefetching. If a request is
+//! abandoned while still in the channel, its weak reference expires and [`Channel::pop`] skips it.
+//! If it was already delivered to the connector, [`Reply::send`] silently drops the response.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -50,7 +41,6 @@ use std::task::{Context, Poll, Waker};
 
 use delta_kernel_derive::internal_api;
 
-use super::invoke_witness;
 use crate::utils::PhantomType;
 use crate::{DeltaResult, Error};
 
@@ -258,62 +248,13 @@ impl<P: Send + 'static> ChannelExchange<P> for Channel<P> {
     }
 }
 
-/// Result of advancing a [`Task`].
-pub(crate) enum Step<R, O> {
-    /// The task completed.
-    Done(O),
-    /// The request currently stored in the task's channel.
-    Request(R),
-}
-
-/// Retains one pinned coroutine and the request lanes observed by its driver.
-pub(crate) struct Task<'a, P: Send + 'static, O> {
-    body: Option<Pin<Box<dyn DeltaFuture<O> + 'a>>>,
-    channel: Arc<Channel<P>>,
-}
-
-impl<'a, P: Send + 'static, O> Task<'a, P, O> {
-    /// Create a task using the concrete future type exposed by `witness`.
-    ///
-    /// See [`invoke_witness`] for why the witness must remain separate from the async callable.
-    pub(crate) fn new_with_witness<State, F, Fut>(state: State, witness: F) -> Self
-    where
-        F: FnOnce(State, Arc<Channel<P>>) -> Fut,
-        Fut: DeltaFuture<O> + 'a,
-    {
-        let channel = Arc::default();
-        let body = Some(Box::pin(invoke_witness(witness, state, Arc::clone(&channel))) as _);
-        Self { body, channel }
-    }
-
-    /// Poll once using `context`, returning pending when the task offers no request.
-    pub(crate) fn poll_step(&mut self, context: &mut Context<'_>) -> Poll<DeltaResult<Step<P, O>>> {
-        let Some(body) = self.body.as_mut() else {
-            return Poll::Ready(Err(Error::internal_error(
-                "coroutine task was advanced after completion",
-            )));
-        };
-        // Reconcile ready replies before accepting queued offers. A request becomes visible to the
-        // connector only when accepted, so polling first lets completed race branches cancel offers
-        // that no longer require connector work.
-        if let Poll::Ready(output) = body.as_mut().poll(context) {
-            self.body = None;
-            return Poll::Ready(output.map(Step::Done));
-        }
-        if let Some(request) = self.channel.pop() {
-            return Poll::Ready(Ok(Step::Request(request)));
-        }
-        Poll::Pending
-    }
-}
-
 /// Create a task context backed by a no-op waker.
 pub(super) fn noop_context() -> Context<'static> {
     Context::from_waker(Waker::noop())
 }
 
-/// A custom [`Future`] that propagates a kernel request through a channel for [`Task::poll_step`]
-/// to retrieve.
+/// A custom [`Future`] that propagates a kernel request through a channel for its driver to
+/// retrieve.
 struct Wait<'a, P: 'static, Out, In, Make> {
     channel: &'a Channel<P>,
     exchange: Arc<Mutex<Exchange<Out, In, Make, P>>>,

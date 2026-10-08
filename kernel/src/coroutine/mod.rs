@@ -104,15 +104,16 @@ use std::any::{type_name, Any};
 use std::future::{poll_fn, Future};
 use std::mem::ManuallyDrop;
 use std::ops::AsyncFnOnce;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::task::Poll;
+use std::task::{Context, Poll};
 
 use delta_kernel_derive::{internal_api, pub_macro};
 use derive_more::Constructor;
 use tracing::{error, Instrument as _, Span};
 
+use self::core::noop_context;
 pub use self::core::Reply;
-use self::core::{noop_context, Step, Task};
 #[doc(inline)]
 #[internal_api]
 pub(crate) use self::core::{Channel, ChannelExchange, DeltaFuture};
@@ -271,7 +272,10 @@ where
 /// request as [`CoroutineStep::Request`] and successful completion as [`CoroutineStep::Done`]. The
 /// `'a` lifetime covers any state borrowed by the operation; [`StaticCoroutine`] owns all captured
 /// state.
-pub struct Coroutine<'a, P: Send + 'static, O>(Task<'a, P, O>);
+pub struct Coroutine<'a, P: Send + 'static, O> {
+    body: Option<Pin<Box<dyn DeltaFuture<O> + 'a>>>,
+    requests: Arc<Channel<P>>,
+}
 
 /// A coroutine that owns all captured state.
 pub type StaticCoroutine<P, O> = Coroutine<'static, P, O>;
@@ -296,13 +300,10 @@ impl<'a, P: Send + 'static, O> Coroutine<'a, P, O> {
     ///
     /// Calling this method after receiving [`CoroutineStep::Done`] is a logic error.
     pub fn try_advance(&mut self) -> DeltaResult<CoroutineStep<P, O>> {
-        let Poll::Ready(result) = self.0.poll_step(&mut noop_context()) else {
+        let Poll::Ready(result) = self.poll_step(&mut noop_context()) else {
             return Err(Error::WouldBlock);
         };
-        match result? {
-            Step::Done(output) => Ok(CoroutineStep::Done(output)),
-            Step::Request(request) => Ok(CoroutineStep::Request(request)),
-        }
+        result
     }
 
     /// Advances to the next request or completion, waiting asynchronously if the coroutine is
@@ -311,15 +312,26 @@ impl<'a, P: Send + 'static, O> Coroutine<'a, P, O> {
     ///
     /// Calling this method after receiving [`CoroutineStep::Done`] is a logic error.
     pub async fn advance(&mut self) -> DeltaResult<CoroutineStep<P, O>> {
-        poll_fn(|context| match self.0.poll_step(context) {
-            Poll::Ready(Ok(Step::Done(output))) => Poll::Ready(Ok(CoroutineStep::Done(output))),
-            Poll::Ready(Ok(Step::Request(request))) => {
-                Poll::Ready(Ok(CoroutineStep::Request(request)))
-            }
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-            Poll::Pending => Poll::Pending,
-        })
-        .await
+        poll_fn(|context| self.poll_step(context)).await
+    }
+
+    fn poll_step(&mut self, context: &mut Context<'_>) -> Poll<DeltaResult<CoroutineStep<P, O>>> {
+        let Some(body) = self.body.as_mut() else {
+            return Poll::Ready(Err(Error::internal_error(
+                "coroutine advanced after completion",
+            )));
+        };
+        // Reconcile ready replies before accepting queued offers. A request becomes visible to the
+        // connector only when accepted, so polling first lets completed race branches cancel offers
+        // that no longer require connector work.
+        if let Poll::Ready(output) = body.as_mut().poll(context) {
+            self.body = None;
+            return Poll::Ready(output.map(CoroutineStep::Done));
+        }
+        if let Some(request) = self.requests.pop() {
+            return Poll::Ready(Ok(CoroutineStep::Request(request)));
+        }
+        Poll::Pending
     }
 }
 
@@ -484,10 +496,9 @@ pub(crate) struct BodyFn<F, P, O> {
 // both the channel and resulting future, the future can retain its channel borrow while suspended
 // without constraining `'coroutine`.
 //
-// `Self::into_coroutine_with` passes `self` and `Self::witness` to `Task::new_with_witness`; the
-// latter's doc comment explains why we must pass the witness separately. The returned future is
-// instrumented with the captured span, and abandoning the coroutine before completion reports a
-// tracing error.
+// `Self::into_coroutine_with` passes `self` and `Self::witness` through [`invoke_witness`], whose
+// doc comment explains why the witness must remain separate. The returned future is instrumented
+// with the captured span, and abandoning the coroutine before completion reports a tracing error.
 impl<F, P: Send + 'static, O> BodyFn<F, P, O> {
     /// Stores `body` without choosing its call-future proof path.
     #[internal_api]
@@ -513,7 +524,11 @@ impl<F, P: Send + 'static, O> BodyFn<F, P, O> {
         P: 'coroutine,
         O: 'coroutine,
     {
-        Coroutine(Task::new_with_witness(self, witness))
+        let requests = Arc::default();
+        Coroutine {
+            body: Some(Box::pin(invoke_witness(witness, self, Arc::clone(&requests))) as _),
+            requests,
+        }
     }
 
     /// Runs the body while exposing its concrete future to [`Self::into_coroutine_with`].
