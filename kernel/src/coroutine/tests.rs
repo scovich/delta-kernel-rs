@@ -1,11 +1,13 @@
 use std::borrow::Borrow;
-use std::future::{pending, poll_fn};
+use std::future::{pending, poll_fn, Future as _};
 use std::ops::Deref;
-use std::pin::Pin;
+use std::pin::{pin, Pin};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::Poll;
 
 use bytes::Bytes;
+use futures::future::join;
 use futures::stream::{FuturesUnordered, StreamExt as _};
 use rstest::rstest;
 use tempfile::tempdir;
@@ -344,6 +346,93 @@ fn connector_facing_generator_interleaves_requests_and_yields() {
     }
 
     assert_eq!(yielded, vec![14]);
+}
+
+#[test]
+fn concurrent_yields_are_drained_before_generator_resumes() {
+    let resumed = Arc::new(AtomicBool::new(false));
+    let generator_resumed = Arc::clone(&resumed);
+    let mut generator = static_generator_coroutine!(Request, async move |channel| {
+        let (first, second) = join(channel.yield_item(1), channel.yield_item(2)).await;
+        first?;
+        second?;
+        generator_resumed.store(true, Ordering::Relaxed);
+        Ok(3)
+    });
+
+    assert!(matches!(
+        generator.try_advance().unwrap(),
+        GeneratorCoroutineStep::Yield(1)
+    ));
+    assert!(!resumed.load(Ordering::Relaxed));
+    assert!(matches!(
+        generator.try_advance().unwrap(),
+        GeneratorCoroutineStep::Yield(2)
+    ));
+    assert!(!resumed.load(Ordering::Relaxed));
+    assert!(matches!(
+        generator.try_advance().unwrap(),
+        GeneratorCoroutineStep::Done(3)
+    ));
+    assert!(resumed.load(Ordering::Relaxed));
+}
+
+#[test]
+fn dropped_yield_future_remains_committed_before_terminal_output() {
+    let mut generator = static_generator_coroutine!(Request, async move |channel| {
+        let mut offered = pin!(channel.yield_item("item"));
+        poll_fn(|context| {
+            assert!(offered.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        Ok(42)
+    });
+
+    assert!(matches!(
+        generator.try_advance().unwrap(),
+        GeneratorCoroutineStep::Yield("item")
+    ));
+    assert!(matches!(
+        generator.try_advance().unwrap(),
+        GeneratorCoroutineStep::Done(42)
+    ));
+}
+
+#[test]
+fn abandoning_generator_drops_queued_yields_and_terminal_output() {
+    struct DropProbe(Arc<AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let generator_drops = Arc::clone(&drops);
+    let mut generator = static_generator_coroutine!(Request, async move |channel| {
+        let mut first = pin!(channel.yield_item(DropProbe(Arc::clone(&generator_drops))));
+        let mut second = pin!(channel.yield_item(DropProbe(Arc::clone(&generator_drops))));
+        poll_fn(|context| {
+            assert!(first.as_mut().poll(context).is_pending());
+            assert!(second.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        Ok(DropProbe(generator_drops))
+    });
+
+    let GeneratorCoroutineStep::Yield(first) = generator.try_advance().unwrap() else {
+        panic!("generator did not yield the first item");
+    };
+    assert_eq!(drops.load(Ordering::Relaxed), 0);
+
+    drop(generator);
+    assert_eq!(drops.load(Ordering::Relaxed), 2);
+
+    drop(first);
+    assert_eq!(drops.load(Ordering::Relaxed), 3);
 }
 
 #[test]

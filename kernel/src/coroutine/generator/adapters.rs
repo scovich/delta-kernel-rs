@@ -280,8 +280,7 @@ impl<Y: Send + 'static, O: Send + 'static> Generator for BoundGenerator<'_, Y, O
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<DeltaResult<GeneratorStep<Y, O>>> {
-        self.get_mut()
-            .poll_step(context, GeneratorStep::Yield, GeneratorStep::Done)
+        self.get_mut().poll_step(context)
     }
 }
 

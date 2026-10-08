@@ -48,10 +48,11 @@
 //! [`generator_coroutine!`]: generator::generator_coroutine
 //! [`static_generator_coroutine!`]: generator::static_generator_coroutine
 
+use std::collections::VecDeque;
 use std::future::{poll_fn, Future};
 use std::ops::{AsyncFnOnce, Deref};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 
 use delta_kernel_derive::internal_api;
@@ -63,7 +64,8 @@ pub use self::adapters::{
     MapAsync, MapAsyncWitness, MapOk, Peekable, Unfold,
 };
 pub(crate) use self::adapters::{unfold_mut_with, unfold_mut_witness};
-use super::core::{noop_context, Channel, ChannelExchange, DeltaFuture, Reply, Step, Task};
+use super::core::{noop_context, Channel, DeltaFuture};
+use super::invoke_witness;
 use crate::utils::PhantomType;
 use crate::{DeltaResult, DeltaResultIteratorStatic, Error};
 
@@ -77,7 +79,14 @@ mod adapters;
 ///
 /// Use [`GeneratorCoroutine`] for an independently driven generator that exposes requests, yielded
 /// items, and completion to its driver.
-pub struct BoundGenerator<'a, Y: Send + 'static, O = ()>(Task<'a, YieldRequest<Y>, O>);
+pub struct BoundGenerator<'a, Y: Send + 'static, O = ()> {
+    body: Option<Pin<Box<dyn DeltaFuture<O> + 'a>>>,
+    yields: Arc<YieldQueue<Y>>,
+    terminal: Option<DeltaResult<O>>,
+}
+
+// The body has its own stable heap address; no other field is structurally pinned.
+impl<Y: Send + 'static, O> Unpin for BoundGenerator<'_, Y, O> {}
 
 impl<'a, Y: Send + 'static> BoundGenerator<'a, Y> {
     /// Waits for the next item, returning `None` if the generator is exhausted.
@@ -90,23 +99,44 @@ impl<'a, Y: Send + 'static> BoundGenerator<'a, Y> {
     }
 }
 
-impl<Y: Send + 'static, O> BoundGenerator<'_, Y, O> {
-    // Receive and acknowlege yields
-    fn poll_step<R>(
-        &mut self,
-        context: &mut Context<'_>,
-        map_yield: impl FnOnce(Y) -> R,
-        map_done: impl FnOnce(O) -> R,
-    ) -> Poll<DeltaResult<R>> {
-        match self.0.poll_step(context) {
-            Poll::Ready(Ok(Step::Request((item, reply)))) => {
-                reply.send(Ok(()));
-                Poll::Ready(Ok(map_yield(item)))
-            }
-            Poll::Ready(Ok(Step::Done(output))) => Poll::Ready(Ok(map_done(output))),
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-            Poll::Pending => Poll::Pending,
+impl<'a, Y: Send + 'static, O> BoundGenerator<'a, Y, O> {
+    fn new_with_witness<State, F, Fut>(state: State, witness: F) -> Self
+    where
+        F: FnOnce(State, Arc<YieldQueue<Y>>) -> Fut,
+        Fut: DeltaFuture<O> + 'a,
+    {
+        let yields = Arc::default();
+        let body = invoke_witness(witness, state, Arc::clone(&yields));
+        Self {
+            body: Some(Box::pin(body) as _),
+            yields,
+            terminal: None,
         }
+    }
+
+    fn take_ready_step(&mut self) -> Option<DeltaResult<GeneratorStep<Y, O>>> {
+        if let Some(result) = self.yields.pop().transpose() {
+            return Some(result.map(GeneratorStep::Yield));
+        }
+        Some(self.terminal.take()?.map(GeneratorStep::Done))
+    }
+
+    fn poll_step(&mut self, context: &mut Context<'_>) -> Poll<DeltaResult<GeneratorStep<Y, O>>> {
+        if let Some(result) = self.take_ready_step() {
+            return Poll::Ready(result);
+        }
+
+        let Some(body) = self.body.as_mut() else {
+            return Poll::Ready(Err(Error::internal_error(
+                "generator advanced after completion",
+            )));
+        };
+        if let Poll::Ready(result) = body.as_mut().poll(context) {
+            self.body = None;
+            self.terminal = Some(result);
+        }
+
+        self.take_ready_step().map_or(Poll::Pending, Poll::Ready)
     }
 }
 
@@ -459,24 +489,56 @@ impl<'a, P: Send + 'static, Y: Send + 'static, O: Send + 'static>
 pub(crate) struct GeneratorChannel<'a, P: Send + 'static, Y: Send + 'static> {
     #[deref]
     channel: &'a Channel<P>,
-    yields: &'a Channel<YieldRequest<Y>>,
+    yields: &'a YieldQueue<Y>,
 }
 
+/// Queue of items committed by generator yield futures.
 #[doc(hidden)]
 #[internal_api]
-pub(crate) type YieldRequest<Y> = (Y, Reply<()>);
+pub(crate) struct YieldQueue<Y>(Mutex<VecDeque<Y>>);
+
+impl<Y> Default for YieldQueue<Y> {
+    fn default() -> Self {
+        Self(Mutex::default())
+    }
+}
+
+impl<Y> YieldQueue<Y> {
+    fn push(&self, item: Y) -> DeltaResult<()> {
+        self.lock()?.push_back(item);
+        Ok(())
+    }
+
+    fn pop(&self) -> DeltaResult<Option<Y>> {
+        Ok(self.lock()?.pop_front())
+    }
+
+    fn lock(&self) -> DeltaResult<MutexGuard<'_, VecDeque<Y>>> {
+        self.0
+            .lock()
+            .map_err(|_| Error::internal_error("generator yield queue lock poisoned"))
+    }
+}
 
 impl<'a, P: Send + 'static, Y: Send + 'static> GeneratorChannel<'a, P, Y> {
-    fn new(channel: &'a Channel<P>, yields: &'a Channel<YieldRequest<Y>>) -> Self {
+    fn new(channel: &'a Channel<P>, yields: &'a YieldQueue<Y>) -> Self {
         Self { channel, yields }
     }
 
-    /// Yield one item and suspend until the consumer receives it.
+    /// Commit one item and suspend until the consumer drains all currently pending yields.
     #[internal_api]
     pub(crate) async fn yield_item(&self, item: Y) -> DeltaResult<()> {
-        self.yields
-            .exchange(item, |item, reply| (item, reply))
-            .await
+        let mut item = Some(item);
+        poll_fn(|_| {
+            let Some(item) = item.take() else {
+                return Poll::Ready(Ok(()));
+            };
+            match self.yields.push(item) {
+                Ok(()) => Poll::Pending,
+                Err(err) => Poll::Ready(Err(err)),
+            }
+        })
+        .await
     }
 
     /// Forward every item from `generator` and return its completion.
@@ -519,13 +581,13 @@ pub(crate) struct BodyFn<F, P, Y, O> {
 
 // `Self::new` and `Self::witness` constrain `F` to be callable with a `GeneratorChannel` of any
 // `'channel` lifetime. That lifetime is local to the higher-ranked call; the `C: 'generator` bound
-// keeps the request-channel binding valid, and the generator owns its yield channel and resulting
+// keeps the request-channel binding valid, and the generator owns its yield queue and resulting
 // future. The future can therefore retain both channel references while suspended without
 // imposing another external lifetime requirement.
 //
 // `Self::into_generator_with` passes `self`, `channel`, and `Self::witness` to
-// `Task::new_with_witness`; the latter's doc comment explains why we must pass the witness
-// separately. The returned future is instrumented with the captured span.
+// `BoundGenerator::new_with_witness`; [`invoke_witness`] explains why the witness must remain
+// separate. The returned future is instrumented with the captured span.
 impl<F, P: Send + 'static, Y: Send + 'static, O> BodyFn<F, P, Y, O> {
     /// Stores `body` without choosing its call-future proof path.
     #[internal_api]
@@ -545,7 +607,7 @@ impl<F, P: Send + 'static, Y: Send + 'static, O> BodyFn<F, P, Y, O> {
     pub(crate) fn into_generator_with<'generator, C, Fut>(
         self,
         channel: C,
-        witness: impl FnOnce(Self, C, Arc<Channel<YieldRequest<Y>>>) -> Fut,
+        witness: impl FnOnce(Self, C, Arc<YieldQueue<Y>>) -> Fut,
     ) -> BoundGenerator<'generator, Y, O>
     where
         C: Deref<Target = Channel<P>> + Send + 'generator,
@@ -553,7 +615,7 @@ impl<F, P: Send + 'static, Y: Send + 'static, O> BodyFn<F, P, Y, O> {
         O: 'generator,
     {
         let witness = move |(this, channel), yields| witness(this, channel, yields);
-        BoundGenerator(Task::new_with_witness((self, channel), witness))
+        BoundGenerator::new_with_witness((self, channel), witness)
     }
 
     /// Runs the body while exposing its concrete future to [`Self::into_generator_with`].
@@ -561,7 +623,7 @@ impl<F, P: Send + 'static, Y: Send + 'static, O> BodyFn<F, P, Y, O> {
     pub(crate) fn witness(
         self,
         channel: impl Deref<Target = Channel<P>> + Send,
-        yields: Arc<Channel<YieldRequest<Y>>>,
+        yields: Arc<YieldQueue<Y>>,
     ) -> impl Future<Output = DeltaResult<O>>
     where
         F: for<'channel> AsyncFnOnce(GeneratorChannel<'channel, P, Y>) -> DeltaResult<O>,
