@@ -560,7 +560,9 @@ fn compatible_adapters_preserve_terminal_output() {
         .chain(tail)
         .map(|item: DeltaResult<i32>| item.map(|value| value + 1))
         .map_ok(|value| value * 2);
-    let items = map_async!(items, |_channel, item| { item.map(|value| value + 1) });
+    let items = map_async!(items, async move |_channel, item| {
+        item.map(|value| value + 1)
+    });
     let items = items.filter_ok(|value: &i32| *value >= 5).peekable();
     let mut generator: StaticGeneratorCoroutine<DeltaResult<i32>, i32> =
         static_generator_coroutine!(Request, async move |channel| {
@@ -575,6 +577,43 @@ fn compatible_adapters_preserve_terminal_output() {
         panic!("expected second item");
     };
     assert_eq!(second.unwrap(), 7);
+    let GeneratorCoroutineStep::Done(output) = generator.try_advance().unwrap() else {
+        panic!("expected completion");
+    };
+    assert_eq!(output, 42);
+}
+
+#[test]
+fn flatten_ok_flattens_inner_generators_and_preserves_output() {
+    let inner = generator_fn!(async move |channel| {
+        channel.yield_item(1).await?;
+        channel.yield_item(2).await
+    });
+    let outer = generator_fn!(async move |channel| -> DeltaResult<i32> {
+        channel.yield_item(Ok::<_, Error>(inner)).await?;
+        channel
+            .yield_item(Err(Error::generic("outer item failed")))
+            .await?;
+        Ok(42)
+    });
+    let items = outer.flatten_ok();
+    let mut generator: StaticGeneratorCoroutine<DeltaResult<i32>, i32> =
+        static_generator_coroutine!(Request, async move |channel| {
+            channel.yield_from(items.into_boxed()).await
+        });
+
+    let GeneratorCoroutineStep::Yield(first) = generator.try_advance().unwrap() else {
+        panic!("expected first item");
+    };
+    assert_eq!(first.unwrap(), 1);
+    let GeneratorCoroutineStep::Yield(second) = generator.try_advance().unwrap() else {
+        panic!("expected second item");
+    };
+    assert_eq!(second.unwrap(), 2);
+    let GeneratorCoroutineStep::Yield(error) = generator.try_advance().unwrap() else {
+        panic!("expected outer item error");
+    };
+    assert!(error.unwrap_err().to_string().contains("outer item failed"));
     let GeneratorCoroutineStep::Done(output) = generator.try_advance().unwrap() else {
         panic!("expected completion");
     };

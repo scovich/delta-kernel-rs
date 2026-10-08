@@ -59,8 +59,8 @@ use tracing::{error, Instrument as _, Span};
 
 pub use self::adapters::{
     empty, from_iter, map_async_witness, unfold, BoxedDeltaResultGenerator, BoxedGenerator, Chain,
-    FilterOk, Flatten, Generator, GeneratorExt, GeneratorStep, IntoGenerator, Iter, Map, MapAsync,
-    MapAsyncWitness, MapOk, Peekable, Unfold,
+    FilterOk, Flatten, FlattenOk, Generator, GeneratorExt, GeneratorStep, IntoGenerator, Iter, Map,
+    MapAsync, MapAsyncWitness, MapOk, Peekable, Unfold,
 };
 pub(crate) use self::adapters::{unfold_mut_with, unfold_mut_witness};
 use super::core::{noop_context, Channel, ChannelExchange, DeltaFuture, Reply, Step, Task};
@@ -299,11 +299,11 @@ macro_rules! generator_fn {
 /// Maps generator items asynchronously through the bound request channel.
 #[internal_api]
 macro_rules! map_async {
-    ($generator:expr, |$channel:ident, $item:ident| $body:block) => {
+    ($generator:expr, $body:expr) => {
         $crate::coroutine::generator::GeneratorExt::map_async(
             $generator,
             $crate::coroutine::generator::map_async_witness,
-            async move |$channel, $item| $body,
+            $body,
         )
     };
 }
@@ -484,7 +484,17 @@ impl<'a, P: Send + 'static, Y: Send + 'static> GeneratorChannel<'a, P, Y> {
         &self,
         generator: Box<dyn IntoGenerator<P, Item = Y, Output = O>>,
     ) -> DeltaResult<O> {
-        let mut generator = generator.bind(self.channel);
+        self.yield_from_bound(generator.bind(self.channel)).await
+    }
+
+    /// Forward every item from a bound `generator` and return its completion.
+    pub(crate) async fn yield_from_bound<G, O: Send + 'static>(
+        &self,
+        mut generator: G,
+    ) -> DeltaResult<O>
+    where
+        G: Generator<Item = Y, Output = O> + Unpin,
+    {
         loop {
             match poll_fn(|context| Pin::new(&mut generator).poll_step(context)).await? {
                 GeneratorStep::Yield(item) => self.yield_item(item).await?,

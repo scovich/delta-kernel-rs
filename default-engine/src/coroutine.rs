@@ -44,8 +44,6 @@ use delta_kernel::metrics::{
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObjectWriter};
-#[cfg(test)]
-use delta_kernel::FilteredEngineData;
 use delta_kernel::{
     DeltaResult, EngineData, Error, EvaluationHandler, ExpressionEvaluator, FileMeta, FileSize,
     FileSlice, ParquetFooter, ParquetMultiFileWrite, PredicateEvaluator, Version,
@@ -766,6 +764,7 @@ fn emit_storage_list(elapsed: Duration, num_files: u64, _bytes_read: u64) {
 mod tests {
     use delta_kernel::coroutine::kernel::StaticGeneratorCoroutine;
     use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::FilteredEngineData;
 
     use super::*;
 

@@ -114,7 +114,7 @@ pub trait GeneratorExt {
         U: Send + 'static,
         F: for<'a> AsyncFnMut(&'a Channel<P>, Self::Item) -> U + Send,
         W: Send,
-        for<'a> W: MapAsyncWitness<'a, P, F, Self::Item, U>,
+        W: for<'a> MapAsyncWitness<'a, P, F, Self::Item, U>,
     {
         MapAsync {
             inner: self,
@@ -141,6 +141,17 @@ pub trait GeneratorExt {
         FilterOk {
             inner: self,
             predicate,
+        }
+    }
+
+    /// Counterpart of `Itertools::flatten_ok`: flattens successful inner generators.
+    fn flatten_ok<P, I, T>(self) -> FlattenOk<Self, P, I, T>
+    where
+        Self: Sized,
+    {
+        FlattenOk {
+            outer: self,
+            _types: PhantomType::default(),
         }
     }
 
@@ -255,6 +266,7 @@ impl<G, F> GeneratorExt for Map<G, F> {}
 impl<G, P, F, W, U> GeneratorExt for MapAsync<G, P, F, W, U> {}
 impl<G, F> GeneratorExt for MapOk<G, F> {}
 impl<G, F> GeneratorExt for FilterOk<G, F> {}
+impl<G, P, I, T> GeneratorExt for FlattenOk<G, P, I, T> {}
 impl<G, I, O> GeneratorExt for Peekable<G, I, O> {}
 impl<A, B> GeneratorExt for Chain<A, B> {}
 impl<I> GeneratorExt for Iter<I> {}
@@ -622,6 +634,94 @@ where
                 Ok(_) => continue,
             };
             return Poll::Ready(Ok(GeneratorStep::Yield(item)));
+        }
+    }
+}
+
+/// Generator returned by [`GeneratorExt::flatten_ok`].
+pub struct FlattenOk<G, P, I, T> {
+    outer: G,
+    _types: PhantomType<(P, I, T)>,
+}
+
+impl<P, G, I, T> IntoGenerator<P> for FlattenOk<G, P, I, T>
+where
+    P: Send + 'static,
+    G: IntoGenerator<P, Item = DeltaResult<I>>,
+    I: IntoGenerator<P, Item = T, Output = ()> + 'static,
+    T: Send + 'static,
+{
+    type Item = DeltaResult<T>;
+    type Output = G::Output;
+
+    fn bind_to<'a>(
+        self,
+        channel: ChannelBinding<'a, P>,
+    ) -> impl Generator<Item = DeltaResult<T>, Output = G::Output> + Unpin + 'a
+    where
+        Self: 'a,
+    {
+        BoundFlattenOk {
+            outer: self.outer.bind_to(channel.clone()),
+            channel,
+            inner: None,
+        }
+    }
+
+    fn bind_boxed<'a>(
+        self: Box<Self>,
+        channel: ChannelBinding<'a, P>,
+    ) -> BoxedGenerator<'a, DeltaResult<T>, G::Output>
+    where
+        Self: 'a,
+    {
+        Box::new((*self).bind_to(channel))
+    }
+}
+
+struct BoundFlattenOk<'a, P: 'static, G, T: Send + 'static> {
+    outer: G,
+    channel: ChannelBinding<'a, P>,
+    inner: Option<BoxedGenerator<'a, T>>,
+}
+
+impl<P, G: Unpin, T: Send + 'static> Unpin for BoundFlattenOk<'_, P, G, T> {}
+impl<P, G, T: Send + 'static> GeneratorExt for BoundFlattenOk<'_, P, G, T> {}
+
+impl<P, G, I, T> Generator for BoundFlattenOk<'_, P, G, T>
+where
+    P: Send + 'static,
+    G: Generator<Item = DeltaResult<I>> + Unpin,
+    I: IntoGenerator<P, Item = T, Output = ()> + 'static,
+    T: Send + 'static,
+{
+    type Item = DeltaResult<T>;
+    type Output = G::Output;
+
+    fn poll_step(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<DeltaResult<GeneratorStep<DeltaResult<T>, G::Output>>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(inner) = &mut this.inner {
+                match Pin::new(inner).poll_step(context) {
+                    Poll::Ready(Ok(GeneratorStep::Yield(item))) => {
+                        return Poll::Ready(Ok(GeneratorStep::Yield(Ok(item))));
+                    }
+                    Poll::Ready(Ok(GeneratorStep::Done(()))) => this.inner = None,
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+
+            match ready_yield!(Pin::new(&mut this.outer).poll_step(context)) {
+                Ok(inner) => {
+                    let inner = inner.into_boxed().bind_to(this.channel.clone());
+                    this.inner = Some(Box::new(inner));
+                }
+                Err(err) => return Poll::Ready(Ok(GeneratorStep::Yield(Err(err)))),
+            }
         }
     }
 }

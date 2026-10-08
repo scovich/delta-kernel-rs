@@ -322,7 +322,7 @@ async fn read_scan_file_with_channel(
     let read_result_iter = channel.prepare_parquet_files([file], physical_schema, None);
     let read_result_iter = read_result_iter.await?.flatten();
 
-    let result = map_async!(read_result_iter, |channel, batch| {
+    let result = map_async!(read_result_iter, async move |channel, batch| {
         let batch = batch?;
         // Transform the physical data into the correct logical form, or pass through unchanged.
         let logical = if let Some(ref eval) = phys_to_logical_eval {

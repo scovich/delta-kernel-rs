@@ -479,7 +479,7 @@ where
         as_log_add_schema(output_schema).into(),
     );
     let adds_evaluator = adds_evaluator.await?;
-    let add_actions = map_async!(add_files_metadata, |channel, add_files_batch| {
+    let add_actions = map_async!(add_files_metadata, async move |channel, add_files_batch| {
         channel
             .evaluate_expression(&adds_evaluator, add_files_batch?)
             .await
@@ -1762,21 +1762,24 @@ impl<S> Transaction<S> {
         let stats_parsed_eval = make_eval(true /* coalesce_stats_with_parsed */).await?;
         let stats_parsed_col = column_name!(STATS_PARSED_NAME);
         let remove_files_metadata = from_iter(remove_files_metadata);
-        let remove_actions = map_async!(remove_files_metadata, |channel, file_metadata_batch| {
-            let data = file_metadata_batch.data();
-            let evaluator = if data.has_field(&stats_parsed_col) {
-                &stats_parsed_eval
-            } else {
-                &base_eval
-            };
-            let updated_engine_data = channel
-                .evaluate_expression(evaluator, file_metadata_batch.data().clone_data())
-                .await?;
-            FilteredEngineData::try_new(
-                updated_engine_data,
-                file_metadata_batch.selection_vector().to_vec(),
-            )
-        });
+        let remove_actions = map_async!(
+            remove_files_metadata,
+            async move |channel, file_metadata_batch| {
+                let data = file_metadata_batch.data();
+                let evaluator = if data.has_field(&stats_parsed_col) {
+                    &stats_parsed_eval
+                } else {
+                    &base_eval
+                };
+                let updated_engine_data = channel
+                    .evaluate_expression(evaluator, file_metadata_batch.data().clone_data())
+                    .await?;
+                FilteredEngineData::try_new(
+                    updated_engine_data,
+                    file_metadata_batch.selection_vector().to_vec(),
+                )
+            }
+        );
         Ok(remove_actions)
     }
 }
