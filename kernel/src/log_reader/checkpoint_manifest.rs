@@ -1,25 +1,36 @@
 //! Manifest phase for log replay - processes single-part checkpoints and manifest checkpoints.
 
+#[cfg(test)]
 use std::sync::Arc;
 
 use itertools::Itertools;
 use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
+#[cfg(test)]
 use crate::coroutine::engine::EngineConnector;
-use crate::coroutine::kernel::request::{ReadJsonFiles, ReadParquetFiles};
+#[cfg(test)]
+use crate::coroutine::engine::EngineResultGeneratorIterator;
+use crate::coroutine::generator::{generator_fn, Generator, GeneratorExt as _, IntoGenerator};
+#[cfg(test)]
+use crate::coroutine::kernel::{coroutine, StaticGeneratorCoroutine};
+use crate::coroutine::kernel::{Channel, ChannelExt as _, DeltaResultGenerator, GeneratorChannel};
 use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
 use crate::schema::SchemaRef;
 use crate::utils::require;
-use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, Error, FileMeta, RowVisitor};
+#[cfg(test)]
+use crate::Engine;
+use crate::{DeltaResult, Error, FileMeta, RowVisitor};
+
+#[cfg(test)]
+type CheckpointManifestEngineIterator =
+    EngineResultGeneratorIterator<'static, ActionsBatch, DeltaResult<Vec<FileMeta>>>;
 
 /// Phase that processes single-part checkpoint. This also treats the checkpoint as a manifest file
 /// and extracts the sidecar actions during iteration.
-#[allow(unused)]
-pub(crate) struct CheckpointManifestReader(
-    CheckpointManifestState<DeltaResultIteratorStatic<ActionsBatch>>,
-);
+#[cfg(test)]
+pub(crate) struct CheckpointManifestReader(CheckpointManifestEngineIterator, FileMeta);
 
 struct CheckpointManifestState<A> {
     actions: A,
@@ -29,6 +40,7 @@ struct CheckpointManifestState<A> {
     manifest_file: FileMeta,
 }
 
+#[cfg(test)]
 impl CheckpointManifestReader {
     /// Creates a manifest reader for a single-part checkpoint.
     ///
@@ -41,51 +53,62 @@ impl CheckpointManifestReader {
     /// - `manifest`: Checkpoint manifest to process.
     /// - `log_root`: Root URL for resolving sidecar paths.
     /// - `read_schema`: Schema for reading the manifest actions.
-    #[allow(unused)]
     pub(crate) fn try_new(
         engine: Arc<dyn Engine>,
         manifest: &ParsedLogPath,
         log_root: Url,
         read_schema: SchemaRef,
     ) -> DeltaResult<Self> {
-        checkpoint_manifest_reader_impl(engine, manifest, log_root, read_schema)
+        let connector = EngineConnector::new(engine.as_ref());
+        let manifest_file = manifest.location.clone();
+        let coroutine = coroutine!(async move |channel| {
+            checkpoint_manifest_reader_impl(channel, manifest, log_root, read_schema).await
+        });
+        let generator = connector.drive(coroutine)?;
+        let generator = StaticGeneratorCoroutine::from_generator(generator);
+        let inner = connector.iterate_result_generator(generator);
+        Ok(Self(inner, manifest_file))
     }
 
     /// Extract the sidecars from the manifest file if there were any.
     /// NOTE: The iterator must be completely exhausted before calling this
-    #[allow(unused)]
     pub(crate) fn extract_sidecars(self) -> DeltaResult<Vec<FileMeta>> {
-        self.0.extract_sidecars()
+        require!(
+            self.0.is_complete(),
+            Error::generic(format!(
+                "Cannot extract sidecars from in-progress ManifestReader for file: {}",
+                self.1.location
+            ))
+        );
+        self.0.into_output()?
     }
 }
 
-fn checkpoint_manifest_reader_impl(
-    engine: Arc<dyn Engine>,
+pub(crate) async fn checkpoint_manifest_reader_impl(
+    channel: &Channel,
     manifest: &ParsedLogPath,
     log_root: Url,
     read_schema: SchemaRef,
-) -> DeltaResult<CheckpointManifestReader> {
-    let connector = EngineConnector::new(engine.as_ref());
+) -> DeltaResult<impl DeltaResultGenerator<ActionsBatch, DeltaResult<Vec<FileMeta>>> + 'static> {
     let actions = match manifest.extension.as_str() {
-        "json" => connector.prepare_flattened_generator(ReadJsonFiles::new(
-            std::slice::from_ref(&manifest.location),
-            read_schema.clone(),
-            None,
-        ))?,
-        "parquet" => connector.prepare_flattened_generator(ReadParquetFiles::new(
-            std::slice::from_ref(&manifest.location),
-            read_schema,
-            None,
-        ))?,
+        "json" => channel
+            .prepare_json_files(vec![manifest.location.clone()], read_schema.clone(), None)
+            .await?
+            .flatten()
+            .map_ok(|batch| ActionsBatch::new(batch, false))
+            .into_boxed(),
+        "parquet" => channel
+            .prepare_parquet_files(vec![manifest.location.clone()], read_schema, None)
+            .await?
+            .flatten()
+            .map_ok(|batch| ActionsBatch::new(batch, false))
+            .into_boxed(),
         extension => {
             return Err(Error::generic(format!(
                 "Unsupported checkpoint extension: {extension}",
             )));
         }
     };
-    let actions = connector.iterate_result_generator(actions);
-    let actions: DeltaResultIteratorStatic<_> =
-        Box::new(actions.map_ok(|batch_res| ActionsBatch::new(batch_res, false)));
     let state = CheckpointManifestState {
         actions,
         sidecar_visitor: SidecarVisitor::default(),
@@ -93,7 +116,7 @@ fn checkpoint_manifest_reader_impl(
         is_complete: false,
         manifest_file: manifest.location.clone(),
     };
-    Ok(CheckpointManifestReader(state))
+    Ok(checkpoint_manifest_generator(state))
 }
 
 impl<A> CheckpointManifestState<A> {
@@ -117,22 +140,67 @@ impl<A> CheckpointManifestState<A> {
     }
 }
 
-impl Iterator for CheckpointManifestState<DeltaResultIteratorStatic<ActionsBatch>> {
-    type Item = DeltaResult<ActionsBatch>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let Some(result) = self.actions.next() else {
+impl<G> CheckpointManifestState<G>
+where
+    G: Generator<Item = DeltaResult<ActionsBatch>, Output = ()> + Unpin,
+{
+    async fn next(&mut self) -> DeltaResult<Option<DeltaResult<ActionsBatch>>> {
+        let Some(result) = self.actions.next().await? else {
             self.is_complete = true;
-            return None;
+            return Ok(None);
         };
-
-        Some(result.and_then(|batch| {
+        Ok(Some(result.and_then(|batch| {
             self.sidecar_visitor.visit_rows_of(batch.actions())?;
             Ok(batch)
-        }))
+        })))
     }
 }
 
+impl<A> CheckpointManifestState<A> {
+    fn bind_actions<'a>(
+        self,
+        channel: &'a Channel,
+    ) -> CheckpointManifestState<
+        impl Generator<Item = DeltaResult<ActionsBatch>, Output = ()> + Unpin + 'a,
+    >
+    where
+        A: DeltaResultGenerator<ActionsBatch> + 'a,
+    {
+        let actions = self.actions.bind(channel);
+        CheckpointManifestState {
+            actions,
+            sidecar_visitor: self.sidecar_visitor,
+            log_root: self.log_root,
+            is_complete: self.is_complete,
+            manifest_file: self.manifest_file,
+        }
+    }
+}
+
+fn checkpoint_manifest_generator<G>(
+    state: CheckpointManifestState<G>,
+) -> impl DeltaResultGenerator<ActionsBatch, DeltaResult<Vec<FileMeta>>>
+where
+    G: DeltaResultGenerator<ActionsBatch> + 'static,
+{
+    generator_fn!(async move |channel| { checkpoint_manifest_impl(channel, state).await })
+}
+
+async fn checkpoint_manifest_impl<G>(
+    channel: GeneratorChannel<'_, DeltaResult<ActionsBatch>>,
+    state: CheckpointManifestState<G>,
+) -> DeltaResult<DeltaResult<Vec<FileMeta>>>
+where
+    G: DeltaResultGenerator<ActionsBatch>,
+{
+    let mut state = state.bind_actions(&channel);
+    while let Some(item) = state.next().await? {
+        channel.yield_item(item).await?;
+    }
+    Ok(state.extract_sidecars())
+}
+
+#[cfg(test)]
 impl Iterator for CheckpointManifestReader {
     type Item = DeltaResult<ActionsBatch>;
 

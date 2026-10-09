@@ -360,7 +360,8 @@ fn test_sql_where() {
 }
 
 /// Validates that the production data-skipping path (the `eval_sql_where` rewrite used by
-/// `DataSkippingFilter::new`) prunes a present-but-all-null file for every null-intolerant
+/// `DataSkippingFilter::new_with_channel`) prunes a present-but-all-null file for every
+/// null-intolerant
 /// comparison operator. The bare `eval` rewrite (test-only callers) lacks the not-all-null
 /// guard and keeps the file. Each operator's predicate evaluates over stats for a file with
 /// `nullCount == numRecords` (all-null) and null min/max -- the `<col> IS NOT NULL` guard that

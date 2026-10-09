@@ -1016,7 +1016,8 @@ async fn data_skipping_filter() {
     assert_eq!(sv, &[false, true, false, false, true]);
 }
 
-// The shared `for_raw_action_batch` filter prunes on partition values on the table_changes path
+// The shared `for_raw_action_batch_with_channel` filter prunes on partition values on the
+// table_changes path
 // too: partition values are parsed from `add.partitionValues` via `map_to_struct`, so `part = 'x'`
 // drops the Add in partition `y`. The Remove in partition `y` must survive: the `OR(NOT is_add,
 // ...)` guard shields non-Add rows from the predicate, so tombstones are never dropped from the

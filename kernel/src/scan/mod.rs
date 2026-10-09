@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 use self::data_skipping::as_checkpoint_skipping_predicate;
-use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
+use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter_with_channel};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
@@ -20,10 +20,13 @@ use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
 use crate::coroutine::engine::EngineConnector;
-use crate::coroutine::kernel::{coroutine, static_coroutine, Channel, Request, StaticCoroutine};
+use crate::coroutine::generator::{AsyncIntoIterator as _, GeneratorExt as _};
+use crate::coroutine::kernel::{
+    coroutine, static_coroutine, Channel, Coroutine, DeltaResultGenerator, StaticCoroutine,
+};
+use crate::coroutine::run_coroutine_with_storage;
 #[cfg(feature = "declarative-plans")]
 use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _};
-use crate::coroutine::{run_coroutine_with_storage, IntoGenerator};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef};
 use crate::kernel_predicates::{
@@ -50,7 +53,7 @@ use crate::schema::{
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
-use crate::utils::{FoldWithOption as _, IteratorExt};
+use crate::utils::FoldWithOption as _;
 use crate::{
     DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, Error, FileMeta, SnapshotRef,
     Version,
@@ -107,8 +110,8 @@ static PARALLEL_CHECKPOINT_READ_SCHEMA_NO_JSON_STATS: LazyLock<SchemaRef> = Lazy
 });
 #[allow(unused)]
 pub use crate::parallel::parallel_scan_metadata::{
-    AfterSequentialScanMetadata, ParallelScanMetadataIterator, ParallelState,
-    SequentialScanMetadataIterator,
+    AfterSequentialScanMetadata, ParallelScanMetadata, ParallelScanMetadataIterator, ParallelState,
+    SequentialScanMetadata, SequentialScanMetadataIterator,
 };
 
 /// Configures structured-stats output and JSON synthesis in scan metadata.
@@ -919,8 +922,26 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-        let actions_with_checkpoint_info = self.replay_for_scan_metadata(engine)?;
-        self.scan_metadata_inner(engine, actions_with_checkpoint_info)
+        let connector =
+            EngineConnector::new(engine).with_cancellation_token(self.cancellation_token.clone());
+        connector.iterate_prepared_result_generator(self.scan_metadata_workflow())
+    }
+
+    #[internal_api]
+    pub(crate) fn scan_metadata_workflow(
+        &self,
+    ) -> Coroutine<'_, impl DeltaResultGenerator<ScanMetadata> + 'static> {
+        coroutine!(async move |channel| { self.scan_metadata_with_channel(channel).await })
+    }
+
+    async fn scan_metadata_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> DeltaResult<impl DeltaResultGenerator<ScanMetadata> + 'static> {
+        let actions_with_checkpoint_info =
+            self.replay_for_scan_metadata_with_channel(channel).await?;
+        self.scan_metadata_inner_with_channel(channel, actions_with_checkpoint_info)
+            .await
     }
 
     /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of
@@ -1081,13 +1102,34 @@ impl Scan {
         )?))
     }
 
-    fn scan_metadata_inner(
+    fn scan_metadata_inner<'a>(
         &self,
         engine: &dyn Engine,
         actions_with_checkpoint_info: ActionsWithCheckpointInfo<
-            impl Iterator<Item = DeltaResult<ActionsBatch>> + Send,
+            impl Iterator<Item = DeltaResult<ActionsBatch>> + Send + 'a,
         >,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>> + Send> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>> + Send + 'a> {
+        let connector = EngineConnector::new(engine);
+        let coroutine = coroutine!(async move |channel| {
+            self.scan_metadata_inner_with_channel(
+                channel,
+                ActionsWithCheckpointInfo {
+                    actions: actions_with_checkpoint_info.actions.into_generator(),
+                    checkpoint_info: actions_with_checkpoint_info.checkpoint_info,
+                },
+            )
+            .await
+        });
+        connector.iterate_prepared_result_generator(coroutine)
+    }
+
+    async fn scan_metadata_inner_with_channel<'a>(
+        &self,
+        channel: &Channel,
+        actions_with_checkpoint_info: ActionsWithCheckpointInfo<
+            impl DeltaResultGenerator<ActionsBatch> + 'a,
+        >,
+    ) -> DeltaResult<impl DeltaResultGenerator<ScanMetadata> + 'a> {
         let start = Instant::now();
         let operation_id = MetricId::new();
         let is_catalog_managed = self.snapshot.table_configuration().is_catalog_managed();
@@ -1099,14 +1141,15 @@ impl Scan {
                 (None, Arc::new(ScanMetrics::default()))
             }
             _ => {
-                let (it, m) = scan_action_iter(
-                    engine,
+                let (it, m) = scan_action_iter_with_channel(
+                    channel,
                     actions_with_checkpoint_info.actions,
                     self.state_info.clone(),
                     actions_with_checkpoint_info.checkpoint_info,
                     self.stats_options(),
                     self.partition_values_options(),
-                )?;
+                )
+                .await?;
                 (Some(it), m)
             }
         };
@@ -1122,7 +1165,8 @@ impl Scan {
             info!(%event);
             emit_scan_metadata_completed(&event);
         };
-        Ok(iter.into_iter().flatten().on_complete(on_complete))
+        let iter = iter.into_generator().flatten_async();
+        Ok(iter.on_complete(on_complete))
     }
 
     #[cfg(feature = "declarative-plans")]
@@ -1186,6 +1230,7 @@ impl Scan {
     }
 
     // Factored out to facilitate testing
+    #[cfg(test)]
     fn replay_for_scan_metadata(
         &self,
         engine: &dyn Engine,
@@ -1211,11 +1256,7 @@ impl Scan {
     async fn replay_for_scan_metadata_with_channel(
         &self,
         channel: &Channel,
-    ) -> DeltaResult<
-        ActionsWithCheckpointInfo<
-            impl IntoGenerator<Request, Item = DeltaResult<ActionsBatch>, Output = ()>,
-        >,
-    > {
+    ) -> DeltaResult<ActionsWithCheckpointInfo<impl DeltaResultGenerator<ActionsBatch>>> {
         let (checkpoint_schema, meta_predicate, physical_stats_schema) =
             self.checkpoint_read_options();
         // Checkpoints already represent reconciled state, so scans project only Add actions. This
@@ -1355,6 +1396,20 @@ impl Scan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<SequentialScanMetadataIterator> {
+        let connector = EngineConnector::new(engine.as_ref());
+        let stream = connector.drive(self.parallel_scan_metadata_workflow())?;
+        Ok(stream.into_engine_iterator(connector))
+    }
+
+    #[internal_api]
+    pub(crate) fn parallel_scan_metadata_workflow(&self) -> Coroutine<'_, SequentialScanMetadata> {
+        coroutine!(async move |channel| { self.parallel_scan_metadata_with_channel(channel).await })
+    }
+
+    async fn parallel_scan_metadata_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> DeltaResult<SequentialScanMetadata> {
         // Fail fast rather than silently ignore a caller-supplied token: the parallel path does
         // not thread cancellation, so honoring a set token would require dropping it on the floor.
         if self.cancellation_token.is_some() {
@@ -1376,21 +1431,23 @@ impl Scan {
             has_partition_values_parsed: false,
             checkpoint_read_schema: checkpoint_read_schema.clone(),
         };
-        let processor = ScanLogReplayProcessor::new(
-            engine.as_ref(),
+        let processor = ScanLogReplayProcessor::new_with_channel(
+            channel,
             self.state_info.clone(),
             checkpoint_info,
             self.stats_options(),
             self.partition_values_options(),
-        )?;
-        let sequential = SequentialPhase::try_new(
+        )
+        .await?;
+        let sequential = SequentialPhase::try_new_with_channel(
+            channel,
             processor,
             self.snapshot.log_segment(),
-            engine.clone(),
             checkpoint_read_schema,
-        )?;
+        )
+        .await?;
 
-        Ok(SequentialScanMetadataIterator::new(
+        Ok(SequentialScanMetadata::new(
             sequential,
             self.correlation_id.clone(),
         ))
