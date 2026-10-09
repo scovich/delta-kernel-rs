@@ -34,6 +34,8 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock};
 
+use crate::coroutine::generator::{generator_fn, Generator};
+use crate::coroutine::kernel::DeltaResultGenerator;
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::deduplicator::{Deduplicator as _, FileActionInfo};
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, HasSelectionVector};
@@ -132,7 +134,7 @@ pub struct ActionReconciliationIterator {
     >,
 }
 
-struct ActionReconciliationState<A, S> {
+pub(crate) struct ActionReconciliationState<A, S> {
     actions: A,
     state: S,
 }
@@ -158,6 +160,32 @@ impl<A, S> ActionReconciliationState<A, S>
 where
     S: Borrow<ActionReconciliationIteratorState>,
 {
+    pub(crate) fn new(actions: A, state: S) -> Self {
+        Self { actions, state }
+    }
+
+    pub(crate) fn into_generator<O, F>(
+        self,
+        map_output: F,
+    ) -> impl DeltaResultGenerator<FilteredEngineData, O>
+    where
+        A: DeltaResultGenerator<ActionReconciliationBatch> + 'static,
+        S: Send + 'static,
+        O: Send + 'static,
+        F: FnOnce(S) -> O + Send + 'static,
+    {
+        generator_fn!(async move |channel| {
+            let mut state = ActionReconciliationState {
+                actions: self.actions.bind(&channel),
+                state: self.state,
+            };
+            while let Some(item) = state.advance().await? {
+                channel.yield_item(item).await?;
+            }
+            Ok(map_output(state.state))
+        })
+    }
+
     /// Helper to transform a batch: update metrics and extract filtered data
     fn transform_batch(
         &mut self,
@@ -181,6 +209,17 @@ where
                 .fetch_add(batch.add_actions_count, Ordering::Release);
             batch.filtered_data
         }))
+    }
+}
+
+impl<G, S> ActionReconciliationState<G, S>
+where
+    G: Generator<Item = DeltaResult<ActionReconciliationBatch>, Output = ()> + Unpin,
+    S: Borrow<ActionReconciliationIteratorState>,
+{
+    async fn advance(&mut self) -> DeltaResult<Option<DeltaResult<FilteredEngineData>>> {
+        let batch = self.actions.next().await?;
+        Ok(self.transform_batch(batch))
     }
 }
 
