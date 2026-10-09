@@ -29,6 +29,7 @@
 //!   3. Tracks state for deduplication across batches
 //!   4. Produces a [`ActionReconciliationBatch`] result which includes both the filtered data and
 //!      counts of actions selected
+use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -125,38 +126,57 @@ impl ActionReconciliationIteratorState {
 /// This iterator yields a stream of [`FilteredEngineData`] items while, tracking action
 /// counts. Used by both checkpoint and log compaction workflows.
 pub struct ActionReconciliationIterator {
-    inner: DeltaResultIteratorStatic<ActionReconciliationBatch>,
-    state: Arc<ActionReconciliationIteratorState>,
+    inner: ActionReconciliationState<
+        DeltaResultIteratorStatic<ActionReconciliationBatch>,
+        Arc<ActionReconciliationIteratorState>,
+    >,
+}
+
+struct ActionReconciliationState<A, S> {
+    actions: A,
+    state: S,
 }
 
 impl ActionReconciliationIterator {
     /// Create a new iterator with counters initialized to 0
     pub(crate) fn new(inner: DeltaResultIteratorStatic<ActionReconciliationBatch>) -> Self {
         Self {
-            inner,
-            state: Arc::new(ActionReconciliationIteratorState::default()),
+            inner: ActionReconciliationState {
+                actions: inner,
+                state: Arc::new(ActionReconciliationIteratorState::default()),
+            },
         }
     }
 
     /// Get the shared state. This allows sharing of stats.
     pub fn state(&self) -> Arc<ActionReconciliationIteratorState> {
-        Arc::clone(&self.state)
+        Arc::clone(&self.inner.state)
     }
+}
 
+impl<A, S> ActionReconciliationState<A, S>
+where
+    S: Borrow<ActionReconciliationIteratorState>,
+{
     /// Helper to transform a batch: update metrics and extract filtered data
     fn transform_batch(
         &mut self,
         batch: Option<DeltaResult<ActionReconciliationBatch>>,
     ) -> Option<DeltaResult<FilteredEngineData>> {
         let Some(batch) = batch else {
-            self.state.is_exhausted.store(true, Ordering::Release);
+            self.state
+                .borrow()
+                .is_exhausted
+                .store(true, Ordering::Release);
             return None;
         };
         Some(batch.map(|batch| {
             self.state
+                .borrow()
                 .actions_count
                 .fetch_add(batch.actions_count, Ordering::Release);
             self.state
+                .borrow()
                 .add_actions_count
                 .fetch_add(batch.add_actions_count, Ordering::Release);
             batch.filtered_data
@@ -167,7 +187,7 @@ impl ActionReconciliationIterator {
 impl std::fmt::Debug for ActionReconciliationIterator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ActionReconciliationIterator")
-            .field("state", &self.state)
+            .field("state", &self.inner.state)
             .finish()
     }
 }
@@ -176,8 +196,8 @@ impl Iterator for ActionReconciliationIterator {
     type Item = DeltaResult<FilteredEngineData>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let batch = self.inner.next();
-        self.transform_batch(batch)
+        let batch = self.inner.actions.next();
+        self.inner.transform_batch(batch)
     }
 }
 

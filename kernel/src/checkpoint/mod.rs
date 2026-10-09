@@ -509,9 +509,11 @@ impl CheckpointWriter {
         // For V2 checkpoints, chain the checkpoint metadata batch after the transformed
         // action stream. The metadata batch is created with the output schema directly,
         // bypassing the stats transform (it has no add actions to transform).
-        let checkpoint_metadata = self
-            .is_v2
-            .then(|| self.create_checkpoint_metadata_batch(engine, &self.output_schema));
+        let checkpoint_metadata = if self.is_v2 {
+            Some(self.create_checkpoint_metadata_batch(engine, &self.output_schema))
+        } else {
+            None
+        };
 
         Ok(ActionReconciliationIterator::new(Box::new(
             transformed.chain(checkpoint_metadata),
@@ -595,7 +597,6 @@ impl CheckpointWriter {
         let iter_state = data_iter.state();
 
         let splitter = SidecarSplitter::new_mut_shared(
-            data_iter,
             engine.evaluation_handler().as_ref(),
             self.output_schema.clone(),
         )?;
@@ -605,7 +606,7 @@ impl CheckpointWriter {
             self.snapshot.version(),
             file_actions_per_sidecar_hint,
         )?;
-        let data = SidecarSplitter::file_action_batches(splitter.clone());
+        let data = SidecarSplitter::file_action_batches(splitter.clone(), data_iter);
         let sidecar_urls = engine
             .parquet_handler()
             .write_parquet_files(write.clone(), Box::new(data))?;
@@ -646,8 +647,8 @@ impl CheckpointWriter {
 
         // Write main checkpoint file: non-file actions + sidecar references
         let checkpoint_path = self.checkpoint_path()?;
-        let main_data: DeltaResultIteratorStatic<Box<dyn EngineData>> =
-            Box::new(non_file_batches.into_iter().chain(sidecar_batch).map(Ok));
+        let main_data = non_file_batches.into_iter().chain(sidecar_batch);
+        let main_data = Box::new(main_data.map(Ok));
         engine
             .parquet_handler()
             .write_parquet_file(checkpoint_path.clone(), main_data)?;

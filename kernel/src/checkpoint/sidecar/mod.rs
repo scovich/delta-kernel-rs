@@ -122,7 +122,8 @@ struct NonNullRowsPicker {
 impl NonNullRowsPicker {
     fn pick(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         let transformed = self.transform.evaluate(batch)?;
-        filter_by_predicate(self.null_row_filter.as_ref(), transformed)
+        let predicate_result = self.null_row_filter.evaluate(transformed.as_ref())?;
+        filter_by_predicate(transformed, predicate_result.as_ref())
     }
 }
 
@@ -154,7 +155,6 @@ impl NonNullRowsPicker {
 ///   - `[add: null, remove: null, protocol: <prot>, metadata: null, txn: null]`
 ///   - `[add: null, remove: null, protocol: null, metadata: <meta>, txn: null]`
 pub(super) struct SidecarSplitter {
-    checkpoint_data_iter: ActionReconciliationIterator,
     /// Projects to add/remove columns and filters out rows where both are null.
     file_actions_picker: NonNullRowsPicker,
     /// Nulls out add/remove columns and filters out rows where all remaining columns are null.
@@ -165,7 +165,6 @@ pub(super) struct SidecarSplitter {
 
 impl SidecarSplitter {
     pub(super) fn new(
-        checkpoint_data_iterator: ActionReconciliationIterator,
         eval_handler: &dyn EvaluationHandler,
         checkpoint_data_schema: SchemaRef,
     ) -> DeltaResult<Self> {
@@ -233,7 +232,6 @@ impl SidecarSplitter {
         };
 
         Ok(Self {
-            checkpoint_data_iter: checkpoint_data_iterator,
             file_actions_picker: NonNullRowsPicker {
                 transform: file_action_projector,
                 null_row_filter: file_actions_null_row_filter,
@@ -250,16 +248,10 @@ impl SidecarSplitter {
     /// shared mutable access. This allows passing [`SidecarSplitter::file_action_batches`] to
     /// [`crate::ParquetHandler::write_parquet_files`], which requires `Box<dyn Iterator + Send>`.
     pub(super) fn new_mut_shared(
-        checkpoint_data_iterator: ActionReconciliationIterator,
         eval_handler: &dyn EvaluationHandler,
         checkpoint_data_schema: SchemaRef,
     ) -> DeltaResult<Arc<Mutex<Self>>> {
-        Self::new(
-            checkpoint_data_iterator,
-            eval_handler,
-            checkpoint_data_schema,
-        )
-        .map(|s| Arc::new(Mutex::new(s)))
+        Self::new(eval_handler, checkpoint_data_schema).map(|s| Arc::new(Mutex::new(s)))
     }
 
     /// Consume the splitter and return the buffered non-file-action batches.
@@ -270,33 +262,40 @@ impl SidecarSplitter {
     /// Yield every file-action batch from `splitter`, buffering non-file actions as it drains.
     pub(super) fn file_action_batches(
         splitter: Arc<Mutex<Self>>,
+        mut checkpoint_data_iter: ActionReconciliationIterator,
     ) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send {
         std::iter::from_fn(move || {
             let Ok(mut splitter) = splitter.lock() else {
                 return Some(Err(Error::internal_error("sidecar splitter lock poisoned")));
             };
-            splitter.next_file_actions_batch()
+            splitter.next_file_actions_batch(&mut checkpoint_data_iter)
         })
     }
 
     /// Pull the next batch from the inner iterator, split it into file-action and non-file-action
     /// parts. Buffers the non-file-action part; returns the next non-empty file-action batch.
     /// Returns `None` when the inner iterator is exhausted.
-    fn next_file_actions_batch(&mut self) -> Option<DeltaResult<Box<dyn EngineData>>> {
+    fn next_file_actions_batch(
+        &mut self,
+        checkpoint_data_iter: &mut ActionReconciliationIterator,
+    ) -> Option<DeltaResult<Box<dyn EngineData>>> {
         loop {
-            let result = self.checkpoint_data_iter.next()?;
-            let batch = match result.and_then(|f| f.apply_selection_vector()) {
+            let result = checkpoint_data_iter.next()?;
+            let result = result.and_then(|f| f.apply_selection_vector());
+            let batch = match result {
                 Ok(b) => b,
                 Err(e) => return Some(Err(e)),
             };
-            let non_file_actions_batch = match self.non_file_actions_picker.pick(batch.as_ref()) {
+            let non_file_actions_batch = self.non_file_actions_picker.pick(batch.as_ref());
+            let non_file_actions_batch = match non_file_actions_batch {
                 Ok(b) => b,
                 Err(e) => return Some(Err(e)),
             };
             if !non_file_actions_batch.is_empty() {
                 self.non_file_action_batches.push(non_file_actions_batch);
             }
-            match self.file_actions_picker.pick(batch.as_ref()) {
+            let file_actions_batch = self.file_actions_picker.pick(batch.as_ref());
+            match file_actions_batch {
                 Ok(file_actions_batch) if file_actions_batch.is_empty() => continue,
                 other => return Some(other),
             }

@@ -967,7 +967,7 @@ impl LogSegment {
         partition_schema: Option<&StructType>,
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<
-            impl IntoGenerator<Request, Item = DeltaResult<ActionsBatch>, Output = ()>,
+            impl IntoGenerator<Request, Item = DeltaResult<ActionsBatch>, Output = ()> + 'static,
         >,
     > {
         // Combine the action-presence predicate with the caller's skipping predicate so readers
@@ -1016,8 +1016,9 @@ impl LogSegment {
         &self,
         channel: &Channel,
         action_schema: SchemaRef,
-    ) -> DeltaResult<impl IntoGenerator<Request, Item = DeltaResult<ActionsBatch>, Output = ()>>
-    {
+    ) -> DeltaResult<
+        impl IntoGenerator<Request, Item = DeltaResult<ActionsBatch>, Output = ()> + 'static,
+    > {
         let result = self
             .read_actions_with_projected_checkpoint_actions_with_channel(
                 channel,
