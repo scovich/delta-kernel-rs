@@ -134,7 +134,7 @@ impl LogCompactionWriter {
         // Process actions using the same iterator pattern as checkpoints
         // The processor handles reverse chronological processing internally
         let result_iter = actions_iter
-            .map(move |batch| processor.process_actions_batch(batch?))
+            .map(move |batch: DeltaResult<_>| processor.process_actions_batch(batch?))
             .filter_ok(HasSelectionVector::has_selected_rows);
 
         // Wrap the iterator to track action counts lazily
