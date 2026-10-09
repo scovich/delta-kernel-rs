@@ -16,8 +16,10 @@ use crate::checkpoint::tests::{
     write_commit_to_store,
 };
 use crate::checkpoint::CheckpointWriter;
+use crate::coroutine::kernel::request::WriteParquetFiles;
+use crate::coroutine::kernel::Channel;
+use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _};
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
-use crate::engine::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::sync::SyncEngine;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
@@ -26,7 +28,7 @@ use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::path::sidecar_parquet_write;
 use crate::schema::{schema, DataType, StructType};
 use crate::unit_test_utils::Action;
-use crate::{DeltaResult, Engine, EngineData, Snapshot};
+use crate::{DeltaResult, Engine, EngineData, Error, Snapshot};
 
 struct CheckpointParts {
     sidecar_files: Vec<Url>,
@@ -42,32 +44,36 @@ fn generate_checkpoint_parts(
     engine: &dyn Engine,
     file_actions_per_sidecar_hint: usize,
 ) -> DeltaResult<CheckpointParts> {
-    let data_iter = writer.checkpoint_data(engine)?;
-    let iter_state = data_iter.state();
-    let output_schema = writer.output_schema.clone();
+    run_coroutine_with_engine!(engine, async move |channel| {
+        generate_checkpoint_parts_impl(writer, channel, file_actions_per_sidecar_hint).await
+    })
+}
 
-    let splitter =
-        SidecarSplitter::new_mut_shared(engine.evaluation_handler().as_ref(), output_schema)?;
-
+async fn generate_checkpoint_parts_impl(
+    writer: &CheckpointWriter,
+    channel: &Channel,
+    file_actions_per_sidecar_hint: usize,
+) -> DeltaResult<CheckpointParts> {
+    let (data_iter, iter_state) = writer
+        .checkpoint_data_generator_with_shared_state(channel)
+        .await?;
+    let splitter = SidecarSplitter::new_with_channel(channel, writer.output_schema.clone()).await?;
     let write = sidecar_parquet_write(
         writer.snapshot.table_root(),
         writer.snapshot.version(),
         NonZero::new(file_actions_per_sidecar_hint),
     )?;
-    let data = SidecarSplitter::file_action_batches(splitter.clone(), data_iter);
-    let sidecar_files = engine
-        .parquet_handler()
-        .write_parquet_files(write, Box::new(data))?;
-
-    let non_file_batches = Arc::into_inner(splitter)
-        .expect("splitter Arc should have no other references")
-        .into_inner()
-        .expect("splitter Mutex should not be poisoned")
-        .into_non_file_batches();
-
+    let data = SidecarSplitter::file_action_batches(splitter, data_iter);
+    let (sidecar_files, state) = channel
+        .write_parquet_files(WriteParquetFiles::new(write, data))
+        .await?;
+    let splitter = state
+        .downcast::<SidecarSplitter>()
+        .map_err(|_| Error::internal_error("invalid sidecar write terminal state"))?;
+    let splitter = *splitter;
     Ok(CheckpointParts {
         sidecar_files,
-        non_file_batches,
+        non_file_batches: splitter.into_non_file_batches(),
         iter_state,
     })
 }
@@ -650,7 +656,7 @@ fn dummy_struct() -> DataType {
     "'remove' field must be nullable"
 )]
 fn test_splitter_rejects_invalid_schema(#[case] schema: StructType, #[case] expected_msg: &str) {
-    let result = SidecarSplitter::new(&ArrowEvaluationHandler, Arc::new(schema));
+    let result = SidecarSplitter::new(&SyncEngine::new(), Arc::new(schema));
     assert!(result.is_err(), "should reject invalid schema");
     let err = result.err().unwrap();
     assert!(

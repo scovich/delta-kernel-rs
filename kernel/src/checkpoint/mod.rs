@@ -99,15 +99,17 @@
 //! [`LastCheckpointHint`]: crate::last_checkpoint_hint::LastCheckpointHint
 //! [`Snapshot::checkpoint`]: crate::Snapshot::checkpoint
 //! [`Snapshot::create_checkpoint_writer`]: crate::Snapshot::create_checkpoint_writer
+use std::borrow::Borrow;
+use std::future::poll_fn;
 use std::num::NonZero;
+use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 
-use itertools::Itertools;
 use tracing::info;
 use url::Url;
 
 use crate::action_reconciliation::log_replay::{
-    ActionReconciliationBatch, ActionReconciliationProcessor,
+    ActionReconciliationBatch, ActionReconciliationProcessor, ActionReconciliationState,
 };
 use crate::action_reconciliation::{
     ActionReconciliationIterator, ActionReconciliationIteratorState, RetentionCalculator,
@@ -116,10 +118,14 @@ use crate::actions::{
     ADD_FIELD, CHECKPOINT_METADATA_NAME, DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD,
     REMOVE_FIELD, SET_TRANSACTION_FIELD, SIDECAR_FIELD,
 };
-use crate::coroutine::generator::AsyncIntoIterator as _;
-use crate::coroutine::kernel::request::FileWriteMode;
-use crate::coroutine::kernel::{Channel, StaticGeneratorCoroutine};
-use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _};
+use crate::coroutine::engine::EngineConnector;
+use crate::coroutine::generator::{
+    map_async, static_generator_coroutine, AsyncIntoIterator as _, Generator, GeneratorExt as _,
+    GeneratorStep, IntoGenerator,
+};
+use crate::coroutine::kernel::request::{FileWriteMode, WriteParquetFile, WriteParquetFiles};
+use crate::coroutine::kernel::{coroutine, Channel, Coroutine, Request, StaticGeneratorCoroutine};
+use crate::coroutine::{run_coroutine_with_engine, AsyncBool as _, ChannelExt as _};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ExpressionRef, Scalar, StructData};
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -129,9 +135,7 @@ use crate::schema::{lazy_schema_ref, schema, DataType, SchemaRef, StructField};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
-use crate::{
-    version_as_i64, DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, Error, FileMeta,
-};
+use crate::{version_as_i64, DeltaResult, Engine, EngineData, Error, FileMeta};
 
 #[cfg(feature = "declarative-plans")]
 mod checkpoint_shape;
@@ -144,7 +148,7 @@ pub(crate) use checkpoint_shape::{CheckpointShape, CheckpointType};
 use checkpoint_transform::{
     build_checkpoint_read_schema, build_checkpoint_transform, StatsTransformConfig,
 };
-use sidecar::{create_sidecar_action_batch, SidecarSplitter};
+use sidecar::{create_sidecar_action_batch_with_channel, SidecarSplitter};
 #[cfg(test)]
 mod tests;
 
@@ -471,11 +475,79 @@ impl CheckpointWriter {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<ActionReconciliationIterator> {
+        let connector = EngineConnector::new(engine);
+        let coroutine = coroutine!(async move |channel| {
+            self.checkpoint_data_actions_with_channel(channel).await
+        });
+        let actions = connector.iterate_prepared_result_generator(coroutine)?;
+        Ok(ActionReconciliationIterator::new(Box::new(actions)))
+    }
+
+    /// Return a lazy workflow that builds the checkpoint data generator.
+    ///
+    /// The generator yields checkpoint batches and returns the completed reconciliation state.
+    ///
+    /// # Errors
+    ///
+    /// When driven, returns log-read or evaluator-creation errors.
+    pub fn checkpoint_data_workflow(
+        &self,
+    ) -> Coroutine<
+        '_,
+        impl IntoGenerator<
+                Request,
+                Item = DeltaResult<FilteredEngineData>,
+                Output = ActionReconciliationIteratorState,
+            > + 'static,
+    > {
+        coroutine!(async move |channel| {
+            let state = ActionReconciliationIteratorState::default();
+            self.checkpoint_data_generator_with_channel(channel, state)
+                .await
+        })
+    }
+
+    async fn checkpoint_data_generator_with_channel<S>(
+        &self,
+        channel: &Channel,
+        state: S,
+    ) -> DeltaResult<
+        impl IntoGenerator<Request, Item = DeltaResult<FilteredEngineData>, Output = S> + 'static,
+    >
+    where
+        S: Borrow<ActionReconciliationIteratorState> + Send + 'static,
+    {
+        let actions = self.checkpoint_data_actions_with_channel(channel).await?;
+        Ok(ActionReconciliationState::new(actions, state).into_generator(std::convert::identity))
+    }
+
+    async fn checkpoint_data_generator_with_shared_state(
+        &self,
+        channel: &Channel,
+    ) -> DeltaResult<(
+        impl IntoGenerator<Request, Item = DeltaResult<FilteredEngineData>, Output = ()> + 'static,
+        Arc<ActionReconciliationIteratorState>,
+    )> {
+        let state = Arc::new(ActionReconciliationIteratorState::default());
+        let actions = self.checkpoint_data_actions_with_channel(channel).await?;
+        let generator =
+            ActionReconciliationState::new(actions, Arc::clone(&state)).into_generator(|_| ());
+        Ok((generator, state))
+    }
+
+    async fn checkpoint_data_actions_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> DeltaResult<
+        impl IntoGenerator<Request, Item = DeltaResult<ActionReconciliationBatch>, Output = ()>
+            + 'static,
+    > {
         // Read actions from log segment
         let actions = self
             .snapshot
             .log_segment()
-            .read_actions(engine, self.read_schema.clone())?;
+            .read_actions_with_channel(channel, self.read_schema.clone())
+            .await?;
 
         // Process actions through reconciliation
         let mut processor = ActionReconciliationProcessor::new(
@@ -488,17 +560,18 @@ impl CheckpointWriter {
 
         // Create the expression evaluator for the checkpoint transform.
         // The transform is applied to reconciled action batches only (not checkpoint metadata).
-        let evaluator = engine.evaluation_handler().new_expression_evaluator(
+        let evaluator = channel.create_expression_evaluator(
             self.read_schema.clone(),
             self.transform_expr.clone(),
             self.output_schema.clone().into(),
-        )?;
+        );
+        let evaluator = evaluator.await?;
 
         // Apply stats transform to each reconciled batch
-        let transformed = checkpoint_data.map(move |batch_result| {
+        let transformed = map_async!(checkpoint_data, async move |channel, batch_result| {
             let batch = batch_result?;
             let (data, sv) = batch.filtered_data.into_parts();
-            let transformed = evaluator.evaluate(data.as_ref())?;
+            let transformed = channel.evaluate_expression(&evaluator, data).await?;
             Ok(ActionReconciliationBatch {
                 filtered_data: FilteredEngineData::try_new(transformed, sv)?,
                 actions_count: batch.actions_count,
@@ -509,15 +582,14 @@ impl CheckpointWriter {
         // For V2 checkpoints, chain the checkpoint metadata batch after the transformed
         // action stream. The metadata batch is created with the output schema directly,
         // bypassing the stats transform (it has no add actions to transform).
-        let checkpoint_metadata = if self.is_v2 {
-            Some(self.create_checkpoint_metadata_batch(engine, &self.output_schema))
-        } else {
-            None
-        };
+        let checkpoint_metadata = self
+            .is_v2
+            .then_async(|| {
+                self.create_checkpoint_metadata_batch_with_channel(channel, &self.output_schema)
+            })
+            .await;
 
-        Ok(ActionReconciliationIterator::new(Box::new(
-            transformed.chain(checkpoint_metadata),
-        )))
+        Ok(transformed.chain(checkpoint_metadata.into_generator()))
     }
 
     /// Finalizes checkpoint creation by saving metadata about the checkpoint.
@@ -593,23 +665,38 @@ impl CheckpointWriter {
         engine: &dyn Engine,
         file_actions_per_sidecar_hint: Option<NonZero<usize>>,
     ) -> DeltaResult<WrittenCheckpointInfo> {
-        let data_iter = self.checkpoint_data(engine)?;
-        let iter_state = data_iter.state();
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.write_v2_checkpoint_with_sidecars_with_channel(
+                channel,
+                file_actions_per_sidecar_hint,
+            )
+            .await
+        })
+    }
 
-        let splitter = SidecarSplitter::new_mut_shared(
-            engine.evaluation_handler().as_ref(),
-            self.output_schema.clone(),
-        )?;
+    async fn write_v2_checkpoint_with_sidecars_with_channel(
+        &self,
+        channel: &Channel,
+        file_actions_per_sidecar_hint: Option<NonZero<usize>>,
+    ) -> DeltaResult<WrittenCheckpointInfo> {
+        let (data_iter, iter_state) = self
+            .checkpoint_data_generator_with_shared_state(channel)
+            .await?;
+        let splitter =
+            SidecarSplitter::new_with_channel(channel, self.output_schema.clone()).await?;
 
         let write = path::sidecar_parquet_write(
             self.snapshot.table_root(),
             self.snapshot.version(),
             file_actions_per_sidecar_hint,
         )?;
-        let data = SidecarSplitter::file_action_batches(splitter.clone(), data_iter);
-        let sidecar_urls = engine
-            .parquet_handler()
-            .write_parquet_files(write.clone(), Box::new(data))?;
+        let data = SidecarSplitter::file_action_batches(splitter, data_iter);
+        let operation = WriteParquetFiles::new(write.clone(), data);
+        let (sidecar_urls, state) = channel.write_parquet_files(operation).await?;
+        let splitter = state
+            .downcast::<SidecarSplitter>()
+            .map_err(|_| Error::internal_error("invalid sidecar write terminal state"))?;
+        let splitter = *splitter;
         let mut sidecar_metas = Vec::with_capacity(sidecar_urls.len());
         for url in sidecar_urls {
             let filename = write
@@ -625,33 +712,28 @@ impl CheckpointWriter {
                         "connector returned invalid sidecar path: {url}"
                     ))
                 })?;
-            let meta = engine.storage_handler().head(&url)?;
+            let meta = channel.head(&url).await?;
             sidecar_metas.push((filename, meta));
         }
 
         // Collect non-file action batches(e.g., `protocol`, `metaData`, `txn`, etc.)
-        let non_file_batches = Arc::into_inner(splitter)
-            .ok_or_else(|| {
-                Error::internal_error("sidecar splitter Arc should have no other references")
-            })?
-            .into_inner()
-            .map_err(|e| Error::internal_error(format!("sidecar splitter lock poisoned: {e}")))?
-            .into_non_file_batches();
+        let non_file_batches = splitter.into_non_file_batches();
 
         // Create sidecar action rows for the main checkpoint file. Each row populates only
         // the `sidecar` column, e.g. `sidecar: { path: "<sidecar_filename>.parquet", sizeInBytes:
         // <size>, modificationTime: <time>, tags: null }`, with all other action columns
         // left null.
         let sidecar_batch =
-            create_sidecar_action_batch(engine, &self.output_schema, &sidecar_metas)?;
+            create_sidecar_action_batch_with_channel(channel, &self.output_schema, &sidecar_metas)
+                .await?;
 
         // Write main checkpoint file: non-file actions + sidecar references
         let checkpoint_path = self.checkpoint_path()?;
         let main_data = non_file_batches.into_iter().chain(sidecar_batch);
-        let main_data = Box::new(main_data.map(Ok));
-        engine
-            .parquet_handler()
-            .write_parquet_file(checkpoint_path.clone(), main_data)?;
+        let main_data = StaticGeneratorCoroutine::from_generator(main_data.into_generator());
+        channel
+            .write_parquet_file(WriteParquetFile::new(checkpoint_path.clone(), main_data))
+            .await?;
 
         // size_in_bytes covers the main checkpoint file plus all sidecar files.
         let sidecar_sizes_sum = sidecar_metas
@@ -659,13 +741,14 @@ impl CheckpointWriter {
             .try_fold(0u64, |acc, (_, m)| acc.checked_add(m.size))
             .ok_or_else(|| Error::internal_error("sidecar sizes sum overflowed u64"))?;
         let sidecar_count = sidecar_metas.len() as u64;
-        build_written_checkpoint_info(
-            engine,
+        build_written_checkpoint_info_with_channel(
+            channel,
             &checkpoint_path,
             iter_state,
             sidecar_sizes_sum,
             sidecar_count,
         )
+        .await
     }
 
     /// Writes a checkpoint without sidecars, will automatically choose V1 or V2
@@ -674,21 +757,44 @@ impl CheckpointWriter {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<WrittenCheckpointInfo> {
-        let checkpoint_path = self.checkpoint_path()?;
-        let data_iter = self.checkpoint_data(engine)?;
-        let state = data_iter.state();
-        let lazy_data = data_iter.map(|r| r.and_then(|f| f.apply_selection_vector()));
-        engine
-            .parquet_handler()
-            .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))?;
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.write_checkpoint_without_sidecars_with_channel(channel)
+                .await
+        })
+    }
 
-        build_written_checkpoint_info(
-            engine,
+    async fn write_checkpoint_without_sidecars_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> DeltaResult<WrittenCheckpointInfo> {
+        let checkpoint_path = self.checkpoint_path()?;
+        let (data_iter, state) = self
+            .checkpoint_data_generator_with_shared_state(channel)
+            .await?;
+        let lazy_data = data_iter
+            .map(|r: DeltaResult<FilteredEngineData>| r.and_then(|f| f.apply_selection_vector()));
+        // Adapt to the sink's infallible-item/unit-output contract by promoting item errors.
+        let lazy_data = static_generator_coroutine!(Request, async move |channel| {
+            let mut lazy_data = lazy_data.bind(&channel);
+            loop {
+                match poll_fn(|context| Pin::new(&mut lazy_data).poll_step(context)).await? {
+                    GeneratorStep::Yield(result) => channel.yield_item(result?).await?,
+                    GeneratorStep::Done(()) => return Ok(()),
+                }
+            }
+        });
+        channel
+            .write_parquet_file(WriteParquetFile::new(checkpoint_path.clone(), lazy_data))
+            .await?;
+
+        build_written_checkpoint_info_with_channel(
+            channel,
             &checkpoint_path,
             state,
             0, /* sidecar_sizes_sum */
             0, /* sidecar_count */
         )
+        .await
     }
 
     /// Creates the checkpoint metadata action for V2 checkpoints.
@@ -711,6 +817,7 @@ impl CheckpointWriter {
     /// An [`ActionReconciliationBatch`] including the single-row [`EngineData`] batch along with
     /// an accompanying selection vector with a single `true` value, indicating the action in
     /// the batch should be included in the checkpoint.
+    #[cfg(test)]
     fn create_checkpoint_metadata_batch(
         &self,
         engine: &dyn Engine,
@@ -852,25 +959,6 @@ pub(crate) async fn create_last_checkpoint_data_with_channel(
     channel
         .create_many(LAST_CHECKPOINT_SCHEMA.clone(), rows)
         .await
-}
-
-fn build_written_checkpoint_info(
-    engine: &dyn Engine,
-    checkpoint_path: &Url,
-    state: Arc<ActionReconciliationIteratorState>,
-    sidecar_sizes_sum: u64,
-    sidecar_count: u64,
-) -> DeltaResult<WrittenCheckpointInfo> {
-    run_coroutine_with_engine!(engine, async move |channel| {
-        build_written_checkpoint_info_with_channel(
-            channel,
-            checkpoint_path,
-            state,
-            sidecar_sizes_sum,
-            sidecar_count,
-        )
-        .await
-    })
 }
 
 async fn build_written_checkpoint_info_with_channel(
