@@ -16,8 +16,7 @@ use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 
 use crate::coroutine::generator::{generator_fn, Generator, GeneratorExt as _, GeneratorStep};
-use crate::coroutine::kernel::Channel;
-use crate::coroutine::{IntoGenerator, Request};
+use crate::coroutine::kernel::{Channel, DeltaResultGenerator};
 use crate::log_reader::checkpoint_manifest::checkpoint_manifest_reader_impl;
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
@@ -79,13 +78,8 @@ impl SequentialPhase<(), ()> {
         processor: ScanLogReplayProcessor,
         log_segment: &LogSegment,
         checkpoint_read_schema: SchemaRef,
-    ) -> DeltaResult<
-        impl IntoGenerator<
-                Request,
-                Item = DeltaResult<ScanMetadata>,
-                Output = DeltaResult<AfterSequential>,
-            > + 'static,
-    > {
+    ) -> DeltaResult<impl DeltaResultGenerator<ScanMetadata, DeltaResult<AfterSequential>> + 'static>
+    {
         let commit_phase = log_segment
             .read_commit_actions_generator(channel, COMMIT_READ_SCHEMA.clone())
             .await?;
@@ -211,12 +205,8 @@ impl<C, M> SequentialPhase<C, M> {
             + 'a,
     >
     where
-        C: IntoGenerator<Request, Item = DeltaResult<ActionsBatch>, Output = ()> + 'a,
-        M: IntoGenerator<
-                Request,
-                Item = DeltaResult<ActionsBatch>,
-                Output = DeltaResult<Vec<FileMeta>>,
-            > + 'a,
+        C: DeltaResultGenerator<ActionsBatch> + 'a,
+        M: DeltaResultGenerator<ActionsBatch, DeltaResult<Vec<FileMeta>>> + 'a,
     {
         SequentialPhase {
             processor: self.processor,

@@ -12,14 +12,12 @@ use crate::actions::{
     Metadata, Protocol, ADD_FIELD, CDC_FIELD, COMMIT_INFO_NAME, METADATA_FIELD, PROTOCOL_FIELD,
     REMOVE_FIELD,
 };
-use crate::coroutine::generator::{
-    map_async_witness, AsyncIntoIterator as _, GeneratorExt as _, IntoGenerator,
-};
-use crate::coroutine::kernel::Channel;
+use crate::coroutine::generator::{map_async_witness, AsyncIntoIterator as _, GeneratorExt as _};
+use crate::coroutine::kernel::{Channel, DeltaResultGenerator};
 #[cfg(test)]
 use crate::coroutine::run_coroutine_with_engine;
 use crate::coroutine::{
-    iterate_prepared_result_generator_with_engine, AsyncOption as _, ChannelExt as _, Request,
+    iterate_prepared_result_generator_with_engine, AsyncOption as _, ChannelExt as _,
 };
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{column_name, ColumnName};
@@ -108,9 +106,7 @@ async fn table_changes_action_iter_with_mode_and_channel<'a>(
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
     mode: CdfMode,
-) -> DeltaResult<
-    impl IntoGenerator<Request, Item = DeltaResult<TableChangesScanMetadata>, Output = ()> + 'a,
-> {
+) -> DeltaResult<impl DeltaResultGenerator<TableChangesScanMetadata> + 'a> {
     // Skip against the raw `{ add, remove, ... }` action batch: table_changes must resolve
     // deletion vector pairs before filtering, so unlike the scan path it operates on raw
     // batches with stats parsed from `add.stats` JSON.
@@ -386,9 +382,7 @@ impl LogReplayScanner {
         self,
         channel: &Channel,
         filter: Option<Arc<DataSkippingFilter>>,
-    ) -> DeltaResult<
-        impl IntoGenerator<Request, Item = DeltaResult<TableChangesScanMetadata>, Output = ()> + 'static,
-    > {
+    ) -> DeltaResult<impl DeltaResultGenerator<TableChangesScanMetadata> + 'static> {
         let Self {
             has_cdc_action,
             remove_dvs,

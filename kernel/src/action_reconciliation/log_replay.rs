@@ -34,8 +34,8 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock};
 
-use crate::coroutine::generator::{generator_fn, Generator, IntoGenerator};
-use crate::coroutine::Request;
+use crate::coroutine::generator::{generator_fn, Generator};
+use crate::coroutine::kernel::DeltaResultGenerator;
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::deduplicator::{Deduplicator as _, FileActionInfo};
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, HasSelectionVector};
@@ -167,10 +167,9 @@ where
     pub(crate) fn into_generator<O, F>(
         self,
         map_output: F,
-    ) -> impl IntoGenerator<Request, Item = DeltaResult<FilteredEngineData>, Output = O>
+    ) -> impl DeltaResultGenerator<FilteredEngineData, O>
     where
-        A: IntoGenerator<Request, Item = DeltaResult<ActionReconciliationBatch>, Output = ()>
-            + 'static,
+        A: DeltaResultGenerator<ActionReconciliationBatch> + 'static,
         S: Send + 'static,
         O: Send + 'static,
         F: FnOnce(S) -> O + Send + 'static,

@@ -22,7 +22,11 @@ pub use request::{PlanRequest, Request};
 /// generators use it for the lifetime of their [`BoundGenerator`].
 pub type Channel = super::Channel<Request>;
 
-/// Unbound kernel generator yielding fallible values.
+/// Unbound kernel generator equivalent to
+/// `IntoGenerator<Request, Item = DeltaResult<T>, Output = O>`.
+///
+/// Polling may fail before an item is yielded, each yielded item may independently be an error,
+/// and `O` is returned only after successful terminal completion.
 pub trait DeltaResultGenerator<T, O = ()>:
     generator::IntoGenerator<Request, Item = DeltaResult<T>, Output = O> + Sized
 where
@@ -84,7 +88,7 @@ macro_rules! generator_coroutine {
 
 /// Creates an unpolled [`StaticGeneratorCoroutine`] from a static generator body.
 #[internal_api]
-macro_rules! static_generator {
+macro_rules! static_generator_coroutine {
     ($body:expr) => {
         $crate::coroutine::generator::static_generator_coroutine!(
             $crate::coroutine::kernel::Request,

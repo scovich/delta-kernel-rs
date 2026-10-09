@@ -6,13 +6,13 @@ use std::sync::Arc;
 use itertools::Itertools;
 
 use crate::actions::{ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
-use crate::coroutine::generator::{
-    static_generator_coroutine, Generator, GeneratorStep, IntoGenerator,
-};
+use crate::coroutine::generator::{Generator, GeneratorStep};
 use crate::coroutine::kernel::request::{
     ExpressionEvaluatorHandle, PredicateEvaluatorHandle, WriteParquetFilesState,
 };
-use crate::coroutine::kernel::{Channel, Request, StaticGeneratorCoroutine};
+use crate::coroutine::kernel::{
+    static_generator_coroutine, Channel, DeltaResultGenerator, StaticGeneratorCoroutine,
+};
 #[cfg(test)]
 use crate::coroutine::run_coroutine_with_engine;
 use crate::coroutine::ChannelExt as _;
@@ -273,9 +273,9 @@ impl SidecarSplitter {
         checkpoint_data_iter: G,
     ) -> StaticGeneratorCoroutine<Box<dyn EngineData>, WriteParquetFilesState>
     where
-        G: IntoGenerator<Request, Item = DeltaResult<FilteredEngineData>, Output = ()> + 'static,
+        G: DeltaResultGenerator<FilteredEngineData> + 'static,
     {
-        static_generator_coroutine!(Request, async move |channel| {
+        static_generator_coroutine!(async move |channel| {
             let mut checkpoint_data_iter = checkpoint_data_iter.bind(&channel);
             loop {
                 match splitter

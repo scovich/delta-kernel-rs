@@ -18,10 +18,10 @@ use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
 use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
 #[cfg(test)]
 use crate::coroutine::iterate_prepared_result_generator_with_engine;
-use crate::coroutine::kernel::{Channel, Request};
+use crate::coroutine::kernel::{Channel, DeltaResultGenerator};
 #[cfg(feature = "declarative-plans")]
 use crate::coroutine::{ChannelExt as _, PageGenerator};
-use crate::coroutine::{Generator, GeneratorExt as _, IntoGenerator};
+use crate::coroutine::{Generator, GeneratorExt as _};
 use crate::crc::Crc;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::ActionsBatch;
@@ -171,8 +171,7 @@ impl LogSegment {
     async fn read_pm_batches_via_plan(
         &self,
         channel: &Channel,
-    ) -> DeltaResult<impl IntoGenerator<Request, Item = DeltaResult<VersionedBatch>, Output = ()>>
-    {
+    ) -> DeltaResult<impl DeltaResultGenerator<VersionedBatch>> {
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let versioned_schema = schema_ref! {
             (&PROTOCOL_FIELD),
@@ -258,8 +257,7 @@ impl LogSegment {
     async fn read_pm_batches_with_channel(
         &self,
         channel: &Channel,
-    ) -> DeltaResult<impl IntoGenerator<Request, Item = DeltaResult<VersionedBatch>, Output = ()>>
-    {
+    ) -> DeltaResult<impl DeltaResultGenerator<VersionedBatch>> {
         let (commit_schema, checkpoint_schema) = pm_replay_schemas();
         // Commit schema only: `_file` in the checkpoint schema would break its skipping predicate.
         let file_column =

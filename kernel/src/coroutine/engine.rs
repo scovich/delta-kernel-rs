@@ -17,14 +17,14 @@ use super::kernel::request::{
     WriteJsonFile, WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
 };
 use super::kernel::{
-    coroutine, ChannelExt as _, Coroutine, GeneratorCoroutine, GeneratorCoroutineStep,
-    StaticCoroutine, StaticGeneratorCoroutine,
+    coroutine, ChannelExt as _, Coroutine, DeltaResultGenerator, GeneratorCoroutine,
+    GeneratorCoroutineStep, StaticCoroutine, StaticGeneratorCoroutine,
 };
 #[cfg(feature = "declarative-plans")]
 use super::PlanOperation;
 use super::{
-    drive_coroutine, Cursor, GeneratorExt as _, IntoGenerator, Page, PageGenerator, PageRequest,
-    PagedOperation, PlanRequest, Request,
+    drive_coroutine, Cursor, GeneratorExt as _, Page, PageGenerator, PageRequest, PagedOperation,
+    PlanRequest, Request,
 };
 use crate::cancellation::{check_cancelled, CancellationTokenRef};
 use crate::committer::Committer;
@@ -349,7 +349,7 @@ impl EngineConnector {
         coroutine: Coroutine<'_, G>,
     ) -> DeltaResult<EngineResultGeneratorIterator<'a, Item>>
     where
-        G: IntoGenerator<Request, Item = DeltaResult<Item>, Output = ()> + 'a,
+        G: DeltaResultGenerator<Item> + 'a,
         Item: Send + 'static,
     {
         let generator = GeneratorCoroutine::from_generator(self.drive(coroutine)?);
@@ -363,7 +363,7 @@ impl EngineConnector {
         into_parts: impl FnOnce(R) -> (G, Companion),
     ) -> DeltaResult<(EngineResultGeneratorIterator<'a, Item>, Companion)>
     where
-        G: IntoGenerator<Request, Item = DeltaResult<Item>, Output = ()> + 'a,
+        G: DeltaResultGenerator<Item> + 'a,
         Item: Send + 'static,
     {
         let (generator, companion) = into_parts(self.drive(coroutine)?);
@@ -616,7 +616,7 @@ pub(crate) fn iterate_prepared_result_generator_with_engine<'a, G, Item>(
     coroutine: Coroutine<'_, G>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<Item>> + Send + 'a>
 where
-    G: IntoGenerator<Request, Item = DeltaResult<Item>, Output = ()> + 'a,
+    G: DeltaResultGenerator<Item> + 'a,
     Item: Send + 'static,
 {
     let connector = EngineConnector::new(engine).with_cancellation_token(cancellation_token);

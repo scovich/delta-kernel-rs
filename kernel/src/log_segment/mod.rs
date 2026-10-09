@@ -18,12 +18,12 @@ use crate::committer::CatalogCommit;
 use crate::coroutine::engine::EngineConnector;
 use crate::coroutine::generator::empty;
 use crate::coroutine::kernel::request::ReadParquetFiles;
-use crate::coroutine::kernel::{coroutine, Channel, Request};
+use crate::coroutine::kernel::{coroutine, Channel, DeltaResultGenerator};
 #[cfg(test)]
 use crate::coroutine::run_coroutine_with_engine;
 use crate::coroutine::{
-    iterate_prepared_result_generator_with_engine, run_coroutine_with_storage, ChannelExt as _,
-    DeltaResultGenerator, GeneratorExt, IntoGenerator,
+    iterate_prepared_result_generator_with_engine, run_coroutine_with_storage,
+    BoxedDeltaResultGenerator, ChannelExt as _, GeneratorExt, IntoGenerator,
 };
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
@@ -965,11 +965,8 @@ impl LogSegment {
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
-    ) -> DeltaResult<
-        ActionsWithCheckpointInfo<
-            impl IntoGenerator<Request, Item = DeltaResult<ActionsBatch>, Output = ()> + 'static,
-        >,
-    > {
+    ) -> DeltaResult<ActionsWithCheckpointInfo<impl DeltaResultGenerator<ActionsBatch> + 'static>>
+    {
         // Combine the action-presence predicate with the caller's skipping predicate so readers
         // can omit checkpoint data that cannot contain a relevant action.
         let projection_predicate = checkpoint_action_projection_predicate(&checkpoint_read_schema);
@@ -1016,9 +1013,7 @@ impl LogSegment {
         &self,
         channel: &Channel,
         action_schema: SchemaRef,
-    ) -> DeltaResult<
-        impl IntoGenerator<Request, Item = DeltaResult<ActionsBatch>, Output = ()> + 'static,
-    > {
+    ) -> DeltaResult<impl DeltaResultGenerator<ActionsBatch> + 'static> {
         let result = self
             .read_actions_with_projected_checkpoint_actions_with_channel(
                 channel,
@@ -1057,9 +1052,7 @@ impl LogSegment {
         &self,
         channel: &Channel,
         schema: SchemaRef,
-    ) -> DeltaResult<
-        impl IntoGenerator<Request, Item = DeltaResult<ActionsBatch>, Output = ()> + 'static,
-    > {
+    ) -> DeltaResult<impl DeltaResultGenerator<ActionsBatch> + 'static> {
         let commit_files = self.find_commit_cover();
         let actions = channel
             .prepare_json_files(commit_files, schema, None)
@@ -1363,11 +1356,7 @@ impl LogSegment {
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
-    ) -> DeltaResult<
-        ActionsWithCheckpointInfo<
-            impl IntoGenerator<Request, Item = DeltaResult<ActionsBatch>, Output = ()>,
-        >,
-    > {
+    ) -> DeltaResult<ActionsWithCheckpointInfo<impl DeltaResultGenerator<ActionsBatch>>> {
         let need_file_actions = schema_contains_file_actions(&action_schema);
 
         let (file_actions_schema, sidecar_files) = if need_file_actions {
@@ -1537,7 +1526,7 @@ impl LogSegment {
     ) -> DeltaResult<Vec<FileMeta>> {
         // Read checkpoint with just the sidecar column
         let files = std::slice::from_ref(&checkpoint.location);
-        let mut batches: DeltaResultGenerator<'_, _> = match checkpoint.extension.as_str() {
+        let mut batches: BoxedDeltaResultGenerator<'_, _> = match checkpoint.extension.as_str() {
             "json" => Box::new(channel.read_json_files(files, Self::sidecar_read_schema(), None)),
             "parquet" => Box::new(channel.flattened(ReadParquetFiles::new(
                 files,

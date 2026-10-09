@@ -14,12 +14,12 @@ use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::coroutine::engine::EngineConnector;
 #[cfg(test)]
 use crate::coroutine::generator::AsyncIntoIterator as _;
-use crate::coroutine::generator::{map_async_witness, GeneratorExt as _, IntoGenerator};
+use crate::coroutine::generator::{map_async_witness, GeneratorExt as _};
 #[cfg(test)]
 use crate::coroutine::kernel::coroutine;
 use crate::coroutine::kernel::request::ExpressionEvaluatorHandle;
-use crate::coroutine::kernel::{Channel, ChannelExt as _};
-use crate::coroutine::{run_coroutine_with_engine, DeltaFuture, Request};
+use crate::coroutine::kernel::{Channel, ChannelExt as _, DeltaResultGenerator};
+use crate::coroutine::{run_coroutine_with_engine, DeltaFuture};
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
     col, column_expr_ref, column_name, null_lit, ColumnName, Expression, ExpressionRef,
@@ -1314,13 +1314,13 @@ pub(crate) fn scan_action_iter<'a>(
 
 pub(super) async fn scan_action_iter_with_channel<'a>(
     channel: &Channel,
-    action_iter: impl IntoGenerator<Request, Item = DeltaResult<ActionsBatch>, Output = ()> + 'a,
+    action_iter: impl DeltaResultGenerator<ActionsBatch> + 'a,
     state_info: Arc<StateInfo>,
     checkpoint_info: CheckpointReadInfo,
     stats_options: ScanStatsOptions,
     partition_values_options: ScanPartitionValuesOptions,
 ) -> DeltaResult<(
-    impl IntoGenerator<Request, Item = DeltaResult<ScanMetadata>, Output = ()> + 'a,
+    impl DeltaResultGenerator<ScanMetadata> + 'a,
     Arc<ScanMetrics>,
 )> {
     let mut processor = ScanLogReplayProcessor::new_with_channel(

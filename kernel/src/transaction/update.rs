@@ -23,10 +23,8 @@ use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::BackReference;
 use crate::actions::{LOG_ADD_SCHEMA, NUM_RECORDS, TIGHT_BOUNDS};
 use crate::coroutine::generator::{map_async_witness, AsyncIntoIterator as _, GeneratorExt as _};
-use crate::coroutine::kernel::{Channel, Request};
-use crate::coroutine::{
-    iterate_prepared_result_generator_with_engine, ChannelExt as _, IntoGenerator,
-};
+use crate::coroutine::kernel::{Channel, DeltaResultGenerator};
+use crate::coroutine::{iterate_prepared_result_generator_with_engine, ChannelExt as _};
 use crate::engine_data::{
     FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData,
 };
@@ -605,9 +603,7 @@ impl<S> Transaction<S> {
     pub(super) async fn generate_dv_update_actions_with_channel(
         &self,
         channel: &Channel,
-    ) -> DeltaResult<
-        impl IntoGenerator<Request, Item = DeltaResult<FilteredEngineData>, Output = ()> + 'static,
-    > {
+    ) -> DeltaResult<impl DeltaResultGenerator<FilteredEngineData> + 'static> {
         // Create-table transactions should not have any DV update actions
         if self.is_create_table() && !self.dv_matched_files.is_empty() {
             return Err(crate::error::Error::internal_error(
@@ -637,9 +633,7 @@ impl<S> Transaction<S> {
         &self,
         channel: &Channel,
         file_metadata_batch: impl Iterator<Item = Arc<FilteredEngineData>> + Send + 'static,
-    ) -> DeltaResult<
-        impl IntoGenerator<Request, Item = DeltaResult<FilteredEngineData>, Output = ()> + 'static,
-    > {
+    ) -> DeltaResult<impl DeltaResultGenerator<FilteredEngineData> + 'static> {
         // Struct patch to replace the deletionVector field with the new DV/stats from
         // NEW_DELETION_VECTOR_NAME/NEW_STATS_NAME, then drop the
         // NEW_DELETION_VECTOR_NAME/NEW_STATS_NAME columns.

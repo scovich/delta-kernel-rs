@@ -14,8 +14,7 @@ use crate::coroutine::engine::EngineResultGeneratorIterator;
 use crate::coroutine::generator::{generator_fn, Generator, GeneratorExt as _, IntoGenerator};
 #[cfg(test)]
 use crate::coroutine::kernel::{coroutine, StaticGeneratorCoroutine};
-use crate::coroutine::kernel::{Channel, ChannelExt as _};
-use crate::coroutine::Request;
+use crate::coroutine::kernel::{Channel, ChannelExt as _, DeltaResultGenerator, GeneratorChannel};
 use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
 use crate::schema::SchemaRef;
@@ -90,13 +89,7 @@ pub(crate) async fn checkpoint_manifest_reader_impl(
     manifest: &ParsedLogPath,
     log_root: Url,
     read_schema: SchemaRef,
-) -> DeltaResult<
-    impl IntoGenerator<
-            Request,
-            Item = DeltaResult<ActionsBatch>,
-            Output = DeltaResult<Vec<FileMeta>>,
-        > + 'static,
-> {
+) -> DeltaResult<impl DeltaResultGenerator<ActionsBatch, DeltaResult<Vec<FileMeta>>> + 'static> {
     let actions = match manifest.extension.as_str() {
         "json" => channel
             .prepare_json_files(vec![manifest.location.clone()], read_schema.clone(), None)
@@ -171,7 +164,7 @@ impl<A> CheckpointManifestState<A> {
         impl Generator<Item = DeltaResult<ActionsBatch>, Output = ()> + Unpin + 'a,
     >
     where
-        A: IntoGenerator<Request, Item = DeltaResult<ActionsBatch>, Output = ()> + 'a,
+        A: DeltaResultGenerator<ActionsBatch> + 'a,
     {
         let actions = self.actions.bind(channel);
         CheckpointManifestState {
@@ -186,19 +179,19 @@ impl<A> CheckpointManifestState<A> {
 
 fn checkpoint_manifest_generator<G>(
     state: CheckpointManifestState<G>,
-) -> impl IntoGenerator<Request, Item = DeltaResult<ActionsBatch>, Output = DeltaResult<Vec<FileMeta>>>
+) -> impl DeltaResultGenerator<ActionsBatch, DeltaResult<Vec<FileMeta>>>
 where
-    G: IntoGenerator<Request, Item = DeltaResult<ActionsBatch>, Output = ()> + 'static,
+    G: DeltaResultGenerator<ActionsBatch> + 'static,
 {
     generator_fn!(async move |channel| { checkpoint_manifest_impl(channel, state).await })
 }
 
 async fn checkpoint_manifest_impl<G>(
-    channel: GeneratorChannel<'_, Request, DeltaResult<ActionsBatch>>,
+    channel: GeneratorChannel<'_, DeltaResult<ActionsBatch>>,
     state: CheckpointManifestState<G>,
 ) -> DeltaResult<DeltaResult<Vec<FileMeta>>>
 where
-    G: IntoGenerator<Request, Item = DeltaResult<ActionsBatch>, Output = ()>,
+    G: DeltaResultGenerator<ActionsBatch>,
 {
     let mut state = state.bind_actions(&channel);
     while let Some(item) = state.next().await? {

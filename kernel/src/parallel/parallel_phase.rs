@@ -13,9 +13,8 @@ use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 
 use crate::coroutine::engine::{EngineConnector, EngineResultGeneratorIterator};
-use crate::coroutine::generator::{map_async_witness, GeneratorExt as _, IntoGenerator};
-use crate::coroutine::kernel::{coroutine, Channel, ChannelExt as _};
-use crate::coroutine::Request;
+use crate::coroutine::generator::{map_async_witness, GeneratorExt as _};
+use crate::coroutine::kernel::{coroutine, Channel, ChannelExt as _, DeltaResultGenerator};
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::scan::CHECKPOINT_READ_SCHEMA;
 use crate::schema::SchemaRef;
@@ -70,9 +69,7 @@ impl ParallelPhase {
         processor: P,
         leaf_files: Vec<FileMeta>,
         read_schema: SchemaRef,
-    ) -> DeltaResult<
-        impl IntoGenerator<Request, Item = DeltaResult<P::Output>, Output = ()> + 'static,
-    >
+    ) -> DeltaResult<impl DeltaResultGenerator<P::Output> + 'static>
     where
         P: ParallelLogReplayProcessor + Send + Sync + 'static,
         P::Output: Send + 'static,
@@ -94,9 +91,8 @@ impl ParallelPhase {
     /// Yields file-reading, Parquet-parsing, and processor errors.
     pub(crate) fn process_batches<P>(
         processor: P,
-        batches: impl IntoGenerator<Request, Item = DeltaResult<Box<dyn EngineData>>, Output = ()>
-            + 'static,
-    ) -> impl IntoGenerator<Request, Item = DeltaResult<P::Output>, Output = ()> + 'static
+        batches: impl DeltaResultGenerator<Box<dyn EngineData>> + 'static,
+    ) -> impl DeltaResultGenerator<P::Output> + 'static
     where
         P: ParallelLogReplayProcessor + Send + Sync + 'static,
         P::Output: Send + 'static,

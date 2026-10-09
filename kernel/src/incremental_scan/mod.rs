@@ -10,7 +10,7 @@ use crate::coroutine::kernel::{
     static_coroutine, static_generator_coroutine, Channel, DeltaResultGenerator, GeneratorChannel,
     GeneratorCoroutineStep, StaticCoroutine, StaticGeneratorCoroutine,
 };
-use crate::coroutine::{ChannelExt as _, GeneratorExt as _, Request};
+use crate::coroutine::{ChannelExt as _, GeneratorExt as _};
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor};
 use crate::expressions::{column_name, ColumnName};
 use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
@@ -310,7 +310,7 @@ impl<A> IncrementalScanState<A> {
         impl Generator<Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + Unpin + 'a,
     >
     where
-        A: IntoGenerator<Request, Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + 'a,
+        A: DeltaResultGenerator<Box<dyn EngineData>> + 'a,
     {
         let actions = self.actions.bind(channel);
         IncrementalScanState {
@@ -328,19 +328,19 @@ impl<A> IncrementalScanState<A> {
 
 fn incremental_scan_generator<G>(state: IncrementalScanState<G>) -> IncrementalScanGenerator
 where
-    G: IntoGenerator<Request, Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + 'static,
+    G: DeltaResultGenerator<Box<dyn EngineData>> + 'static,
 {
-    static_generator_coroutine!(Request, async move |channel| {
+    static_generator_coroutine!(async move |channel| {
         incremental_scan_impl(channel, state).await
     })
 }
 
 async fn incremental_scan_impl<G>(
-    channel: GeneratorChannel<'_, Request, DeltaResult<FilteredEngineData>>,
+    channel: GeneratorChannel<'_, DeltaResult<FilteredEngineData>>,
     state: IncrementalScanState<G>,
 ) -> DeltaResult<DeltaResult<IncrementalScanSummary>>
 where
-    G: IntoGenerator<Request, Item = DeltaResult<Box<dyn EngineData>>, Output = ()>,
+    G: DeltaResultGenerator<Box<dyn EngineData>>,
 {
     let mut state = state.bind_actions(&channel);
     while let Some(item) = state.advance(&channel).await? {

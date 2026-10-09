@@ -12,8 +12,8 @@ use crate::action_reconciliation::{
     ActionReconciliationIterator, ActionReconciliationIteratorState, RetentionCalculator,
 };
 use crate::coroutine::engine::EngineConnector;
-use crate::coroutine::generator::{GeneratorExt as _, IntoGenerator};
-use crate::coroutine::kernel::{coroutine, Channel, Coroutine, Request};
+use crate::coroutine::generator::GeneratorExt as _;
+use crate::coroutine::kernel::{coroutine, Channel, Coroutine, DeltaResultGenerator};
 use crate::log_replay::HasSelectionVector;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
@@ -126,11 +126,7 @@ impl LogCompactionWriter {
         &mut self,
     ) -> Coroutine<
         '_,
-        impl IntoGenerator<
-                Request,
-                Item = DeltaResult<FilteredEngineData>,
-                Output = ActionReconciliationIteratorState,
-            > + 'static,
+        impl DeltaResultGenerator<FilteredEngineData, ActionReconciliationIteratorState> + 'static,
     > {
         coroutine!(async move |channel| {
             let actions = self.compaction_data_actions_with_channel(channel).await?;
@@ -143,10 +139,7 @@ impl LogCompactionWriter {
     async fn compaction_data_actions_with_channel(
         &mut self,
         channel: &Channel,
-    ) -> DeltaResult<
-        impl IntoGenerator<Request, Item = DeltaResult<ActionReconciliationBatch>, Output = ()>
-            + 'static,
-    > {
+    ) -> DeltaResult<impl DeltaResultGenerator<ActionReconciliationBatch> + 'static> {
         // Validate that the requested version range is within the snapshot's range
         let snapshot_end_version = self.snapshot.version();
         if self.end_version > snapshot_end_version {

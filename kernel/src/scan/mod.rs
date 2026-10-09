@@ -22,11 +22,11 @@ use crate::checkpoint::CheckpointShape;
 use crate::coroutine::engine::EngineConnector;
 use crate::coroutine::generator::{AsyncIntoIterator as _, GeneratorExt as _};
 use crate::coroutine::kernel::{
-    coroutine, static_coroutine, Channel, Coroutine, Request, StaticCoroutine,
+    coroutine, static_coroutine, Channel, Coroutine, DeltaResultGenerator, StaticCoroutine,
 };
+use crate::coroutine::run_coroutine_with_storage;
 #[cfg(feature = "declarative-plans")]
 use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _};
-use crate::coroutine::{run_coroutine_with_storage, IntoGenerator};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef};
 use crate::kernel_predicates::{
@@ -930,19 +930,14 @@ impl Scan {
     #[internal_api]
     pub(crate) fn scan_metadata_workflow(
         &self,
-    ) -> Coroutine<
-        '_,
-        impl IntoGenerator<Request, Item = DeltaResult<ScanMetadata>, Output = ()> + 'static,
-    > {
+    ) -> Coroutine<'_, impl DeltaResultGenerator<ScanMetadata> + 'static> {
         coroutine!(async move |channel| { self.scan_metadata_with_channel(channel).await })
     }
 
     async fn scan_metadata_with_channel(
         &self,
         channel: &Channel,
-    ) -> DeltaResult<
-        impl IntoGenerator<Request, Item = DeltaResult<ScanMetadata>, Output = ()> + 'static,
-    > {
+    ) -> DeltaResult<impl DeltaResultGenerator<ScanMetadata> + 'static> {
         let actions_with_checkpoint_info =
             self.replay_for_scan_metadata_with_channel(channel).await?;
         self.scan_metadata_inner_with_channel(channel, actions_with_checkpoint_info)
@@ -1132,10 +1127,9 @@ impl Scan {
         &self,
         channel: &Channel,
         actions_with_checkpoint_info: ActionsWithCheckpointInfo<
-            impl IntoGenerator<Request, Item = DeltaResult<ActionsBatch>, Output = ()> + 'a,
+            impl DeltaResultGenerator<ActionsBatch> + 'a,
         >,
-    ) -> DeltaResult<impl IntoGenerator<Request, Item = DeltaResult<ScanMetadata>, Output = ()> + 'a>
-    {
+    ) -> DeltaResult<impl DeltaResultGenerator<ScanMetadata> + 'a> {
         let start = Instant::now();
         let operation_id = MetricId::new();
         let is_catalog_managed = self.snapshot.table_configuration().is_catalog_managed();
@@ -1262,11 +1256,7 @@ impl Scan {
     async fn replay_for_scan_metadata_with_channel(
         &self,
         channel: &Channel,
-    ) -> DeltaResult<
-        ActionsWithCheckpointInfo<
-            impl IntoGenerator<Request, Item = DeltaResult<ActionsBatch>, Output = ()>,
-        >,
-    > {
+    ) -> DeltaResult<ActionsWithCheckpointInfo<impl DeltaResultGenerator<ActionsBatch>>> {
         let (checkpoint_schema, meta_predicate, physical_stats_schema) =
             self.checkpoint_read_options();
         // Checkpoints already represent reconciled state, so scans project only Add actions. This

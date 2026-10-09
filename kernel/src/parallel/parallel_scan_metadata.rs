@@ -5,11 +5,12 @@ use delta_kernel_derive::internal_api;
 use tracing::{info_span, Instrument as _, Span};
 
 use crate::coroutine::engine::{EngineConnector, EngineResultGeneratorIterator};
-use crate::coroutine::generator::{AsyncIntoIterator as _, IntoGenerator};
+use crate::coroutine::generator::AsyncIntoIterator as _;
 use crate::coroutine::kernel::{
-    static_coroutine, Channel, GeneratorCoroutineStep, StaticCoroutine, StaticGeneratorCoroutine,
+    static_coroutine, Channel, DeltaResultGenerator, GeneratorCoroutineStep, StaticCoroutine,
+    StaticGeneratorCoroutine,
 };
-use crate::coroutine::{run_coroutine_with_engine, DeltaFuture, Request};
+use crate::coroutine::{run_coroutine_with_engine, DeltaFuture};
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
@@ -50,11 +51,7 @@ pub struct SequentialScanMetadata {
 
 impl SequentialScanMetadata {
     pub(crate) fn new(
-        sequential: impl IntoGenerator<
-                Request,
-                Item = DeltaResult<ScanMetadata>,
-                Output = DeltaResult<AfterSequential>,
-            > + 'static,
+        sequential: impl DeltaResultGenerator<ScanMetadata, DeltaResult<AfterSequential>> + 'static,
         correlation_id: Option<Arc<str>>,
     ) -> Self {
         Self {

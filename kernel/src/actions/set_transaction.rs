@@ -3,10 +3,10 @@ use crate::actions::visitors::SetTransactionVisitor;
 use crate::actions::{SetTransaction, LOG_TXN_SCHEMA};
 #[cfg(test)]
 use crate::coroutine::iterate_prepared_result_generator_with_engine;
-use crate::coroutine::kernel::{Channel, Request};
+use crate::coroutine::kernel::{Channel, DeltaResultGenerator};
 #[cfg(test)]
 use crate::coroutine::run_coroutine_with_engine;
-use crate::coroutine::{GeneratorExt as _, IntoGenerator};
+use crate::coroutine::GeneratorExt as _;
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 #[cfg(test)]
@@ -132,7 +132,7 @@ fn replay_for_app_ids(
 async fn replay_for_app_ids_with_channel(
     log_segment: &LogSegment,
     channel: &Channel,
-) -> DeltaResult<impl IntoGenerator<Request, Item = DeltaResult<ActionsBatch>, Output = ()>> {
+) -> DeltaResult<impl DeltaResultGenerator<ActionsBatch>> {
     log_segment
         .read_actions_with_channel(channel, LOG_TXN_SCHEMA.clone())
         .await

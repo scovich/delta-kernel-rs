@@ -12,9 +12,9 @@ use super::scan_file::scan_metadata_to_scan_file;
 use super::{CdfMode, TableChanges};
 use crate::actions::deletion_vector::split_vector;
 use crate::coroutine::generator::{map_async_witness, GeneratorExt as _};
-use crate::coroutine::kernel::{Channel, Request};
+use crate::coroutine::kernel::{Channel, DeltaResultGenerator};
 use crate::coroutine::{
-    iterate_prepared_result_generator_with_engine, AsyncOption as _, ChannelExt as _, IntoGenerator,
+    iterate_prepared_result_generator_with_engine, AsyncOption as _, ChannelExt as _,
 };
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
 use crate::scan::state_info::StateInfo;
@@ -281,9 +281,7 @@ async fn read_scan_file_with_channel(
     table_root: &Url,
     state_info: &StateInfo,
     _physical_predicate: Option<PredicateRef>,
-) -> DeltaResult<
-    impl IntoGenerator<Request, Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + 'static,
-> {
+) -> DeltaResult<impl DeltaResultGenerator<Box<dyn EngineData>> + 'static> {
     let ResolvedCdfScanFile {
         scan_file,
         mut selection_vector,

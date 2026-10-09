@@ -20,12 +20,12 @@ use crate::committer::{
 };
 use crate::coroutine::generator::{map_async_witness, AsyncIntoIterator as _, GeneratorExt as _};
 use crate::coroutine::kernel::request::EvaluationInput;
-use crate::coroutine::kernel::{Channel, Request};
+use crate::coroutine::kernel::Channel;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::coroutine::AsyncOption as _;
 use crate::coroutine::{
     iterate_prepared_result_generator_with_engine, run_coroutine_with_engine, ChannelExt as _,
-    DeltaResultGenerator, IntoGenerator,
+    DeltaResultGenerator,
 };
 use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
@@ -1705,9 +1705,7 @@ impl<S> Transaction<S> {
         channel: &Channel,
         remove_files_metadata: impl Iterator<Item = Arc<FilteredEngineData>> + Send + 'static,
         has_dv_update_columns: bool,
-    ) -> DeltaResult<
-        impl IntoGenerator<Request, Item = DeltaResult<FilteredEngineData>, Output = ()> + 'static,
-    > {
+    ) -> DeltaResult<impl DeltaResultGenerator<FilteredEngineData> + 'static> {
         // Create-table transactions should not have any remove actions.
         // Only error if there are actually files queued for removal.
         if self.is_create_table() && !self.remove_files_metadata.is_empty() {

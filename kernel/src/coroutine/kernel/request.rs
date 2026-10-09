@@ -11,8 +11,8 @@ use bytes::Bytes;
 use derive_more::{Constructor, From};
 use url::Url;
 
+use super::StaticGeneratorCoroutine;
 use crate::committer::PublishMetadata;
-use crate::coroutine::generator::StaticGeneratorCoroutine;
 use crate::coroutine::{PageRequest, PagedOperation, PlanOperation, Reply};
 use crate::engine_data::EngineData;
 use crate::expressions::{ExpressionRef, PredicateRef, Scalar};
@@ -465,7 +465,7 @@ pub struct WriteJsonFile {
     /// Existing-destination behavior.
     pub mode: FileWriteMode,
     /// Row batches to serialize in generator order.
-    pub input: StaticGeneratorCoroutine<Request, FilteredEngineData>,
+    pub input: StaticGeneratorCoroutine<FilteredEngineData>,
 }
 
 /// Writes row batches to one Parquet file.
@@ -474,7 +474,7 @@ pub struct WriteParquetFile {
     /// Destination URL.
     pub url: Url,
     /// Row batches to serialize in generator order.
-    pub input: StaticGeneratorCoroutine<Request, Box<dyn EngineData>>,
+    pub input: StaticGeneratorCoroutine<Box<dyn EngineData>>,
 }
 
 /// Writes one row stream to connector-selected Parquet files.
@@ -483,7 +483,7 @@ pub struct WriteParquetFiles {
     /// Connector-owned file placement and sizing policy.
     pub write: ParquetMultiFileWrite,
     /// Row batches to serialize in generator order and their opaque terminal state.
-    pub input: StaticGeneratorCoroutine<Request, Box<dyn EngineData>, WriteParquetFilesState>,
+    pub input: StaticGeneratorCoroutine<Box<dyn EngineData>, WriteParquetFilesState>,
 }
 
 /// Write the bytes of one complete storage object to the specified destination URL.

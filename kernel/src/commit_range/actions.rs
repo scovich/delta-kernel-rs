@@ -8,8 +8,8 @@ use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::actions::{Metadata, Protocol, COMMIT_INFO_FIELD, METADATA_FIELD, PROTOCOL_FIELD};
 use crate::commit_range::with_version_context;
 use crate::coroutine::engine::EngineConnector;
-use crate::coroutine::kernel::{coroutine, Channel, Coroutine, Request};
-use crate::coroutine::{ChannelExt as _, GeneratorExt as _, IntoGenerator};
+use crate::coroutine::kernel::{coroutine, Channel, Coroutine, DeltaResultGenerator};
+use crate::coroutine::{ChannelExt as _, GeneratorExt as _};
 use crate::engine_data::RowVisitor as _;
 use crate::path::ParsedLogPath;
 use crate::schema::{lazy_schema_ref, SchemaRef};
@@ -233,10 +233,7 @@ impl CommitAction {
     #[internal_api]
     pub(crate) fn get_actions_coroutine(
         &self,
-    ) -> Coroutine<
-        '_,
-        impl IntoGenerator<Request, Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + 'static,
-    > {
+    ) -> Coroutine<'_, impl DeltaResultGenerator<Box<dyn EngineData>> + 'static> {
         coroutine!(async move |channel| self.get_actions_generator(channel).await)
     }
 
@@ -245,9 +242,7 @@ impl CommitAction {
     pub(crate) async fn get_actions_generator(
         &self,
         channel: &Channel,
-    ) -> DeltaResult<
-        impl IntoGenerator<Request, Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + 'static,
-    > {
+    ) -> DeltaResult<impl DeltaResultGenerator<Box<dyn EngineData>> + 'static> {
         let pages = channel
             .prepare_json_files(
                 slice::from_ref(&self.log_path.location),
