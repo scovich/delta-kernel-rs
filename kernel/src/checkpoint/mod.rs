@@ -120,11 +120,13 @@ use crate::actions::{
 };
 use crate::coroutine::engine::EngineConnector;
 use crate::coroutine::generator::{
-    map_async, static_generator_coroutine, AsyncIntoIterator as _, Generator, GeneratorExt as _,
-    GeneratorStep, IntoGenerator,
+    map_async, AsyncIntoIterator as _, Generator, GeneratorExt as _, GeneratorStep,
 };
 use crate::coroutine::kernel::request::{FileWriteMode, WriteParquetFile, WriteParquetFiles};
-use crate::coroutine::kernel::{coroutine, Channel, Coroutine, Request, StaticGeneratorCoroutine};
+use crate::coroutine::kernel::{
+    coroutine, static_generator_coroutine, Channel, Coroutine, DeltaResultGenerator,
+    StaticGeneratorCoroutine,
+};
 use crate::coroutine::{run_coroutine_with_engine, AsyncBool as _, ChannelExt as _};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ExpressionRef, Scalar, StructData};
@@ -494,11 +496,7 @@ impl CheckpointWriter {
         &self,
     ) -> Coroutine<
         '_,
-        impl IntoGenerator<
-                Request,
-                Item = DeltaResult<FilteredEngineData>,
-                Output = ActionReconciliationIteratorState,
-            > + 'static,
+        impl DeltaResultGenerator<FilteredEngineData, ActionReconciliationIteratorState> + 'static,
     > {
         coroutine!(async move |channel| {
             let state = ActionReconciliationIteratorState::default();
@@ -511,9 +509,7 @@ impl CheckpointWriter {
         &self,
         channel: &Channel,
         state: S,
-    ) -> DeltaResult<
-        impl IntoGenerator<Request, Item = DeltaResult<FilteredEngineData>, Output = S> + 'static,
-    >
+    ) -> DeltaResult<impl DeltaResultGenerator<FilteredEngineData, S> + 'static>
     where
         S: Borrow<ActionReconciliationIteratorState> + Send + 'static,
     {
@@ -525,7 +521,7 @@ impl CheckpointWriter {
         &self,
         channel: &Channel,
     ) -> DeltaResult<(
-        impl IntoGenerator<Request, Item = DeltaResult<FilteredEngineData>, Output = ()> + 'static,
+        impl DeltaResultGenerator<FilteredEngineData> + 'static,
         Arc<ActionReconciliationIteratorState>,
     )> {
         let state = Arc::new(ActionReconciliationIteratorState::default());
@@ -538,10 +534,7 @@ impl CheckpointWriter {
     async fn checkpoint_data_actions_with_channel(
         &self,
         channel: &Channel,
-    ) -> DeltaResult<
-        impl IntoGenerator<Request, Item = DeltaResult<ActionReconciliationBatch>, Output = ()>
-            + 'static,
-    > {
+    ) -> DeltaResult<impl DeltaResultGenerator<ActionReconciliationBatch> + 'static> {
         // Read actions from log segment
         let actions = self
             .snapshot
@@ -619,7 +612,7 @@ impl CheckpointWriter {
         })
     }
 
-    async fn finalize_with_channel(
+    pub(crate) async fn finalize_with_channel(
         self,
         channel: &Channel,
         last_checkpoint_stats: &LastCheckpointHintStats,
@@ -660,21 +653,7 @@ impl CheckpointWriter {
         Ok(())
     }
 
-    pub(crate) fn write_v2_checkpoint_with_sidecars(
-        &self,
-        engine: &dyn Engine,
-        file_actions_per_sidecar_hint: Option<NonZero<usize>>,
-    ) -> DeltaResult<WrittenCheckpointInfo> {
-        run_coroutine_with_engine!(engine, async move |channel| {
-            self.write_v2_checkpoint_with_sidecars_with_channel(
-                channel,
-                file_actions_per_sidecar_hint,
-            )
-            .await
-        })
-    }
-
-    async fn write_v2_checkpoint_with_sidecars_with_channel(
+    pub(crate) async fn write_v2_checkpoint_with_sidecars_with_channel(
         &self,
         channel: &Channel,
         file_actions_per_sidecar_hint: Option<NonZero<usize>>,
@@ -753,17 +732,7 @@ impl CheckpointWriter {
 
     /// Writes a checkpoint without sidecars, will automatically choose V1 or V2
     /// based on the table features.
-    pub(crate) fn write_checkpoint_without_sidecars(
-        &self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<WrittenCheckpointInfo> {
-        run_coroutine_with_engine!(engine, async move |channel| {
-            self.write_checkpoint_without_sidecars_with_channel(channel)
-                .await
-        })
-    }
-
-    async fn write_checkpoint_without_sidecars_with_channel(
+    pub(crate) async fn write_checkpoint_without_sidecars_with_channel(
         &self,
         channel: &Channel,
     ) -> DeltaResult<WrittenCheckpointInfo> {
@@ -774,7 +743,7 @@ impl CheckpointWriter {
         let lazy_data = data_iter
             .map(|r: DeltaResult<FilteredEngineData>| r.and_then(|f| f.apply_selection_vector()));
         // Adapt to the sink's infallible-item/unit-output contract by promoting item errors.
-        let lazy_data = static_generator_coroutine!(Request, async move |channel| {
+        let lazy_data = static_generator_coroutine!(async move |channel| {
             let mut lazy_data = lazy_data.bind(&channel);
             loop {
                 match poll_fn(|context| Pin::new(&mut lazy_data).poll_step(context)).await? {
