@@ -32,7 +32,7 @@ pub enum AfterSequentialScanMetadata {
 /// This phase processes commits and single-part checkpoint manifests sequentially.
 /// After exhaustion, call `finish()` to get the result which indicates whether
 /// a distributed phase is needed.
-pub struct SequentialScanMetadata {
+pub struct SequentialScanMetadataIterator {
     pub(crate) sequential: SequentialPhase,
     operation_id: MetricId,
     /// Opaque, caller-supplied correlation id propagated to both phases' metric events.
@@ -41,7 +41,7 @@ pub struct SequentialScanMetadata {
     span: Span,
 }
 
-impl SequentialScanMetadata {
+impl SequentialScanMetadataIterator {
     pub(crate) fn new(sequential: SequentialPhase, correlation_id: Option<Arc<str>>) -> Self {
         let operation_id = MetricId::new();
         Self {
@@ -57,50 +57,65 @@ impl SequentialScanMetadata {
 
     pub fn finish(self) -> DeltaResult<AfterSequentialScanMetadata> {
         let _guard = self.span.enter();
-        match self.sequential.finish()? {
-            AfterSequential::Done(processor) => {
-                let event = processor.get_metrics().to_event(
-                    self.operation_id,
-                    processor.is_catalog_managed(),
-                    self.correlation_id,
-                    ScanType::SequentialPhase,
-                    self.start.elapsed(),
-                );
-                processor
-                    .get_metrics()
-                    .log("Sequential scan metadata completed");
-                emit_scan_metadata_completed(&event);
-                Ok(AfterSequentialScanMetadata::Done)
-            }
-            AfterSequential::Parallel { processor, files } => {
-                let event = processor.get_metrics().to_event(
-                    self.operation_id,
-                    processor.is_catalog_managed(),
-                    self.correlation_id.clone(),
-                    ScanType::SequentialPhase,
-                    self.start.elapsed(),
-                );
-                processor
-                    .get_metrics()
-                    .log("Sequential scan metadata completed");
-                emit_scan_metadata_completed(&event);
-                processor.get_metrics().reset_counters();
+        let after = self.sequential.finish()?;
+        Ok(finish_sequential_scan_metadata(
+            after,
+            self.operation_id,
+            self.correlation_id,
+            self.start,
+        ))
+    }
+}
 
-                Ok(AfterSequentialScanMetadata::Parallel {
-                    state: Box::new(ParallelState {
-                        inner: processor,
-                        operation_id: self.operation_id,
-                        correlation_id: self.correlation_id,
-                        parallel_start: Instant::now(),
-                    }),
-                    files,
-                })
+fn finish_sequential_scan_metadata(
+    after: AfterSequential,
+    operation_id: MetricId,
+    correlation_id: Option<Arc<str>>,
+    start: Instant,
+) -> AfterSequentialScanMetadata {
+    match after {
+        AfterSequential::Done(processor) => {
+            let event = processor.get_metrics().to_event(
+                operation_id,
+                processor.is_catalog_managed(),
+                correlation_id,
+                ScanType::SequentialPhase,
+                start.elapsed(),
+            );
+            processor
+                .get_metrics()
+                .log("Sequential scan metadata completed");
+            emit_scan_metadata_completed(&event);
+            AfterSequentialScanMetadata::Done
+        }
+        AfterSequential::Parallel { processor, files } => {
+            let event = processor.get_metrics().to_event(
+                operation_id,
+                processor.is_catalog_managed(),
+                correlation_id.clone(),
+                ScanType::SequentialPhase,
+                start.elapsed(),
+            );
+            processor
+                .get_metrics()
+                .log("Sequential scan metadata completed");
+            emit_scan_metadata_completed(&event);
+            processor.get_metrics().reset_counters();
+
+            AfterSequentialScanMetadata::Parallel {
+                state: Box::new(ParallelState {
+                    inner: processor,
+                    operation_id,
+                    correlation_id,
+                    parallel_start: Instant::now(),
+                }),
+                files,
             }
         }
     }
 }
 
-impl Iterator for SequentialScanMetadata {
+impl Iterator for SequentialScanMetadataIterator {
     type Item = DeltaResult<ScanMetadata>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -242,12 +257,12 @@ impl ParallelState {
     }
 }
 
-pub struct ParallelScanMetadata {
+pub struct ParallelScanMetadataIterator {
     pub(crate) processor: ParallelPhase<Arc<ParallelState>>,
     span: Span,
 }
 
-impl ParallelScanMetadata {
+impl ParallelScanMetadataIterator {
     pub fn try_new(
         engine: Arc<dyn Engine>,
         state: Arc<ParallelState>,
@@ -260,20 +275,9 @@ impl ParallelScanMetadata {
             span: info_span!("parallel_scan_metadata"),
         })
     }
-
-    pub fn new_from_iter(
-        state: Arc<ParallelState>,
-        iter: impl IntoIterator<Item = DeltaResult<Box<dyn EngineData>>, IntoIter: Send + 'static>,
-    ) -> Self {
-        Self {
-            processor: ParallelPhase::new_from_iter(state.clone(), iter),
-            // TODO: Associate the same scan ID from sequential phase to correlate phases
-            span: info_span!("parallel_scan_metadata"),
-        }
-    }
 }
 
-impl Iterator for ParallelScanMetadata {
+impl Iterator for ParallelScanMetadataIterator {
     type Item = DeltaResult<ScanMetadata>;
 
     fn next(&mut self) -> Option<Self::Item> {

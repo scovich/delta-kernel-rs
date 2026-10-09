@@ -24,7 +24,9 @@ use delta_kernel::expressions::{
 };
 use delta_kernel::metrics::{MetricEvent, ScanType};
 use delta_kernel::object_store::local::LocalFileSystem;
-use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata, Scan, StatsOptions};
+use delta_kernel::scan::{
+    AfterSequentialScanMetadata, ParallelScanMetadataIterator, Scan, StatsOptions,
+};
 use delta_kernel::schema::{schema, schema_ref, DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
@@ -133,8 +135,11 @@ fn collect_scan_paths(
         if let AfterSequentialScanMetadata::Parallel { state, files } = sequential.finish()? {
             let state = Arc::from(state);
             for file in files {
-                let parallel =
-                    ParallelScanMetadata::try_new(engine.clone(), Arc::clone(&state), vec![file])?;
+                let parallel = ParallelScanMetadataIterator::try_new(
+                    engine.clone(),
+                    Arc::clone(&state),
+                    vec![file],
+                )?;
                 for sm in parallel {
                     paths = sm?.visit_scan_files(paths, push_path)?;
                 }

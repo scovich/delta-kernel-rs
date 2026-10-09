@@ -14,30 +14,27 @@ use itertools::Itertools;
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::scan::CHECKPOINT_READ_SCHEMA;
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, FileMeta};
+use crate::{DeltaResult, Engine, EngineData, FileMeta};
 
-/// Processes checkpoint leaf files in parallel using a shared processor.
+/// Creates iterators that process checkpoint leaf files in parallel using a shared processor.
 ///
-/// This struct is designed for distributed execution where checkpoint leaf files (sidecars or
-/// multi-part checkpoint parts) are partitioned across multiple executors. Each executor creates
-/// its own `ParallelPhase` instance with a subset of files, but all instances share the same
-/// processor (typically wrapped in `Arc`) to coordinate deduplication.
+/// This is designed for distributed execution where checkpoint leaf files (sidecars or multi-part
+/// checkpoint parts) are partitioned across multiple executors. Each executor creates an iterator
+/// with a subset of files, but all iterators share the same processor (typically wrapped in `Arc`)
+/// to coordinate deduplication.
 ///
-/// Implements `Iterator` to yield processed batches. The processor is responsible for filtering
-/// out actions for files already seen in the sequential_phase.
+/// The processor is responsible for filtering out actions for files already seen in the
+/// sequential phase.
 ///
 /// # Example workflow
 /// - Partition leaf files across N executors
-/// - Create one `ParallelPhase<Arc<Processor>>` per executor with its file subset
-/// - Each instance processes its files independently while sharing deduplication state
+/// - Create one iterator per executor with its file subset
+/// - Each iterator processes its files independently while sharing deduplication state
 /// cbindgen:ignore
 #[internal_api]
-pub(crate) struct ParallelPhase<P: ParallelLogReplayProcessor> {
-    processor: P,
-    leaf_checkpoint_reader: DeltaResultIteratorStatic<ActionsBatch>,
-}
+pub(crate) struct ParallelPhase;
 
-impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
+impl ParallelPhase {
     /// Creates a new parallel phase for processing checkpoint leaf files.
     ///
     /// # Parameters
@@ -47,44 +44,38 @@ impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
     /// - `read_schema`: Schema to use for reading checkpoint files
     #[internal_api]
     #[allow(unused)]
-    pub(crate) fn try_new(
+    pub(crate) fn try_new<P>(
         engine: Arc<dyn Engine>,
         processor: P,
         leaf_files: Vec<FileMeta>,
         read_schema: SchemaRef,
-    ) -> DeltaResult<Self> {
-        let leaf_checkpoint_reader = engine
-            .parquet_handler()
-            .read_parquet_files(&leaf_files, read_schema, None)?
-            .map_ok(|batch| ActionsBatch::new(batch, false));
-        Ok(Self {
-            processor,
-            leaf_checkpoint_reader: Box::new(leaf_checkpoint_reader),
-        })
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<P::Output>>>
+    where
+        P: ParallelLogReplayProcessor,
+    {
+        let batches =
+            engine
+                .parquet_handler()
+                .read_parquet_files(&leaf_files, read_schema, None)?;
+        Ok(Self::process_batches(processor, batches))
     }
 
-    /// Creates a new parallel phase from an existing iterator of EngineData.
+    /// Yields processed batches from checkpoint leaf files.
     ///
-    /// Use this constructor when you want to parallelize processing at the row group level.
-    /// Instead of reading entire checkpoint files, you can provide an iterator that yields
-    /// individual row groups, allowing finer-grained parallelization.
+    /// The processor applies filtering logic (e.g. removing files already seen in the sequential
+    /// phase) and returns the processed output.
     ///
-    /// # Parameters
-    /// - `processor`: Shared processor (wrap in `Arc` for distribution across executors)
-    /// - `iter`: Iterator yielding checkpoint action batches, typically from individual row groups
-    #[internal_api]
-    #[allow(unused)]
-    pub(crate) fn new_from_iter(
+    /// # Errors
+    ///
+    /// Yields file-reading, Parquet-parsing, and processor errors.
+    fn process_batches<P>(
         processor: P,
-        iter: impl IntoIterator<Item = DeltaResult<Box<dyn EngineData>>, IntoIter: Send + 'static>,
-    ) -> Self {
-        let leaf_checkpoint_reader = iter
-            .into_iter()
-            .map_ok(|batch| ActionsBatch::new(batch, false));
-        Self {
-            processor,
-            leaf_checkpoint_reader: Box::new(leaf_checkpoint_reader),
-        }
+        batches: impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>,
+    ) -> impl Iterator<Item = DeltaResult<P::Output>>
+    where
+        P: ParallelLogReplayProcessor,
+    {
+        batches.map(move |batch| processor.process_actions_batch(ActionsBatch::new(batch?, false)))
     }
 
     /// Returns the schema used for reading checkpoint files.
@@ -95,27 +86,6 @@ impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
     #[allow(unused)]
     pub(crate) fn file_read_schema() -> SchemaRef {
         CHECKPOINT_READ_SCHEMA.clone()
-    }
-}
-
-/// Yields processed batches from checkpoint leaf files.
-///
-/// Each call to `next()` reads one batch from the checkpoint reader and processes it through
-/// the processor. The processor applies filtering logic (e.g., removing files already seen in
-/// the sequential phase) and returns the processed output.
-///
-/// # Errors
-/// Returns `DeltaResult` errors for:
-/// - File reading failures
-/// - Parquet parsing errors
-/// - Processing errors from the processor
-impl<P: ParallelLogReplayProcessor> Iterator for ParallelPhase<P> {
-    type Item = DeltaResult<P::Output>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.leaf_checkpoint_reader
-            .next()
-            .map(|batch| self.processor.process_actions_batch(batch?))
     }
 }
 
@@ -139,7 +109,7 @@ mod tests {
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
     use crate::parallel::parallel_scan_metadata::{
-        AfterSequentialScanMetadata, ParallelScanMetadata, ParallelState,
+        AfterSequentialScanMetadata, ParallelScanMetadataIterator, ParallelState,
     };
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
     use crate::scan::log_replay::{
@@ -459,7 +429,7 @@ mod tests {
 
                             assert!(!partition_files.is_empty());
 
-                            let mut parallel = ParallelScanMetadata::try_new(
+                            let mut parallel = ParallelScanMetadataIterator::try_new(
                                 engine.clone(),
                                 state,
                                 partition_files,
@@ -534,7 +504,8 @@ mod tests {
         } else {
             Arc::new(*state)
         };
-        let mut parallel = ParallelScanMetadata::try_new(engine.clone(), state.clone(), files)?;
+        let mut parallel =
+            ParallelScanMetadataIterator::try_new(engine.clone(), state.clone(), files)?;
         for sm in parallel.by_ref() {
             sm?;
         }
@@ -1065,7 +1036,7 @@ mod tests {
             AfterSequentialScanMetadata::Parallel { state, files } => {
                 // Verify stats is None in parallel results and collect paths
                 let mut parallel =
-                    ParallelScanMetadata::try_new(engine.clone(), Arc::from(state), files)?;
+                    ParallelScanMetadataIterator::try_new(engine.clone(), Arc::from(state), files)?;
 
                 let parallel_paths = parallel.try_fold(Vec::new(), |acc, metadata_res| {
                     metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
@@ -1160,7 +1131,8 @@ mod tests {
             .expect("expected SequentialPhase ScanMetadataCompleted event after finish()");
 
         let final_state = Arc::new(*state);
-        let mut parallel = ParallelScanMetadata::try_new(engine, final_state.clone(), files)?;
+        let mut parallel =
+            ParallelScanMetadataIterator::try_new(engine, final_state.clone(), files)?;
         for result in parallel.by_ref() {
             result?;
         }

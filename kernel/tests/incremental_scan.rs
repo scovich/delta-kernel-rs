@@ -13,7 +13,7 @@ use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::{col, lit, Predicate as Pred, PredicateRef};
 use delta_kernel::incremental_scan::{
-    IncrementalListing, IncrementalListingAgainstBase, IncrementalScanStream,
+    IncrementalListing, IncrementalListingAgainstBase, IncrementalScanIterator,
     IncrementalScanSummary,
 };
 use delta_kernel::log_replay::FileActionKey;
@@ -66,7 +66,7 @@ fn live_add_count(listing: &IncrementalListing) -> usize {
         .sum()
 }
 
-fn unwrap_listing(result: Option<IncrementalScanStream>) -> IncrementalListing {
+fn unwrap_listing(result: Option<IncrementalScanIterator>) -> IncrementalListing {
     result
         .expect("expected Some(stream), got None (commits unavailable)")
         .into_listing()
@@ -933,7 +933,7 @@ async fn single_commit_split_across_batches_dedups_correctly(
 // stale base entry.
 
 fn unwrap_classified_listing<'a>(
-    result: Option<IncrementalScanStream>,
+    result: Option<IncrementalScanIterator>,
     base_keys: impl IntoIterator<Item = &'a FileActionKey>,
 ) -> IncrementalListingAgainstBase {
     result
