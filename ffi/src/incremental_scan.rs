@@ -34,7 +34,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use delta_kernel::incremental_scan::{IncrementalScanStream, IncrementalScanSummary};
+use delta_kernel::incremental_scan::{IncrementalScanIterator, IncrementalScanSummary};
 use delta_kernel::log_replay::FileActionKey;
 use delta_kernel::snapshot::SnapshotRef;
 use delta_kernel::{DeltaResult, Error, PredicateRef, Version};
@@ -51,7 +51,7 @@ use crate::{
     NullableCvoid, OptionalValue, SharedExternEngine, SharedSnapshot,
 };
 
-/// Opaque builder for constructing an [`IncrementalScanStream`] from a snapshot.
+/// Opaque builder for constructing an [`IncrementalScanIterator`] from a snapshot.
 ///
 /// Create with [`snapshot_incremental_scan_builder`]. Call [`incremental_scan_builder_build`] to
 /// consume the builder and obtain the stream, or [`free_incremental_scan_builder`] to drop it
@@ -73,7 +73,7 @@ pub struct MutableFfiIncrementalScanBuilder;
 /// The engine `Arc` is retained so the JSON reader's runtime outlives the stream even if the
 /// caller drops its own engine handle first.
 pub struct FfiIncrementalScanStream {
-    stream: Mutex<Option<IncrementalScanStream>>,
+    stream: Mutex<Option<IncrementalScanIterator>>,
     engine: Arc<dyn ExternEngine>,
 }
 
@@ -252,7 +252,7 @@ fn incremental_scan_stream_next_arrow_impl(
 
 #[cfg(feature = "default-engine-base")]
 fn next_arrow_batch(
-    stream: &mut IncrementalScanStream,
+    stream: &mut IncrementalScanIterator,
 ) -> DeltaResult<*mut ScanMetadataArrowResult> {
     let Some(filtered) = stream.next().transpose()? else {
         return Ok(std::ptr::null_mut());
@@ -302,7 +302,7 @@ fn incremental_scan_stream_into_summary_impl(
 
 fn lock_stream(
     stream: &FfiIncrementalScanStream,
-) -> DeltaResult<std::sync::MutexGuard<'_, Option<IncrementalScanStream>>> {
+) -> DeltaResult<std::sync::MutexGuard<'_, Option<IncrementalScanIterator>>> {
     stream
         .stream
         .lock()

@@ -64,14 +64,14 @@ use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, Error, FileMeta};
 /// ```
 /// cbindgen:ignore
 #[internal_api]
-pub(crate) struct SequentialPhase {
+pub(crate) struct SequentialPhase<C, M> {
     // The processor that will be used to process the action batches
     processor: ScanLogReplayProcessor,
     // Commit action batches, exhausted before the checkpoint manifest
-    commit_phase: Option<DeltaResultIteratorStatic<ActionsBatch>>,
+    commit_phase: Option<C>,
     // The checkpoint manifest reader that will be used to read the checkpoint manifest files.
     // If the checkpoint is single-part, this will be Some(CheckpointManifestReader).
-    checkpoint_manifest_phase: Option<CheckpointManifestReader>,
+    checkpoint_manifest_phase: Option<M>,
     // Whether the iterator has been fully exhausted
     is_finished: bool,
     // Checkpoint parts for potential parallel phase processing
@@ -91,7 +91,7 @@ pub(crate) enum AfterSequential {
     },
 }
 
-impl SequentialPhase {
+impl SequentialPhase<DeltaResultIteratorStatic<ActionsBatch>, CheckpointManifestReader> {
     /// Create a new sequential phase log replay.
     ///
     /// # Parameters
@@ -181,12 +181,8 @@ impl SequentialPhase {
             })
         }
     }
-}
 
-impl Iterator for SequentialPhase {
-    type Item = DeltaResult<ScanMetadata>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+    fn next_action(&mut self) -> Option<DeltaResult<ActionsBatch>> {
         let next = self
             .commit_phase
             .as_mut()
@@ -201,7 +197,25 @@ impl Iterator for SequentialPhase {
             return None;
         };
 
-        Some(result.and_then(|batch| self.processor.process_actions_batch(batch)))
+        Some(result)
+    }
+}
+
+fn process_action_batch(
+    processor: &mut ScanLogReplayProcessor,
+    batch: DeltaResult<ActionsBatch>,
+) -> DeltaResult<ScanMetadata> {
+    processor.process_actions_batch(batch?)
+}
+
+impl Iterator
+    for SequentialPhase<DeltaResultIteratorStatic<ActionsBatch>, CheckpointManifestReader>
+{
+    type Item = DeltaResult<ScanMetadata>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let result = self.next_action()?;
+        Some(process_action_batch(&mut self.processor, result))
     }
 }
 

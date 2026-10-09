@@ -82,7 +82,7 @@ impl IncrementalScanBuilder {
     ///   references a column absent from the table schema.
     /// - `Err` if the target snapshot's protocol contains an unsupported reader feature.
     /// - `Err` if the engine fails to open the commit stream.
-    pub fn build(self, engine: &dyn Engine) -> DeltaResult<Option<IncrementalScanStream>> {
+    pub fn build(self, engine: &dyn Engine) -> DeltaResult<Option<IncrementalScanIterator>> {
         // TODO(#2493): the version validation, the snapshot-commit-list extraction and
         // clipping below, and the "snapshot covers the range" check should all be replaced
         // by a single `CommitRangeBuilder::from_snapshot(...).build(engine)` call once
@@ -149,7 +149,7 @@ impl IncrementalScanBuilder {
             None,
         )?;
 
-        Ok(Some(IncrementalScanStream {
+        let state = IncrementalScanState {
             base_version: self.base_version,
             target_version,
             actions,
@@ -158,7 +158,8 @@ impl IncrementalScanBuilder {
             live_adds: HashSet::new(),
             removes: HashSet::new(),
             errored: false,
-        }))
+        };
+        Ok(Some(IncrementalScanIterator(state)))
     }
 
     /// Lowers `self.predicate` into the per-batch skipping strategy applied to live Adds.
@@ -208,7 +209,69 @@ enum AddSkipping {
     Filter(Arc<DataSkippingFilter>),
 }
 
-/// Streaming output of an incremental scan over `(base_version, target_version]`.
+struct IncrementalScanState<A> {
+    base_version: Version,
+    target_version: Version,
+    actions: A,
+    add_skipping: AddSkipping,
+    seen_file_keys: HashSet<FileActionKey>,
+    live_adds: HashSet<FileActionKey>,
+    removes: HashSet<FileActionKey>,
+    errored: bool,
+}
+
+impl Iterator for IncrementalScanState<FileDataReadResultIterator> {
+    type Item = DeltaResult<FilteredEngineData>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.errored {
+            return None;
+        }
+        loop {
+            let Some(result) = self.actions.next() else {
+                break None;
+            };
+            match result {
+                Err(e) => {
+                    self.errored = true;
+                    break Some(Err(e));
+                }
+                Ok(batch) => match process_batch(
+                    batch,
+                    &self.add_skipping,
+                    &mut self.seen_file_keys,
+                    &mut self.live_adds,
+                    &mut self.removes,
+                ) {
+                    Ok(Some(filtered)) => break Some(Ok(filtered)),
+                    Ok(None) => continue,
+                    Err(e) => {
+                        self.errored = true;
+                        break Some(Err(e));
+                    }
+                },
+            }
+        }
+    }
+}
+
+impl<A> IncrementalScanState<A> {
+    fn into_summary(self) -> DeltaResult<IncrementalScanSummary> {
+        if self.errored {
+            return Err(Error::generic(
+                "IncrementalScanStream: cannot finish a stream that previously errored",
+            ));
+        }
+        Ok(IncrementalScanSummary {
+            base_version: self.base_version,
+            target_version: self.target_version,
+            live_adds: self.live_adds,
+            removes: self.removes,
+        })
+    }
+}
+
+/// Iterator compatibility adapter for an incremental scan over `(base_version, target_version]`.
 /// Yields live Add batches as [`FilteredEngineData`] in newest-first order via
 /// [`Iterator::next`]; call [`into_summary`] or [`into_listing`] to terminate and recover
 /// the live file-key sets.
@@ -224,50 +287,17 @@ enum AddSkipping {
 ///
 /// [`into_summary`]: Self::into_summary
 /// [`into_listing`]: Self::into_listing
-pub struct IncrementalScanStream {
-    base_version: Version,
-    target_version: Version,
-    actions: FileDataReadResultIterator,
-    add_skipping: AddSkipping,
-    seen_file_keys: HashSet<FileActionKey>,
-    live_adds: HashSet<FileActionKey>,
-    removes: HashSet<FileActionKey>,
-    errored: bool,
-}
+pub struct IncrementalScanIterator(IncrementalScanState<FileDataReadResultIterator>);
 
-impl Iterator for IncrementalScanStream {
+impl Iterator for IncrementalScanIterator {
     type Item = DeltaResult<FilteredEngineData>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.errored {
-            return None;
-        }
-        loop {
-            match self.actions.next()? {
-                Err(e) => {
-                    self.errored = true;
-                    return Some(Err(e));
-                }
-                Ok(batch) => match process_batch(
-                    batch,
-                    &self.add_skipping,
-                    &mut self.seen_file_keys,
-                    &mut self.live_adds,
-                    &mut self.removes,
-                ) {
-                    Ok(Some(filtered)) => return Some(Ok(filtered)),
-                    Ok(None) => continue,
-                    Err(e) => {
-                        self.errored = true;
-                        return Some(Err(e));
-                    }
-                },
-            }
-        }
+        self.0.next()
     }
 }
 
-impl IncrementalScanStream {
+impl IncrementalScanIterator {
     /// Drain any unread batches, then return the live file-key sets without applying
     /// cross-snapshot dedup. Consumers can intersect these against whatever base
     /// data structure they prefer.
@@ -285,22 +315,12 @@ impl IncrementalScanStream {
     ///   `next()` returned `Err`. Rebuild to retry the latter; the former indicates table
     ///   corruption.
     pub fn into_summary(mut self) -> DeltaResult<IncrementalScanSummary> {
-        if self.errored {
-            return Err(Error::generic(
-                "IncrementalScanStream: cannot finish a stream that previously errored",
-            ));
-        }
         // Drain anything the consumer didn't pull. `self.next()` propagates errors via
         // `Some(Err(_))` and sets `errored`; the `?` below surfaces them.
         for item in self.by_ref() {
             item?;
         }
-        Ok(IncrementalScanSummary {
-            base_version: self.base_version,
-            target_version: self.target_version,
-            live_adds: self.live_adds,
-            removes: self.removes,
-        })
+        self.0.into_summary()
     }
 
     /// Eager helper: collect every live Add batch into a [`Vec`], then call
@@ -446,20 +466,20 @@ impl IncrementalScanStream {
     }
 }
 
-impl std::fmt::Debug for IncrementalScanStream {
+impl std::fmt::Debug for IncrementalScanIterator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IncrementalScanStream")
-            .field("base_version", &self.base_version)
-            .field("target_version", &self.target_version)
-            .field("live_adds", &self.live_adds.len())
-            .field("removes", &self.removes.len())
-            .field("errored", &self.errored)
+        f.debug_struct("IncrementalScanIterator")
+            .field("base_version", &self.0.base_version)
+            .field("target_version", &self.0.target_version)
+            .field("live_adds", &self.0.live_adds.len())
+            .field("removes", &self.0.removes.len())
+            .field("errored", &self.0.errored)
             .finish()
     }
 }
 
 /// Live file-key sets without cross-snapshot classification, returned by
-/// [`IncrementalScanStream::into_summary`].
+/// [`IncrementalScanIterator::into_summary`].
 ///
 /// Each set element is a [`FileActionKey`] of `(path, dv_unique_id)`. Consumers should match
 /// on the full key rather than just the path: the same path with different DV ids (e.g. an
@@ -480,7 +500,7 @@ pub struct IncrementalScanSummary {
     pub removes: HashSet<FileActionKey>,
 }
 
-/// Eager output of [`IncrementalScanStream::into_listing`]: the buffered Add
+/// Eager output of [`IncrementalScanIterator::into_listing`]: the buffered Add
 /// batches plus the summary (no cross-snapshot classification).
 #[non_exhaustive]
 pub struct IncrementalListing {
@@ -501,7 +521,7 @@ impl std::fmt::Debug for IncrementalListing {
 }
 
 /// Cross-snapshot-classified file-key sets, returned by
-/// [`IncrementalScanStream::into_summary_against_base_iter`] (or its closure variant).
+/// [`IncrementalScanIterator::into_summary_against_base_iter`] (or its closure variant).
 ///
 /// To advance a delta-on-base file listing cache, append the streamed Add batches to
 /// the delta layer and use the union `removes U duplicate_adds` as the remove-mask
@@ -525,7 +545,7 @@ pub struct IncrementalScanSummaryAgainstBase {
     pub removes: HashSet<FileActionKey>,
 }
 
-/// Eager output of [`IncrementalScanStream::into_listing_against_base_iter`] (or its
+/// Eager output of [`IncrementalScanIterator::into_listing_against_base_iter`] (or its
 /// closure variant): the buffered
 /// Add batches plus the classified summary.
 #[non_exhaustive]

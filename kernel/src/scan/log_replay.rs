@@ -311,34 +311,37 @@ impl ScanLogReplayProcessor {
             )
         };
 
+        // Commit transform: parse JSON for stats, MapToStruct for partition values
+        let commit_transform = engine.evaluation_handler().new_expression_evaluator(
+            COMMIT_READ_SCHEMA.clone(),
+            get_add_transform_expr(
+                stats_schema_for_transform.clone(),
+                false,
+                skip_stats,
+                synthesize_json,
+                partition_schema_for_transform.clone(),
+                false,
+            ),
+            output_schema.clone().into(),
+        )?;
+        // Checkpoint transform: read pre-parsed columns directly when available
+        let checkpoint_transform = engine.evaluation_handler().new_expression_evaluator(
+            checkpoint_read_schema,
+            get_add_transform_expr(
+                stats_schema_for_transform,
+                has_stats_parsed,
+                skip_stats,
+                synthesize_json,
+                partition_schema_for_transform,
+                has_partition_values_parsed,
+            ),
+            output_schema.into(),
+        )?;
+
         Ok(Self {
             data_skipping_filter,
-            // Commit transform: parse JSON for stats, MapToStruct for partition values
-            commit_transform: engine.evaluation_handler().new_expression_evaluator(
-                COMMIT_READ_SCHEMA.clone(),
-                get_add_transform_expr(
-                    stats_schema_for_transform.clone(),
-                    false,
-                    skip_stats,
-                    synthesize_json,
-                    partition_schema_for_transform.clone(),
-                    false,
-                ),
-                output_schema.clone().into(),
-            )?,
-            // Checkpoint transform: read pre-parsed columns directly when available
-            checkpoint_transform: engine.evaluation_handler().new_expression_evaluator(
-                checkpoint_read_schema,
-                get_add_transform_expr(
-                    stats_schema_for_transform,
-                    has_stats_parsed,
-                    skip_stats,
-                    synthesize_json,
-                    partition_schema_for_transform,
-                    has_partition_values_parsed,
-                ),
-                output_schema.into(),
-            )?,
+            commit_transform,
+            checkpoint_transform,
             seen_file_keys,
             state_info,
             stats_options,
@@ -540,8 +543,8 @@ impl ScanLogReplayProcessor {
             .filter_map(|(selected, size)| (*selected).then_some(size))
             .collect();
         let actions = actions.apply_selection_vector(dedup_selection)?;
-        let (transformed_actions, final_selection) =
-            self.transform_and_data_skip(actions.as_ref(), is_log_batch)?;
+        let transformed = self.transform_and_data_skip(actions.as_ref(), is_log_batch);
+        let (transformed_actions, final_selection) = transformed?;
         Ok(RetryTransformAndDataSkipOutput {
             transformed_actions,
             final_selection,
@@ -971,17 +974,17 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
         // This step transforms all Adds, including those superseded by Removes (dead Adds).
         // The transform for a dead Add may fail because it may have a different partition column
         // type. In that case, we get a ParseError and retry after deduplication.
-        let (pre_dedup_transform_result, pre_dedup_selection) =
-            match self.transform_and_data_skip(actions.as_ref(), is_log_batch) {
-                Ok((transformed_actions, pre_dedup_selection)) => {
-                    (Ok(transformed_actions), pre_dedup_selection)
-                }
-                Err(err @ Error::ParseError(_, _)) => {
-                    should_retry_transform_and_data_skip = true;
-                    (Err(err), vec![true; actions.len()])
-                }
-                Err(err) => return Err(err),
-            };
+        let transformed = self.transform_and_data_skip(actions.as_ref(), is_log_batch);
+        let (pre_dedup_transform_result, pre_dedup_selection) = match transformed {
+            Ok((transformed_actions, pre_dedup_selection)) => {
+                (Ok(transformed_actions), pre_dedup_selection)
+            }
+            Err(err @ Error::ParseError(_, _)) => {
+                should_retry_transform_and_data_skip = true;
+                (Err(err), vec![true; actions.len()])
+            }
+            Err(err) => return Err(err),
+        };
 
         // Step 2: Run deduplication visitor on RAW batch (needs add.path, remove.path, etc.)
         let deduplicator = CheckpointDeduplicator::try_new(
@@ -1014,13 +1017,14 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
         } = if should_retry_transform_and_data_skip {
             // If step 1 failed with a parse error, filter out the dead Adds and retry after
             // deduplication.
-            self.retry_transform_and_data_skip(
+            let retry = self.retry_transform_and_data_skip(
                 actions,
                 is_log_batch,
                 dedup_selection,
                 row_transform_exprs,
                 active_add_file_sizes,
-            )?
+            );
+            retry?
         } else {
             RetryTransformAndDataSkipOutput {
                 transformed_actions: pre_dedup_transform_result?,
@@ -1074,17 +1078,17 @@ impl ScanLogReplayProcessor {
         // with ISNULL guards that keep rows with missing stats. For partition values, the
         // predicate is wrapped with OR(NOT is_add, pred) via guard_for_removes, so non-Add
         // rows always pass the partition filter regardless of null partition values.
-        let (pre_dedup_transform_result, pre_dedup_selection) =
-            match self.transform_and_data_skip(actions.as_ref(), is_log_batch) {
-                Ok((transformed_actions, pre_dedup_selection)) => {
-                    (Ok(transformed_actions), pre_dedup_selection)
-                }
-                Err(err @ Error::ParseError(_, _)) => {
-                    should_retry_transform_and_data_skip = true;
-                    (Err(err), vec![true; actions.len()])
-                }
-                Err(err) => return Err(err),
-            };
+        let transformed = self.transform_and_data_skip(actions.as_ref(), is_log_batch);
+        let (pre_dedup_transform_result, pre_dedup_selection) = match transformed {
+            Ok((transformed_actions, pre_dedup_selection)) => {
+                (Ok(transformed_actions), pre_dedup_selection)
+            }
+            Err(err @ Error::ParseError(_, _)) => {
+                should_retry_transform_and_data_skip = true;
+                (Err(err), vec![true; actions.len()])
+            }
+            Err(err) => return Err(err),
+        };
 
         // Step 2: Run deduplication visitor on RAW batch (needs add.path, remove.path, etc.)
         let deduplicator = FileActionDeduplicator::new(
@@ -1120,13 +1124,14 @@ impl ScanLogReplayProcessor {
         } = if should_retry_transform_and_data_skip {
             // If step 1 failed with a parse error, filter out the dead Adds and retry after
             // deduplication.
-            self.retry_transform_and_data_skip(
+            let retry = self.retry_transform_and_data_skip(
                 actions,
                 is_log_batch,
                 dedup_selection,
                 row_transform_exprs,
                 active_add_file_sizes,
-            )?
+            );
+            retry?
         } else {
             RetryTransformAndDataSkipOutput {
                 transformed_actions: pre_dedup_transform_result?,

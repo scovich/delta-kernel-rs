@@ -53,7 +53,7 @@ let maybe_stream = target
 # }
 ```
 
-`build()` returns `Option<IncrementalScanStream>`, not the stream directly. The next section
+`build()` returns `Option<IncrementalScanIterator>`, not the iterator directly. The next section
 explains why.
 
 ### Handle `None`: fall back to a full scan
@@ -72,8 +72,8 @@ from a full scan:
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::{DeltaResult, Snapshot};
-# use delta_kernel::incremental_scan::IncrementalScanStream;
-# fn consume(_: IncrementalScanStream) {}
+# use delta_kernel::incremental_scan::IncrementalScanIterator;
+# fn consume(_: IncrementalScanIterator) {}
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
@@ -101,7 +101,7 @@ match target.clone().incremental_scan_builder(base_version).build(&engine)? {
 
 ## Consuming the stream
 
-`IncrementalScanStream` yields the live added files as `FilteredEngineData` batches, newest
+`IncrementalScanIterator` yields the live added files as `FilteredEngineData` batches, newest
 commit first. A `FilteredEngineData` pairs a data batch with a selection vector, so respect
 the selection vector when reading. Each batch is a raw commit action batch, one row per action.
 Only the rows the selection vector marks active are live Adds. Every other row is present but
