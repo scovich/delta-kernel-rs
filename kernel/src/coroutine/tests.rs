@@ -17,8 +17,8 @@ use url::Url;
 
 use super::engine::{drive_with_engine, run_coroutine_with_connector, EngineConnector};
 use super::generator::{
-    empty, from_iter, generator, map_async, static_generator_coroutine, GeneratorExt as _,
-    GeneratorStep,
+    empty, generator, map_async_witness, static_generator_coroutine, AsyncIntoIterator as _,
+    GeneratorExt as _, GeneratorStep,
 };
 use super::kernel::request::{BackwardListing, ForwardListing, ListingBounds};
 use super::kernel::{
@@ -30,7 +30,7 @@ use crate::metrics::MetricEvent;
 use crate::unit_test_utils::{
     assert_result_error_with_message, install_thread_local_metrics_reporter, CapturingReporter,
 };
-use crate::{DeltaResult, DeltaResultIteratorStatic, Error};
+use crate::{DeltaResult, Error};
 
 /// Connector action after the toy coroutine's single `ReadSmallFile` request.
 #[derive(Clone, Copy)]
@@ -152,30 +152,6 @@ async fn async_generator_resumes_after_cross_task_reply() {
     };
     reply_task.await.unwrap();
     assert_eq!(output, 8);
-}
-
-#[test]
-fn iterator_generator_is_lazy_and_stops_at_first_error() {
-    let polls = Arc::new(AtomicUsize::new(0));
-    let iterator_polls = Arc::clone(&polls);
-    let items: DeltaResultIteratorStatic<usize> = Box::new(std::iter::from_fn(move || {
-        match iterator_polls.fetch_add(1, Ordering::Relaxed) {
-            0 => Some(Ok(1)),
-            1 => Some(Err(Error::generic("iterator failed"))),
-            _ => panic!("generator polled past the first error"),
-        }
-    }));
-    let mut generator = StaticGeneratorCoroutine::from_iterator(items);
-
-    assert_eq!(polls.load(Ordering::Relaxed), 0);
-    let GeneratorCoroutineStep::Yield(item) = generator.try_advance().unwrap() else {
-        panic!("generator did not yield the first item");
-    };
-    assert_eq!(item, 1);
-    assert_eq!(polls.load(Ordering::Relaxed), 1);
-
-    assert_result_error_with_message(generator.try_advance(), "iterator failed");
-    assert_eq!(polls.load(Ordering::Relaxed), 2);
 }
 
 #[test]
@@ -530,8 +506,8 @@ fn parent_intercepts_child_items_while_child_io_reaches_connector() {
 }
 
 #[test]
-fn from_iter_yields_each_item_then_exhausts() {
-    let items = from_iter([1, 2, 3]);
+fn into_generator_yields_each_item_then_exhausts() {
+    let items = [1, 2, 3].into_generator();
     let mut coroutine = coroutine!(async move |channel| {
         let mut items = items.bind(channel);
         let mut output = Vec::new();
@@ -548,7 +524,7 @@ fn from_iter_yields_each_item_then_exhausts() {
 
 #[test]
 fn flatten_yields_collection_elements_then_exhausts() {
-    let items = from_iter([vec![1, 2], vec![], vec![3]]);
+    let items = [vec![1, 2], vec![], vec![3]].into_generator();
     let mut coroutine = coroutine!(async move |channel| {
         let mut items = items.flatten().bind(channel);
         let mut output = Vec::new();
@@ -618,9 +594,77 @@ fn map_passes_through_errors_after_mapping_earlier_items() {
 }
 
 #[test]
+fn on_complete_runs_only_after_generator_completion() {
+    let completed = Arc::new(AtomicBool::new(false));
+    let callback_completed = Arc::clone(&completed);
+    let items = generator_fn!(async move |channel| {
+        channel.yield_item(1).await?;
+        Ok(42)
+    })
+    .on_complete(move || callback_completed.store(true, Ordering::Relaxed));
+    let mut generator: StaticGeneratorCoroutine<i32, i32> =
+        static_generator_coroutine!(Request, async move |channel| {
+            channel.yield_from(items.bind(&channel)).await
+        });
+
+    assert!(matches!(
+        generator.try_advance().unwrap(),
+        GeneratorCoroutineStep::Yield(1)
+    ));
+    assert!(!completed.load(Ordering::Relaxed));
+    assert!(matches!(
+        generator.try_advance().unwrap(),
+        GeneratorCoroutineStep::Done(42)
+    ));
+    assert!(completed.load(Ordering::Relaxed));
+}
+
+#[rstest]
+#[case(Some(vec![1, 2, 3]), &[1, 2, 3])]
+#[case(None, &[])]
+fn flatten_async_yields_inner_generator_items(
+    #[case] input: Option<Vec<i32>>,
+    #[case] expected: &[i32],
+) {
+    let inner = input.map(|items| items.into_generator());
+    let items = inner.into_generator().flatten_async();
+    let mut coroutine =
+        coroutine!(async move |channel| { items.bind(channel).collect::<Vec<_>>().await });
+    let CoroutineStep::Done(items) = coroutine.try_advance().unwrap() else {
+        panic!("generator did not complete");
+    };
+    assert_eq!(items, expected);
+}
+
+#[test]
+fn flatten_async_preserves_outer_output() {
+    let outer = generator_fn!(async move |channel| -> DeltaResult<i32> {
+        channel.yield_item(vec![1, 2].into_generator()).await?;
+        channel.yield_item(vec![3].into_generator()).await?;
+        Ok(42)
+    });
+    let items = outer.flatten_async();
+    let mut generator: StaticGeneratorCoroutine<i32, i32> =
+        static_generator_coroutine!(Request, async move |channel| {
+            channel.yield_from(items.bind(&channel)).await
+        });
+
+    for expected in [1, 2, 3] {
+        let GeneratorCoroutineStep::Yield(item) = generator.try_advance().unwrap() else {
+            panic!("expected item");
+        };
+        assert_eq!(item, expected);
+    }
+    let GeneratorCoroutineStep::Done(output) = generator.try_advance().unwrap() else {
+        panic!("expected completion");
+    };
+    assert_eq!(output, 42);
+}
+
+#[test]
 fn filter_ok_retains_matches_and_passes_through_item_errors() {
     let items = vec![Ok(1), Ok(2), Err(Error::generic("item failed")), Ok(4)];
-    let items = from_iter(items).filter_ok(|item: &i32| item % 2 == 0);
+    let items = items.into_generator().filter_ok(|item: &i32| item % 2 == 0);
     let mut coroutine = coroutine!(async move |channel| {
         let mut items = items.bind(channel);
         assert_eq!(items.next().await?.transpose()?, Some(2));
@@ -645,17 +689,18 @@ fn compatible_adapters_preserve_terminal_output() {
         Ok(42)
     });
     let first: [DeltaResult<i32>; 1] = [Ok(0)];
-    let items = from_iter(first)
+    let items = first
+        .into_generator()
         .chain(tail)
         .map(|item: DeltaResult<i32>| item.map(|value| value + 1))
         .map_ok(|value| value * 2);
-    let items = map_async!(items, async move |_channel, item| {
+    let items = items.map_async(map_async_witness, async move |_channel, item| {
         item.map(|value| value + 1)
     });
     let items = items.filter_ok(|value: &i32| *value >= 5).peekable();
     let mut generator: StaticGeneratorCoroutine<DeltaResult<i32>, i32> =
         static_generator_coroutine!(Request, async move |channel| {
-            channel.yield_from(items.into_boxed()).await
+            channel.yield_from(items.bind(&channel)).await
         });
 
     let GeneratorCoroutineStep::Yield(first) = generator.try_advance().unwrap() else {
@@ -688,7 +733,7 @@ fn flatten_ok_flattens_inner_generators_and_preserves_output() {
     let items = outer.flatten_ok();
     let mut generator: StaticGeneratorCoroutine<DeltaResult<i32>, i32> =
         static_generator_coroutine!(Request, async move |channel| {
-            channel.yield_from(items.into_boxed()).await
+            channel.yield_from(items.bind(&channel)).await
         });
 
     let GeneratorCoroutineStep::Yield(first) = generator.try_advance().unwrap() else {
@@ -739,7 +784,7 @@ fn peekable_preserves_output_after_peeking_at_completion() {
 fn try_collect_collects_successes_and_short_circuits_item_errors() {
     let items: Vec<DeltaResult<_>> = vec![Ok(1), Ok(2)];
     let mut coroutine = coroutine!(async move |channel| {
-        let collected: Vec<_> = from_iter(items).bind(channel).try_collect().await?;
+        let collected: Vec<_> = items.into_generator().bind(channel).try_collect().await?;
         Ok(collected)
     });
     let CoroutineStep::Done(collected) = coroutine.try_advance().unwrap() else {
@@ -749,7 +794,7 @@ fn try_collect_collects_successes_and_short_circuits_item_errors() {
 
     let items = vec![Ok(1), Err(Error::generic("item failed")), Ok(3)];
     let mut coroutine = coroutine!(async move |channel| {
-        let collected: Vec<_> = from_iter(items).bind(channel).try_collect().await?;
+        let collected: Vec<_> = items.into_generator().bind(channel).try_collect().await?;
         Ok(collected)
     });
     assert_result_error_with_message(coroutine.try_advance(), "item failed");

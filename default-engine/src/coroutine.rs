@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::coroutine::generator::AsyncIntoIterator as _;
 use delta_kernel::coroutine::kernel::request::{
     BackwardListing, BackwardListingResult, DirectoryListing, ExpressionEvaluatorHandle,
     FileWriteMode, ForwardListing, ListingBounds, PredicateEvaluatorHandle, ReadJsonFiles,
@@ -435,7 +436,7 @@ impl AsyncEngineConnector {
         batches: Vec<Box<dyn EngineData>>,
     ) -> DeltaResult<Url> {
         let url = write.new_file_url()?;
-        let input = StaticGeneratorCoroutine::from_iterator(Box::new(batches.into_iter().map(Ok)));
+        let input = StaticGeneratorCoroutine::from_generator(batches.into_generator());
         self.write_parquet_file(WriteParquetFile::new(url.clone(), input))
             .await?;
         Ok(url)
@@ -762,6 +763,7 @@ fn emit_storage_list(elapsed: Duration, num_files: u64, _bytes_read: u64) {
 
 #[cfg(test)]
 mod tests {
+    use delta_kernel::coroutine::generator::empty;
     use delta_kernel::coroutine::kernel::StaticGeneratorCoroutine;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::FilteredEngineData;
@@ -774,7 +776,7 @@ mod tests {
         let connector = AsyncEngineConnector::new(Arc::clone(&store));
         let url = Url::parse("memory:///empty.json").unwrap();
         let input: StaticGeneratorCoroutine<FilteredEngineData> =
-            StaticGeneratorCoroutine::from_iterator(Box::new(std::iter::empty()));
+            StaticGeneratorCoroutine::from_generator(empty());
 
         let size = connector
             .write_json_file(WriteJsonFile::new(

@@ -5,9 +5,10 @@
 //! Kernel functions return [`IntoGenerator`]. Combinators on [`GeneratorExt`] run before a request
 //! [`Channel`] exists: [`GeneratorExt::map`] transforms items, [`GeneratorExt::map_ok`] transforms
 //! successful result items, [`GeneratorExt::chain`] concatenates two generators, [`empty`] yields
-//! nothing, and [`from_iter`] wraps an iterator. [`unfold`] and [`unfold_mut`] build a bound
-//! generator from owned state and a step future. Item-transforming combinators preserve terminal
-//! output; consuming helpers such as [`GeneratorExt::next`] require `Output = ()`.
+//! nothing, and [`AsyncIntoIterator::into_generator`] wraps an iterable. [`unfold`] and
+//! [`unfold_mut`] build a bound generator from owned state and a step future. Item-transforming
+//! combinators preserve terminal output; consuming helpers such as [`GeneratorExt::next`] require
+//! `Output = ()`.
 //! [`generator_fn!`] builds an erased pipeline from an async body that later receives its channel.
 //!
 //! # Binding
@@ -39,8 +40,8 @@
 //! [`GeneratorCoroutine::try_advance`]: generator::GeneratorCoroutine::try_advance
 //! [`GeneratorCoroutineStep`]: generator::GeneratorCoroutineStep
 //! [`StaticGeneratorCoroutine`]: generator::StaticGeneratorCoroutine
+//! [`AsyncIntoIterator::into_generator`]: generator::AsyncIntoIterator::into_generator
 //! [`empty`]: generator::empty
-//! [`from_iter`]: generator::from_iter
 //! [`unfold`]: generator::unfold
 //! [`unfold_mut`]: generator::unfold_mut
 //! [`generator_fn!`]: generator::generator_fn
@@ -59,9 +60,9 @@ use delta_kernel_derive::internal_api;
 use tracing::{error, Instrument as _, Span};
 
 pub use self::adapters::{
-    empty, from_iter, map_async_witness, unfold, BoxedDeltaResultGenerator, BoxedGenerator, Chain,
-    FilterOk, Flatten, FlattenOk, Generator, GeneratorExt, GeneratorStep, IntoGenerator, Iter, Map,
-    MapAsync, MapAsyncWitness, MapOk, Peekable, Unfold,
+    empty, map_async_witness, unfold, AsyncIntoIterator, BoxedDeltaResultGenerator, BoxedGenerator,
+    Chain, FilterOk, Flatten, FlattenAsync, FlattenOk, Generator, GeneratorExt, GeneratorStep,
+    IntoGenerator, Iter, Map, MapAsync, MapAsyncWitness, MapOk, OnComplete, Peekable, Unfold,
 };
 pub(crate) use self::adapters::{unfold_mut_with, unfold_mut_witness};
 use super::core::{noop_context, Channel, DeltaFuture};
@@ -106,9 +107,8 @@ impl<'a, Y: Send + 'a, O> BoundGenerator<'a, Y, O> {
         Fut: DeltaFuture<O> + 'a,
     {
         let yields = Arc::default();
-        let body = invoke_witness(witness, state, Arc::clone(&yields));
         Self {
-            body: Some(Box::pin(body) as _),
+            body: Some(Box::pin(invoke_witness(witness, state, Arc::clone(&yields))) as _),
             yields,
             terminal: None,
         }
@@ -330,12 +330,8 @@ macro_rules! generator_fn {
 /// Maps generator items asynchronously through the bound request channel.
 #[internal_api]
 macro_rules! map_async {
-    ($generator:expr, $body:expr) => {
-        $crate::coroutine::generator::GeneratorExt::map_async(
-            $generator,
-            $crate::coroutine::generator::map_async_witness,
-            $body,
-        )
+    ($generator:expr, $body:expr $(,)?) => {
+        $generator.map_async($crate::coroutine::generator::map_async_witness, $body)
     };
 }
 
@@ -542,19 +538,8 @@ impl<'a, P: Send + 'static, Y: Send> GeneratorChannel<'a, P, Y> {
         .await
     }
 
-    /// Forward every item from `generator` and return its completion.
-    pub(crate) async fn yield_from<O: Send + 'static>(
-        &self,
-        generator: Box<dyn IntoGenerator<P, Item = Y, Output = O>>,
-    ) -> DeltaResult<O> {
-        self.yield_from_bound(generator.bind(self.channel)).await
-    }
-
     /// Forward every item from a bound `generator` and return its completion.
-    pub(crate) async fn yield_from_bound<G, O: Send + 'static>(
-        &self,
-        mut generator: G,
-    ) -> DeltaResult<O>
+    pub(crate) async fn yield_from<G, O: Send + 'static>(&self, mut generator: G) -> DeltaResult<O>
     where
         G: Generator<Item = Y, Output = O> + Unpin,
     {

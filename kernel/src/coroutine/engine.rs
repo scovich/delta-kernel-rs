@@ -923,6 +923,7 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use crate::coroutine::generator::empty;
     use crate::unit_test_utils::TestCancellationToken;
 
     struct CancelAfterFirstRead {
@@ -1019,9 +1020,7 @@ mod tests {
             let inner: Arc<dyn Engine> = Arc::new(SyncEngine::new());
             let engine =
                 DelegatingEngine::new(inner).with_json_handler(Arc::new(EarlyReturnJsonHandler));
-            let actions: DeltaResultIteratorStatic<FilteredEngineData> =
-                Box::new(std::iter::empty());
-            let input = StaticGeneratorCoroutine::from_iterator(actions);
+            let input = StaticGeneratorCoroutine::from_generator(empty());
             let operation = WriteJsonFile::new(
                 Url::parse("memory:///_delta_log/0.json").unwrap(),
                 FileWriteMode::CreateNew,

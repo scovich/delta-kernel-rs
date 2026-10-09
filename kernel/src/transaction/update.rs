@@ -22,7 +22,7 @@ use crate::actions::deletion_vector::DeletionVectorDescriptor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::BackReference;
 use crate::actions::{LOG_ADD_SCHEMA, NUM_RECORDS, TIGHT_BOUNDS};
-use crate::coroutine::generator::{from_iter, map_async_witness, GeneratorExt as _};
+use crate::coroutine::generator::{map_async_witness, AsyncIntoIterator as _, GeneratorExt as _};
 use crate::coroutine::kernel::{Channel, Request};
 use crate::coroutine::{
     iterate_prepared_result_generator_with_engine, ChannelExt as _, IntoGenerator,
@@ -681,7 +681,7 @@ impl<S> Transaction<S> {
             nullable_add_log_schema().clone().into(),
         );
         let with_data_change_eval = with_data_change_eval.await?;
-        let file_metadata_batch = from_iter(file_metadata_batch);
+        let file_metadata_batch = file_metadata_batch.into_generator();
         let add_actions = file_metadata_batch.map_async(
             map_async_witness,
             async move |channel, file_metadata_batch| {

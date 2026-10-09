@@ -116,6 +116,7 @@ use crate::actions::{
     ADD_FIELD, CHECKPOINT_METADATA_NAME, DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD,
     REMOVE_FIELD, SET_TRANSACTION_FIELD, SIDECAR_FIELD,
 };
+use crate::coroutine::generator::AsyncIntoIterator as _;
 use crate::coroutine::kernel::request::FileWriteMode;
 use crate::coroutine::kernel::{Channel, StaticGeneratorCoroutine};
 use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _};
@@ -576,8 +577,8 @@ impl CheckpointWriter {
         let data = data.await;
         // Write the `_last_checkpoint` file to `table/_delta_log/_last_checkpoint`
         let filtered_data = FilteredEngineData::with_all_rows_selected(data?);
-        let input = Box::new(std::iter::once(Ok(filtered_data)));
-        let input = StaticGeneratorCoroutine::from_iterator(input);
+        let input = std::iter::once(filtered_data).into_generator();
+        let input = StaticGeneratorCoroutine::from_generator(input);
         channel
             .write_json_file(&last_checkpoint_path, FileWriteMode::Overwrite, input)
             .await?;

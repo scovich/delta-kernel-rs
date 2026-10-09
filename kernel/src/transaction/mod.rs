@@ -18,7 +18,7 @@ use crate::committer::{
     Commit, CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
     FileSystemCommitter,
 };
-use crate::coroutine::generator::{from_iter, map_async};
+use crate::coroutine::generator::{map_async_witness, AsyncIntoIterator as _, GeneratorExt as _};
 use crate::coroutine::kernel::request::EvaluationInput;
 use crate::coroutine::kernel::{Channel, Request};
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -479,11 +479,12 @@ where
         as_log_add_schema(output_schema).into(),
     );
     let adds_evaluator = adds_evaluator.await?;
-    let add_actions = map_async!(add_files_metadata, async move |channel, add_files_batch| {
-        channel
-            .evaluate_expression(&adds_evaluator, add_files_batch?)
-            .await
-    });
+    let add_actions =
+        add_files_metadata.map_async(map_async_witness, async move |channel, add_files_batch| {
+            channel
+                .evaluate_expression(&adds_evaluator, add_files_batch?)
+                .await
+        });
     Ok(add_actions)
 }
 
@@ -1484,7 +1485,7 @@ impl<S> Transaction<S> {
             let add_files_metadata = self.add_files_metadata.clone();
             let add_actions = build_add_actions(
                 engine,
-                from_iter(add_files_metadata.into_iter().map(Ok)),
+                add_files_metadata.into_iter().map(Ok).into_generator(),
                 self.add_files_schema().clone(),
                 self.data_change,
             )?;
@@ -1533,7 +1534,7 @@ impl<S> Transaction<S> {
         // Generate add actions including row tracking metadata
         let add_actions = build_add_actions(
             engine,
-            from_iter(extended_add_files),
+            extended_add_files.into_generator(),
             with_row_tracking_cols(self.add_files_schema())?,
             self.data_change,
         )?;
@@ -1761,9 +1762,9 @@ impl<S> Transaction<S> {
         let base_eval = make_eval(false /* coalesce_stats_with_parsed */).await?;
         let stats_parsed_eval = make_eval(true /* coalesce_stats_with_parsed */).await?;
         let stats_parsed_col = column_name!(STATS_PARSED_NAME);
-        let remove_files_metadata = from_iter(remove_files_metadata);
-        let remove_actions = map_async!(
-            remove_files_metadata,
+        let remove_files_metadata = remove_files_metadata.into_generator();
+        let remove_actions = remove_files_metadata.map_async(
+            map_async_witness,
             async move |channel, file_metadata_batch| {
                 let data = file_metadata_batch.data();
                 let evaluator = if data.has_field(&stats_parsed_col) {
@@ -1778,7 +1779,7 @@ impl<S> Transaction<S> {
                     updated_engine_data,
                     file_metadata_batch.selection_vector().to_vec(),
                 )
-            }
+            },
         );
         Ok(remove_actions)
     }

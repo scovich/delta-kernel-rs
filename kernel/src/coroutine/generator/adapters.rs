@@ -107,6 +107,18 @@ pub trait GeneratorExt {
         Map { inner: self, map }
     }
 
+    /// Counterpart of the iterator `on_complete` adapter: invokes `on_complete` after successful
+    /// generator completion.
+    fn on_complete<F>(self, on_complete: F) -> OnComplete<Self, F>
+    where
+        Self: Sized,
+    {
+        OnComplete {
+            inner: self,
+            on_complete,
+        }
+    }
+
     /// Maps items asynchronously using the supplied call-future witness.
     fn map_async<P, U, F, W>(self, witness: W, mapper: F) -> MapAsync<Self, P, F, W, U>
     where
@@ -142,6 +154,17 @@ pub trait GeneratorExt {
         FilterOk {
             inner: self,
             predicate,
+        }
+    }
+
+    /// Flattens inner generators, preserving this generator's completion value.
+    fn flatten_async<P, I, T>(self) -> FlattenAsync<Self, P, I, T>
+    where
+        Self: Sized,
+    {
+        FlattenAsync {
+            outer: self,
+            _types: PhantomType::default(),
         }
     }
 
@@ -267,9 +290,12 @@ impl<'g, P: Send + 'static, Y: Send + 'g, O: Send + 'static> GeneratorExt
 }
 impl<'a, Y: Send + 'a, O: Send + 'static> GeneratorExt for BoxedGenerator<'a, Y, O> {}
 impl<G, F> GeneratorExt for Map<G, F> {}
+impl<G, F> GeneratorExt for OnComplete<G, F> {}
+impl<G, F: FnOnce()> GeneratorExt for BoundOnComplete<G, F> {}
 impl<G, P, F, W, U> GeneratorExt for MapAsync<G, P, F, W, U> {}
 impl<G, F> GeneratorExt for MapOk<G, F> {}
 impl<G, F> GeneratorExt for FilterOk<G, F> {}
+impl<G, P, I, T> GeneratorExt for FlattenAsync<G, P, I, T> {}
 impl<G, P, I, T> GeneratorExt for FlattenOk<G, P, I, T> {}
 impl<G, I, O> GeneratorExt for Peekable<G, I, O> {}
 impl<A, B> GeneratorExt for Chain<A, B> {}
@@ -314,7 +340,7 @@ impl<'g, P: Send + 'static, Y: Send + 'g, O: Send + 'static> IntoGenerator<P>
         Self: 'a,
         Y: 'a,
     {
-        IntoGenerator::bind_boxed(self, channel)
+        self.bind_boxed(channel)
     }
 
     fn into_boxed<'a>(self) -> Box<dyn IntoGenerator<P, Item = Y, Output = O> + 'a>
@@ -331,6 +357,88 @@ impl<'g, P: Send + 'static, Y: Send + 'g, O: Send + 'static> IntoGenerator<P>
         Y: 'a,
     {
         (*self).bind_boxed(channel)
+    }
+}
+
+/// Generator returned by [`GeneratorExt::on_complete`].
+pub struct OnComplete<G, F> {
+    inner: G,
+    on_complete: F,
+}
+
+struct BoundOnComplete<G, F: FnOnce()> {
+    inner: G,
+    on_complete: Option<F>,
+}
+
+// The callback is never structurally pinned; it is only taken after `inner` completes.
+impl<G: Unpin, F: FnOnce()> Unpin for BoundOnComplete<G, F> {}
+
+impl<P, G, F> IntoGenerator<P> for OnComplete<G, F>
+where
+    P: Send + 'static,
+    G: IntoGenerator<P>,
+    F: FnOnce() + Send,
+{
+    type Item = G::Item;
+    type Output = G::Output;
+
+    fn bind_to<'a>(
+        self,
+        channel: ChannelBinding<'a, P>,
+    ) -> impl Generator<Item = G::Item, Output = G::Output> + Unpin + 'a
+    where
+        Self: 'a,
+    {
+        BoundOnComplete {
+            inner: self.inner.bind_to(channel),
+            on_complete: Some(self.on_complete),
+        }
+    }
+
+    fn bind_boxed<'a>(
+        self: Box<Self>,
+        channel: ChannelBinding<'a, P>,
+    ) -> BoxedGenerator<'a, G::Item, G::Output>
+    where
+        Self: 'a,
+    {
+        Box::new((*self).bind_to(channel))
+    }
+}
+
+impl<G, F> Generator for BoundOnComplete<G, F>
+where
+    G: Generator + Unpin,
+    F: FnOnce() + Send,
+{
+    type Item = G::Item;
+    type Output = G::Output;
+
+    fn poll_step(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<DeltaResult<GeneratorStep<G::Item, G::Output>>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_step(context) {
+            Poll::Ready(Ok(GeneratorStep::Done(output))) => {
+                if let Some(on_complete) = this.on_complete.take() {
+                    on_complete();
+                }
+                Poll::Ready(Ok(GeneratorStep::Done(output)))
+            }
+            other => other,
+        }
+    }
+}
+
+impl<G, F: FnOnce()> Drop for BoundOnComplete<G, F> {
+    fn drop(&mut self) {
+        if self.on_complete.is_some() {
+            tracing::debug!(
+                "OnComplete generator dropped before completion; completion callback not called"
+            );
+        }
     }
 }
 
@@ -400,13 +508,13 @@ where
 /// Witnesses one call to an asynchronous mapper.
 pub async fn map_async_witness<'a, P, F, I, U>(
     mapper: &'a mut F,
-    (channel, item): (ChannelBinding<'a, P>, I),
+    (channel, item): (&'a Channel<P>, I),
 ) -> U
 where
     P: Send + 'static,
     F: for<'b> AsyncFnMut(&'b Channel<P>, I) -> U,
 {
-    mapper(&channel, item).await
+    mapper(channel, item).await
 }
 
 /// Exposes one concrete asynchronous mapper call future for a channel lifetime.
@@ -416,18 +524,18 @@ pub trait MapAsyncWitness<'a, P: 'static, F, I, U> {
     type Future: Future<Output = U> + Send + 'a;
 
     /// Invoke the witness for `mapper` and its channel-bound item.
-    fn invoke(&self, mapper: &'a mut F, argument: (ChannelBinding<'a, P>, I)) -> Self::Future;
+    fn invoke(&self, mapper: &'a mut F, argument: (&'a Channel<P>, I)) -> Self::Future;
 }
 
 impl<'a, P, F: 'a, I, U, W, Fut> MapAsyncWitness<'a, P, F, I, U> for W
 where
     P: 'static,
-    W: Fn(&'a mut F, (ChannelBinding<'a, P>, I)) -> Fut,
+    W: Fn(&'a mut F, (&'a Channel<P>, I)) -> Fut,
     Fut: Future<Output = U> + Send + 'a,
 {
     type Future = Fut;
 
-    fn invoke(&self, mapper: &'a mut F, argument: (ChannelBinding<'a, P>, I)) -> Self::Future {
+    fn invoke(&self, mapper: &'a mut F, argument: (&'a Channel<P>, I)) -> Self::Future {
         self(mapper, argument)
     }
 }
@@ -499,7 +607,7 @@ where
     async fn next(mut self) -> DeltaResult<ControlFlow<G::Output, (Self, U)>> {
         match poll_fn(|context| Pin::new(&mut self.inner).poll_step(context)).await? {
             GeneratorStep::Yield(item) => {
-                let argument = (self.channel.clone(), item);
+                let argument = (&*self.channel, item);
                 let item = self.witness.invoke(&mut self.mapper, argument).await;
                 Ok(ControlFlow::Continue((self, item)))
             }
@@ -644,6 +752,93 @@ where
     }
 }
 
+/// Generator returned by [`GeneratorExt::flatten_async`].
+pub struct FlattenAsync<G, P, I, T> {
+    outer: G,
+    _types: PhantomType<(P, I, T)>,
+}
+
+impl<P, G, I, T> IntoGenerator<P> for FlattenAsync<G, P, I, T>
+where
+    P: Send + 'static,
+    G: IntoGenerator<P, Item = I>,
+    I: IntoGenerator<P, Item = T, Output = ()>,
+    T: Send,
+{
+    type Item = T;
+    type Output = G::Output;
+
+    fn bind_to<'a>(
+        self,
+        channel: ChannelBinding<'a, P>,
+    ) -> impl Generator<Item = T, Output = G::Output> + Unpin + 'a
+    where
+        Self: 'a,
+    {
+        BoundFlattenAsync {
+            outer: self.outer.bind_to(channel.clone()),
+            channel,
+            bind_inner: |inner: I, channel| inner.bind_to(channel),
+            inner: None,
+        }
+    }
+
+    fn bind_boxed<'a>(
+        self: Box<Self>,
+        channel: ChannelBinding<'a, P>,
+    ) -> BoxedGenerator<'a, T, G::Output>
+    where
+        Self: 'a,
+    {
+        Box::new((*self).bind_to(channel))
+    }
+}
+
+struct BoundFlattenAsync<'a, P: 'static, G, F, B> {
+    outer: G,
+    channel: ChannelBinding<'a, P>,
+    bind_inner: F,
+    inner: Option<B>,
+}
+
+// Only `outer` and `inner` are polled; `channel` is cloned and `bind_inner` is called through &mut.
+impl<P, G: Unpin, F, B: Unpin> Unpin for BoundFlattenAsync<'_, P, G, F, B> {}
+impl<P, G, F, B> GeneratorExt for BoundFlattenAsync<'_, P, G, F, B> {}
+
+impl<'a, P, G, I, F, B> Generator for BoundFlattenAsync<'a, P, G, F, B>
+where
+    P: Send + 'static,
+    G: Generator<Item = I> + Unpin,
+    I: Send + 'a,
+    F: FnMut(I, ChannelBinding<'a, P>) -> B + Send,
+    B: Generator<Output = ()> + Unpin,
+{
+    type Item = B::Item;
+    type Output = G::Output;
+
+    fn poll_step(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<DeltaResult<GeneratorStep<B::Item, G::Output>>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(inner) = &mut this.inner {
+                match Pin::new(inner).poll_step(context) {
+                    Poll::Ready(Ok(GeneratorStep::Yield(item))) => {
+                        return Poll::Ready(Ok(GeneratorStep::Yield(item)));
+                    }
+                    Poll::Ready(Ok(GeneratorStep::Done(()))) => this.inner = None,
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+
+            let inner = ready_yield!(Pin::new(&mut this.outer).poll_step(context));
+            this.inner = Some((this.bind_inner)(inner, this.channel.clone()));
+        }
+    }
+}
+
 /// Generator returned by [`GeneratorExt::flatten_ok`].
 pub struct FlattenOk<G, P, I, T> {
     outer: G,
@@ -654,8 +849,8 @@ impl<P, G, I, T> IntoGenerator<P> for FlattenOk<G, P, I, T>
 where
     P: Send + 'static,
     G: IntoGenerator<P, Item = DeltaResult<I>>,
-    I: IntoGenerator<P, Item = T, Output = ()> + 'static,
-    T: Send + 'static,
+    I: IntoGenerator<P, Item = T, Output = ()>,
+    T: Send,
 {
     type Item = DeltaResult<T>;
     type Output = G::Output;
@@ -670,6 +865,7 @@ where
         BoundFlattenOk {
             outer: self.outer.bind_to(channel.clone()),
             channel,
+            bind_inner: |inner: I, channel| inner.bind_to(channel),
             inner: None,
         }
     }
@@ -685,29 +881,32 @@ where
     }
 }
 
-struct BoundFlattenOk<'a, P: 'static, G, T: Send + 'static> {
+struct BoundFlattenOk<'a, P: 'static, G, F, B> {
     outer: G,
     channel: ChannelBinding<'a, P>,
-    inner: Option<BoxedGenerator<'a, T>>,
+    bind_inner: F,
+    inner: Option<B>,
 }
 
-impl<P, G: Unpin, T: Send + 'static> Unpin for BoundFlattenOk<'_, P, G, T> {}
-impl<P, G, T: Send + 'static> GeneratorExt for BoundFlattenOk<'_, P, G, T> {}
+// Only `outer` and `inner` are polled; `channel` is cloned and `bind_inner` is called through &mut.
+impl<P, G: Unpin, F, B: Unpin> Unpin for BoundFlattenOk<'_, P, G, F, B> {}
+impl<P, G, F, B> GeneratorExt for BoundFlattenOk<'_, P, G, F, B> {}
 
-impl<P, G, I, T> Generator for BoundFlattenOk<'_, P, G, T>
+impl<'a, P, G, I, F, B> Generator for BoundFlattenOk<'a, P, G, F, B>
 where
     P: Send + 'static,
     G: Generator<Item = DeltaResult<I>> + Unpin,
-    I: IntoGenerator<P, Item = T, Output = ()> + 'static,
-    T: Send + 'static,
+    I: Send + 'a,
+    F: FnMut(I, ChannelBinding<'a, P>) -> B + Send,
+    B: Generator<Output = ()> + Unpin,
 {
-    type Item = DeltaResult<T>;
+    type Item = DeltaResult<B::Item>;
     type Output = G::Output;
 
     fn poll_step(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
-    ) -> Poll<DeltaResult<GeneratorStep<DeltaResult<T>, G::Output>>> {
+    ) -> Poll<DeltaResult<GeneratorStep<DeltaResult<B::Item>, G::Output>>> {
         let this = self.get_mut();
         loop {
             if let Some(inner) = &mut this.inner {
@@ -723,8 +922,7 @@ where
 
             match ready_yield!(Pin::new(&mut this.outer).poll_step(context)) {
                 Ok(inner) => {
-                    let inner = inner.into_boxed().bind_to(this.channel.clone());
-                    this.inner = Some(Box::new(inner));
+                    this.inner = Some((this.bind_inner)(inner, this.channel.clone()));
                 }
                 Err(err) => return Poll::Ready(Ok(GeneratorStep::Yield(Err(err)))),
             }
@@ -970,20 +1168,24 @@ where
 
 /// Counterpart of [`std::iter::empty`]: a generator that yields nothing.
 pub fn empty<Y: Send>() -> Iter<std::iter::Empty<Y>> {
-    from_iter(std::iter::empty())
+    Iter(std::iter::empty())
 }
 
-/// Wrap `iter` as a [`Generator`] that yields each item synchronously.
-pub fn from_iter<T>(iter: T) -> Iter<T::IntoIter>
-where
-    T: IntoIterator,
-    T::IntoIter: Send,
-    T::Item: Send,
-{
-    Iter(iter.into_iter())
+/// Converts synchronous iterables into generators.
+pub trait AsyncIntoIterator: IntoIterator + Sized {
+    /// Convert this iterable into a generator.
+    fn into_generator(self) -> Iter<Self::IntoIter>
+    where
+        Self::IntoIter: Send,
+        Self::Item: Send,
+    {
+        Iter(self.into_iter())
+    }
 }
 
-/// Generator returned by [`from_iter`].
+impl<T: IntoIterator> AsyncIntoIterator for T {}
+
+/// Generator returned by [`AsyncIntoIterator::into_generator`].
 // WARNING: We manually impl `Unpin` for `Iter`, so pinning the generator will not structurally pin
 // `I`, even if `I: !Unpin`. This is sound only because `Iter` does not structurally pin its inner
 // value; it is accessed only through `Iterator::next(&mut self)`.

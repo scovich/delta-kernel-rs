@@ -11,7 +11,7 @@ use super::resolve_dvs::{resolve_scan_file_dv, ResolvedCdfScanFile};
 use super::scan_file::scan_metadata_to_scan_file;
 use super::{CdfMode, TableChanges};
 use crate::actions::deletion_vector::split_vector;
-use crate::coroutine::generator::{map_async, GeneratorExt as _};
+use crate::coroutine::generator::{map_async_witness, GeneratorExt as _};
 use crate::coroutine::kernel::{Channel, Request};
 use crate::coroutine::{
     iterate_prepared_result_generator_with_engine, AsyncOption as _, ChannelExt as _, IntoGenerator,
@@ -322,7 +322,7 @@ async fn read_scan_file_with_channel(
     let read_result_iter = channel.prepare_parquet_files([file], physical_schema, None);
     let read_result_iter = read_result_iter.await?.flatten();
 
-    let result = map_async!(read_result_iter, async move |channel, batch| {
+    let result = read_result_iter.map_async(map_async_witness, async move |channel, batch| {
         let batch = batch?;
         // Transform the physical data into the correct logical form, or pass through unchanged.
         let logical = if let Some(ref eval) = phys_to_logical_eval {
