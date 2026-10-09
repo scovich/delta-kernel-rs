@@ -5,9 +5,7 @@ use rstest::rstest;
 use serde_json::json;
 use url::Url;
 
-use crate::action_reconciliation::{
-    ActionReconciliationIterator, ActionReconciliationIteratorState,
-};
+use crate::action_reconciliation::ActionReconciliationIteratorState;
 use crate::actions::{Add, ADD_NAME, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::arrow::array::{Array, ArrayRef, AsArray, RecordBatch, StructArray};
 use crate::arrow::datatypes::{ArrowPrimitiveType, Int32Type, Int64Type};
@@ -48,18 +46,15 @@ fn generate_checkpoint_parts(
     let iter_state = data_iter.state();
     let output_schema = writer.output_schema.clone();
 
-    let splitter = SidecarSplitter::new_mut_shared(
-        data_iter,
-        engine.evaluation_handler().as_ref(),
-        output_schema,
-    )?;
+    let splitter =
+        SidecarSplitter::new_mut_shared(engine.evaluation_handler().as_ref(), output_schema)?;
 
     let write = sidecar_parquet_write(
         writer.snapshot.table_root(),
         writer.snapshot.version(),
         NonZero::new(file_actions_per_sidecar_hint),
     )?;
-    let data = SidecarSplitter::file_action_batches(splitter.clone());
+    let data = SidecarSplitter::file_action_batches(splitter.clone(), data_iter);
     let sidecar_files = engine
         .parquet_handler()
         .write_parquet_files(write, Box::new(data))?;
@@ -608,27 +603,13 @@ async fn test_splitter_no_file_actions() -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
-    let data_iter = writer.checkpoint_data(&engine)?;
-    let output_schema = writer.output_schema.clone();
-
-    let splitter = SidecarSplitter::new_mut_shared(
-        data_iter,
-        engine.evaluation_handler().as_ref(),
-        output_schema,
-    )?;
-
-    let total_file_rows: usize = SidecarSplitter::file_action_batches(splitter.clone())
-        .map(|batch| batch.unwrap().len())
-        .sum();
-    assert_eq!(total_file_rows, 0, "should have no file-action rows");
-
-    let non_file_batches = Arc::into_inner(splitter)
-        .expect("splitter Arc should have no other references")
-        .into_inner()
-        .expect("splitter Mutex should not be poisoned")
-        .into_non_file_batches();
+    let result = generate_checkpoint_parts(&writer, &engine, usize::MAX)?;
+    assert!(
+        result.sidecar_files.is_empty(),
+        "should have no file-action rows"
+    );
     verify_non_file_batches(
-        &non_file_batches,
+        &result.non_file_batches,
         &ExpectedNonFileContent {
             reader_version: 3,
             writer_version: 7,
@@ -669,8 +650,7 @@ fn dummy_struct() -> DataType {
     "'remove' field must be nullable"
 )]
 fn test_splitter_rejects_invalid_schema(#[case] schema: StructType, #[case] expected_msg: &str) {
-    let iter = ActionReconciliationIterator::new(Box::new(std::iter::empty()));
-    let result = SidecarSplitter::new(iter, &ArrowEvaluationHandler, Arc::new(schema));
+    let result = SidecarSplitter::new(&ArrowEvaluationHandler, Arc::new(schema));
     assert!(result.is_err(), "should reject invalid schema");
     let err = result.err().unwrap();
     assert!(
