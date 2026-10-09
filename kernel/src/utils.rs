@@ -189,6 +189,7 @@ pub(crate) trait FoldWithOption: Sized {
 impl<T: Sized> FoldWithOption for T {}
 
 /// Extension trait for adding completion callbacks to iterators.
+#[cfg(test)]
 pub(crate) trait IteratorExt: Iterator + Sized {
     /// Wraps this iterator to call a closure when fully exhausted.
     ///
@@ -202,14 +203,17 @@ pub(crate) trait IteratorExt: Iterator + Sized {
     }
 }
 
+#[cfg(test)]
 impl<I: Iterator> IteratorExt for I {}
 
 /// Iterator adaptor that executes a closure when fully exhausted.
+#[cfg(test)]
 pub(crate) struct OnComplete<I, F: FnOnce()> {
     inner: I,
     on_complete: Option<F>,
 }
 
+#[cfg(test)]
 impl<I, F: FnOnce()> Drop for OnComplete<I, F> {
     fn drop(&mut self) {
         if self.on_complete.is_some() {
@@ -220,6 +224,7 @@ impl<I, F: FnOnce()> Drop for OnComplete<I, F> {
     }
 }
 
+#[cfg(test)]
 impl<I, F> Iterator for OnComplete<I, F>
 where
     I: Iterator,

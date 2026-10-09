@@ -5,7 +5,6 @@ use std::collections::{HashMap, HashSet};
 use std::slice;
 use std::sync::{Arc, LazyLock};
 
-use itertools::Itertools;
 use tracing::info;
 
 use crate::actions::visitors::{visit_deletion_vector_at, InCommitTimestampVisitor};
@@ -13,8 +12,15 @@ use crate::actions::{
     Metadata, Protocol, ADD_FIELD, CDC_FIELD, COMMIT_INFO_NAME, METADATA_FIELD, PROTOCOL_FIELD,
     REMOVE_FIELD,
 };
+use crate::coroutine::generator::{
+    map_async_witness, AsyncIntoIterator as _, GeneratorExt as _, IntoGenerator,
+};
 use crate::coroutine::kernel::Channel;
-use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _, GeneratorExt as _};
+#[cfg(test)]
+use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::{
+    iterate_prepared_result_generator_with_engine, AsyncOption as _, ChannelExt as _, Request,
+};
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{column_name, ColumnName};
 use crate::path::{AsUrl, ParsedLogPath};
@@ -51,13 +57,13 @@ pub(crate) struct TableChangesScanMetadata {
 ///
 /// Note: The [`ParsedLogPath`]s in the `commit_files` iterator must be ordered, contiguous
 /// (JSON) commit files.
-pub(crate) fn table_changes_action_iter(
+pub(crate) fn table_changes_action_iter<'a>(
     engine: Arc<dyn Engine>,
     start_table_configuration: &TableConfiguration,
-    commit_files: impl IntoIterator<Item = ParsedLogPath>,
+    commit_files: impl IntoIterator<Item = ParsedLogPath, IntoIter: Send + 'a> + Send + 'a,
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
+) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>> + 'a> {
     // The data-reading (`execute`) path always uses change-data-file semantics.
     table_changes_action_iter_with_mode(
         engine,
@@ -74,51 +80,78 @@ pub(crate) fn table_changes_action_iter(
 /// [`CdfMode::ChangeDataFeed`] uses `AddCDCFile` actions because they contain changes recorded by
 /// the writer. [`CdfMode::RowTracking`] ignores those actions and reconstructs changes from
 /// row lineage in the data files referenced by `add` and `remove` actions.
-pub(crate) fn table_changes_action_iter_with_mode(
+pub(crate) fn table_changes_action_iter_with_mode<'a>(
     engine: Arc<dyn Engine>,
     start_table_configuration: &TableConfiguration,
-    commit_files: impl IntoIterator<Item = ParsedLogPath>,
+    commit_files: impl IntoIterator<Item = ParsedLogPath, IntoIter: Send + 'a> + Send + 'a,
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
     mode: CdfMode,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
+) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>> + 'a> {
+    iterate_prepared_result_generator_with_engine!(engine.as_ref(), None, async move |channel| {
+        table_changes_action_iter_with_mode_and_channel(
+            channel,
+            start_table_configuration,
+            commit_files,
+            table_schema,
+            physical_predicate,
+            mode,
+        )
+        .await
+    })
+}
+
+async fn table_changes_action_iter_with_mode_and_channel<'a>(
+    channel: &Channel,
+    start_table_configuration: &TableConfiguration,
+    commit_files: impl IntoIterator<Item = ParsedLogPath, IntoIter: Send + 'a> + Send + 'a,
+    table_schema: SchemaRef,
+    physical_predicate: Option<(PredicateRef, SchemaRef)>,
+    mode: CdfMode,
+) -> DeltaResult<
+    impl IntoGenerator<Request, Item = DeltaResult<TableChangesScanMetadata>, Output = ()> + 'a,
+> {
     // Skip against the raw `{ add, remove, ... }` action batch: table_changes must resolve
     // deletion vector pairs before filtering, so unlike the scan path it operates on raw
     // batches with stats parsed from `add.stats` JSON.
     let filter = physical_predicate
-        .and_then(|(predicate, _ref_schema)| {
-            DataSkippingFilter::for_raw_action_batch(
-                engine.as_ref(),
+        .and_then_async(|(predicate, _ref_schema)| {
+            DataSkippingFilter::for_raw_action_batch_with_channel(
+                channel,
                 predicate,
                 start_table_configuration,
                 FileActionSelectionVisitor::schema(),
             )
         })
+        .await
         .map(Arc::new);
 
     let mut current_configuration = start_table_configuration.clone();
     let result = commit_files
-        .into_iter()
-        .map(move |commit_file| -> DeltaResult<_> {
-            let scanner = LogReplayScanner::try_new(
-                engine.as_ref(),
+        .into_generator()
+        .map_async(map_async_witness, async move |channel, commit_file| {
+            let scanner = LogReplayScanner::try_new_with_channel(
+                channel,
                 &mut current_configuration,
                 commit_file,
                 &table_schema,
                 mode,
-            )?;
-            scanner.into_scan_batches(engine.clone(), filter.clone())
-        }) //Iterator-Result-Iterator-Result
-        .flatten_ok() // Iterator-Result-Result
-        .map(|x| x?); // Iterator-Result
+            )
+            .await?;
+            scanner
+                .into_scan_batches_with_channel(channel, filter.clone())
+                .await
+        }) // Generator-Result-Generator-Result
+        .flatten_ok() // Generator-Result-Result
+        .map(|x| x?); // Generator-Result
     Ok(result)
 }
 
 /// Processes a single commit file from the log to generate an iterator of
 /// [`TableChangesScanMetadata`]. The scanner operates in two phases that _must_ be performed in the
 /// following order:
-/// 1. Prepare phase [`LogReplayScanner::try_new`]: This iterates over every action in the commit.
-///    In this phase, we do the following:
+/// 1. Prepare phase [`LogReplayScanner::try_new_with_channel`]: This iterates over every action in
+///    the commit. In this phase, we do the following:
 ///     - Determine if there exist any `cdc` actions. We determine this in the first phase because
 ///       the selection vectors for actions are lazily constructed in phase 2. We must know ahead of
 ///       time whether to filter out add/remove actions. In [`CdfMode::RowTracking`] mode `cdc`
@@ -145,10 +178,10 @@ pub(crate) fn table_changes_action_iter_with_mode(
 ///
 /// See https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors
 ///
-/// 2. Scan file generation phase [`LogReplayScanner::into_scan_batches`]: This iterates over every
-///    action in the commit, and generates [`TableChangesScanMetadata`]. It does so by transforming
-///    the actions using [`add_transform_expr`], and generating selection vectors with the following
-///    rules:
+/// 2. Scan file generation phase [`LogReplayScanner::into_scan_batches_with_channel`]: This
+///    iterates over every action in the commit, and generates [`TableChangesScanMetadata`]. It does
+///    so by transforming the actions using [`add_transform_expr`], and generating selection vectors
+///    with the following rules:
 ///     - If a `cdc` action was found in the prepare phase, only `cdc` actions are selected
 ///     - Otherwise, select `add` and `remove` actions. Note that only `remove` actions that do not
 ///       share a path with an `add` action are selected.
@@ -157,7 +190,7 @@ pub(crate) fn table_changes_action_iter_with_mode(
 /// commit twice. It also may use an unbounded amount of memory, proportional to the number of
 /// `add` + `remove` actions in the _single_ commit.
 struct LogReplayScanner {
-    // True if a `cdc` action was found after running [`LogReplayScanner::try_new`]
+    // True if a `cdc` action was found after running [`LogReplayScanner::try_new_with_channel`]
     has_cdc_action: bool,
     // A map from path to the deletion vector from the remove action. It is guaranteed that there
     // is an add action with the same path in this commit
@@ -178,6 +211,7 @@ impl LogReplayScanner {
     /// 3. Perform validation on each protocol and metadata action in the commit.
     ///
     /// For more details, see the documentation for [`LogReplayScanner`].
+    #[cfg(test)]
     fn try_new(
         engine: &dyn Engine,
         table_configuration: &mut TableConfiguration,
@@ -345,14 +379,16 @@ impl LogReplayScanner {
             remove_dvs,
         })
     }
-    /// Generates an iterator of [`TableChangesScanMetadata`] by iterating over each action of the
-    /// commit, generating a selection vector, and transforming the engine data. This performs
-    /// phase 2 of [`LogReplayScanner`].
-    fn into_scan_batches(
+    /// Generates [`TableChangesScanMetadata`] by iterating over each action of the commit,
+    /// generating a selection vector, and transforming the engine data. This performs phase 2 of
+    /// [`LogReplayScanner`].
+    async fn into_scan_batches_with_channel(
         self,
-        engine: Arc<dyn Engine>,
+        channel: &Channel,
         filter: Option<Arc<DataSkippingFilter>>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
+    ) -> DeltaResult<
+        impl IntoGenerator<Request, Item = DeltaResult<TableChangesScanMetadata>, Output = ()> + 'static,
+    > {
         let Self {
             has_cdc_action,
             remove_dvs,
@@ -363,36 +399,36 @@ impl LogReplayScanner {
         let remove_dvs = Arc::new(remove_dvs);
 
         let schema = FileActionSelectionVisitor::schema();
-        let action_iter = engine.json_handler().read_json_files(
-            slice::from_ref(&commit_file.location),
-            schema.clone(),
-            None,
-        )?;
+        let action_iter = channel
+            .prepare_json_files([commit_file.location], schema.clone(), None)
+            .await?
+            .flatten();
         let commit_version = commit_file
             .version
             .try_into()
             .map_err(|_| Error::generic("Failed to convert commit version to i64"))?;
-        let evaluator = engine.evaluation_handler().new_expression_evaluator(
+        let evaluator = channel.create_expression_evaluator(
             schema,
             Arc::new(cdf_scan_row_expression(timestamp, commit_version)),
             cdf_scan_row_schema().into(),
-        )?;
+        );
+        let evaluator = evaluator.await?;
 
-        let result = action_iter.map(move |actions| -> DeltaResult<_> {
+        let result = action_iter.map_async(map_async_witness, async move |channel, actions| {
             let actions = actions?;
 
             // Apply data skipping to get back a selection vector for actions that passed skipping.
             // We start our selection vector based on what was filtered. We will add to this vector
             // below if a file has been removed. Note: None implies all files passed data skipping.
             let selection_vector = match &filter {
-                Some(filter) => filter.apply(actions.as_ref())?,
+                Some(filter) => filter.apply_with_channel(channel, actions.as_ref()).await?,
                 None => vec![true; actions.len()],
             };
 
             let mut visitor =
                 FileActionSelectionVisitor::new(&remove_dvs, selection_vector, has_cdc_action);
             visitor.visit_rows_of(actions.as_ref())?;
-            let scan_metadata = evaluator.evaluate(actions.as_ref())?;
+            let scan_metadata = channel.evaluate_expression(&evaluator, actions).await?;
             Ok(TableChangesScanMetadata {
                 scan_metadata,
                 selection_vector: visitor.selection_vector,
@@ -404,7 +440,7 @@ impl LogReplayScanner {
 }
 
 // This is a visitor used in the prepare phase of [`LogReplayScanner`]. See
-// [`LogReplayScanner::try_new`] for details usage.
+// [`LogReplayScanner::try_new_with_channel`] for details usage.
 struct PreparePhaseVisitor<'a> {
     has_cdc_action: &'a mut bool,
     add_paths: &'a mut HashSet<String>,
@@ -485,7 +521,7 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
 }
 
 // This visitor generates selection vectors based on the rules specified in [`LogReplayScanner`].
-// See [`LogReplayScanner::into_scan_batches`] for usage.
+// See [`LogReplayScanner::into_scan_batches_with_channel`] for usage.
 struct FileActionSelectionVisitor<'a> {
     selection_vector: Vec<bool>,
     has_cdc_action: bool,

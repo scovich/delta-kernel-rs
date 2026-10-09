@@ -1405,7 +1405,9 @@ pub(crate) fn load_type_from_attrs(attrs: &Attributes<'_>) -> SnapshotLoadType {
 }
 
 /// A `scan_metadata` scan emits one event with [`ScanType::Full`] after iterator exhaustion.
-/// Calling
+/// Completing
+/// [`SequentialScanMetadata`](crate::scan::SequentialScanMetadata) through `advance` or
+/// `try_advance`, or calling
 /// [`SequentialScanMetadataIterator::finish`](crate::scan::SequentialScanMetadataIterator::finish)
 /// emits a [`ScanType::SequentialPhase`] event. If it returns parallel work, the caller emits a
 /// [`ScanType::ParallelPhase`] event by calling

@@ -1,7 +1,8 @@
 //! Parallel phase of log replay - processes checkpoint leaf files (sidecars or multi-part parts).
 //!
 //! This phase runs after [`SequentialPhase`] completes and is designed for parallel execution.
-//! Partition the leaf files across executors and create one `ParallelPhase` per partition.
+//! Partition the leaf files across executors and use `ParallelPhase` to create one generator per
+//! partition.
 //!
 //! [`SequentialPhase`]: super::sequential_phase::SequentialPhase
 #![allow(unused)]
@@ -11,16 +12,20 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 
+use crate::coroutine::engine::{EngineConnector, EngineResultGeneratorIterator};
+use crate::coroutine::generator::{map_async_witness, GeneratorExt as _, IntoGenerator};
+use crate::coroutine::kernel::{coroutine, Channel, ChannelExt as _};
+use crate::coroutine::Request;
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::scan::CHECKPOINT_READ_SCHEMA;
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Engine, EngineData, FileMeta};
 
-/// Creates iterators that process checkpoint leaf files in parallel using a shared processor.
+/// Creates generators that process checkpoint leaf files in parallel using a shared processor.
 ///
 /// This is designed for distributed execution where checkpoint leaf files (sidecars or multi-part
-/// checkpoint parts) are partitioned across multiple executors. Each executor creates an iterator
-/// with a subset of files, but all iterators share the same processor (typically wrapped in `Arc`)
+/// checkpoint parts) are partitioned across multiple executors. Each executor creates a generator
+/// with a subset of files, but all generators share the same processor (typically wrapped in `Arc`)
 /// to coordinate deduplication.
 ///
 /// The processor is responsible for filtering out actions for files already seen in the
@@ -28,8 +33,8 @@ use crate::{DeltaResult, Engine, EngineData, FileMeta};
 ///
 /// # Example workflow
 /// - Partition leaf files across N executors
-/// - Create one iterator per executor with its file subset
-/// - Each iterator processes its files independently while sharing deduplication state
+/// - Create one generator per executor with its file subset
+/// - Each generator processes its files independently while sharing deduplication state
 /// cbindgen:ignore
 #[internal_api]
 pub(crate) struct ParallelPhase;
@@ -42,21 +47,40 @@ impl ParallelPhase {
     /// - `processor`: Shared processor (wrap in `Arc` for distribution across executors)
     /// - `leaf_files`: Checkpoint leaf files (sidecars or multi-part checkpoint parts)
     /// - `read_schema`: Schema to use for reading checkpoint files
-    #[internal_api]
-    #[allow(unused)]
+    #[cfg(test)]
     pub(crate) fn try_new<P>(
         engine: Arc<dyn Engine>,
         processor: P,
         leaf_files: Vec<FileMeta>,
         read_schema: SchemaRef,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<P::Output>>>
+    ) -> DeltaResult<EngineResultGeneratorIterator<'static, P::Output>>
     where
-        P: ParallelLogReplayProcessor,
+        P: ParallelLogReplayProcessor + Send + Sync + 'static,
+        P::Output: Send + 'static,
     {
-        let batches =
-            engine
-                .parquet_handler()
-                .read_parquet_files(&leaf_files, read_schema, None)?;
+        let connector = EngineConnector::new(engine.as_ref());
+        let coroutine = coroutine!(async move |channel| {
+            Self::try_new_with_channel(channel, processor, leaf_files, read_schema).await
+        });
+        connector.iterate_prepared_result_generator(coroutine)
+    }
+
+    pub(crate) async fn try_new_with_channel<P>(
+        channel: &Channel,
+        processor: P,
+        leaf_files: Vec<FileMeta>,
+        read_schema: SchemaRef,
+    ) -> DeltaResult<
+        impl IntoGenerator<Request, Item = DeltaResult<P::Output>, Output = ()> + 'static,
+    >
+    where
+        P: ParallelLogReplayProcessor + Send + Sync + 'static,
+        P::Output: Send + 'static,
+    {
+        let batches = channel
+            .prepare_parquet_files(leaf_files, read_schema, None)
+            .await?
+            .flatten();
         Ok(Self::process_batches(processor, batches))
     }
 
@@ -68,14 +92,20 @@ impl ParallelPhase {
     /// # Errors
     ///
     /// Yields file-reading, Parquet-parsing, and processor errors.
-    fn process_batches<P>(
+    pub(crate) fn process_batches<P>(
         processor: P,
-        batches: impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>,
-    ) -> impl Iterator<Item = DeltaResult<P::Output>>
+        batches: impl IntoGenerator<Request, Item = DeltaResult<Box<dyn EngineData>>, Output = ()>
+            + 'static,
+    ) -> impl IntoGenerator<Request, Item = DeltaResult<P::Output>, Output = ()> + 'static
     where
-        P: ParallelLogReplayProcessor,
+        P: ParallelLogReplayProcessor + Send + Sync + 'static,
+        P::Output: Send + 'static,
     {
-        batches.map(move |batch| processor.process_actions_batch(ActionsBatch::new(batch?, false)))
+        batches.map_async(map_async_witness, async move |channel, batch| {
+            processor
+                .process_actions_batch(channel, ActionsBatch::new(batch?, false))
+                .await
+        })
     }
 
     /// Returns the schema used for reading checkpoint files.

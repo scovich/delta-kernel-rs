@@ -20,6 +20,8 @@ use delta_kernel_derive::internal_api;
 use derive_more::Constructor;
 use tracing::{debug, warn};
 
+use crate::coroutine::kernel::Channel;
+use crate::coroutine::DeltaFuture;
 use crate::engine_data::GetData;
 use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
 use crate::{DeltaResult, EngineData};
@@ -209,7 +211,11 @@ impl ActionsBatch {
 #[internal_api]
 pub(crate) trait ParallelLogReplayProcessor {
     type Output;
-    fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output>;
+    fn process_actions_batch(
+        &self,
+        channel: &Channel,
+        actions_batch: ActionsBatch,
+    ) -> impl DeltaFuture<Self::Output>;
 }
 
 impl<T> ParallelLogReplayProcessor for Arc<T>
@@ -218,8 +224,12 @@ where
 {
     type Output = T::Output;
 
-    fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
-        T::process_actions_batch(self, actions_batch)
+    fn process_actions_batch(
+        &self,
+        channel: &Channel,
+        actions_batch: ActionsBatch,
+    ) -> impl DeltaFuture<Self::Output> {
+        T::process_actions_batch(self, channel, actions_batch)
     }
 }
 

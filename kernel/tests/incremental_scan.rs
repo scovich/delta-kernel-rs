@@ -1858,7 +1858,8 @@ async fn column_free_predicate_keeps_all_added_files() -> Result<(), Box<dyn std
 // The correctness promise of `with_predicate` is that the incremental live-Add set, reconciled
 // against the base, reproduces what a full `Scan` at the target with the same predicate keeps.
 // The two paths parse stats differently: a full scan reads pre-parsed `stats_parsed` (from a
-// checkpoint), while the incremental path parses `add.stats` JSON via `for_raw_action_batch`.
+// checkpoint), while the incremental path parses `add.stats` JSON via
+// `for_raw_action_batch_with_channel`.
 //
 // The incremental scan reads only raw commit JSON and never touches checkpoints, so it cannot
 // serve a range predating a checkpoint (the target snapshot's log segment drops pre-checkpoint
