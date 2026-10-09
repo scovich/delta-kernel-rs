@@ -18,7 +18,7 @@ use crate::checkpoint::{CheckpointSpec, CheckpointWriter, V2CheckpointConfig};
 use crate::clustering::{parse_clustering_columns, ClusteringColumnInfo, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
 use crate::coroutine::engine::EngineConnector;
-use crate::coroutine::kernel::{coroutine, static_coroutine, Channel, StaticCoroutine};
+use crate::coroutine::kernel::{coroutine, static_coroutine, Channel, Coroutine, StaticCoroutine};
 use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _};
 use crate::crc::{
     try_write_crc_file_with_channel, Crc, CrcDelta, DomainMetadataState, FileSizeHistogram,
@@ -1545,10 +1545,32 @@ impl Snapshot {
     ///
     /// Note: There is currently no public api for callers to determine whether a table supports V2
     /// checkpoints directly. Tracked in <https://github.com/delta-io/delta-kernel-rs/issues/2450>.
-    #[instrument(parent = &self.span, name = "snap.checkpoint", skip_all, err)]
     pub fn checkpoint(
         self: &SnapshotRef,
         engine: &dyn Engine,
+        spec: Option<&CheckpointSpec>,
+    ) -> DeltaResult<(CheckpointWriteResult, SnapshotRef)> {
+        run_coroutine_with_engine!(engine, async move |channel| {
+            self.checkpoint_impl(channel, spec).await
+        })
+    }
+
+    /// Return a lazy workflow that writes a checkpoint for this snapshot.
+    ///
+    /// # Errors
+    ///
+    /// When driven, returns the errors documented by [`Self::checkpoint`].
+    pub fn checkpoint_workflow<'a>(
+        self: &'a SnapshotRef,
+        spec: Option<&'a CheckpointSpec>,
+    ) -> Coroutine<'a, (CheckpointWriteResult, SnapshotRef)> {
+        coroutine!(async move |channel| { self.checkpoint_impl(channel, spec).await })
+    }
+
+    #[instrument(parent = &self.span, name = "snap.checkpoint", skip_all, err)]
+    async fn checkpoint_impl(
+        self: &SnapshotRef,
+        channel: &Channel,
         spec: Option<&CheckpointSpec>,
     ) -> DeltaResult<(CheckpointWriteResult, SnapshotRef)> {
         if self.log_segment.checkpoint_version == Some(self.log_segment.end_version) {
@@ -1593,16 +1615,24 @@ impl Snapshot {
             _ => {}
         }
 
-        let writer = Arc::clone(self).create_checkpoint_writer(engine)?;
+        let writer = CheckpointWriter::try_new_with_channel(Arc::clone(self), channel).await?;
 
         let write_result = match spec {
             Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
                 file_actions_per_sidecar_hint,
-            })) => writer.write_v2_checkpoint_with_sidecars(
-                engine,
-                file_actions_per_sidecar_hint.and_then(NonZero::new),
-            ),
-            _ => writer.write_checkpoint_without_sidecars(engine),
+            })) => {
+                writer
+                    .write_v2_checkpoint_with_sidecars_with_channel(
+                        channel,
+                        file_actions_per_sidecar_hint.and_then(NonZero::new),
+                    )
+                    .await
+            }
+            _ => {
+                writer
+                    .write_checkpoint_without_sidecars_with_channel(channel)
+                    .await
+            }
         };
 
         let info = match write_result {
@@ -1620,7 +1650,9 @@ impl Snapshot {
             Err(e) => return Err(e),
         };
 
-        writer.finalize(engine, &info.last_checkpoint_stats)?;
+        writer
+            .finalize_with_channel(channel, &info.last_checkpoint_stats)
+            .await?;
 
         let checkpoint_log_path = ParsedLogPath::try_from(info.file_meta)?.ok_or_else(|| {
             Error::internal_error("Checkpoint path could not be parsed as a log path")

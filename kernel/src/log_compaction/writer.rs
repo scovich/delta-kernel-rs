@@ -5,13 +5,20 @@ use itertools::Itertools;
 use url::Url;
 
 use super::COMPACTION_ACTIONS_SCHEMA;
-use crate::action_reconciliation::log_replay::ActionReconciliationProcessor;
-use crate::action_reconciliation::{ActionReconciliationIterator, RetentionCalculator};
+use crate::action_reconciliation::log_replay::{
+    ActionReconciliationBatch, ActionReconciliationProcessor, ActionReconciliationState,
+};
+use crate::action_reconciliation::{
+    ActionReconciliationIterator, ActionReconciliationIteratorState, RetentionCalculator,
+};
+use crate::coroutine::engine::EngineConnector;
+use crate::coroutine::generator::{GeneratorExt as _, IntoGenerator};
+use crate::coroutine::kernel::{coroutine, Channel, Coroutine, Request};
 use crate::log_replay::HasSelectionVector;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::table_properties::TableProperties;
-use crate::{DeltaResult, Engine, Error, SnapshotRef, Version};
+use crate::{DeltaResult, Engine, Error, FilteredEngineData, SnapshotRef, Version};
 
 /// Determine if log compaction should be performed based on the commit version and
 /// compaction interval.
@@ -100,6 +107,46 @@ impl LogCompactionWriter {
         &mut self,
         engine: &dyn Engine,
     ) -> DeltaResult<ActionReconciliationIterator> {
+        let connector = EngineConnector::new(engine);
+        let coroutine = coroutine!(async move |channel| {
+            self.compaction_data_actions_with_channel(channel).await
+        });
+        let actions = connector.iterate_prepared_result_generator(coroutine)?;
+        // Wrap the iterator to track action counts lazily
+        Ok(ActionReconciliationIterator::new(Box::new(actions)))
+    }
+
+    /// Return a lazy workflow that builds the compaction data generator.
+    ///
+    /// # Errors
+    ///
+    /// When driven, returns the validation and connector errors documented by
+    /// [`Self::compaction_data`].
+    pub fn compaction_data_workflow(
+        &mut self,
+    ) -> Coroutine<
+        '_,
+        impl IntoGenerator<
+                Request,
+                Item = DeltaResult<FilteredEngineData>,
+                Output = ActionReconciliationIteratorState,
+            > + 'static,
+    > {
+        coroutine!(async move |channel| {
+            let actions = self.compaction_data_actions_with_channel(channel).await?;
+            let state = ActionReconciliationIteratorState::default();
+            Ok(ActionReconciliationState::new(actions, state)
+                .into_generator(std::convert::identity))
+        })
+    }
+
+    async fn compaction_data_actions_with_channel(
+        &mut self,
+        channel: &Channel,
+    ) -> DeltaResult<
+        impl IntoGenerator<Request, Item = DeltaResult<ActionReconciliationBatch>, Output = ()>
+            + 'static,
+    > {
         // Validate that the requested version range is within the snapshot's range
         let snapshot_end_version = self.snapshot.version();
         if self.end_version > snapshot_end_version {
@@ -111,16 +158,18 @@ impl LogCompactionWriter {
 
         // Create a log segment specifically for the compaction range
         // This ensures we only process commits in [start_version, end_version]
-        let compaction_log_segment = LogSegment::for_table_changes(
-            engine.storage_handler().as_ref(),
+        let compaction_log_segment = LogSegment::for_table_changes_with_channel(
+            channel,
             self.snapshot.log_segment().log_root.clone(),
             self.start_version,
             Some(self.end_version),
-        )?;
+        )
+        .await?;
 
         // Read actions from the version-filtered log segment
-        let actions_iter =
-            compaction_log_segment.read_actions(engine, COMPACTION_ACTIONS_SCHEMA.clone())?;
+        let actions_iter = compaction_log_segment
+            .read_actions_with_channel(channel, COMPACTION_ACTIONS_SCHEMA.clone())
+            .await?;
 
         let min_file_retention_timestamp_millis = self.deleted_file_retention_timestamp()?;
 
@@ -137,7 +186,6 @@ impl LogCompactionWriter {
             .map(move |batch: DeltaResult<_>| processor.process_actions_batch(batch?))
             .filter_ok(HasSelectionVector::has_selected_rows);
 
-        // Wrap the iterator to track action counts lazily
-        Ok(ActionReconciliationIterator::new(Box::new(result_iter)))
+        Ok(result_iter)
     }
 }
