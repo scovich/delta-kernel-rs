@@ -5,6 +5,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use delta_kernel_derive::internal_api;
+use itertools::Itertools;
 use tracing::instrument;
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -18,7 +19,7 @@ use crate::committer::{
     CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
 };
 use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta};
-use crate::engine_data::FilteredEngineData;
+use crate::engine_data::{EngineRelationRef, FilteredEngineData, InMemoryEngineRelation};
 use crate::error::KernelError;
 use crate::expressions::UnaryExpressionOp::ToJson;
 use crate::expressions::{
@@ -51,7 +52,7 @@ use crate::table_features::TableFeature;
 use crate::utils::{require, PhantomType};
 use crate::{
     create_row, version_as_i64, DataType, Engine, EngineData, Expression, FileMeta, KernelResult,
-    KernelResultIterator, Predicate, Result, RowVisitor, Version,
+    KernelResultIterator, Predicate, Result, ResultIteratorStatic, RowVisitor, Version,
 };
 
 #[cfg(feature = "internal-api")]
@@ -109,6 +110,8 @@ pub use write_state::{BoundWriteContextBuilder, RowTrackingMetadataColumns, Writ
 
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> = KernelResultIterator<'a, Box<dyn EngineData>>;
+
+type EngineDataRelationIterator = ResultIteratorStatic<Arc<dyn EngineData>>;
 
 /// The static instance referenced by [`add_files_schema`] that doesn't contain the dataChange
 /// column.
@@ -244,7 +247,7 @@ pub struct Transaction<S = ExistingTable> {
     // Engine-provided CommitInfo.operationMetrics. None uses CommitInfo's omitted default.
     operation_metrics: Option<HashMap<String, Option<String>>>,
     engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
-    add_files_metadata: Vec<Box<dyn EngineData>>,
+    add_files_metadata: Vec<EngineRelationRef>,
     remove_files_metadata: Vec<FilteredEngineData>,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
     // key/payload. HashSet requires Borrow<&str> with matching Eq, Ord, and Hash. Plus,
@@ -465,10 +468,10 @@ impl<S> Transaction<S> {
         // Note: Stats validation cannot use `StagedDataValidator` because its columns and types
         // are determined at runtime, whereas `RowVisitor::selected_column_names_and_types` must
         // return a static projection. It therefore uses dynamic per-column visitors.
-        self.validate_add_files_stats()?;
+        self.validate_add_files_stats(engine)?;
 
         // Validate required fields for addFile.
-        let add_files_metadata = self.scan_add_files();
+        let add_files_metadata = self.scan_add_files(engine);
         write_validation::StagedDataValidator::staged_add_file(
             self.effective_table_config.physical_partition_columns(),
         )
@@ -606,7 +609,7 @@ impl<S> Transaction<S> {
                     .and_then(|s| s.file_size_histogram)
                     .map(|h| h.sorted_bin_boundaries);
                 let file_stats = FileStatsDelta::try_compute_for_txn(
-                    self.scan_add_files(),
+                    self.scan_add_files(engine),
                     &self.remove_files_metadata,
                     bin_boundaries.as_deref(),
                 )?;
@@ -1297,7 +1300,15 @@ impl<S: SupportsDataFiles> Transaction<S> {
     ///
     /// The expected schema for `add_metadata` is given by [`Transaction::add_files_schema`].
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
-        self.add_files_metadata.push(add_metadata);
+        let relation = InMemoryEngineRelation::new(vec![add_metadata.into()]);
+        self.add_files_relation(Arc::new(relation));
+    }
+
+    /// Add files from an immutable, replayable metadata relation.
+    pub fn add_files_relation(&mut self, add_metadata: EngineRelationRef) {
+        if !add_metadata.is_empty() {
+            self.add_files_metadata.push(add_metadata);
+        }
     }
 }
 
@@ -1305,10 +1316,16 @@ impl<S: SupportsDataFiles> Transaction<S> {
 // Internal methods available on ALL transaction types (used by commit path)
 // =============================================================================
 impl<S> Transaction<S> {
-    fn scan_add_files(&self) -> impl Iterator<Item = Result<&dyn EngineData>> + Send + '_ {
-        self.add_files_metadata
-            .iter()
-            .map(|batch| Ok(batch.as_ref()))
+    fn scan_add_files(&self, engine: &dyn Engine) -> EngineDataRelationIterator {
+        let handler = engine.relation_handler();
+        let batches = self
+            .add_files_metadata
+            .clone()
+            .into_iter()
+            .map(move |relation| handler.read_relation(relation))
+            .flatten_ok()
+            .map(|result| result?);
+        Box::new(batches)
     }
 
     /// Validate that add files carry the per-file statistics required by the table's protocol.
@@ -1324,7 +1341,7 @@ impl<S> Transaction<S> {
     /// Only add files are validated(remove files do not carry statistics).
     ///
     /// [`requires_stats_num_records`]: crate::table_configuration::TableConfiguration::requires_stats_num_records
-    fn validate_add_files_stats(&self) -> KernelResult<()> {
+    fn validate_add_files_stats(&self, engine: &dyn Engine) -> KernelResult<()> {
         if self.add_files_metadata.is_empty() {
             return Ok(());
         }
@@ -1332,7 +1349,7 @@ impl<S> Transaction<S> {
             // TODO: Likely it's better to merge this with the clustering column validation below,
             // benchmark it and see if it's faster. If so, refactor this to do both validations in
             // one pass.
-            stats_verifier::verify_num_records_present(self.scan_add_files())?;
+            stats_verifier::verify_num_records_present(self.scan_add_files(engine))?;
         }
         if let Some(ref clustering_cols) = self.physical_clustering_columns {
             if !clustering_cols.is_empty() {
@@ -1353,7 +1370,7 @@ impl<S> Transaction<S> {
                     })
                     .collect::<KernelResult<_>>()?;
                 let verifier = StatsColumnVerifier::new(columns_with_types);
-                verifier.verify(self.scan_add_files())?;
+                verifier.verify(self.scan_add_files(engine))?;
             }
         }
         Ok(())
@@ -1392,7 +1409,7 @@ impl<S> Transaction<S> {
         } else {
             let add_actions = build_add_actions(
                 engine,
-                self.scan_add_files(),
+                self.scan_add_files(engine),
                 self.add_files_schema().clone(),
                 self.data_change,
             )?;
@@ -1425,16 +1442,16 @@ impl<S> Transaction<S> {
         // Compute the final high water mark without retaining per-file assignments.
         let mut high_water_mark_visitor = RowTrackingVisitor::new(row_id_high_water_mark);
         high_water_mark_visitor.collect_base_row_ids = false;
-        for add_files_batch in self.scan_add_files() {
-            high_water_mark_visitor.visit_rows_of(add_files_batch?)?;
+        for add_files_batch in self.scan_add_files(engine) {
+            high_water_mark_visitor.visit_rows_of(add_files_batch?.as_ref())?;
         }
 
         // Assign base row IDs from a fresh running prefix.
         let mut row_tracking_visitor = RowTrackingVisitor::new(row_id_high_water_mark);
         let row_id_high_water_mark = high_water_mark_visitor.row_id_high_water_mark;
-        let extended_add_files = self.scan_add_files().map(move |add_files_batch| {
+        let extended_add_files = self.scan_add_files(engine).map(move |add_files_batch| {
             let add_files_batch = add_files_batch?;
-            row_tracking_visitor.visit_rows_of(add_files_batch)?;
+            row_tracking_visitor.visit_rows_of(add_files_batch.as_ref())?;
             let base_row_ids = row_tracking_visitor.take_base_row_ids();
             let commit_versions = vec![commit_version; base_row_ids.len()];
             let base_row_ids_array =
@@ -3736,7 +3753,7 @@ mod tests {
     #[test]
     fn test_stats_validation_allows_all_null_clustering_column() {
         let (engine, snapshot) = setup_non_dv_table();
-        let txn = snapshot
+        let mut txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)
             .unwrap()
             .with_operation("WRITE".to_string())
@@ -3744,7 +3761,8 @@ mod tests {
 
         let add_files = create_test_add_files(vec!["file1.parquet"], vec![TestFileStats::AllNull]);
 
-        let result = txn.validate_add_files_stats(&[add_files]);
+        txn.add_files(add_files);
+        let result = txn.validate_add_files_stats(&engine);
 
         assert!(
             result.is_ok(),
@@ -3755,7 +3773,7 @@ mod tests {
     #[test]
     fn test_stats_validation_when_clustering_cols_missing_stats() {
         let (engine, snapshot) = setup_non_dv_table();
-        let txn = snapshot
+        let mut txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)
             .unwrap()
             .with_operation("WRITE".to_string())
@@ -3766,7 +3784,8 @@ mod tests {
         let add_files = create_test_add_files(vec!["file1.parquet"], vec![TestFileStats::None]);
 
         // Directly test the validation method instead of committing
-        let result = txn.validate_add_files_stats(&[add_files]);
+        txn.add_files(add_files);
+        let result = txn.validate_add_files_stats(&engine);
 
         assert!(
             result.is_err(),
@@ -3783,7 +3802,7 @@ mod tests {
     #[test]
     fn test_stats_validation_when_clustering_stats_present() {
         let (engine, snapshot) = setup_non_dv_table();
-        let txn = snapshot
+        let mut txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)
             .unwrap()
             .with_operation("WRITE".to_string())
@@ -3794,7 +3813,8 @@ mod tests {
         let add_files = create_test_add_files(vec!["file1.parquet"], vec![TestFileStats::Present]);
 
         // Directly test the validation method
-        let result = txn.validate_add_files_stats(&[add_files]);
+        txn.add_files(add_files);
+        let result = txn.validate_add_files_stats(&engine);
 
         assert!(
             result.is_ok(),
@@ -3805,7 +3825,7 @@ mod tests {
     #[test]
     fn test_stats_validation_skipped_without_clustering() {
         let (engine, snapshot) = setup_non_dv_table();
-        let txn = snapshot
+        let mut txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)
             .unwrap()
             .with_operation("WRITE".to_string());
@@ -3815,7 +3835,8 @@ mod tests {
         let add_files = create_test_add_files(vec!["file1.parquet"], vec![TestFileStats::None]);
 
         // Directly test the validation method - should pass because no clustering
-        let result = txn.validate_add_files_stats(&[add_files]);
+        txn.add_files(add_files);
+        let result = txn.validate_add_files_stats(&engine);
 
         assert!(
             result.is_ok(),
