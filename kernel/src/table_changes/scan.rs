@@ -2,17 +2,18 @@
 
 use std::sync::Arc;
 
-use itertools::Itertools;
 use url::Url;
 
-use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
+use super::log_replay::{table_changes_action_iter_with_channel, TableChangesScanMetadata};
 use super::physical_to_logical::{get_cdf_transform_expr, scan_file_physical_schema};
-use super::resolve_dvs::{resolve_scan_file_dv, ResolvedCdfScanFile};
-use super::scan_file::scan_metadata_to_scan_file;
+use super::resolve_dvs::{resolve_scan_file_dv_with_channel, ResolvedCdfScanFile};
+use super::scan_file::scan_metadata_to_scan_file_generator;
 use super::{CdfMode, TableChanges};
 use crate::actions::deletion_vector::split_vector;
-use crate::coroutine::generator::{map_async_witness, GeneratorExt as _};
-use crate::coroutine::kernel::{Channel, DeltaResultGenerator};
+use crate::coroutine::generator::{map_async_witness, AsyncIntoIterator as _, GeneratorExt as _};
+use crate::coroutine::kernel::{
+    generator_coroutine, Channel, DeltaResultGenerator, GeneratorCoroutine,
+};
 use crate::coroutine::{
     iterate_prepared_result_generator_with_engine, AsyncOption as _, ChannelExt as _,
 };
@@ -162,10 +163,10 @@ impl TableChangesScan {
     /// deletion vectors present in the commit. The engine data in each scan metadata is guaranteed
     /// to belong to the same commit. Several [`TableChangesScanMetadata`] may belong to the same
     /// commit.
-    fn scan_metadata(
+    async fn scan_metadata_with_channel(
         &self,
-        engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
+        channel: &Channel,
+    ) -> DeltaResult<impl DeltaResultGenerator<TableChangesScanMetadata> + 'static> {
         let commits = self
             .table_changes
             .log_segment
@@ -174,19 +175,20 @@ impl TableChangesScan {
             .clone();
         // NOTE: This is a cheap arc clone
         let physical_predicate = match self.state_info.physical_predicate.clone() {
-            PhysicalPredicate::StaticSkipAll => return Ok(None.into_iter().flatten()),
+            PhysicalPredicate::StaticSkipAll => return Ok(None.into_generator().flatten_async()),
             PhysicalPredicate::Some(predicate, schema) => Some((predicate, schema)),
             PhysicalPredicate::None => None,
         };
         let schema = self.table_changes.end_snapshot.schema();
-        let it = table_changes_action_iter(
-            engine,
+        let it = table_changes_action_iter_with_channel(
+            channel,
             &self.table_changes.start_table_config,
             commits,
             schema,
             physical_predicate,
-        )?;
-        Ok(Some(it).into_iter().flatten())
+        );
+        let it = it.await?;
+        Ok(Some(it).into_generator().flatten_async())
     }
 
     /// Get a shared reference to the logical [`Schema`] of the table changes scan.
@@ -223,58 +225,66 @@ impl TableChangesScan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
-        let scan_metadata = self.scan_metadata(engine.clone())?;
-        let scan_files = scan_metadata_to_scan_file(scan_metadata);
+        iterate_prepared_result_generator_with_engine!(
+            engine.as_ref(),
+            None,
+            async move |channel| { self.execute_with_channel(channel).await }
+        )
+    }
+
+    /// Return a connector-driven generator over change data feed batches.
+    pub fn execute_generator(&self) -> GeneratorCoroutine<'_, DeltaResult<Box<dyn EngineData>>> {
+        generator_coroutine!(async move |channel| {
+            let batches = self.execute_with_channel(&channel).await?;
+            channel.yield_from(batches.bind(&channel)).await
+        })
+    }
+
+    async fn execute_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> DeltaResult<impl DeltaResultGenerator<Box<dyn EngineData>> + 'static> {
+        let scan_metadata = self.scan_metadata_with_channel(channel).await?;
+        let scan_files = scan_metadata_to_scan_file_generator(scan_metadata);
 
         let table_root = self.table_changes.table_root().clone();
         let state_info = self.state_info.clone();
-        let dv_engine_ref = engine.clone();
 
         let table_root_copy = self.table_changes.table_root().clone();
         let physical_predicate = self.physical_predicate().clone();
 
-        let result = scan_files
-            .map(move |scan_file| {
-                resolve_scan_file_dv(dv_engine_ref.as_ref(), &table_root, scan_file?)
-            }) // Iterator-Result-Iterator
-            .flatten_ok() // Iterator-Result
-            .map(move |resolved_scan_file| -> DeltaResult<_> {
-                read_scan_file(
-                    engine.as_ref(),
+        let scan_files = scan_files.map_async(
+            map_async_witness,
+            async move |channel, scan_file| -> DeltaResult<_> {
+                let scan_files =
+                    resolve_scan_file_dv_with_channel(channel, &table_root, scan_file?);
+                let scan_files = scan_files.await?;
+                Ok(scan_files.into_generator())
+            },
+        ); // Generator-Result-Generator
+        let scan_files = scan_files.flatten_ok(); // Generator-Result
+        let result = scan_files.map_async(
+            map_async_witness,
+            async move |channel, resolved_scan_file| -> DeltaResult<_> {
+                let result = read_scan_file_with_channel(
+                    channel,
                     resolved_scan_file?,
                     &table_root_copy,
                     state_info.as_ref(),
                     physical_predicate.clone(),
-                )
-            }) // Iterator-Result-Iterator-Result
-            .flatten_ok() // Iterator-Result-Result
-            .map(|x| x?); // Iterator-Result
+                );
+                result.await
+            },
+        ); // Generator-Result-Generator-Result
+        let result = result.flatten_ok(); // Generator-Result-Result
+        let result = result.map(|x| x?); // Generator-Result
 
         Ok(result)
     }
 }
 
 /// Reads the data at the `resolved_scan_file` and transforms the data from physical to logical.
-/// The result is a fallible iterator of [`Box<dyn EngineData>`] containing the logical data.
-fn read_scan_file(
-    engine: &dyn Engine,
-    resolved_scan_file: ResolvedCdfScanFile,
-    table_root: &Url,
-    state_info: &StateInfo,
-    _physical_predicate: Option<PredicateRef>,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
-    iterate_prepared_result_generator_with_engine!(engine, None, async move |channel| {
-        read_scan_file_with_channel(
-            channel,
-            resolved_scan_file,
-            table_root,
-            state_info,
-            _physical_predicate,
-        )
-        .await
-    })
-}
-
+/// The result is a fallible generator of [`Box<dyn EngineData>`] containing the logical data.
 async fn read_scan_file_with_channel(
     channel: &Channel,
     resolved_scan_file: ResolvedCdfScanFile,

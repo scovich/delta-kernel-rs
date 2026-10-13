@@ -13,12 +13,12 @@ use crate::actions::{
     REMOVE_FIELD,
 };
 use crate::coroutine::generator::{map_async_witness, AsyncIntoIterator as _, GeneratorExt as _};
+#[cfg(test)]
+use crate::coroutine::iterate_prepared_result_generator_with_engine;
 use crate::coroutine::kernel::{Channel, DeltaResultGenerator};
 #[cfg(test)]
 use crate::coroutine::run_coroutine_with_engine;
-use crate::coroutine::{
-    iterate_prepared_result_generator_with_engine, AsyncOption as _, ChannelExt as _,
-};
+use crate::coroutine::{AsyncOption as _, ChannelExt as _};
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{column_name, ColumnName};
 use crate::path::{AsUrl, ParsedLogPath};
@@ -30,7 +30,9 @@ use crate::table_changes::CdfMode;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{format_features, Operation, TableFeature};
 use crate::utils::require;
-use crate::{DeltaResult, Engine, EngineData, Error, PredicateRef, RowVisitor};
+#[cfg(test)]
+use crate::Engine;
+use crate::{DeltaResult, EngineData, Error, PredicateRef, RowVisitor};
 
 #[cfg(test)]
 mod tests;
@@ -55,6 +57,7 @@ pub(crate) struct TableChangesScanMetadata {
 ///
 /// Note: The [`ParsedLogPath`]s in the `commit_files` iterator must be ordered, contiguous
 /// (JSON) commit files.
+#[cfg(test)]
 pub(crate) fn table_changes_action_iter<'a>(
     engine: Arc<dyn Engine>,
     start_table_configuration: &TableConfiguration,
@@ -73,11 +76,30 @@ pub(crate) fn table_changes_action_iter<'a>(
     )
 }
 
+pub(super) async fn table_changes_action_iter_with_channel<'a>(
+    channel: &Channel,
+    start_table_configuration: &TableConfiguration,
+    commit_files: impl IntoIterator<Item = ParsedLogPath, IntoIter: Send + 'a> + Send + 'a,
+    table_schema: SchemaRef,
+    physical_predicate: Option<(PredicateRef, SchemaRef)>,
+) -> DeltaResult<impl DeltaResultGenerator<TableChangesScanMetadata> + 'a> {
+    table_changes_action_iter_with_mode_and_channel(
+        channel,
+        start_table_configuration,
+        commit_files,
+        table_schema,
+        physical_predicate,
+        CdfMode::ChangeDataFeed,
+    )
+    .await
+}
+
 /// Replays change-feed actions according to `mode`.
 ///
 /// [`CdfMode::ChangeDataFeed`] uses `AddCDCFile` actions because they contain changes recorded by
 /// the writer. [`CdfMode::RowTracking`] ignores those actions and reconstructs changes from
 /// row lineage in the data files referenced by `add` and `remove` actions.
+#[cfg(test)]
 pub(crate) fn table_changes_action_iter_with_mode<'a>(
     engine: Arc<dyn Engine>,
     start_table_configuration: &TableConfiguration,
@@ -99,7 +121,7 @@ pub(crate) fn table_changes_action_iter_with_mode<'a>(
     })
 }
 
-async fn table_changes_action_iter_with_mode_and_channel<'a>(
+pub(super) async fn table_changes_action_iter_with_mode_and_channel<'a>(
     channel: &Channel,
     start_table_configuration: &TableConfiguration,
     commit_files: impl IntoIterator<Item = ParsedLogPath, IntoIter: Send + 'a> + Send + 'a,
