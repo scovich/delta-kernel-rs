@@ -7,11 +7,14 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use delta_kernel_derive::internal_api;
+#[cfg(test)]
 use itertools::Itertools;
 
 use super::log_replay::TableChangesScanMetadata;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::visitors::visit_deletion_vector_at;
+use crate::coroutine::generator::{AsyncIntoIterator as _, GeneratorExt as _};
+use crate::coroutine::kernel::DeltaResultGenerator;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{col, lit, Expression};
 use crate::scan::state::DvInfo;
@@ -196,6 +199,7 @@ impl TableChangesScanFile {
 
 /// Transforms an iterator of [`TableChangesScanMetadata`] into an iterator of
 /// [`CdfScanFile`] by visiting the engine data.
+#[cfg(test)]
 pub(crate) fn scan_metadata_to_scan_file(
     scan_metadata: impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>,
 ) -> impl Iterator<Item = DeltaResult<CdfScanFile>> {
@@ -207,6 +211,19 @@ pub(crate) fn scan_metadata_to_scan_file(
             Ok(visit_cdf_scan_files(&scan_metadata, vec![], callback)?.into_iter())
         }) // Iterator-Result-Iterator
         .flatten_ok() // Iterator-Result
+}
+
+pub(crate) fn scan_metadata_to_scan_file_generator<'a>(
+    scan_metadata: impl DeltaResultGenerator<TableChangesScanMetadata> + 'a,
+) -> impl DeltaResultGenerator<CdfScanFile> + 'a {
+    scan_metadata
+        .map(|scan_metadata| -> DeltaResult<_> {
+            let scan_metadata = scan_metadata?;
+            let callback: CdfScanCallback<Vec<CdfScanFile>> =
+                |context, scan_file| context.push(scan_file);
+            Ok(visit_cdf_scan_files(&scan_metadata, vec![], callback)?.into_generator())
+        }) // Generator-Result-Generator
+        .flatten_ok() // Generator-Result
 }
 
 /// Request that the kernel call a callback on each valid file that needs to be read for the

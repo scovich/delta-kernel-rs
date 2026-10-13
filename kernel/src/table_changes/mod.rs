@@ -39,13 +39,13 @@
 use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
-use log_replay::table_changes_action_iter_with_mode;
+use log_replay::table_changes_action_iter_with_mode_and_channel;
 use scan::TableChangesScanBuilder;
-use scan_file::scan_metadata_to_scan_file;
+use scan_file::scan_metadata_to_scan_file_generator;
 use url::Url;
 
 use crate::coroutine::kernel::{static_coroutine, Channel, StaticCoroutine};
-use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::{run_coroutine_with_engine, GeneratorExt as _};
 use crate::log_segment::LogSegment;
 use crate::path::AsUrl;
 use crate::schema::compare::SchemaComparison as _;
@@ -556,6 +556,29 @@ impl TableChanges {
         engine: Arc<dyn Engine>,
         mode: TableChangesListingMode,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesFileAction>>> {
+        let actions = run_coroutine_with_engine!(engine.as_ref(), async move |channel| {
+            self.scan_file_listing_with_channel(channel, mode).await
+        })?;
+        Ok(actions.into_iter().map(Ok))
+    }
+
+    /// Return a lazy workflow that prepares a row-tracking file-action listing.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[internal_api]
+    pub(crate) fn scan_file_listing_workflow(
+        self: Arc<Self>,
+        mode: TableChangesListingMode,
+    ) -> StaticCoroutine<Vec<TableChangesFileAction>> {
+        static_coroutine!(async move |channel| {
+            self.scan_file_listing_with_channel(channel, mode).await
+        })
+    }
+
+    async fn scan_file_listing_with_channel(
+        &self,
+        channel: &Channel,
+        mode: TableChangesListingMode,
+    ) -> DeltaResult<Vec<TableChangesFileAction>> {
         if self.mode != CdfMode::RowTracking {
             return Err(Error::unsupported(
                 "scan_file_listing is only supported for row-tracking change feeds; construct \
@@ -565,23 +588,26 @@ impl TableChanges {
 
         let commits = self.log_segment.listed.ascending_commit_files.clone();
         let schema = self.end_snapshot.schema();
-        let scan_metadata = table_changes_action_iter_with_mode(
-            engine,
+        let scan_metadata = table_changes_action_iter_with_mode_and_channel(
+            channel,
             &self.start_table_config,
             commits,
             schema,
             None,
             self.mode,
-        )?;
+        );
+        let scan_metadata = scan_metadata.await?;
         // Any listing error surfaces here rather than mid-iteration.
-        let actions = scan_metadata_to_scan_file(scan_metadata)
+        let actions = scan_metadata_to_scan_file_generator(scan_metadata)
             .map(|scan_file| TableChangesFileAction::try_from_scan_file(scan_file?))
-            .collect::<DeltaResult<Vec<_>>>()?;
+            .bind(channel)
+            .try_collect()
+            .await?;
         let actions = match mode {
             TableChangesListingMode::AllChanges => actions,
             TableChangesListingMode::NetChanges => net_changes::collapse_net_changes(actions)?,
         };
-        Ok(actions.into_iter().map(Ok))
+        Ok(actions)
     }
 }
 
