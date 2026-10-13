@@ -1498,80 +1498,93 @@ impl Scan {
         let physical_schema = self.physical_schema().clone();
         let logical_schema = self.logical_schema().clone();
         let result = scan_files_iter
-            .map(move |scan_file| -> DeltaResult<_> {
-                let scan_file = scan_file?;
-                let file_path = table_root.join(&scan_file.path)?;
-                let mut selection_vector = scan_file
-                    .dv_info
-                    .get_selection_vector(engine.as_ref(), &table_root)?;
-                let meta = FileMeta {
-                    last_modified: scan_file.modification_time,
-                    size: scan_file.size.try_into().map_err(|_| {
-                        Error::generic("Unable to convert scan file size into FileSize")
-                    })?,
-                    location: file_path,
-                };
-
-                // WARNING: We validated the physical predicate against a schema that includes
-                // partition columns, but the read schema we use here does _NOT_ include partition
-                // columns. So we cannot safely assume that all column references are valid. See
-                // https://github.com/delta-io/delta-kernel-rs/issues/434 for more details.
-                //
-                // TODO(#860): we disable predicate pushdown until we support row indexes.
-                let read_result_iter = engine.parquet_handler().read_parquet_files(
-                    &[meta],
-                    physical_schema.clone(),
-                    None,
-                )?;
-
-                let mut read_result_iter = read_result_iter.peekable();
-
-                // Only flag an empty iterator as a connector bug when stats are present and report
-                // a positive row count. When stats are absent we cannot distinguish a legitimate
-                // 0-row file from a buggy connector, so we conservatively allow it.
-                let expect_data = scan_file.stats.as_ref().is_some_and(|s| s.num_records > 0);
-                if expect_data && read_result_iter.peek().is_none() {
-                    return Err(Error::internal_error(format!(
-                        "ParquetHandler returned no data for file '{}'. This is likely a connector \
-                         bug -- the handler's read_parquet_files must return at least one batch for \
-                         each requested file that contains rows.",
-                        scan_file.path
-                    )));
-                }
-
-                let engine = engine.clone(); // Arc clone
-                let physical_schema_inner = physical_schema.clone();
-                let logical_schema_inner = logical_schema.clone();
-                Ok(read_result_iter.map(move |read_result| -> DeltaResult<_> {
-                    let read_result = read_result?;
-                    // transform the physical data into the correct logical form
-                    let logical = state::transform_to_logical(
-                        engine.as_ref(),
-                        read_result,
-                        &physical_schema_inner,
-                        &logical_schema_inner,
-                        scan_file.transform.clone(), // Arc clone
-                    );
-                    let len = logical.as_ref().map_or(0, |res| res.len());
-                    // need to split the dv_mask. what's left in dv_mask covers this result, and rest
-                    // will cover the following results. we `take()` out of `selection_vector` to avoid
-                    // trying to return a captured variable. We're going to reassign `selection_vector`
-                    // to `rest` in a moment anyway
-                    let mut sv = selection_vector.take();
-                    let rest = split_vector(sv.as_mut(), len, None);
-                    let result = logical.fold_with(sv, |logical, sv| {
-                        logical.and_then(|data| data.apply_selection_vector(sv))
-                    });
-                    selection_vector = rest;
-                    result
-                }))
-            })
-            // Iterator<DeltaResult<Iterator<DeltaResult<Box<dyn EngineData>>>>> to Iterator<DeltaResult<DeltaResult<Box<dyn EngineData>>>>
-            .flatten_ok()
-            // Iterator<DeltaResult<DeltaResult<Box<dyn EngineData>>>> to Iterator<DeltaResult<Box<dyn EngineData>>>
-            .map(|x| x?);
+            .map(move |scan_file| {
+                read_scan_file(
+                    &engine,
+                    &table_root,
+                    &physical_schema,
+                    &logical_schema,
+                    scan_file?,
+                )
+            }) // Iterator-Result-Iterator-Result
+            .flatten_ok() // Iterator-Result-Result
+            .map(|x| x?); // Iterator-Result
         Ok(result)
     }
+}
+
+fn read_scan_file(
+    engine: &Arc<dyn Engine>,
+    table_root: &Url,
+    physical_schema: &SchemaRef,
+    logical_schema: &SchemaRef,
+    scan_file: state::ScanFile,
+) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
+    let file_path = table_root.join(&scan_file.path)?;
+    let mut selection_vector = scan_file
+        .dv_info
+        .get_selection_vector(engine.as_ref(), table_root)?;
+    let meta = FileMeta {
+        last_modified: scan_file.modification_time,
+        size: scan_file
+            .size
+            .try_into()
+            .map_err(|_| Error::generic("Unable to convert scan file size into FileSize"))?,
+        location: file_path,
+    };
+
+    // WARNING: We validated the physical predicate against a schema that includes
+    // partition columns, but the read schema we use here does _NOT_ include partition
+    // columns. So we cannot safely assume that all column references are valid. See
+    // https://github.com/delta-io/delta-kernel-rs/issues/434 for more details.
+    //
+    // TODO(#860): we disable predicate pushdown until we support row indexes.
+    let read_result_iter =
+        engine
+            .parquet_handler()
+            .read_parquet_files(&[meta], physical_schema.clone(), None)?;
+
+    let mut read_result_iter = read_result_iter.peekable();
+
+    // Only flag an empty iterator as a connector bug when stats are present and report
+    // a positive row count. When stats are absent we cannot distinguish a legitimate
+    // 0-row file from a buggy connector, so we conservatively allow it.
+    let expect_data = scan_file.stats.as_ref().is_some_and(|s| s.num_records > 0);
+    if expect_data && read_result_iter.peek().is_none() {
+        return Err(Error::internal_error(format!(
+            "ParquetHandler returned no data for file '{}'. This is likely a connector \
+             bug -- the handler's read_parquet_files must return at least one batch for \
+             each requested file that contains rows.",
+            scan_file.path
+        )));
+    }
+
+    let engine = engine.clone(); // Arc clone
+    let physical_schema_inner = physical_schema.clone();
+    let logical_schema_inner = logical_schema.clone();
+    Ok(read_result_iter.map(move |read_result| -> DeltaResult<_> {
+        let read_result = read_result?;
+        // transform the physical data into the correct logical form
+        let logical = state::transform_to_logical(
+            engine.as_ref(),
+            read_result,
+            &physical_schema_inner,
+            &logical_schema_inner,
+            scan_file.transform.clone(), // Arc clone
+        );
+        let len = logical.as_ref().map_or(0, |res| res.len());
+        // need to split the dv_mask. what's left in dv_mask covers this result, and rest
+        // will cover the following results. we `take()` out of `selection_vector` to avoid
+        // trying to return a captured variable. We're going to reassign `selection_vector`
+        // to `rest` in a moment anyway
+        let mut sv = selection_vector.take();
+        let rest = split_vector(sv.as_mut(), len, None);
+        let result = logical.fold_with(sv, |logical, sv| {
+            logical.and_then(|data| data.apply_selection_vector(sv))
+        });
+        selection_vector = rest;
+        result
+    }))
 }
 
 /// Get the base schema that scan rows (from [`Scan::scan_metadata`]) will be returned with.
