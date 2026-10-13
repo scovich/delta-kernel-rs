@@ -21,7 +21,9 @@ use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
 use crate::coroutine::engine::EngineConnector;
-use crate::coroutine::generator::{map_async_witness, AsyncIntoIterator as _, GeneratorExt as _};
+use crate::coroutine::generator::{
+    map_async_witness, AsyncIntoIterator as _, GeneratorExt as _, IntoGenerator,
+};
 use crate::coroutine::kernel::request::ReadParquetFiles;
 use crate::coroutine::kernel::{
     coroutine, generator_coroutine, static_coroutine, Channel, Coroutine, DeltaResultGenerator,
@@ -31,7 +33,7 @@ use crate::coroutine::kernel::{
 use crate::coroutine::run_coroutine_with_engine;
 use crate::coroutine::{
     iterate_prepared_result_generator_with_engine, run_coroutine_with_storage, ChannelExt as _,
-    PageGenerator,
+    PageGenerator, Request,
 };
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef};
@@ -999,15 +1001,55 @@ impl Scan {
         engine: &dyn Engine,
         existing_version: Version,
         existing_data: impl IntoIterator<Item = Box<dyn EngineData>, IntoIter: Send + 'static>,
-        _existing_predicate: Option<PredicateRef>,
+        existing_predicate: Option<PredicateRef>,
     ) -> DeltaResult<DeltaResultIteratorStatic<ScanMetadata>> {
-        // TODO(#966): validate that the current predicate is compatible with the hint predicate.
         let existing_data = existing_data.into_iter();
         // Cached metadata bypasses engine handlers, so kernel must poll cancellation while
         // consuming it.
         let existing_data =
             CancellableIterator::new(existing_data.map(Ok), self.cancellation_token.clone());
+        let connector =
+            EngineConnector::new(engine).with_cancellation_token(self.cancellation_token.clone());
+        let result =
+            connector.iterate_prepared_result_generator(self.scan_metadata_from_workflow(
+                existing_version,
+                existing_data.into_generator(),
+                existing_predicate,
+            ))?;
+        Ok(Box::new(result))
+    }
 
+    #[internal_api]
+    pub(crate) fn scan_metadata_from_workflow(
+        &self,
+        existing_version: Version,
+        existing_data: impl DeltaResultGenerator<Box<dyn EngineData>> + 'static,
+        existing_predicate: Option<PredicateRef>,
+    ) -> Coroutine<
+        '_,
+        Box<dyn IntoGenerator<Request, Item = DeltaResult<ScanMetadata>, Output = ()> + 'static>,
+    > {
+        coroutine!(async move |channel| {
+            self.scan_metadata_from_with_channel(
+                channel,
+                existing_version,
+                existing_data,
+                existing_predicate,
+            )
+            .await
+        })
+    }
+
+    async fn scan_metadata_from_with_channel(
+        &self,
+        channel: &Channel,
+        existing_version: Version,
+        existing_data: impl DeltaResultGenerator<Box<dyn EngineData>> + 'static,
+        _existing_predicate: Option<PredicateRef>,
+    ) -> DeltaResult<
+        Box<dyn IntoGenerator<Request, Item = DeltaResult<ScanMetadata>, Output = ()> + 'static>,
+    > {
+        // TODO(#966): validate that the current predicate is compatible with the hint predicate.
         if existing_version > self.snapshot.version() {
             return Err(Error::Generic(format!(
                 "existing_version {} is greater than current version {}",
@@ -1021,14 +1063,15 @@ impl Scan {
         // we treat it as if it originated from a checkpoint.
         // TODO(#3263): Existing data may contain `stats_parsed` and `partitionValues_parsed`;
         // provide its full schema to the evaluator.
-        let transform = engine.evaluation_handler().new_expression_evaluator(
+        let transform = channel.create_expression_evaluator(
             scan_row_schema(),
             get_scan_metadata_transform_expr(),
             restored_add_schema().clone().into(),
-        )?;
-        let apply_transform = move |data: DeltaResult<Box<dyn EngineData>>| {
+        );
+        let transform = transform.await?;
+        let apply_transform = async move |channel: &Channel, data| {
             let data = data?;
-            let data = transform.evaluate(data.as_ref())?;
+            let data = channel.evaluate_expression(&transform, data).await?;
             Ok(ActionsBatch::new(data, false))
         };
 
@@ -1039,7 +1082,7 @@ impl Scan {
         // Since we're only processing existing data (no checkpoint), we use the base schema
         // and no stats_parsed optimization.
         if existing_version == self.snapshot.version() {
-            let actions = existing_data.map(apply_transform);
+            let actions = existing_data.map_async(map_async_witness, apply_transform);
             let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
                 actions,
                 checkpoint_info: CheckpointReadInfo {
@@ -1048,9 +1091,10 @@ impl Scan {
                     checkpoint_read_schema: restored_add_schema().clone(),
                 },
             };
-            return Ok(Box::new(
-                self.scan_metadata_inner(engine, actions_with_checkpoint_info)?,
-            ));
+            let result = self
+                .scan_metadata_inner_with_channel(channel, actions_with_checkpoint_info)
+                .await?;
+            return Ok(result.into_boxed());
         }
 
         // If the current log segment contains a checkpoint newer than the hint version
@@ -1059,7 +1103,8 @@ impl Scan {
         // TODO: we may be able to apply heuristics or other logic to try and fetch missing deltas
         // from the log.
         if matches!(log_segment.checkpoint_version, Some(v) if v > existing_version) {
-            return Ok(Box::new(self.scan_metadata(engine)?));
+            let result = self.scan_metadata_with_channel(channel).await?;
+            return Ok(result.into_boxed());
         }
 
         // create a new log segment containing only the commits added after the version hint.
@@ -1081,18 +1126,18 @@ impl Scan {
         // checkpoint schema returned by the function for consistency.
         let (checkpoint_schema, meta_predicate, physical_stats_schema) =
             self.checkpoint_read_options();
-        let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
-            engine,
+        let result = new_log_segment.read_actions_with_projected_checkpoint_actions_with_channel(
+            channel,
             COMMIT_READ_SCHEMA.clone(),
             checkpoint_schema,
             meta_predicate,
             physical_stats_schema,
             None,
-            self.cancellation_token.as_ref(),
-        )?;
+        );
+        let result = result.await?;
         // Only the cached suffix needs a kernel-side check. The engine owns cancellation for the
         // newly read action prefix.
-        let existing_actions = existing_data.map(apply_transform);
+        let existing_actions = existing_data.map_async(map_async_witness, apply_transform);
         let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
             actions: result.actions.chain(existing_actions),
             checkpoint_info: CheckpointReadInfo {
@@ -1102,31 +1147,10 @@ impl Scan {
             },
         };
 
-        Ok(Box::new(self.scan_metadata_inner(
-            engine,
-            actions_with_checkpoint_info,
-        )?))
-    }
-
-    fn scan_metadata_inner<'a>(
-        &self,
-        engine: &dyn Engine,
-        actions_with_checkpoint_info: ActionsWithCheckpointInfo<
-            impl Iterator<Item = DeltaResult<ActionsBatch>> + Send + 'a,
-        >,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>> + Send + 'a> {
-        let connector = EngineConnector::new(engine);
-        let coroutine = coroutine!(async move |channel| {
-            self.scan_metadata_inner_with_channel(
-                channel,
-                ActionsWithCheckpointInfo {
-                    actions: actions_with_checkpoint_info.actions.into_generator(),
-                    checkpoint_info: actions_with_checkpoint_info.checkpoint_info,
-                },
-            )
-            .await
-        });
-        connector.iterate_prepared_result_generator(coroutine)
+        let result = self
+            .scan_metadata_inner_with_channel(channel, actions_with_checkpoint_info)
+            .await?;
+        Ok(result.into_boxed())
     }
 
     async fn scan_metadata_inner_with_channel<'a>(
