@@ -42,11 +42,22 @@ macro_rules! require {
 /// implementation consumes the Committer to commit to the table, must call `commit` from within a
 /// multi-threaded tokio runtime context. Since the default engine uses tokio, this is compatible,
 /// but must ensure that the multi-threaded runtime is used.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct UCCommitter<C: UpdateTableClient> {
     update_table_client: Arc<C>,
     table_id: String,
     table: TableIdentifier,
+}
+
+// Hand-written so cloning the Arc does not require `C: Clone`.
+impl<C: UpdateTableClient> Clone for UCCommitter<C> {
+    fn clone(&self) -> Self {
+        Self {
+            update_table_client: Arc::clone(&self.update_table_client),
+            table_id: self.table_id.clone(),
+            table: self.table.clone(),
+        }
+    }
 }
 
 impl<C: UpdateTableClient> UCCommitter<C> {
