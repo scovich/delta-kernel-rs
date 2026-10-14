@@ -51,8 +51,8 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::utils::{require, PhantomType};
 use crate::{
-    create_row, version_as_i64, DataType, DeltaResult, DeltaResultIterator, Engine, EngineData,
-    Expression, FileMeta, Predicate, RowVisitor, Version,
+    create_row, version_as_i64, DataType, DeltaResult, DeltaResultIteratorStatic, Engine,
+    EngineData, Expression, FileMeta, Predicate, RowVisitor, Version,
 };
 
 #[cfg(feature = "internal-api")]
@@ -97,7 +97,7 @@ use update::{intermediate_dv_schema, new_dv_column_schema};
 pub use write_state::{BoundWriteContextBuilder, RowTrackingMetadataColumns, WriteState};
 
 /// Type alias for an iterator of [`EngineData`] results.
-pub(crate) type EngineDataResultIterator<'a> = DeltaResultIterator<'a, Box<dyn EngineData>>;
+pub(crate) type EngineDataResultIterator = DeltaResultIteratorStatic<Box<dyn EngineData>>;
 
 /// The static instance referenced by [`add_files_schema`] that doesn't contain the dataChange
 /// column.
@@ -439,15 +439,15 @@ fn build_add_action_projection(
 
 /// Transforms add file metadata into commit-ready add actions by converting stats to JSON and
 /// setting the `dataChange` field.
-fn build_add_actions<'a, I, T>(
+fn build_add_actions<I, T>(
     engine: &dyn Engine,
     add_files_metadata: I,
     input_schema: SchemaRef,
     data_change: bool,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a>
+) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'static>
 where
-    I: Iterator<Item = DeltaResult<T>> + Send + 'a,
-    T: Deref<Target = dyn EngineData> + Send + 'a,
+    I: Iterator<Item = DeltaResult<T>> + Send + 'static,
+    T: Deref<Target = dyn EngineData> + Send + 'static,
 {
     let evaluation_handler = engine.evaluation_handler();
     let (output_schema, adds_expr) = build_add_action_projection(&input_schema, data_change)?;
@@ -652,10 +652,11 @@ impl<S> Transaction<S> {
         // Step 5: Generate DV update actions (remove/add pairs) if any DV updates are present
         let dv_update_actions = self.generate_dv_update_actions(engine)?;
 
-        // Step 6: Generate remove actions (collect to avoid borrowing self)
+        // Step 6: Generate remove actions without borrowing self
+        let remove_files_metadata = self.remove_files_metadata.clone().into_iter();
         let remove_actions = self.generate_remove_actions(
             engine,
-            self.remove_files_metadata.iter(),
+            remove_files_metadata,
             false, /* has_dv_update_columns */
         )?;
 
@@ -1405,14 +1406,11 @@ impl<S> Transaction<S> {
 
     /// Generates add actions and row tracking domain metadata for a commit.
     #[instrument(name = "txn.gen_adds", skip_all, err)]
-    fn generate_adds<'a>(
-        &'a self,
+    fn generate_adds(
+        &self,
         engine: &dyn Engine,
         commit_version: u64,
-    ) -> DeltaResult<(
-        EngineDataResultIterator<'a>,
-        Option<RowTrackingDomainMetadata>,
-    )> {
+    ) -> DeltaResult<(EngineDataResultIterator, Option<RowTrackingDomainMetadata>)> {
         // Note: this does not require delta.enableRowTracking=true. "supported" is sufficient
         // for writers to assign row IDs.
         let assign_fresh_row_tracking_metadata = self
@@ -1434,9 +1432,10 @@ impl<S> Transaction<S> {
         if assign_fresh_row_tracking_metadata {
             self.generate_adds_with_row_tracking(engine, commit_version)
         } else {
+            let add_files_metadata = self.add_files_metadata.clone();
             let add_actions = build_add_actions(
                 engine,
-                self.add_files_metadata.iter().map(|a| Ok(a.as_ref())),
+                add_files_metadata.into_iter().map(Ok),
                 self.add_files_schema().clone(),
                 self.data_change,
             )?;
@@ -1451,14 +1450,11 @@ impl<S> Transaction<S> {
     /// non-overlapping `baseRowId` range to each file and computing the final high water mark
     /// for the domain metadata action. The initial high water mark is read from the snapshot
     /// for existing tables, or defaults to -1 for create-table (no prior log to read from).
-    fn generate_adds_with_row_tracking<'a>(
-        &'a self,
+    fn generate_adds_with_row_tracking(
+        &self,
         engine: &dyn Engine,
         commit_version: i64,
-    ) -> DeltaResult<(
-        EngineDataResultIterator<'a>,
-        Option<RowTrackingDomainMetadata>,
-    )> {
+    ) -> DeltaResult<(EngineDataResultIterator, Option<RowTrackingDomainMetadata>)> {
         let row_id_high_water_mark = if self.is_create_table() {
             None
         } else {
@@ -1468,7 +1464,8 @@ impl<S> Transaction<S> {
 
         // Assign base row IDs starting from the current high water mark.
         let mut row_tracking_visitor = RowTrackingVisitor::new(row_id_high_water_mark);
-        let extended_add_files = self.add_files_metadata.iter().map(move |add_files_batch| {
+        let add_files_metadata = self.add_files_metadata.clone();
+        let extended_add_files = add_files_metadata.into_iter().map(move |add_files_batch| {
             row_tracking_visitor.visit_rows_of(add_files_batch.as_ref())?;
             let base_row_ids = row_tracking_visitor.take_base_row_ids();
             let commit_versions = vec![commit_version; base_row_ids.len()];
@@ -1637,12 +1634,12 @@ impl<S> Transaction<S> {
     /// [`remove_files`]: Transaction::remove_files
     /// [`update_deletion_vectors`]: Transaction::update_deletion_vectors
     #[instrument(name = "txn.gen_removes", skip_all, err)]
-    fn generate_remove_actions<'a>(
-        &'a self,
+    fn generate_remove_actions(
+        &self,
         engine: &dyn Engine,
-        remove_files_metadata: impl Iterator<Item = &'a Arc<FilteredEngineData>> + Send + 'a,
+        remove_files_metadata: impl Iterator<Item = Arc<FilteredEngineData>> + Send + 'static,
         has_dv_update_columns: bool,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'static> {
         // Create-table transactions should not have any remove actions.
         // Only error if there are actually files queued for removal.
         if self.is_create_table() && !self.remove_files_metadata.is_empty() {

@@ -587,10 +587,10 @@ impl<S> Transaction<S> {
     /// actions. For each file:
     /// 1. A Remove action is generated for the old file
     /// 2. An Add action is generated with the new DV descriptor
-    pub(super) fn generate_dv_update_actions<'a>(
-        &'a self,
-        engine: &'a dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
+    pub(super) fn generate_dv_update_actions(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'static> {
         // Create-table transactions should not have any DV update actions
         if self.is_create_table() && !self.dv_matched_files.is_empty() {
             return Err(crate::error::Error::internal_error(
@@ -598,12 +598,14 @@ impl<S> Transaction<S> {
             ));
         }
 
+        let remove_files_metadata = self.dv_matched_files.clone().into_iter();
         let remove_actions = self.generate_remove_actions(
             engine,
-            self.dv_matched_files.iter(),
+            remove_files_metadata,
             true, /* has_dv_update_columns */
         )?;
-        let add_actions = self.generate_adds_for_dv_update(engine, self.dv_matched_files.iter())?;
+        let file_metadata_batch = self.dv_matched_files.clone().into_iter();
+        let add_actions = self.generate_adds_for_dv_update(engine, file_metadata_batch)?;
         Ok(remove_actions.chain(add_actions))
     }
 
@@ -611,11 +613,11 @@ impl<S> Transaction<S> {
     ///
     /// This transforms scan file metadata with new DV descriptors (appended as a temporary column)
     /// into Add actions for the Delta log.
-    fn generate_adds_for_dv_update<'a>(
-        &'a self,
-        engine: &'a dyn Engine,
-        file_metadata_batch: impl Iterator<Item = &'a Arc<FilteredEngineData>> + Send + 'a,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
+    fn generate_adds_for_dv_update(
+        &self,
+        engine: &dyn Engine,
+        file_metadata_batch: impl Iterator<Item = Arc<FilteredEngineData>> + Send + 'static,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'static> {
         let evaluation_handler = engine.evaluation_handler();
         // Struct patch to replace the deletionVector field with the new DV/stats from
         // NEW_DELETION_VECTOR_NAME/NEW_STATS_NAME, then drop the
