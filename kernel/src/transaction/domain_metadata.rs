@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 
-use super::{EngineDataResultIterator, Transaction};
-use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX, LOG_DOMAIN_METADATA_SCHEMA};
+use super::Transaction;
+use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::error::Error;
 use crate::row_tracking::{
     RowTrackingDomainMetadata, ROW_TRACKING_DOMAIN_NAME, ROW_TRACKING_INITIAL_HIGH_WATER_MARK,
 };
 use crate::table_features::TableFeature;
-use crate::{create_row, DeltaResult, Engine};
+use crate::{DeltaResult, Engine};
 
 impl<S> Transaction<S> {
     /// Validate domain metadata operations for both create-table and existing-table transactions.
@@ -193,20 +193,17 @@ impl<S> Transaction<S> {
 
     /// Generate domain metadata actions with validation. Handle both user and system domains.
     ///
-    /// Returns a tuple of `(action_iter, domain_metadata_vec)`.
-    /// - The action iterator contains EngineData to be written to the commit file (`00N.json`).
-    /// - The `Vec<DomainMetadata>` is used to construct a [`CrcDelta`](crate::crc::CrcDelta), which
-    ///   feeds the post-commit snapshot with the domain metadata written in this transaction and
-    ///   powers CRC file writes.
+    /// Returns the `DomainMetadata` values used to construct commit actions and the
+    /// [`CrcDelta`](crate::crc::CrcDelta) that feeds the post-commit snapshot.
     ///
     /// This function may perform an expensive log replay operation if there are any domain
     /// removals. The log replay is required to fetch the previous configuration value for the
     /// domain to preserve in removal tombstones as mandated by the Delta spec.
-    pub(super) fn generate_domain_metadata_actions<'a>(
-        &'a self,
-        engine: &'a dyn Engine,
+    pub(super) fn generate_domain_metadata_actions(
+        &self,
+        engine: &dyn Engine,
         row_tracking_high_watermark: Option<RowTrackingDomainMetadata>,
-    ) -> DeltaResult<(EngineDataResultIterator<'a>, Vec<DomainMetadata>)> {
+    ) -> DeltaResult<Vec<DomainMetadata>> {
         let is_create = self.is_create_table();
 
         // Validate domain operations (includes feature validation)
@@ -256,14 +253,6 @@ impl<S> Transaction<S> {
             .chain(removal_actions)
             .collect();
 
-        let schema = LOG_DOMAIN_METADATA_SCHEMA.clone();
-
-        let dm_actions_iter: Vec<_> = dm_actions_vec
-            .iter()
-            .cloned()
-            .map(|dm| create_row(engine, schema.clone(), dm))
-            .collect();
-
-        Ok((Box::new(dm_actions_iter.into_iter()), dm_actions_vec))
+        Ok(dm_actions_vec)
     }
 }

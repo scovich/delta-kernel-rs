@@ -11,8 +11,8 @@ use tracing::instrument;
 use crate::actions::BackReference;
 use crate::actions::{
     as_log_add_schema, CommitInfo, DomainMetadata, Metadata, Protocol, SetTransaction,
-    LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_REMOVE_SCHEMA, LOG_TXN_SCHEMA, MAX_VALUES,
-    MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
+    LOG_DOMAIN_METADATA_SCHEMA, LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_REMOVE_SCHEMA,
+    LOG_TXN_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
 };
 use crate::committer::{
     CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
@@ -583,11 +583,15 @@ impl<S> Transaction<S> {
             .validate_filtered(&self.remove_files_metadata)?;
 
         // Step 1: Generate SetTransaction actions
-        let set_transaction_actions = self
-            .set_transactions
-            .clone()
-            .into_iter()
-            .map(|txn| create_row(engine, LOG_TXN_SCHEMA.clone(), txn));
+        let set_transaction_actions = (!self.set_transactions.is_empty()).then(|| {
+            let rows = self
+                .set_transactions
+                .iter()
+                .map(|txn| vec![txn.clone().into()]);
+            engine
+                .evaluation_handler()
+                .create_many(LOG_TXN_SCHEMA.clone(), Vec::from_iter(rows))
+        });
 
         // Step 2: Construct commit info with ICT if enabled
         let in_commit_timestamp = self.get_in_commit_timestamp(engine)?;
@@ -636,8 +640,14 @@ impl<S> Transaction<S> {
             self.generate_adds(engine, commit_version)?;
 
         // Step 4b: Generate all domain metadata actions (user and system domains)
-        let (domain_metadata_actions, dm_changes) =
+        let dm_changes =
             self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
+        let domain_metadata_actions = (!dm_changes.is_empty()).then(|| {
+            let rows = dm_changes.iter().map(|dm| vec![dm.clone().into()]);
+            engine
+                .evaluation_handler()
+                .create_many(LOG_DOMAIN_METADATA_SCHEMA.clone(), Vec::from_iter(rows))
+        });
 
         // Step 5: Generate DV update actions (remove/add pairs) if any DV updates are present
         let dv_update_actions = self.generate_dv_update_actions(engine)?;
