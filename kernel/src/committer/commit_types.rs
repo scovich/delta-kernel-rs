@@ -298,19 +298,31 @@ impl CommitMetadata {
             .any(|dm| dm.domain() == domain)
     }
 
-    /// Creates a new `CommitMetadata` for the given `table_root` and `version`. Test-only.
+    /// Creates a new `CommitMetadata` for the given table, version, and commit type. Test-only.
     ///
     /// Uses a default modern protocol (empty features) and empty metadata.
     #[cfg(any(test, feature = "test-utils"))]
-    pub fn new_unchecked(table_root: Url, version: Version) -> DeltaResult<Self> {
-        Self::new_unchecked_with(table_root, version, vec![], vec![], HashMap::new())
+    pub fn new_unchecked(
+        table_root: Url,
+        version: Version,
+        commit_type: CommitType,
+    ) -> DeltaResult<Self> {
+        Self::new_unchecked_with(
+            table_root,
+            version,
+            commit_type,
+            vec![],
+            vec![],
+            HashMap::new(),
+        )
     }
 
-    /// Creates a new `CommitMetadata` with specific features and configuration. Test-only.
+    /// Creates a new `CommitMetadata` with a commit type, features, and configuration. Test-only.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn new_unchecked_with(
         table_root: Url,
         version: Version,
+        commit_type: CommitType,
         reader_features: Vec<&str>,
         writer_features: Vec<&str>,
         configuration: HashMap<String, String>,
@@ -322,7 +334,7 @@ impl CommitMetadata {
         Ok(Self::new(
             log_root,
             version,
-            CommitType::PathBasedWrite,
+            commit_type,
             0,
             None,
             CommitProtocolMetadata::try_new(Some(protocol), Some(metadata), None, None)?,
