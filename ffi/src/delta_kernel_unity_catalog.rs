@@ -7,6 +7,7 @@ use delta_kernel::DeltaResult;
 use delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
+use delta_kernel_default_engine::executor::TaskExecutor;
 use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel_ffi::handle::Handle;
 use delta_kernel_ffi::{kernel_string_slice, KernelStringSlice, OptionalValue, TryFromStringSlice};
@@ -168,15 +169,12 @@ struct FfiUCCommitter<C: UpdateTableClient> {
     inner: UCCommitter<C>,
 }
 
-impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
-    fn commit(
+impl<C: UpdateTableClient> FfiUCCommitter<C> {
+    fn enter_runtime<'a>(
         &self,
-        engine: &dyn delta_kernel::Engine,
-        commit: KernelCommit,
-    ) -> DeltaResult<delta_kernel::committer::CommitResponse> {
-        // We hold this guard until the end of the function so we stay in the tokio context until
-        // we're done
-        let _guard = engine
+        engine: &'a dyn delta_kernel::Engine,
+    ) -> DeltaResult<<TokioMultiThreadExecutor as TaskExecutor>::Guard<'a>> {
+        engine
             .any_ref()
             .downcast_ref::<DefaultEngine<TokioMultiThreadExecutor>>()
             .map(|e| e.enter())
@@ -190,7 +188,19 @@ impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
                 delta_kernel::Error::generic(
                     "FFIUCCommitter can only be used with the default engine",
                 )
-            })?;
+            })
+    }
+}
+
+impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
+    fn commit(
+        &self,
+        engine: &dyn delta_kernel::Engine,
+        commit: KernelCommit,
+    ) -> DeltaResult<delta_kernel::committer::CommitResponse> {
+        // We hold this guard until the end of the function so we stay in the tokio context until
+        // we're done
+        let _guard = self.enter_runtime(engine)?;
         self.inner.commit(engine, commit)
     }
 

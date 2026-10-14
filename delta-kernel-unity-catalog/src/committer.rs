@@ -227,7 +227,30 @@ impl<C: UpdateTableClient> UCCommitter<C> {
         )
         .map_err(|e| DeltaError::generic(format!("invalid UC update_table request: {e}")))?;
         let target = self.table.clone();
+        self.execute_update_table_blocking(target, update_req)?;
+        Ok(CommitResponse::Committed {
+            file_meta: committed,
+        })
+    }
 
+    async fn execute_update_table(
+        &self,
+        target: TableIdentifier,
+        update_req: UpdateTableRequest,
+    ) -> DeltaResult<()> {
+        self.update_table_client
+            .update_table(&target, update_req)
+            .await
+            // TODO(#2970): classify version conflicts as CommitResponse::Conflict so the
+            // transaction layer can rebase/retry, instead of collapsing every error to Generic.
+            .map_err(|err| DeltaError::Generic(format!("UC update_table error: {err}")))
+    }
+
+    fn execute_update_table_blocking(
+        &self,
+        target: TableIdentifier,
+        update_req: UpdateTableRequest,
+    ) -> DeltaResult<()> {
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
             DeltaError::generic("UCCommitter may only be used within a tokio runtime")
         })?;
@@ -235,13 +258,9 @@ impl<C: UpdateTableClient> UCCommitter<C> {
         // that up front: `runtime_flavor()` can't tell a real single-threaded runtime (where this
         // panics) apart from the FFI case (single-threaded on top of multi-threaded, where it's
         // fine). So we let it run and catch the panic.
-        let result = catch_unwind(AssertUnwindSafe(|| {
+        catch_unwind(AssertUnwindSafe(|| {
             tokio::task::block_in_place(|| {
-                handle.block_on(async move {
-                    self.update_table_client
-                        .update_table(&target, update_req)
-                        .await
-                })
+                handle.block_on(self.execute_update_table(target, update_req))
             })
         }))
         .map_err(|panic| {
@@ -253,15 +272,7 @@ impl<C: UpdateTableClient> UCCommitter<C> {
             DeltaError::generic(format!(
                 "UCCommitter commit panicked (requires a multi-threaded tokio runtime): {msg}"
             ))
-        })?;
-        match result {
-            Ok(_) => Ok(CommitResponse::Committed {
-                file_meta: committed,
-            }),
-            // TODO(#2970): classify version conflicts as CommitResponse::Conflict so the
-            // transaction layer can rebase/retry, instead of collapsing every error to Generic.
-            Err(e) => Err(DeltaError::Generic(format!("UC update_table error: {e}"))),
-        }
+        })?
     }
 
     fn commit_impl(
