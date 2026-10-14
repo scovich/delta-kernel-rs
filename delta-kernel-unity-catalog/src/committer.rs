@@ -390,9 +390,15 @@ mod tests {
 
     /// Creates a valid catalog-managed CommitMetadata with all required UC features and properties.
     fn catalog_managed_commit_metadata(table_root: url::Url, version: Version) -> CommitMetadata {
+        let commit_type = if version == 0 {
+            CommitType::CatalogManagedCreate
+        } else {
+            CommitType::CatalogManagedWrite
+        };
         CommitMetadata::new_unchecked_with(
             table_root,
             version,
+            commit_type,
             vec!["catalogManaged", "vacuumProtocolCheck"],
             vec!["catalogManaged", "inCommitTimestamp", "vacuumProtocolCheck"],
             HashMap::from([
@@ -479,7 +485,8 @@ mod tests {
     fn commit_version_0_rejects_missing_catalog_managed_feature() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
-        let commit_metadata = CommitMetadata::new_unchecked(table_root, 0).unwrap();
+        let commit_metadata =
+            CommitMetadata::new_unchecked(table_root, 0, CommitType::CatalogManagedCreate).unwrap();
         let committer = test_committer();
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
         fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
@@ -501,6 +508,7 @@ mod tests {
         let commit_metadata = CommitMetadata::new_unchecked_with(
             table_root,
             0,
+            CommitType::CatalogManagedCreate,
             vec!["catalogManaged", "vacuumProtocolCheck"],
             vec!["catalogManaged", "inCommitTimestamp", "vacuumProtocolCheck"],
             HashMap::from([(
@@ -530,6 +538,7 @@ mod tests {
         let commit_metadata = CommitMetadata::new_unchecked_with(
             table_root,
             0,
+            CommitType::CatalogManagedCreate,
             vec!["catalogManaged", "vacuumProtocolCheck"],
             vec!["catalogManaged", "inCommitTimestamp", "vacuumProtocolCheck"],
             HashMap::from([(
@@ -556,7 +565,8 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         // Version >= 1 but without catalogManaged feature (simulates downgrade attempt)
-        let commit_metadata = CommitMetadata::new_unchecked(table_root, 1).unwrap();
+        let commit_metadata =
+            CommitMetadata::new_unchecked(table_root, 1, CommitType::CatalogManagedWrite).unwrap();
         let committer = test_committer();
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
 
