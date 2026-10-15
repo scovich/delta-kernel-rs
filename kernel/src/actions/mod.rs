@@ -1730,14 +1730,12 @@ mod tests {
     };
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use crate::arrow::json::ReaderBuilder;
+    use crate::create_row;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
-    use crate::engine::arrow_expression::ArrowEvaluationHandler;
+    use crate::engine::sync::SyncEngine;
     use crate::expressions::Scalar;
     use crate::schema::{schema, schema_ref, DataType, MapType, StructField};
     use crate::unit_test_utils::assert_result_error_with_message;
-    use crate::{
-        create_row, Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
-    };
 
     #[rstest]
     #[case::add(ADD_NAME, Some("path"))]
@@ -1755,32 +1753,7 @@ mod tests {
         assert_eq!(action_presence_leaf(action_name), expected_leaf);
     }
 
-    // duplicated
-    struct ExprEngine(Arc<dyn EvaluationHandler>);
-
-    impl ExprEngine {
-        fn new() -> Self {
-            ExprEngine(Arc::new(ArrowEvaluationHandler))
-        }
-    }
-
-    impl Engine for ExprEngine {
-        fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-            self.0.clone()
-        }
-
-        fn json_handler(&self) -> Arc<dyn JsonHandler> {
-            unimplemented!()
-        }
-
-        fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-            unimplemented!()
-        }
-
-        fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-            unimplemented!()
-        }
-    }
+    type ExprEngine = SyncEngine;
 
     #[rstest]
     #[case::no_expiration_configured(None, Some(1000), false)]
