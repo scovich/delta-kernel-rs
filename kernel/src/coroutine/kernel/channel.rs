@@ -12,8 +12,8 @@ use url::Url;
 use super::request::{
     CopyAtomic, CreateEngineData, CreateExpressionEvaluator, CreatePredicateEvaluator,
     EvaluateExpression, EvaluatePredicate, EvaluationInput, EvaluatorHandle, FileWriteMode,
-    PredicateEvaluatorHandle, WriteBytes, WriteJsonFile, WriteParquetFile, WriteParquetFiles,
-    WriteParquetFilesResult,
+    PredicateEvaluatorHandle, ReadJsonFiles, ReadParquetFiles, WriteBytes, WriteJsonFile,
+    WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
 };
 #[cfg(feature = "declarative-plans")]
 use super::PlanRequest;
@@ -21,7 +21,10 @@ use super::{Channel, Request, StaticGeneratorCoroutine};
 use crate::committer::PublishMetadata;
 #[cfg(feature = "declarative-plans")]
 use crate::coroutine::PlanOperation;
-use crate::coroutine::{ChannelExchange, Cursor, DeltaFuture, Page, PageRequest, PagedOperation};
+use crate::coroutine::{
+    ChannelExchange, Cursor, DeltaFuture, Generator, Page, PageGenerator, PageRequest,
+    PagedOperation, Pages,
+};
 use crate::engine_data::{EngineData, FilteredEngineData};
 use crate::expressions::{ExpressionRef, PredicateRef, Scalar};
 #[cfg(feature = "declarative-plans")]
@@ -29,7 +32,7 @@ use crate::plans::ir::plan::Plan;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::Operation;
 use crate::schema::{DataType, SchemaRef};
-use crate::{FileIndex, FileMeta, FileSize, ParquetFooter};
+use crate::{DeltaResult, FileIndex, FileMeta, FileSize, ParquetFooter};
 
 /// Typed kernel operations available on its request channel.
 #[internal_api]
@@ -39,13 +42,13 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
         &self,
         url: Url,
         range: Option<Range<FileIndex>>,
-    ) -> impl DeltaFuture<Bytes> {
+    ) -> impl DeltaFuture<Option<Bytes>> {
         self.exchange((url, range), Request::ReadSmallFile)
     }
 
     /// Read a Parquet file footer.
-    fn read_parquet_footer(&self, file: FileMeta) -> impl DeltaFuture<ParquetFooter> {
-        self.exchange(file, Request::ReadParquetFooter)
+    fn read_parquet_footer(&self, file: &FileMeta) -> impl DeltaFuture<ParquetFooter> {
+        self.exchange(file.clone(), Request::ReadParquetFooter)
     }
 
     /// Initialize `operation` and return its first page.
@@ -57,6 +60,14 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
         self.exchange(operation, PageRequest::Start)
     }
 
+    /// Verify that the connector provides a declarative plan executor.
+    #[cfg(feature = "declarative-plans")]
+    fn require_plan_executor(&self) -> impl DeltaFuture<()> {
+        self.exchange((), |(), reply| {
+            Request::ExecutePlan(PlanRequest::Require(reply))
+        })
+    }
+
     /// Initialize execution of `plan` and return its first output page.
     #[cfg(feature = "declarative-plans")]
     fn start_query_plan(&self, plan: Plan) -> impl DeltaFuture<Page<PlanOperation>> {
@@ -65,8 +76,8 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
 
     /// Read one Parquet footer through the declarative plan executor.
     #[cfg(feature = "declarative-plans")]
-    fn read_plan_parquet_footer(&self, file: FileMeta) -> impl DeltaFuture<ParquetFooter> {
-        self.exchange(file, |file, reply| {
+    fn read_plan_parquet_footer(&self, file: &FileMeta) -> impl DeltaFuture<ParquetFooter> {
+        self.exchange(file.clone(), |file, reply| {
             Request::ExecutePlan(PlanRequest::ParquetFooter(file, reply))
         })
     }
@@ -87,6 +98,92 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
         PageRequest<Op>: Into<Request>,
     {
         self.exchange(cursor, PageRequest::Continue)
+    }
+
+    /// Iterate pages of `operation`, starting it on the first [`Pages::next`] call.
+    fn paged<Op>(&self, operation: Op) -> Pages<'_, Self, Op>
+    where
+        Op: PagedOperation,
+        PageRequest<Op>: Into<Request>,
+    {
+        Pages::start(self, operation)
+    }
+
+    /// Iterate remaining pages of `operation`, starting from `cursor`.
+    fn resume_paged<Op>(&self, cursor: Cursor<Op>) -> Pages<'_, Self, Op>
+    where
+        Op: PagedOperation,
+        PageRequest<Op>: Into<Request>,
+    {
+        Pages::resume(self, cursor)
+    }
+
+    /// Iterate items of `operation`, flattening collection-valued pages.
+    fn flattened<Op>(
+        &self,
+        operation: Op,
+    ) -> impl Generator<Item = <Op::Page as IntoIterator>::Item, Output = ()> + Unpin + '_
+    where
+        Op: PagedOperation + Unpin,
+        Op::Page: IntoIterator,
+        <Op::Page as IntoIterator>::IntoIter: Send + Unpin,
+        <Op::Page as IntoIterator>::Item: Send + 'static,
+        PageRequest<Op>: Into<Request>,
+        Self: Sync + 'static,
+    {
+        self.paged(operation).flatten()
+    }
+
+    /// Read JSON files as a stream of result batches.
+    fn read_json_files(
+        &self,
+        files: impl Into<Vec<FileMeta>>,
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> impl Generator<Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + Unpin + '_
+    where
+        Self: Sync + 'static,
+    {
+        self.flattened(ReadJsonFiles::new(files, physical_schema, predicate))
+    }
+
+    /// Prepare a JSON read without fetching its first page.
+    fn prepare_json_files(
+        &self,
+        files: impl Into<Vec<FileMeta>>,
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> impl DeltaFuture<PageGenerator<ReadJsonFiles>> + '_
+    where
+        Self: Sync,
+    {
+        let operation = ReadJsonFiles::new(files, physical_schema, predicate);
+        async move {
+            let cursor = self.prepare_paged(operation).await?;
+            Ok(PageGenerator::resume(cursor))
+        }
+    }
+
+    /// Prepare a Parquet read without fetching its first page.
+    fn prepare_parquet_files(
+        &self,
+        files: impl Into<Vec<FileMeta>>,
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> impl DeltaFuture<PageGenerator<ReadParquetFiles>> + '_
+    where
+        Self: Sync,
+    {
+        let operation = ReadParquetFiles::new(files, physical_schema, predicate);
+        async move {
+            let cursor = self.prepare_paged(operation).await?;
+            Ok(PageGenerator::resume(cursor))
+        }
+    }
+
+    /// Fetch metadata for one object.
+    fn head(&self, url: &Url) -> impl DeltaFuture<FileMeta> {
+        self.exchange(url.clone(), Request::Head)
     }
 
     /// Write generated row batches to one newline-delimited JSON file.
@@ -114,8 +211,8 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
     }
 
     /// Write `data` to `url`, replacing an existing object only when `overwrite` is true.
-    fn write_bytes(&self, url: Url, data: Bytes, overwrite: bool) -> impl DeltaFuture<()> {
-        let outbound = WriteBytes::new(url, data, overwrite);
+    fn write_bytes(&self, url: &Url, data: Bytes, overwrite: bool) -> impl DeltaFuture<()> {
+        let outbound = WriteBytes::new(url.clone(), data, overwrite);
         self.exchange(outbound, Request::WriteBytes)
     }
 

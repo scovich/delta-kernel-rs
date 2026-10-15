@@ -116,7 +116,11 @@ use self::core::{noop_context, Step, Task};
 #[doc(inline)]
 #[internal_api]
 pub(crate) use self::core::{Channel, ChannelExchange, DeltaFuture};
-pub use self::generator::{BoundGenerator, Generator, GeneratorExt, GeneratorStep, IntoGenerator};
+use self::generator::{unfold_mut, ChannelBinding};
+pub use self::generator::{
+    BoundGenerator, BoxedDeltaResultGenerator, BoxedGenerator, Flatten, Generator, GeneratorExt,
+    GeneratorStep, IntoGenerator,
+};
 #[doc(inline)]
 #[internal_api]
 pub(crate) use self::kernel::ChannelExt;
@@ -496,15 +500,176 @@ pub enum PageRequest<Op: PagedOperation> {
     Continue(Cursor<Op>, Reply<Page<Op>>),
 }
 
+/// Unbound generator of page payloads.
+#[internal_api]
+pub(crate) enum PageGenerator<Op: PagedOperation> {
+    /// Start a new paged operation.
+    Start(Op),
+    /// Resume an initialized operation from `cursor`.
+    Next(Cursor<Op>),
+    /// The operation is exhausted.
+    Done,
+}
+
+impl<Op: PagedOperation> PageGenerator<Op> {
+    /// Create a generator that starts a new paged operation.
+    pub(crate) fn start(operation: Op) -> Self {
+        Self::Start(operation)
+    }
+
+    /// Create a generator that resumes an initialized paged operation.
+    pub(crate) fn resume(cursor: Cursor<Op>) -> Self {
+        Self::Next(cursor)
+    }
+}
+
+impl<Op: PagedOperation> GeneratorExt for PageGenerator<Op> {}
+
+impl<P, Op> IntoGenerator<P> for PageGenerator<Op>
+where
+    P: Send + 'static,
+    Op: PagedOperation + Unpin,
+    PageRequest<Op>: Into<P>,
+{
+    type Item = Op::Page;
+    type Output = ();
+
+    fn bind_to<'a>(
+        self,
+        channel: ChannelBinding<'a, P>,
+    ) -> impl Generator<Item = Op::Page, Output = ()> + Unpin + 'a {
+        unfold_mut!(BoundPages::new(channel, self), BoundPages::next)
+    }
+
+    fn bind_boxed<'a>(
+        self: Box<Self>,
+        channel: ChannelBinding<'a, P>,
+    ) -> BoxedGenerator<'a, Op::Page> {
+        Box::new((*self).bind_to(channel))
+    }
+}
+
+struct BoundPages<'a, P: Send + 'static, Op: PagedOperation> {
+    channel: ChannelBinding<'a, P>,
+    state: PageGenerator<Op>,
+}
+
+impl<'a, P: Send + 'static, Op: PagedOperation> BoundPages<'a, P, Op> {
+    fn new(channel: ChannelBinding<'a, P>, state: PageGenerator<Op>) -> Self {
+        Self { channel, state }
+    }
+
+    async fn next(&mut self) -> DeltaResult<Option<Op::Page>>
+    where
+        PageRequest<Op>: Into<P>,
+    {
+        let page = match std::mem::replace(&mut self.state, PageGenerator::Done) {
+            PageGenerator::Start(operation) => {
+                self.channel.exchange(operation, PageRequest::Start).await?
+            }
+            PageGenerator::Next(cursor) => {
+                self.channel.exchange(cursor, PageRequest::Continue).await?
+            }
+            PageGenerator::Done => return Ok(None),
+        };
+        if let Some(cursor) = page.next {
+            self.state = PageGenerator::Next(cursor);
+        }
+        Ok(Some(page.data))
+    }
+}
+
+/// Pulls successive page payloads until the connector reports exhaustion.
+///
+/// Call sites iterate this helper and then walk [`PagedOperation::Page`] themselves. Flatten
+/// collection-valued pages with [`GeneratorExt::flatten`].
+#[internal_api]
+pub(crate) struct Pages<'a, C: ?Sized, Op: PagedOperation> {
+    channel: &'a C,
+    state: PageGenerator<Op>,
+}
+
+impl<'a, C: ?Sized, Op: PagedOperation> Pages<'a, C, Op> {
+    fn new(channel: &'a C, state: PageGenerator<Op>) -> Self {
+        Self { channel, state }
+    }
+
+    /// Iterate over the pages of `operation`.
+    #[internal_api]
+    pub(crate) fn start(channel: &'a C, operation: Op) -> Self {
+        Self::new(channel, PageGenerator::start(operation))
+    }
+
+    /// Iterate over the remaining pages of an in-progress operation, starting from `cursor`.
+    #[internal_api]
+    pub(crate) fn resume(channel: &'a C, cursor: Cursor<Op>) -> Self {
+        Self::new(channel, PageGenerator::resume(cursor))
+    }
+
+    /// Drive this page stream as a [`Generator`].
+    #[internal_api]
+    pub(crate) fn into_generator<P>(
+        self,
+    ) -> impl Generator<Item = Op::Page, Output = ()> + Unpin + 'a
+    where
+        PageRequest<Op>: Into<P>,
+        C: ChannelExchange<P> + Sync + 'static,
+        Op: Unpin,
+        P: Send + 'static,
+    {
+        unfold_mut!(self, Pages::next)
+    }
+
+    /// Yield items from collection-valued pages.
+    #[internal_api]
+    pub(crate) fn flatten<P>(
+        self,
+    ) -> impl Generator<Item = <Op::Page as IntoIterator>::Item, Output = ()> + Unpin + 'a
+    where
+        Op: Unpin,
+        Op::Page: IntoIterator,
+        <Op::Page as IntoIterator>::IntoIter: Send + Unpin,
+        <Op::Page as IntoIterator>::Item: Send + 'static,
+        PageRequest<Op>: Into<P>,
+        C: ChannelExchange<P> + Sync + 'static,
+        P: Send + 'static,
+    {
+        self.into_generator().flatten()
+    }
+
+    /// Fetch the next page payload, or `None` after the last page.
+    #[internal_api]
+    pub(crate) async fn next<P>(&mut self) -> DeltaResult<Option<Op::Page>>
+    where
+        PageRequest<Op>: Into<P>,
+        C: ChannelExchange<P>,
+        P: Send + 'static,
+    {
+        let page = match std::mem::replace(&mut self.state, PageGenerator::Done) {
+            PageGenerator::Start(operation) => {
+                self.channel.exchange(operation, PageRequest::Start).await?
+            }
+            PageGenerator::Next(cursor) => {
+                self.channel.exchange(cursor, PageRequest::Continue).await?
+            }
+            PageGenerator::Done => return Ok(None),
+        };
+        if let Some(cursor) = page.next {
+            self.state = PageGenerator::Next(cursor);
+        }
+        Ok(Some(page.data))
+    }
+}
+
 #[doc(inline)]
 #[internal_api]
 pub(crate) use self::engine::drive_with_engine;
 #[doc(inline)]
 #[internal_api]
 pub(crate) use self::engine::drive_with_storage;
-#[cfg(feature = "internal-api")]
 #[doc(inline)]
-pub use self::engine::{run_coroutine_with_engine, run_coroutine_with_storage};
+#[internal_api]
+pub(crate) use self::engine::{run_coroutine_with_engine, run_coroutine_with_storage};
 
 #[cfg(test)]
 mod tests;

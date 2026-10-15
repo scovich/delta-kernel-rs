@@ -55,9 +55,7 @@ use futures::{Stream, StreamExt as _};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-#[cfg(test)]
-use crate::filesystem::head_impl;
-use crate::filesystem::{copy_atomic_impl, list_from_impl, put_impl, read_files_impl};
+use crate::filesystem::{copy_atomic_impl, head_impl, list_from_impl, put_impl, read_files_impl};
 use crate::json::read_json_files_impl;
 use crate::parquet::{read_parquet_files_impl, read_parquet_footer_impl};
 use crate::{DEFAULT_READ_BATCH_SIZE, DEFAULT_READ_BUFFER_SIZE};
@@ -161,16 +159,23 @@ impl AsyncEngineConnector {
     ///
     /// Publish requests are rejected because they require a catalog-specific driver.
     pub async fn reply(&self, request: Request) -> DeltaResult<()> {
+        self.check_cancelled()?;
         match request {
             Request::ListDirectory(request) => respond_paged(self, request).await,
             Request::ListForward(request) => respond_paged(self, request).await,
             Request::ListBackward(request) => respond_paged(self, request).await,
             Request::ReadSmallFile(file, reply) => reply.send(self.read_small_file(file).await),
+            Request::Head(url, reply) => reply.send(self.head(url).await),
             Request::ReadParquetFooter(file, reply) => {
                 reply.send(self.read_parquet_footer(file).await)
             }
             Request::ReadJson(request) => respond_paged(self, request).await,
             Request::ReadParquet(request) => respond_paged(self, request).await,
+            Request::ExecutePlan(PlanRequest::Require(reply)) => {
+                reply.send(Err(Error::unsupported(
+                    "Default engine does not execute plans",
+                )));
+            }
             Request::ExecutePlan(PlanRequest::Query(request)) => {
                 let err = Error::unsupported("Default engine does not execute plans");
                 match request {
@@ -235,7 +240,7 @@ impl AsyncEngineConnector {
         Ok(())
     }
 
-    async fn read_small_file(&self, file: FileSlice) -> DeltaResult<Bytes> {
+    async fn read_small_file(&self, file: FileSlice) -> DeltaResult<Option<Bytes>> {
         let start = Instant::now();
         let stream = self
             .cancel(read_files_impl(
@@ -246,9 +251,7 @@ impl AsyncEngineConnector {
             .await?;
         let observe = |bytes: &Bytes| (1, bytes.len() as u64);
         let mut stream = metered_stream(stream, start, observe, emit_storage_read_completed);
-        let Some(data) = self.next(&mut stream).await?.transpose()? else {
-            return Err(Error::internal_error("single-file read returned no result"));
-        };
+        let data = self.next(&mut stream).await?.transpose()?;
         if self.next(&mut stream).await?.transpose()?.is_some() {
             return Err(Error::internal_error(
                 "single-file read returned more than one result",
@@ -257,16 +260,20 @@ impl AsyncEngineConnector {
         Ok(data)
     }
 
+    async fn head(&self, url: Url) -> DeltaResult<FileMeta> {
+        self.cancel(head_impl(self.object_store.clone(), url)).await
+    }
+
     async fn read_parquet_footer(&self, file: FileMeta) -> DeltaResult<ParquetFooter> {
         self.cancel(read_parquet_footer_impl(self.object_store.clone(), file))
             .await
     }
 
-    async fn next_data<Op: PagedOperation<Page = Vec<Box<dyn EngineData>>>>(
+    async fn next_data<Op: PagedOperation<Page = Vec<DeltaResult<Box<dyn EngineData>>>>>(
         &self,
         mut stream: ResultStream<Box<dyn EngineData>>,
     ) -> DeltaResult<Page<Op>> {
-        let (data, next) = match self.next(&mut stream).await?.transpose()? {
+        let (data, next) = match self.next(&mut stream).await? {
             Some(data) => (vec![data], Some(Cursor::new(stream))),
             None => (Vec::new(), None),
         };
@@ -325,14 +332,13 @@ impl AsyncEngineConnector {
         }
         let overwrite = mode == FileWriteMode::Overwrite;
         let written_size = buffer.len() as FileSize;
-        self.check_cancelled()?;
         let path = Path::from_url_path(url.path())?;
-        put_impl(
+        self.cancel(put_impl(
             self.object_store.clone(),
             path,
             Bytes::from(buffer),
             overwrite,
-        )
+        ))
         .await?;
         Ok(written_size)
     }
@@ -383,9 +389,11 @@ impl AsyncEngineConnector {
                 GeneratorCoroutineStep::Request(request) => self.reply(request).await?,
             }
         }
-        self.check_cancelled()?;
-        writer.finish().await?;
-        Ok(())
+        self.cancel(async {
+            writer.finish().await?;
+            Ok(())
+        })
+        .await
     }
 
     async fn write_parquet_files(

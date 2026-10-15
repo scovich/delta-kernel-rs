@@ -5,7 +5,7 @@
 //! same request channel plus a separate lane for yielded items.
 use delta_kernel_derive::internal_api;
 
-use crate::coroutine::{generator, PageRequest, PagedOperation};
+use crate::coroutine::generator;
 use crate::DeltaResult;
 
 mod channel;
@@ -81,6 +81,17 @@ macro_rules! generator_coroutine {
     };
 }
 
+/// Creates an unpolled [`StaticGeneratorCoroutine`] from a static generator body.
+#[internal_api]
+macro_rules! static_generator {
+    ($body:expr) => {
+        $crate::coroutine::generator::static_generator_coroutine!(
+            $crate::coroutine::kernel::Request,
+            $body
+        )
+    };
+}
+
 /// Creates a [`Coroutine`] that may borrow captured state.
 #[internal_api]
 macro_rules! coroutine {
@@ -95,27 +106,4 @@ macro_rules! static_coroutine {
     ($body:expr) => {
         $crate::coroutine::static_coroutine!($crate::coroutine::kernel::Request, $body)
     };
-}
-
-/// Yields every item of every page of `operation`, in order.
-pub(crate) fn paged_items<Op, T>(
-    operation: Op,
-) -> impl generator::IntoGenerator<Request, Item = T, Output = ()>
-where
-    Op: PagedOperation<Page = Vec<T>>,
-    PageRequest<Op>: Into<Request>,
-    T: Send + 'static,
-{
-    generator_fn!(async move |channel| {
-        let mut page = channel.start_paged(operation).await?;
-        loop {
-            for item in page.data {
-                channel.yield_item(item).await?;
-            }
-            let Some(next) = page.next else {
-                return Ok(());
-            };
-            page = channel.continue_paged(next).await?;
-        }
-    })
 }

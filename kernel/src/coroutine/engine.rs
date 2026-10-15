@@ -16,10 +16,15 @@ use super::kernel::request::{
     ListingBounds, PredicateEvaluatorHandle, ReadJsonFiles, ReadParquetFiles, WriteJsonFile,
     WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
 };
-use super::kernel::{Coroutine, GeneratorCoroutineStep, StaticCoroutine, StaticGeneratorCoroutine};
+use super::kernel::{
+    coroutine, ChannelExt as _, Coroutine, GeneratorCoroutineStep, StaticCoroutine,
+    StaticGeneratorCoroutine,
+};
 #[cfg(feature = "declarative-plans")]
 use super::PlanOperation;
-use super::{drive_coroutine, Cursor, Page, PageRequest, PagedOperation, PlanRequest, Request};
+use super::{
+    drive_coroutine, Cursor, IntoGenerator, Page, PageRequest, PagedOperation, PlanRequest, Request,
+};
 use crate::cancellation::{check_cancelled, CancellationTokenRef};
 use crate::committer::Committer;
 use crate::engine_data::{EngineData, FilteredEngineData};
@@ -105,7 +110,7 @@ struct StorageConnector<'a> {
     cancellation_token: Option<CancellationTokenRef>,
 }
 
-#[cfg(all(test, feature = "declarative-plans"))]
+#[cfg(feature = "declarative-plans")]
 struct PlanExecutorConnector<'a> {
     executor: &'a dyn PlanExecutor,
 }
@@ -118,6 +123,15 @@ pub(crate) struct EngineGeneratorIterator<
 > {
     connector: C,
     state: GeneratorState<Item, O>,
+}
+
+/// Iterator over fallible yielded items that also serves generator requests.
+pub(crate) struct EngineResultGeneratorIterator<
+    Item: Send + 'static,
+    O: Send + 'static = (),
+    C = EngineConnector,
+> {
+    inner: EngineGeneratorIterator<DeltaResult<Item>, O, C>,
 }
 
 enum GeneratorState<Item: Send + 'static, O: Send + 'static> {
@@ -166,21 +180,28 @@ pub(crate) fn drive_with_storage<O>(
     cancellation_token: Option<CancellationTokenRef>,
     coroutine: Coroutine<'_, O>,
 ) -> DeltaResult<O> {
-    let connector = StorageConnector::new(storage, cancellation_token);
+    let connector = StorageConnector::new(storage, cancellation_token.clone());
     Ok(drive_coroutine!(coroutine, |request| {
+        check_cancelled(cancellation_token.as_ref())?;
         connector.respond(request)?
     }))
 }
 
 /// Drive `coroutine` through `engine`, capturing all handlers only when an operation needs the
 /// stateful connector.
+///
+/// Pass a cancellation token to install it when the engine connector is first captured. `None`
+/// matches the two-argument [`run_coroutine_with_engine`] form.
 #[internal_api]
 pub(crate) fn drive_with_engine<O>(
     engine: &dyn Engine,
+    cancellation_token: impl Into<Option<CancellationTokenRef>>,
     coroutine: Coroutine<'_, O>,
 ) -> DeltaResult<O> {
+    let cancellation_token = cancellation_token.into();
     let mut connector = None;
     Ok(drive_coroutine!(coroutine, |request| {
+        check_cancelled(cancellation_token.as_ref())?;
         match request {
             Request::CreateEngineData(operation, reply) => {
                 reply.send(
@@ -189,21 +210,21 @@ pub(crate) fn drive_with_engine<O>(
                         .create_many(operation.schema, operation.rows),
                 );
             }
-            Request::WriteBytes(operation, reply) => {
-                reply.send(engine.storage_handler().put(
-                    &operation.url,
-                    operation.data,
-                    operation.overwrite,
-                ));
+            request @ Request::WriteBytes(..) => {
+                let storage = engine.storage_handler();
+                StorageConnector::new(storage.as_ref(), cancellation_token.clone())
+                    .respond(request)?
             }
             request => connector
-                .get_or_insert_with(|| EngineConnector::new(engine))
+                .get_or_insert_with(|| {
+                    EngineConnector::new(engine).with_cancellation_token(cancellation_token.clone())
+                })
                 .respond(request)?,
         }
     }))
 }
 
-#[cfg(all(test, feature = "declarative-plans"))]
+#[cfg(feature = "declarative-plans")]
 pub(crate) fn drive_with_plan_executor<O>(
     executor: &dyn PlanExecutor,
     coroutine: Coroutine<'_, O>,
@@ -220,33 +241,31 @@ impl StorageConnector<'_> {
             Request::ListDirectory(request) => respond_paged(self, request),
             Request::ListForward(request) => respond_paged(self, request),
             Request::ListBackward(request) => respond_paged(self, request),
-            Request::ReadSmallFile(file, reply) => {
-                reply.send(self.read_small_file(file));
-            }
-            Request::CopyAtomic(operation, reply) => {
-                reply.send(
-                    check_cancelled(self.cancellation_token.as_ref()).and_then(|()| {
-                        self.storage
-                            .copy_atomic(&operation.source, &operation.destination)
-                    }),
-                );
-            }
+            Request::ReadSmallFile(file, reply) => reply.send(self.read_small_file(file)),
+            Request::Head(url, reply) => reply.send(self.storage.head(&url)),
+            Request::CopyAtomic(operation, reply) => reply.send(
+                self.storage
+                    .copy_atomic(&operation.source, &operation.destination),
+            ),
+            Request::WriteBytes(operation, reply) => reply.send(self.storage.put(
+                &operation.url,
+                operation.data,
+                operation.overwrite,
+            )),
             _ => {
                 return Err(Error::internal_error(
                     "storage-only coroutine requested a non-storage operation",
-                ))
+                ));
             }
         }
         Ok(())
     }
 
-    fn read_small_file(&self, file: FileSlice) -> DeltaResult<Bytes> {
+    fn read_small_file(&self, file: FileSlice) -> DeltaResult<Option<Bytes>> {
         let mut reads = self
             .storage
             .read_files_with_cancellation(vec![file], self.cancellation_token.clone())?;
-        let Some(data) = reads.next().transpose()? else {
-            return Err(Error::internal_error("single-file read returned no result"));
-        };
+        let data = reads.next().transpose()?;
         if reads.next().transpose()?.is_some() {
             return Err(Error::internal_error(
                 "single-file read returned more than one result",
@@ -256,10 +275,11 @@ impl StorageConnector<'_> {
     }
 }
 
-#[cfg(all(test, feature = "declarative-plans"))]
+#[cfg(feature = "declarative-plans")]
 impl PlanExecutorConnector<'_> {
     fn respond(&self, request: Request) -> DeltaResult<()> {
         match request {
+            Request::ExecutePlan(PlanRequest::Require(reply)) => reply.send(Ok(())),
             Request::ExecutePlan(PlanRequest::ParquetFooter(file, reply)) => {
                 reply.send(self.executor.read_parquet_footer(file));
             }
@@ -304,7 +324,23 @@ impl EngineConnector {
 
     /// Drive an existing coroutine through this connector.
     pub(crate) fn drive<O>(&self, coroutine: Coroutine<'_, O>) -> DeltaResult<O> {
-        Ok(drive_coroutine!(coroutine, |request| self.respond(request)?))
+        Ok(drive_coroutine!(coroutine, |request| {
+            self.check_cancelled()?;
+            self.respond(request)?
+        }))
+    }
+
+    /// Drive generator preparation and bind the resulting generator to an owned request channel.
+    pub(crate) fn prepare_generator<G>(
+        &self,
+        coroutine: Coroutine<'_, G>,
+    ) -> DeltaResult<StaticGeneratorCoroutine<G::Item, G::Output>>
+    where
+        G: IntoGenerator<Request>,
+    {
+        Ok(StaticGeneratorCoroutine::from_generator(
+            self.drive(coroutine)?,
+        ))
     }
 
     /// Drive a coroutine whose catalog requests are handled by `committer`.
@@ -314,11 +350,14 @@ impl EngineConnector {
         engine: &dyn Engine,
         committer: &dyn Committer,
     ) -> DeltaResult<O> {
-        Ok(drive_coroutine!(coroutine, |request| match request {
-            Request::Publish(metadata, reply) => {
-                reply.send(committer.publish(engine, metadata));
+        Ok(drive_coroutine!(coroutine, |request| {
+            self.check_cancelled()?;
+            match request {
+                Request::Publish(metadata, reply) => {
+                    reply.send(committer.publish(engine, metadata));
+                }
+                request => self.respond(request)?,
             }
-            request => self.respond(request)?,
         }))
     }
 
@@ -333,8 +372,33 @@ impl EngineConnector {
         }
     }
 
+    /// Like [`iterate_generator`], but for generators that yield [`DeltaResult`] items.
+    pub(crate) fn iterate_result_generator<Item: Send + 'static, O: Send + 'static>(
+        self,
+        generator: impl Into<StaticGeneratorCoroutine<DeltaResult<Item>, O>>,
+    ) -> EngineResultGeneratorIterator<Item, O> {
+        EngineResultGeneratorIterator {
+            inner: self.iterate_generator(generator),
+        }
+    }
+
+    /// Initialize `operation` and return its continuation cursor without fetching a page.
+    pub(crate) fn prepare_paged<Op>(&self, operation: Op) -> DeltaResult<Cursor<Op>>
+    where
+        Op: PagedOperation,
+        PageRequest<Op>: Into<Request>,
+    {
+        self.drive(coroutine!(async move |channel| {
+            channel.prepare_paged(operation).await
+        }))
+    }
+
     fn storage_connector(&self) -> StorageConnector<'_> {
         StorageConnector::new(self.storage.as_ref(), self.cancellation_token.clone())
+    }
+
+    fn check_cancelled(&self) -> DeltaResult<()> {
+        check_cancelled(self.cancellation_token.as_ref())
     }
 
     fn respond(&self, request: Request) -> DeltaResult<()> {
@@ -342,106 +406,87 @@ impl EngineConnector {
             request @ (Request::ListDirectory(_)
             | Request::ListForward(_)
             | Request::ListBackward(_)
-            | Request::ReadSmallFile(..)) => self.storage_connector().respond(request)?,
-            Request::ReadParquetFooter(file, reply) => {
-                reply.send(
-                    self.parquet.read_parquet_footer_with_cancellation(
-                        &file,
-                        self.cancellation_token.clone(),
-                    ),
-                );
-            }
+            | Request::ReadSmallFile(..)
+            | Request::Head(..)
+            | Request::WriteBytes(..)
+            | Request::CopyAtomic(..)) => self.storage_connector().respond(request)?,
+            Request::ReadParquetFooter(file, reply) => reply.send(
+                self.parquet
+                    .read_parquet_footer_with_cancellation(&file, self.cancellation_token.clone()),
+            ),
             Request::ReadJson(request) => respond_paged(self, request),
             Request::ReadParquet(request) => respond_paged(self, request),
             #[cfg(feature = "declarative-plans")]
+            Request::ExecutePlan(PlanRequest::Require(reply)) => {
+                reply.send(self.plan_executor.as_ref().map(|_| ()).ok_or_else(|| {
+                    Error::unsupported("this engine does not provide a PlanExecutor")
+                }))
+            }
+            #[cfg(feature = "declarative-plans")]
             Request::ExecutePlan(PlanRequest::Query(request)) => respond_paged(self, request),
             #[cfg(feature = "declarative-plans")]
-            Request::ExecutePlan(PlanRequest::ParquetFooter(file, reply)) => {
-                reply.send(self.check_cancelled().and_then(|()| {
-                    self.plan_executor
-                        .as_deref()
-                        .ok_or_else(|| {
-                            Error::unsupported("this engine does not provide a PlanExecutor")
-                        })?
-                        .read_parquet_footer(file)
-                }));
+            Request::ExecutePlan(PlanRequest::ParquetFooter(file, reply)) => reply.send(
+                self.plan_executor
+                    .as_deref()
+                    .ok_or_else(|| {
+                        Error::unsupported("this engine does not provide a PlanExecutor")
+                    })
+                    .and_then(|executor| executor.read_parquet_footer(file)),
+            ),
+            #[cfg(not(feature = "declarative-plans"))]
+            Request::ExecutePlan(PlanRequest::Require(reply)) => {
+                reply.send(Err(Error::unsupported("declarative plans are disabled")));
             }
             #[cfg(not(feature = "declarative-plans"))]
             Request::ExecutePlan(PlanRequest::Query(request)) => {
                 let err = Error::unsupported("declarative plans are disabled");
                 match request {
                     PageRequest::Start(_, reply) => reply.send(Err(err)),
-                    PageRequest::Prepare(_, reply) => {
-                        reply.send(Err(err));
-                    }
+                    PageRequest::Prepare(_, reply) => reply.send(Err(err)),
                     PageRequest::Continue(_, reply) => reply.send(Err(err)),
                 }
             }
             #[cfg(not(feature = "declarative-plans"))]
             Request::ExecutePlan(PlanRequest::ParquetFooter(_, reply)) => {
-                reply.send(Err(Error::unsupported("declarative plans are disabled")));
+                reply.send(Err(Error::unsupported("declarative plans are disabled")))
             }
-            Request::CreateEngineData(operation, reply) => {
-                reply.send(
-                    self.evaluation
-                        .create_many(operation.schema, operation.rows),
-                );
-            }
-            Request::CreateExpressionEvaluator(operation, reply) => {
-                reply.send(
-                    self.evaluation
-                        .new_expression_evaluator(
-                            operation.input_schema,
-                            operation.expression,
-                            operation.output_type,
-                        )
-                        .map(|evaluator| Arc::new(evaluator) as _),
-                );
-            }
-            Request::CreatePredicateEvaluator(operation, reply) => {
-                reply.send(
-                    self.evaluation
-                        .new_predicate_evaluator(operation.input_schema, operation.predicate)
-                        .map(|evaluator| Arc::new(evaluator) as _),
-                );
-            }
-            Request::EvaluateExpression(operation, reply) => {
-                reply.send(
-                    expression_evaluator(&operation.evaluator)
-                        .and_then(|evaluator| evaluator.evaluate(operation.input.as_ref())),
-                );
-            }
-            Request::EvaluatePredicate(operation, reply) => {
-                reply.send(
-                    predicate_evaluator(&operation.evaluator)
-                        .and_then(|evaluator| evaluator.evaluate(operation.input.as_ref())),
-                );
-            }
-            Request::WriteJson(operation, reply) => {
-                reply.send(self.write_json_file(*operation));
-            }
+            Request::CreateEngineData(operation, reply) => reply.send(
+                self.evaluation
+                    .create_many(operation.schema, operation.rows),
+            ),
+            Request::CreateExpressionEvaluator(operation, reply) => reply.send(
+                self.evaluation
+                    .new_expression_evaluator(
+                        operation.input_schema,
+                        operation.expression,
+                        operation.output_type,
+                    )
+                    .map(|evaluator| Arc::new(evaluator) as _),
+            ),
+            Request::CreatePredicateEvaluator(operation, reply) => reply.send(
+                self.evaluation
+                    .new_predicate_evaluator(operation.input_schema, operation.predicate)
+                    .map(|evaluator| Arc::new(evaluator) as _),
+            ),
+            Request::EvaluateExpression(operation, reply) => reply.send(
+                expression_evaluator(&operation.evaluator)
+                    .and_then(|evaluator| evaluator.evaluate(operation.input.as_ref())),
+            ),
+            Request::EvaluatePredicate(operation, reply) => reply.send(
+                predicate_evaluator(&operation.evaluator)
+                    .and_then(|evaluator| evaluator.evaluate(operation.input.as_ref())),
+            ),
+            Request::WriteJson(operation, reply) => reply.send(self.write_json_file(*operation)),
             Request::WriteParquet(operation, reply) => {
-                reply.send(self.write_parquet_file(*operation));
+                reply.send(self.write_parquet_file(*operation))
             }
             Request::WriteParquetFiles(operation, reply) => {
-                reply.send(self.write_parquet_files(*operation));
-            }
-            Request::WriteBytes(operation, reply) => {
-                reply.send(self.check_cancelled().and_then(|()| {
-                    self.storage
-                        .put(&operation.url, operation.data, operation.overwrite)
-                }));
-            }
-            Request::CopyAtomic(operation, reply) => {
-                reply.send(self.check_cancelled().and_then(|()| {
-                    self.storage
-                        .copy_atomic(&operation.source, &operation.destination)
-                }));
+                reply.send(self.write_parquet_files(*operation))
             }
             Request::Publish(..) => {
                 return Err(Error::internal_error(
                     "publish request requires a catalog committer",
-                ))
+                ));
             }
         }
         Ok(())
@@ -505,17 +550,27 @@ impl EngineConnector {
         )?;
         Ok((locations, output))
     }
-
-    fn check_cancelled(&self) -> DeltaResult<()> {
-        check_cancelled(self.cancellation_token.as_ref())
-    }
 }
 
 /// Construct and drive a coroutine through an [`Engine`].
+///
+/// The two-argument form does not propagate cancellation. Pass a token as the second argument
+/// to install it when the engine connector is first captured.
 #[internal_api]
 macro_rules! run_coroutine_with_engine {
     ($engine:expr, $body:expr) => {
-        $crate::coroutine::drive_with_engine($engine, $crate::coroutine::kernel::coroutine!($body))
+        $crate::coroutine::drive_with_engine(
+            $engine,
+            None,
+            $crate::coroutine::kernel::coroutine!($body),
+        )
+    };
+    ($engine:expr, $cancellation_token:expr, $body:expr) => {
+        $crate::coroutine::drive_with_engine(
+            $engine,
+            $cancellation_token,
+            $crate::coroutine::kernel::coroutine!($body),
+        )
     };
 }
 
@@ -657,7 +712,6 @@ impl EnginePagination<PlanOperation> for EngineConnector {
     type State = EngineDataIterator;
 
     fn initialize(&self, operation: PlanOperation) -> DeltaResult<Self::State> {
-        self.check_cancelled()?;
         self.plan_executor
             .as_deref()
             .ok_or_else(|| Error::unsupported("this engine does not provide a PlanExecutor"))?
@@ -666,12 +720,11 @@ impl EnginePagination<PlanOperation> for EngineConnector {
     }
 
     fn next_page(&self, state: Self::State) -> DeltaResult<Page<PlanOperation>> {
-        self.check_cancelled()?;
         next_engine_data(state)
     }
 }
 
-#[cfg(all(test, feature = "declarative-plans"))]
+#[cfg(feature = "declarative-plans")]
 impl EnginePagination<PlanOperation> for PlanExecutorConnector<'_> {
     type State = EngineDataIterator;
 
@@ -704,6 +757,18 @@ impl<Item: Send + 'static, O: Send + 'static, C> EngineGeneratorIterator<Item, O
     }
 }
 
+impl<Item: Send + 'static, O: Send + 'static, C> EngineResultGeneratorIterator<Item, O, C> {
+    /// Return whether the generator completed and stored its terminal output.
+    pub(crate) fn is_complete(&self) -> bool {
+        self.inner.is_complete()
+    }
+
+    /// Return the terminal output after this iterator has been exhausted.
+    pub(crate) fn into_output(self) -> DeltaResult<O> {
+        self.inner.into_output()
+    }
+}
+
 impl<C: Borrow<EngineConnector>, Item: Send + 'static, O: Send + 'static> Iterator
     for EngineGeneratorIterator<Item, O, C>
 {
@@ -711,6 +776,16 @@ impl<C: Borrow<EngineConnector>, Item: Send + 'static, O: Send + 'static> Iterat
 
     fn next(&mut self) -> Option<Self::Item> {
         next_generator(self.connector.borrow(), &mut self.state)
+    }
+}
+
+impl<C: Borrow<EngineConnector>, Item: Send + 'static, O: Send + 'static> Iterator
+    for EngineResultGeneratorIterator<Item, O, C>
+{
+    type Item = DeltaResult<Item>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|result| result?)
     }
 }
 
@@ -725,7 +800,6 @@ fn next_generator<Item: Send + 'static, O: Send + 'static>(
         *state = GeneratorState::Failed;
         return Some(Err(err));
     }
-
     loop {
         match generator.try_advance() {
             Ok(GeneratorCoroutineStep::Done(output)) => {
@@ -749,9 +823,9 @@ fn next_generator<Item: Send + 'static, O: Send + 'static>(
 
 fn next_engine_data<Op>(mut reads: EngineDataIterator) -> DeltaResult<Page<Op>>
 where
-    Op: PagedOperation<Page = Vec<Box<dyn EngineData>>>,
+    Op: PagedOperation<Page = Vec<DeltaResult<Box<dyn EngineData>>>>,
 {
-    let (data, next) = match reads.next().transpose()? {
+    let (data, next) = match reads.next() {
         Some(data) => (vec![data], Some(Cursor::new(reads))),
         None => (Vec::new(), None),
     };
@@ -763,8 +837,6 @@ mod tests {
     use url::Url;
 
     use super::*;
-    #[cfg(feature = "declarative-plans")]
-    use crate::engine::sync::SyncEngine;
     use crate::unit_test_utils::TestCancellationToken;
 
     struct CancelAfterFirstRead {
@@ -877,21 +949,5 @@ mod tests {
                 .to_string()
                 .contains("before exhausting its input"));
         }
-    }
-
-    #[cfg(feature = "declarative-plans")]
-    #[test]
-    fn plan_continuation_checks_cancellation_before_polling_iterator() {
-        let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
-        let engine = SyncEngine::new();
-        let connector = EngineConnector::new(&engine).with_cancellation_token(token);
-        let reads: EngineDataIterator = Box::new(std::iter::from_fn(|| {
-            panic!("cancelled plan continuation polled its iterator")
-        }));
-        let cursor = Cursor::<PlanOperation>::new(reads);
-
-        let result = EnginePagination::continue_from(&connector, cursor);
-
-        assert!(matches!(result, Err(Error::Cancelled)));
     }
 }

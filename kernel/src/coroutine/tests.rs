@@ -1,5 +1,6 @@
 use std::borrow::Borrow;
 use std::future::pending;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -12,7 +13,9 @@ use tracing::info_span;
 use url::Url;
 
 use super::engine::{drive_with_engine, run_coroutine_with_connector, EngineConnector};
-use super::generator::{empty, generator, static_generator_coroutine, GeneratorExt as _};
+use super::generator::{
+    empty, from_iter, generator, static_generator_coroutine, GeneratorExt as _,
+};
 use super::kernel::request::{BackwardListing, ForwardListing, ListingBounds};
 use super::kernel::{
     coroutine, generator_fn, Channel, GeneratorCoroutineStep, StaticGeneratorCoroutine,
@@ -78,14 +81,14 @@ async fn async_coroutine_resumes_after_cross_task_reply() {
     };
     let reply_task = tokio::spawn(async move {
         tokio::task::yield_now().await;
-        reply.send(Ok(Bytes::from_static(b"response")));
+        reply.send(Ok(Some(Bytes::from_static(b"response"))));
     });
 
     let CoroutineStep::Done(output) = coroutine.advance().await.unwrap() else {
         panic!("coroutine did not complete");
     };
     reply_task.await.unwrap();
-    assert_eq!(output, Bytes::from_static(b"response"));
+    assert_eq!(output, Some(Bytes::from_static(b"response")));
 }
 
 #[tokio::test]
@@ -98,7 +101,7 @@ async fn selectively_polled_channel_futures_keep_every_request_live() {
         reads.push(channel.read_small_file(second, None));
         let mut lengths = Vec::new();
         while let Some(bytes) = reads.next().await {
-            lengths.push(bytes?.len());
+            lengths.push(bytes?.ok_or_else(|| Error::generic("empty read"))?.len());
         }
         Ok(lengths)
     });
@@ -109,7 +112,7 @@ async fn selectively_polled_channel_futures_keep_every_request_live() {
             CoroutineStep::Done(lengths) => break lengths,
             CoroutineStep::Request(Request::ReadSmallFile(_file, reply)) => {
                 requests += 1;
-                reply.send(Ok(Bytes::from(vec![0; requests])));
+                reply.send(Ok(Some(Bytes::from(vec![0; requests]))));
             }
             CoroutineStep::Request(_) => panic!("coroutine requested an unexpected operation"),
         }
@@ -124,7 +127,10 @@ async fn selectively_polled_channel_futures_keep_every_request_live() {
 async fn async_generator_resumes_after_cross_task_reply() {
     let location = Url::parse("memory:///async-generator").unwrap();
     let mut generator = static_generator_coroutine!(Request, async move |channel| {
-        let bytes = channel.read_small_file(location, None).await?;
+        let bytes = channel
+            .read_small_file(location, None)
+            .await?
+            .ok_or_else(|| Error::generic("empty read"))?;
         channel.yield_item(bytes.len()).await
     });
     let GeneratorCoroutineStep::Request(Request::ReadSmallFile(_file, reply)) =
@@ -134,7 +140,7 @@ async fn async_generator_resumes_after_cross_task_reply() {
     };
     let reply_task = tokio::spawn(async move {
         tokio::task::yield_now().await;
-        reply.send(Ok(Bytes::from_static(b"response")));
+        reply.send(Ok(Some(Bytes::from_static(b"response"))));
     });
 
     let GeneratorCoroutineStep::Yield(output) = generator.advance().await.unwrap() else {
@@ -170,7 +176,7 @@ fn iterator_generator_is_lazy_and_stops_at_first_error() {
 
 #[test]
 fn nested_async_operation_uses_the_parent_request_channel() {
-    async fn child(channel: &Channel, location: Url) -> DeltaResult<Bytes> {
+    async fn child(channel: &Channel, location: Url) -> DeltaResult<Option<Bytes>> {
         channel.read_small_file(location, None).await
     }
 
@@ -182,11 +188,11 @@ fn nested_async_operation_uses_the_parent_request_channel() {
     else {
         panic!("nested coroutine did not expose its read request");
     };
-    reply.send(Ok(Bytes::from_static(b"response")));
+    reply.send(Ok(Some(Bytes::from_static(b"response"))));
     let CoroutineStep::Done(bytes) = coroutine.try_advance().unwrap() else {
         panic!("nested coroutine did not complete");
     };
-    assert_eq!(bytes, Bytes::from_static(b"response"));
+    assert_eq!(bytes, Some(Bytes::from_static(b"response")));
 }
 
 #[test]
@@ -200,12 +206,12 @@ fn coroutine_retains_handle_between_advances() {
     else {
         panic!("coroutine did not produce its request");
     };
-    let bytes = Ok(Bytes::from_static(b"response"));
+    let bytes = Ok(Some(Bytes::from_static(b"response")));
     reply.send(bytes);
     let CoroutineStep::Done(output) = coroutine.try_advance().unwrap() else {
         panic!("coroutine did not complete");
     };
-    assert_eq!(output, Bytes::from_static(b"response"));
+    assert_eq!(output, Some(Bytes::from_static(b"response")));
     assert_result_error_with_message(coroutine.try_advance(), "advanced after completion");
 }
 
@@ -220,7 +226,7 @@ fn coroutine_try_advance_before_reply_would_block() {
         panic!("coroutine did not produce its request");
     };
     assert!(matches!(coroutine.try_advance(), Err(Error::WouldBlock)));
-    reply.send(Ok(Bytes::new()));
+    reply.send(Ok(Some(Bytes::new())));
     assert!(matches!(
         coroutine.try_advance().unwrap(),
         CoroutineStep::Done(_)
@@ -248,7 +254,7 @@ fn reporting_span_tracks_single_reply_outcome(#[case] outcome: ReplyOutcome) {
         };
         match outcome {
             ReplyOutcome::Ok => {
-                reply.send(Ok(Bytes::from_static(b"ok")));
+                reply.send(Ok(Some(Bytes::from_static(b"ok"))));
                 let _ = coroutine.try_advance().unwrap();
             }
             ReplyOutcome::Err => {
@@ -286,7 +292,10 @@ fn coroutine_output_is_independent_of_request_response_type() {
     let location = Url::parse("memory:///answer").unwrap();
     let expected_location = location.clone();
     let mut coroutine = coroutine!(async move |channel| {
-        let bytes = channel.read_small_file(location, None).await?;
+        let bytes = channel
+            .read_small_file(location, None)
+            .await?
+            .ok_or_else(|| Error::generic("empty read"))?;
         Ok(format!("read {} bytes", bytes.len()))
     });
     let output = loop {
@@ -295,7 +304,7 @@ fn coroutine_output_is_independent_of_request_response_type() {
             CoroutineStep::Request(Request::ReadSmallFile((location, range), reply)) => {
                 assert_eq!(location, expected_location);
                 assert_eq!(range, None);
-                reply.send(Ok(Bytes::from_static(b"answer")));
+                reply.send(Ok(Some(Bytes::from_static(b"answer"))));
             }
             CoroutineStep::Request(_) => {
                 panic!("coroutine requested an unexpected operation")
@@ -310,7 +319,10 @@ fn coroutine_output_is_independent_of_request_response_type() {
 fn connector_facing_generator_interleaves_requests_and_yields() {
     let location = Url::parse("memory:///item").unwrap();
     let mut generator = static_generator_coroutine!(Request, async move |channel| {
-        let bytes = channel.read_small_file(location, None).await?;
+        let bytes = channel
+            .read_small_file(location, None)
+            .await?
+            .ok_or_else(|| Error::generic("empty read"))?;
         channel.yield_item(bytes.len()).await?;
         Ok(())
     });
@@ -321,7 +333,7 @@ fn connector_facing_generator_interleaves_requests_and_yields() {
             GeneratorCoroutineStep::Done(()) => break,
             GeneratorCoroutineStep::Yield(item) => yielded.push(item),
             GeneratorCoroutineStep::Request(Request::ReadSmallFile(_file, reply)) => {
-                reply.send(Ok(Bytes::from_static(b"generated item")));
+                reply.send(Ok(Some(Bytes::from_static(b"generated item"))));
             }
             GeneratorCoroutineStep::Request(_) => {
                 panic!("generator requested an unexpected operation")
@@ -383,7 +395,10 @@ fn parent_intercepts_child_items_while_child_io_reaches_connector() {
         let second = Url::parse("memory:///second")?;
         let mut child = generator!(channel, async move |channel| {
             for location in [first, second] {
-                let item = channel.read_small_file(location, None).await?;
+                let item = channel
+                    .read_small_file(location, None)
+                    .await?
+                    .ok_or_else(|| Error::generic("empty read"))?;
                 channel.yield_item(item).await?;
             }
             Ok(())
@@ -403,7 +418,7 @@ fn parent_intercepts_child_items_while_child_io_reaches_connector() {
             CoroutineStep::Request(Request::ReadSmallFile((location, range), reply)) => {
                 assert_eq!(range, None);
                 connector_inputs.push(location.path().to_string());
-                reply.send(Ok(Bytes::copy_from_slice(location.path().as_bytes())));
+                reply.send(Ok(Some(Bytes::copy_from_slice(location.path().as_bytes()))));
             }
             CoroutineStep::Request(_) => {
                 panic!("coroutine requested an unexpected operation")
@@ -424,14 +439,51 @@ fn parent_intercepts_child_items_while_child_io_reaches_connector() {
 }
 
 #[test]
-fn map_ok_and_chain_transform_items_and_forward_child_requests() {
+fn from_iter_yields_each_item_then_exhausts() {
+    let items = from_iter([1, 2, 3]);
+    let mut coroutine = coroutine!(async move |channel| {
+        let mut items = items.bind(channel);
+        let mut output = Vec::new();
+        while let Some(item) = items.next().await? {
+            output.push(item);
+        }
+        Ok(output)
+    });
+    let CoroutineStep::Done(output) = coroutine.try_advance().unwrap() else {
+        panic!("expected completion");
+    };
+    assert_eq!(output, [1, 2, 3]);
+}
+
+#[test]
+fn flatten_yields_collection_elements_then_exhausts() {
+    let items = from_iter([vec![1, 2], vec![], vec![3]]);
+    let mut coroutine = coroutine!(async move |channel| {
+        let mut items = items.flatten().bind(channel);
+        let mut output = Vec::new();
+        while let Some(item) = items.next().await? {
+            output.push(item);
+        }
+        Ok(output)
+    });
+    let CoroutineStep::Done(output) = coroutine.try_advance().unwrap() else {
+        panic!("expected completion");
+    };
+    assert_eq!(output, [1, 2, 3]);
+}
+
+#[test]
+fn map_and_chain_transform_items_and_forward_child_requests() {
     let first = generator_fn!(async move |channel| {
         let location = Url::parse("memory:///first")?;
-        let bytes = channel.read_small_file(location, None).await?;
+        let bytes = channel
+            .read_small_file(location, None)
+            .await?
+            .ok_or_else(|| Error::generic("empty read"))?;
         channel.yield_item(bytes.len()).await
     });
     let second = generator_fn!(async move |channel| channel.yield_item(100).await);
-    let items = empty().chain(first).chain(second).map_ok(|len| len + 1);
+    let items = empty().chain(first).chain(second).map(|len| len + 1);
 
     let mut coroutine = coroutine!(async move |channel| {
         let mut items = items.bind(channel);
@@ -445,7 +497,7 @@ fn map_ok_and_chain_transform_items_and_forward_child_requests() {
         match coroutine.try_advance().unwrap() {
             CoroutineStep::Done(output) => break output,
             CoroutineStep::Request(Request::ReadSmallFile(_file, reply)) => {
-                reply.send(Ok(Bytes::from_static(b"12345")));
+                reply.send(Ok(Some(Bytes::from_static(b"12345"))));
             }
             CoroutineStep::Request(_) => {
                 panic!("coroutine requested an unexpected operation")
@@ -457,12 +509,12 @@ fn map_ok_and_chain_transform_items_and_forward_child_requests() {
 }
 
 #[test]
-fn map_ok_passes_through_errors_after_mapping_earlier_items() {
+fn map_passes_through_errors_after_mapping_earlier_items() {
     let items = generator_fn!(async move |channel| {
         channel.yield_item(1).await?;
         Err(Error::generic("generator failed"))
     });
-    let items = items.map_ok(|item| item * 10);
+    let items = items.map(|item| item * 10);
 
     let mut coroutine = coroutine!(async move |channel| {
         let mut items = items.bind(channel);
@@ -477,7 +529,7 @@ fn map_ok_passes_through_errors_after_mapping_earlier_items() {
 #[test]
 fn channel_taking_generator_supports_static_and_borrowed_state() {
     fn operation<'a>(
-        channel: impl Borrow<Channel> + Send + 'a,
+        channel: impl Deref<Target = Channel> + Send + 'a,
         prefix: impl Borrow<str> + Send + 'a,
     ) -> BoundGenerator<'a, String> {
         generator!(channel, async move |channel| {
@@ -549,7 +601,7 @@ fn static_generator_coroutine_try_advance_before_request_reply_would_block() {
         panic!("generator did not request a read");
     };
     assert!(matches!(generator.try_advance(), Err(Error::WouldBlock)));
-    reply.send(Ok(Bytes::new()));
+    reply.send(Ok(Some(Bytes::new())));
     assert!(matches!(
         generator.try_advance().unwrap(),
         GeneratorCoroutineStep::Done(())
@@ -562,7 +614,7 @@ fn engine_coroutine_can_borrow_caller_state() {
     let value = "scoped".to_string();
     let value = value.as_str();
     let coroutine = coroutine!(async move |_channel| Ok::<_, Error>(value.len()));
-    let length = drive_with_engine(&engine, coroutine).unwrap();
+    let length = drive_with_engine(&engine, None, coroutine).unwrap();
 
     assert_eq!(length, 6);
 }
@@ -584,14 +636,12 @@ fn engine_connector_drives_real_storage_operations() {
     let write_data = expected.clone();
 
     let coroutine = coroutine!(async move |channel| {
-        channel
-            .write_bytes(location.clone(), write_data, false)
-            .await?;
+        channel.write_bytes(&location, write_data, false).await?;
         channel.read_small_file(location, None).await
     });
     let connector = EngineConnector::new(&SyncEngine::new());
     let actual = connector.drive(coroutine).unwrap();
-    assert_eq!(actual, expected);
+    assert_eq!(actual, Some(expected));
 }
 
 #[test]
@@ -608,28 +658,21 @@ fn engine_connector_pages_forward_listing() {
         for version in 1..=3 {
             channel
                 .write_bytes(
-                    root.join(&format!("{version:020}.json"))?,
+                    &root.join(&format!("{version:020}.json"))?,
                     Bytes::new(),
                     false,
                 )
                 .await?;
         }
-        let mut page = channel
-            .start_paged(ForwardListing::new(ListingBounds {
-                prefix: root.clone(),
-                low: root.join("00000000000000000000")?,
-                high: root.join("00000000000000000004")?,
-            }))
-            .await?;
-        loop {
-            for entry in page.data {
-                channel.yield_item(entry?.location).await?;
-            }
-            let Some(next) = page.next else {
-                return Ok(());
-            };
-            page = channel.continue_paged(next).await?;
+        let mut pages = channel.flattened(ForwardListing::new(ListingBounds {
+            prefix: root.clone(),
+            low: root.join("00000000000000000000")?,
+            high: root.join("00000000000000000004")?,
+        }));
+        while let Some(entry) = pages.next().await? {
+            channel.yield_item(entry?.location).await?;
         }
+        Ok(())
     });
     let actual = connector
         .iterate_generator(generator)
@@ -653,29 +696,23 @@ fn engine_connector_pages_backward_listing() {
         for version in 1..=3 {
             channel
                 .write_bytes(
-                    root.join(&format!("{version:020}.json"))?,
+                    &root.join(&format!("{version:020}.json"))?,
                     Bytes::new(),
                     false,
                 )
                 .await?;
         }
-        let mut page = channel
-            .start_paged(BackwardListing::new(ListingBounds {
-                prefix: root.clone(),
-                low: root.join("00000000000000000000")?,
-                high: root.join("00000000000000000004")?,
-            }))
-            .await?;
+        let mut pages = channel.paged(BackwardListing::new(ListingBounds {
+            prefix: root.clone(),
+            low: root.join("00000000000000000000")?,
+            high: root.join("00000000000000000004")?,
+        }));
         let mut files = Vec::new();
-        loop {
-            assert!(page.data.known_version_boundary);
-            for entry in page.data.entries {
+        while let Some(page) = pages.next().await? {
+            assert!(page.known_version_boundary);
+            for entry in page.entries {
                 files.push(entry?.location);
             }
-            let Some(next) = page.next else {
-                break;
-            };
-            page = channel.continue_paged(next).await?;
         }
         Ok(files)
     })

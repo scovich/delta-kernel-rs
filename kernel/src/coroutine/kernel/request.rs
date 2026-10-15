@@ -33,7 +33,11 @@ pub enum Request {
     /// List page ranges from high to low, with entries ascending within each page.
     ListBackward(PageRequest<BackwardListing>),
     /// Read a whole file when the range is `None`, or exactly the half-open range otherwise.
-    ReadSmallFile(FileSlice, Reply<Bytes>),
+    ///
+    /// Missing objects reply `Ok(None)`. Extra objects from a single-file read are an error.
+    ReadSmallFile(FileSlice, Reply<Option<Bytes>>),
+    /// Fetch metadata for one object.
+    Head(Url, Reply<FileMeta>),
     /// Read one Parquet footer.
     ReadParquetFooter(FileMeta, Reply<ParquetFooter>),
     /// Read JSON files as ordered [`EngineData`] batches: Each file may produce multiple
@@ -73,6 +77,8 @@ pub enum Request {
 
 /// Declarative plan operations with result-specific reply types.
 pub enum PlanRequest {
+    /// Verify that the connector provides a declarative plan executor.
+    Require(Reply<()>),
     /// Execute a query plan in connector-selected pages.
     Query(PageRequest<PlanOperation>),
     /// Read a Parquet footer through the plan-execution path.
@@ -302,12 +308,12 @@ pub struct ReadJsonFiles {
 
 impl ReadJsonFiles {
     pub fn new(
-        files: Vec<FileMeta>,
+        files: impl Into<Vec<FileMeta>>,
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> Self {
         Self {
-            files,
+            files: files.into(),
             physical_schema,
             predicate,
         }
@@ -315,7 +321,7 @@ impl ReadJsonFiles {
 }
 
 impl PagedOperation for ReadJsonFiles {
-    type Page = Vec<Box<dyn EngineData>>;
+    type Page = Vec<DeltaResult<Box<dyn EngineData>>>;
 }
 
 /// Paginated Parquet read operation.
@@ -331,12 +337,12 @@ pub struct ReadParquetFiles {
 
 impl ReadParquetFiles {
     pub fn new(
-        files: Vec<FileMeta>,
+        files: impl Into<Vec<FileMeta>>,
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> Self {
         Self {
-            files,
+            files: files.into(),
             physical_schema,
             predicate,
         }
@@ -344,12 +350,12 @@ impl ReadParquetFiles {
 }
 
 impl PagedOperation for ReadParquetFiles {
-    type Page = Vec<Box<dyn EngineData>>;
+    type Page = Vec<DeltaResult<Box<dyn EngineData>>>;
 }
 
 /// Paginated declarative-plan execution.
 impl PagedOperation for PlanOperation {
-    type Page = Vec<Box<dyn EngineData>>;
+    type Page = Vec<DeltaResult<Box<dyn EngineData>>>;
 }
 
 // === Evaluation ===

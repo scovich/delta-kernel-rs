@@ -68,8 +68,7 @@ impl<T, F> DeltaFuture<T> for F where F: Future<Output = DeltaResult<T>> + Send 
 /// Passing an existing channel to nested operations routes all their requests through the same
 /// connector-owned driver. Most connectors use channels only indirectly through Kernel entry
 /// points; custom coroutine implementations use them directly in concert with [`ChannelExchange`]..
-#[internal_api]
-pub(crate) struct Channel<P: 'static>(Mutex<VecDeque<Weak<dyn Accept<P>>>>);
+pub struct Channel<P: 'static>(Mutex<VecDeque<Weak<dyn Accept<P>>>>);
 
 impl<P: 'static> Default for Channel<P> {
     fn default() -> Self {
