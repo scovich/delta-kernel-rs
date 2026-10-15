@@ -8,9 +8,8 @@
 //! kernel needs to commit a transaction to a table. The goal terminal state of every
 //! [`Transaction`] is to be committed to the table. This means writing the changes (we call these
 //! actions) in the transaction as a new version of the table. The [`Committer`] trait exposes a
-//! single method, [`commit`] which takes an engine, an iterator of actions (as [`EngineData`]
-//! batches), and [`CommitMetadata`] (which includes critical commit metadata like the version to
-//! commit) to allow different catalogs to define what it means to 'commit' the actions to a table.
+//! single method, [`commit`], which takes an engine and a prepared [`Commit`] to allow different
+//! catalogs to define what it means to commit the actions to a table.
 //! For some, this may mean writing staged commits to object storage and retaining an in-memory list
 //! (server side) of commits. For others, this may mean writing new (version, actions) tuples to a
 //! database.
@@ -23,17 +22,42 @@
 //! [`Transaction`]: crate::transaction::Transaction
 //! [`commit`]: crate::committer::Committer::commit
 //! [`log_tail`]: crate::snapshot::SnapshotBuilder::with_log_tail
-//! [`EngineData`]: crate::EngineData
 
 mod commit_types;
 mod filesystem;
 mod publish_types;
 
 pub use commit_types::{CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType};
+use derive_more::Constructor;
 pub use filesystem::FileSystemCommitter;
 pub use publish_types::{CatalogCommit, PublishMetadata};
 
-use crate::{DeltaResult, DeltaResultIterator, Engine, FilteredEngineData};
+use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, FilteredEngineData};
+
+/// A Delta log commit ready for a [`Committer`] to persist.
+#[derive(Constructor)]
+pub struct Commit {
+    metadata: CommitMetadata,
+    actions: CommitActions,
+}
+
+/// Actions ready to be committed in Delta log order.
+pub type CommitActions = DeltaResultIteratorStatic<FilteredEngineData>;
+
+impl Commit {
+    /// Validate the selected committer and return this commit's metadata and actions.
+    pub fn try_into_parts(
+        self,
+        is_catalog_committer: bool,
+    ) -> DeltaResult<(CommitMetadata, CommitActions)> {
+        self.metadata.validate_committer(is_catalog_committer)?;
+        Ok((self.metadata, self.actions))
+    }
+
+    pub(crate) fn version(&self) -> crate::Version {
+        self.metadata.version()
+    }
+}
 
 /// A Committer is the system by which transactions are committed to a table. Transactions are
 /// effectively a collection of actions performed on the table at a specific version. The kernel
@@ -41,30 +65,23 @@ use crate::{DeltaResult, DeltaResultIterator, Engine, FilteredEngineData};
 /// example, different catalogs may: commit directly to a database, commit to an object store, or
 /// use another system entirely.
 ///
-/// Critically, a Committer must implement [`commit`] which takes an engine and an iterator of
-/// actions (as [`EngineData`] batches) to commit to the table at the given version
-/// ([`CommitMetadata::version`]).
+/// Critically, a Committer must implement [`commit`] which takes an engine and a prepared
+/// [`Commit`] to commit to the table.
 ///
 /// [`commit`]: Committer::commit
-/// [`EngineData`]: crate::EngineData
 //
 // Note: While we could omit the Send bound, we keep it here for simplicity - so usage can be
 // Arc<dyn Committer> (instead of Arc<dyn Committer + Send>). If there is a strong case for a !Send
 // Committer then we can remove this bound and possibly just do an alias like CommitterRef =
 // Arc<dyn Committer + Send>.
 pub trait Committer: Send {
-    /// Commits actions to the table at the version specified in [`CommitMetadata`].
+    /// Commits a prepared transaction.
     ///
     /// Implementations must ensure that actions are committed atomically and either:
     /// 1. Persisted directly to object storage as published deltas (for filesystem-based tables),
     ///    or
     /// 2. Persisted as per the managing catalog's semantics (for catalog-managed tables)
-    fn commit(
-        &self,
-        engine: &dyn Engine,
-        actions: DeltaResultIterator<'_, FilteredEngineData>,
-        commit_metadata: CommitMetadata,
-    ) -> DeltaResult<CommitResponse>;
+    fn commit(&self, engine: &dyn Engine, commit: Commit) -> DeltaResult<CommitResponse>;
 
     /// Returns `true` if this committer is for a catalog-managed table, else `false`.
     fn is_catalog_committer(&self) -> bool;

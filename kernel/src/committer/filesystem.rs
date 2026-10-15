@@ -2,10 +2,12 @@
 
 use tracing::{info, instrument};
 
-use super::commit_types::{CommitMetadata, CommitResponse};
+#[cfg(test)]
+use super::commit_types::CommitMetadata;
+use super::commit_types::CommitResponse;
 use super::publish_types::PublishMetadata;
-use super::Committer;
-use crate::{DeltaResult, DeltaResultIterator, Engine, Error, FileMeta, FilteredEngineData};
+use super::{Commit, Committer};
+use crate::{DeltaResult, Engine, Error, FileMeta};
 
 /// The `FileSystemCommitter` is an internal implementation of the `Committer` trait which
 /// commits to a file system directly via `Engine::json_handler().write_json_file` for
@@ -19,29 +21,22 @@ impl FileSystemCommitter {
     pub fn new() -> Self {
         Self {}
     }
-}
 
-impl Committer for FileSystemCommitter {
     #[instrument(
         name = "fs_committer.commit",
         skip_all,
-        fields(version = commit_metadata.version()),
+        fields(version = commit.version()),
         err
     )]
-    fn commit(
-        &self,
-        engine: &dyn Engine,
-        actions: DeltaResultIterator<'_, FilteredEngineData>,
-        commit_metadata: CommitMetadata,
-    ) -> DeltaResult<CommitResponse> {
+    fn commit_impl(engine: &dyn Engine, commit: Commit) -> DeltaResult<CommitResponse> {
+        let (commit_metadata, actions) = commit.try_into_parts(false)?;
         let version = commit_metadata.version();
         let published_commit_path = commit_metadata.published_commit_path()?;
 
-        match engine.json_handler().write_json_file(
-            &published_commit_path,
-            Box::new(actions),
-            false,
-        ) {
+        match engine
+            .json_handler()
+            .write_json_file(&published_commit_path, actions, false)
+        {
             Ok(written_size) => {
                 info!(
                     committed_version = version,
@@ -63,6 +58,12 @@ impl Committer for FileSystemCommitter {
             }
             Err(e) => Err(e),
         }
+    }
+}
+
+impl Committer for FileSystemCommitter {
+    fn commit(&self, engine: &dyn Engine, commit: Commit) -> DeltaResult<CommitResponse> {
+        Self::commit_impl(engine, commit)
     }
 
     fn is_catalog_committer(&self) -> bool {
@@ -91,13 +92,13 @@ mod tests {
     use super::*;
     use crate::actions::{Metadata, Protocol, LOG_METADATA_SCHEMA};
     use crate::committer::{CommitProtocolMetadata, CommitType};
-    use crate::create_row;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
     use crate::path::LogRoot;
     use crate::schema::schema_ref;
+    use crate::{create_row, FilteredEngineData};
 
     #[tokio::test]
     async fn disallow_filesystem_committer_for_catalog_managed_tables() {
@@ -156,7 +157,8 @@ mod tests {
             FilteredEngineData::with_all_rows_selected(action),
         )));
 
-        let result = committer.commit(&engine, actions, commit_metadata).unwrap();
+        let commit = Commit::new(commit_metadata, actions);
+        let result = committer.commit(&engine, commit).unwrap();
         let stored_size = storage
             .head(&Path::from("_delta_log/00000000000000000001.json"))
             .await
@@ -209,14 +211,12 @@ mod tests {
             vec![],
         );
 
-        let first = committer
-            .commit(&engine, Box::new(std::iter::empty()), first_metadata)
-            .unwrap();
+        let first_commit = Commit::new(first_metadata, Box::new(std::iter::empty()));
+        let first = committer.commit(&engine, first_commit).unwrap();
         assert!(matches!(first, CommitResponse::Committed { .. }));
 
-        let second = committer
-            .commit(&engine, Box::new(std::iter::empty()), second_metadata)
-            .unwrap();
+        let second_commit = Commit::new(second_metadata, Box::new(std::iter::empty()));
+        let second = committer.commit(&engine, second_commit).unwrap();
         assert!(matches!(second, CommitResponse::Conflict { version: 1 }));
     }
 }

@@ -2,7 +2,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 use delta_kernel::committer::{
-    CommitMetadata, CommitResponse, CommitType, Committer, PublishMetadata,
+    Commit as KernelCommit, CommitMetadata, CommitResponse, CommitType, Committer, PublishMetadata,
 };
 use delta_kernel::{
     DeltaResult, DeltaResultIterator, Engine, Error as DeltaError, FileMeta, FilteredEngineData,
@@ -250,6 +250,21 @@ impl<C: UpdateTableClient> UCCommitter<C> {
             Err(e) => Err(DeltaError::Generic(format!("UC update_table error: {e}"))),
         }
     }
+
+    fn commit_impl(
+        &self,
+        engine: &dyn Engine,
+        actions: DeltaResultIterator<'_, FilteredEngineData>,
+        commit_metadata: CommitMetadata,
+    ) -> DeltaResult<CommitResponse>
+    where
+        C: 'static,
+    {
+        if commit_metadata.version() == 0 {
+            return self.commit_version_0(engine, actions, &commit_metadata);
+        }
+        self.commit_version_non_zero(engine, actions, commit_metadata)
+    }
 }
 
 impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
@@ -259,16 +274,9 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
     /// commit path; the caller finalizes the table in UC via the create-table API. For version >=
     /// 1, connectors should publish staged commits to the delta log immediately after writing;
     /// UC expects to be informed of the last known published version during commit.
-    fn commit(
-        &self,
-        engine: &dyn Engine,
-        actions: DeltaResultIterator<'_, FilteredEngineData>,
-        commit_metadata: CommitMetadata,
-    ) -> DeltaResult<CommitResponse> {
-        if commit_metadata.version() == 0 {
-            return self.commit_version_0(engine, actions, &commit_metadata);
-        }
-        self.commit_version_non_zero(engine, actions, commit_metadata)
+    fn commit(&self, engine: &dyn Engine, commit: KernelCommit) -> DeltaResult<CommitResponse> {
+        let (commit_metadata, actions) = commit.try_into_parts(true)?;
+        self.commit_impl(engine, actions, commit_metadata)
     }
 
     fn is_catalog_committer(&self) -> bool {
@@ -340,6 +348,10 @@ mod tests {
         )
     }
 
+    fn empty_commit(metadata: CommitMetadata) -> KernelCommit {
+        KernelCommit::new(metadata, Box::new(std::iter::empty()))
+    }
+
     /// Creates a valid catalog-managed CommitMetadata with all required UC features and properties.
     fn catalog_managed_commit_metadata(table_root: url::Url, version: Version) -> CommitMetadata {
         CommitMetadata::new_unchecked_with(
@@ -382,7 +394,8 @@ mod tests {
         // Create the _delta_log directory
         fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
 
-        let result = committer.commit(&engine, actions, commit_metadata).unwrap();
+        let commit = KernelCommit::new(commit_metadata, actions);
+        let result = committer.commit(&engine, commit).unwrap();
         match result {
             CommitResponse::Committed { file_meta } => {
                 assert!(
@@ -418,7 +431,7 @@ mod tests {
 
         let commit_metadata = catalog_managed_commit_metadata(table_root, 0);
         let result = committer
-            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
+            .commit(&engine, empty_commit(commit_metadata))
             .unwrap();
         assert!(
             matches!(result, CommitResponse::Conflict { version: 0 }),
@@ -436,7 +449,7 @@ mod tests {
         fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
 
         let err = committer
-            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
+            .commit(&engine, empty_commit(commit_metadata))
             .unwrap_err();
         assert!(
             err.to_string().contains("catalogManaged"),
@@ -465,7 +478,7 @@ mod tests {
         fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
 
         let err = committer
-            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
+            .commit(&engine, empty_commit(commit_metadata))
             .unwrap_err();
         assert!(
             err.to_string().contains("io.unitycatalog.tableId"),
@@ -494,7 +507,7 @@ mod tests {
         fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
 
         let err = committer
-            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
+            .commit(&engine, empty_commit(commit_metadata))
             .unwrap_err();
         assert!(
             err.to_string().contains("enableInCommitTimestamps"),
@@ -512,7 +525,7 @@ mod tests {
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
 
         let err = committer
-            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
+            .commit(&engine, empty_commit(commit_metadata))
             .unwrap_err();
         assert!(
             err.to_string().contains("catalogManaged"),
@@ -531,7 +544,7 @@ mod tests {
         fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
 
         let err = test_committer()
-            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
+            .commit(&engine, empty_commit(commit_metadata))
             .unwrap_err();
         assert!(
             err.to_string().contains("multi-threaded"),
@@ -547,7 +560,7 @@ mod tests {
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
 
         let err = test_committer()
-            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
+            .commit(&engine, empty_commit(commit_metadata))
             .unwrap_err();
         assert!(
             err.to_string().contains("table protocol"),
@@ -563,7 +576,7 @@ mod tests {
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
 
         let err = test_committer()
-            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
+            .commit(&engine, empty_commit(commit_metadata))
             .unwrap_err();
         assert!(
             err.to_string().contains("table metadata"),
@@ -580,7 +593,7 @@ mod tests {
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
 
         let err = test_committer()
-            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
+            .commit(&engine, empty_commit(commit_metadata))
             .unwrap_err();
         assert!(
             err.to_string().contains("clustering columns"),
@@ -602,7 +615,7 @@ mod tests {
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
 
         let err = committer
-            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
+            .commit(&engine, empty_commit(commit_metadata))
             .unwrap_err();
         assert!(
             err.to_string().contains("table ID mismatch"),

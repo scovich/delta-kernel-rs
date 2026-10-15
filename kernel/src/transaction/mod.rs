@@ -15,7 +15,7 @@ use crate::actions::{
     LOG_TXN_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
 };
 use crate::committer::{
-    CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
+    Commit, CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
     FileSystemCommitter,
 };
 use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta};
@@ -693,10 +693,10 @@ impl<S> Transaction<S> {
             metadata,
             dm_changes.clone(),
         )?;
-        commit_metadata.validate_committer(committer.is_catalog_committer())?;
+        let commit = Commit::new(commit_metadata, Box::new(filtered_actions));
         let prepare_duration = commit_start.elapsed();
         let committer_start = Instant::now();
-        let commit_response = committer.commit(engine, Box::new(filtered_actions), commit_metadata);
+        let commit_response = committer.commit(engine, commit);
         let committer_duration = committer_start.elapsed();
         match commit_response {
             Ok(CommitResponse::Committed { file_meta }) => {
@@ -1985,7 +1985,7 @@ mod tests {
     };
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::unit_test_utils::{MockProtocolBuilder, MockTableConfigurationBuilder};
-    use crate::{DeltaResultIterator, EvaluationHandler, Snapshot};
+    use crate::{EvaluationHandler, Snapshot};
 
     impl Transaction {
         /// Set clustering columns for testing purposes without needing a table
@@ -2000,12 +2000,7 @@ mod tests {
     struct IoErrorCommitter;
 
     impl Committer for IoErrorCommitter {
-        fn commit(
-            &self,
-            _engine: &dyn Engine,
-            _actions: DeltaResultIterator<'_, FilteredEngineData>,
-            _commit_metadata: CommitMetadata,
-        ) -> DeltaResult<CommitResponse> {
+        fn commit(&self, _engine: &dyn Engine, _commit: Commit) -> DeltaResult<CommitResponse> {
             Err(Error::IOError(std::io::Error::other("simulated IO error")))
         }
         fn is_catalog_committer(&self) -> bool {
@@ -2025,12 +2020,7 @@ mod tests {
     struct GenericErrorCommitter;
 
     impl Committer for GenericErrorCommitter {
-        fn commit(
-            &self,
-            _engine: &dyn Engine,
-            _actions: DeltaResultIterator<'_, FilteredEngineData>,
-            _commit_metadata: CommitMetadata,
-        ) -> DeltaResult<CommitResponse> {
+        fn commit(&self, _engine: &dyn Engine, _commit: Commit) -> DeltaResult<CommitResponse> {
             Err(Error::generic("simulated commit error"))
         }
         fn is_catalog_committer(&self) -> bool {
@@ -2049,13 +2039,8 @@ mod tests {
     struct MockCatalogCommitter;
 
     impl Committer for MockCatalogCommitter {
-        fn commit(
-            &self,
-            _engine: &dyn Engine,
-            _actions: DeltaResultIterator<'_, FilteredEngineData>,
-            _commit_metadata: CommitMetadata,
-        ) -> DeltaResult<CommitResponse> {
-            // This won't be reached in tests — the validation error fires before commit.
+        fn commit(&self, _engine: &dyn Engine, commit: Commit) -> DeltaResult<CommitResponse> {
+            let _ = commit.try_into_parts(true)?;
             Ok(CommitResponse::Conflict { version: 0 })
         }
         fn is_catalog_committer(&self) -> bool {
@@ -3967,12 +3952,8 @@ mod tests {
     }
 
     impl Committer for CapturingCommitter {
-        fn commit(
-            &self,
-            _engine: &dyn Engine,
-            _actions: DeltaResultIterator<'_, FilteredEngineData>,
-            commit_metadata: CommitMetadata,
-        ) -> DeltaResult<CommitResponse> {
+        fn commit(&self, _engine: &dyn Engine, commit: Commit) -> DeltaResult<CommitResponse> {
+            let (commit_metadata, _actions) = commit.try_into_parts(false)?;
             *self.captured.lock().unwrap() = Some(commit_metadata.in_commit_timestamp());
             Ok(CommitResponse::Conflict {
                 version: commit_metadata.version(),
