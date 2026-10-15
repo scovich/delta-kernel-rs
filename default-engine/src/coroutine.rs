@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::coroutine::generator::AsyncIntoIterator as _;
 use delta_kernel::coroutine::kernel::request::{
     BackwardListing, BackwardListingResult, DirectoryListing, ExpressionEvaluatorHandle,
@@ -156,7 +157,8 @@ impl AsyncEngineConnector {
 
     /// Perform `request` and deliver its response to the suspended coroutine.
     ///
-    /// Publish requests are rejected because they require a catalog-specific driver.
+    /// Commit requests run the filesystem commit coroutine recursively. Publish requests are
+    /// rejected because they require a catalog-specific driver.
     pub async fn reply(&self, request: Request) -> DeltaResult<()> {
         self.check_cancelled()?;
         match request {
@@ -230,6 +232,11 @@ impl AsyncEngineConnector {
                 predicate_evaluator(&operation.evaluator)
                     .and_then(|evaluator| evaluator.evaluate(operation.input.as_ref())),
             ),
+            Request::Commit(operation, reply) => {
+                let workflow = FileSystemCommitter::commit_workflow(*operation);
+                let result = Box::pin(self.run(workflow)).await;
+                reply.send(result);
+            }
             Request::Publish(..) => {
                 return Err(Error::unsupported(
                     "the async default engine does not publish catalog commits",

@@ -24,7 +24,7 @@ use crate::actions::BackReference;
 use crate::actions::{LOG_ADD_SCHEMA, NUM_RECORDS, TIGHT_BOUNDS};
 use crate::coroutine::generator::{map_async_witness, AsyncIntoIterator as _, GeneratorExt as _};
 use crate::coroutine::kernel::{Channel, DeltaResultGenerator};
-use crate::coroutine::{iterate_prepared_result_generator_with_engine, ChannelExt as _};
+use crate::coroutine::ChannelExt as _;
 use crate::engine_data::{
     FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData,
 };
@@ -48,7 +48,7 @@ use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation}
 use crate::utils::{current_time_ms, require, PhantomType};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::FileMeta;
-use crate::{DataType, DeltaResult, Engine, Expression};
+use crate::{DataType, DeltaResult, Expression};
 
 // =============================================================================
 // Update table transactions only
@@ -590,16 +590,6 @@ impl<S> Transaction<S> {
     /// actions. For each file:
     /// 1. A Remove action is generated for the old file
     /// 2. An Add action is generated with the new DV descriptor
-    pub(super) fn generate_dv_update_actions(
-        &self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'static> {
-        iterate_prepared_result_generator_with_engine!(engine, None, async move |channel| {
-            self.generate_dv_update_actions_with_channel(channel).await
-        })
-    }
-
-    /// Generate remove/add action pairs for DV updates through `channel`.
     pub(super) async fn generate_dv_update_actions_with_channel(
         &self,
         channel: &Channel,

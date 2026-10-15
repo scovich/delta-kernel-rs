@@ -3,13 +3,12 @@ use std::collections::HashSet;
 use super::Transaction;
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::coroutine::kernel::Channel;
-use crate::coroutine::run_coroutine_with_engine;
 use crate::error::Error;
 use crate::row_tracking::{
     RowTrackingDomainMetadata, ROW_TRACKING_DOMAIN_NAME, ROW_TRACKING_INITIAL_HIGH_WATER_MARK,
 };
 use crate::table_features::TableFeature;
-use crate::{DeltaResult, Engine};
+use crate::DeltaResult;
 
 impl<S> Transaction<S> {
     /// Validate domain metadata operations for both create-table and existing-table transactions.
@@ -202,18 +201,7 @@ impl<S> Transaction<S> {
     /// This function may perform an expensive log replay operation if there are any domain
     /// removals. The log replay is required to fetch the previous configuration value for the
     /// domain to preserve in removal tombstones as mandated by the Delta spec.
-    pub(super) fn generate_domain_metadata_actions(
-        &self,
-        engine: &dyn Engine,
-        row_tracking_high_watermark: Option<RowTrackingDomainMetadata>,
-    ) -> DeltaResult<Vec<DomainMetadata>> {
-        run_coroutine_with_engine!(engine, async move |channel| {
-            self.generate_domain_metadata_actions_with_channel(channel, row_tracking_high_watermark)
-                .await
-        })
-    }
-
-    async fn generate_domain_metadata_actions_with_channel(
+    pub(super) async fn generate_domain_metadata_actions_with_channel(
         &self,
         channel: &Channel,
         row_tracking_high_watermark: Option<RowTrackingDomainMetadata>,

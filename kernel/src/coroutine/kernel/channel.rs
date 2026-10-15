@@ -18,7 +18,7 @@ use super::request::{
 #[cfg(feature = "declarative-plans")]
 use super::PlanRequest;
 use super::{Channel, Request, StaticGeneratorCoroutine};
-use crate::committer::PublishMetadata;
+use crate::committer::{Commit, CommitResponse, PublishMetadata};
 #[cfg(feature = "declarative-plans")]
 use crate::coroutine::PlanOperation;
 use crate::coroutine::{
@@ -221,6 +221,11 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
     fn copy_atomic(&self, source: &Url, destination: &Url) -> impl DeltaFuture<()> {
         let operation = CopyAtomic::new(source.clone(), destination.clone());
         self.exchange(operation, Request::CopyAtomic)
+    }
+
+    /// Delegate a prepared transaction to the connector's committer.
+    fn commit(&self, commit: Commit) -> impl DeltaFuture<CommitResponse> {
+        self.exchange(Box::new(commit), Request::Commit)
     }
 
     /// Publish catalog commits through the connector's catalog committer.

@@ -401,9 +401,10 @@ pub unsafe extern "C" fn commit(
 ) -> ExternResult<Handle<ExclusiveCommittedTransaction>> {
     let txn = unsafe { txn.into_inner() };
     let extern_engine = unsafe { engine.as_ref() };
-    let engine = extern_engine.engine();
-    commit_result_to_committed_handle(txn.commit(engine.as_ref()))
-        .into_extern_result(&extern_engine)
+    let (workflow, committer) = txn.commit_workflow();
+    let result = drive_kernel_with_committer(extern_engine, committer.as_ref(), workflow)
+        .map(|result| (result, committer));
+    commit_result_to_committed_handle(result).into_extern_result(&extern_engine)
 }
 
 // ============================================================================
@@ -526,9 +527,10 @@ pub unsafe extern "C" fn create_table_commit(
 ) -> ExternResult<Handle<ExclusiveCommittedTransaction>> {
     let txn = unsafe { txn.into_inner() };
     let extern_engine = unsafe { engine.as_ref() };
-    let engine = extern_engine.engine();
-    commit_result_to_committed_handle(txn.commit(engine.as_ref()))
-        .into_extern_result(&extern_engine)
+    let (workflow, committer) = txn.commit_workflow();
+    let result = drive_kernel_with_committer(extern_engine, committer.as_ref(), workflow)
+        .map(|result| (result, committer));
+    commit_result_to_committed_handle(result).into_extern_result(&extern_engine)
 }
 
 // ============================================================================

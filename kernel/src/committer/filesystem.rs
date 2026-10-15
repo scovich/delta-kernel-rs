@@ -7,6 +7,10 @@ use super::commit_types::CommitMetadata;
 use super::commit_types::CommitResponse;
 use super::publish_types::PublishMetadata;
 use super::{Commit, Committer};
+use crate::coroutine::engine::EngineConnector;
+use crate::coroutine::kernel::request::FileWriteMode;
+use crate::coroutine::kernel::{static_coroutine, Channel, StaticCoroutine};
+use crate::coroutine::ChannelExt as _;
 use crate::{DeltaResult, Engine, Error, FileMeta};
 
 /// The `FileSystemCommitter` is an internal implementation of the `Committer` trait which
@@ -22,20 +26,25 @@ impl FileSystemCommitter {
         Self {}
     }
 
+    /// Return a lazy workflow that commits a prepared path-based transaction.
+    pub fn commit_workflow(commit: Commit) -> StaticCoroutine<CommitResponse> {
+        static_coroutine!(async move |channel| Self::commit_impl(channel, commit).await)
+    }
+
     #[instrument(
         name = "fs_committer.commit",
         skip_all,
         fields(version = commit.version()),
         err
     )]
-    fn commit_impl(engine: &dyn Engine, commit: Commit) -> DeltaResult<CommitResponse> {
+    async fn commit_impl(channel: &Channel, commit: Commit) -> DeltaResult<CommitResponse> {
         let (commit_metadata, actions) = commit.try_into_parts(false)?;
         let version = commit_metadata.version();
         let published_commit_path = commit_metadata.published_commit_path()?;
 
-        match engine
-            .json_handler()
-            .write_json_file(&published_commit_path, actions, false)
+        match channel
+            .write_json_file(&published_commit_path, FileWriteMode::CreateNew, actions)
+            .await
         {
             Ok(written_size) => {
                 info!(
@@ -63,7 +72,7 @@ impl FileSystemCommitter {
 
 impl Committer for FileSystemCommitter {
     fn commit(&self, engine: &dyn Engine, commit: Commit) -> DeltaResult<CommitResponse> {
-        Self::commit_impl(engine, commit)
+        EngineConnector::new(engine).run(Self::commit_workflow(commit))
     }
 
     fn is_catalog_committer(&self) -> bool {
@@ -157,7 +166,7 @@ mod tests {
             FilteredEngineData::with_all_rows_selected(action),
         )));
 
-        let commit = Commit::new(commit_metadata, actions);
+        let commit = Commit::from_iterator(actions, commit_metadata);
         let result = committer.commit(&engine, commit).unwrap();
         let stored_size = storage
             .head(&Path::from("_delta_log/00000000000000000001.json"))
@@ -211,11 +220,11 @@ mod tests {
             vec![],
         );
 
-        let first_commit = Commit::new(first_metadata, Box::new(std::iter::empty()));
+        let first_commit = Commit::from_iterator(Box::new(std::iter::empty()), first_metadata);
         let first = committer.commit(&engine, first_commit).unwrap();
         assert!(matches!(first, CommitResponse::Committed { .. }));
 
-        let second_commit = Commit::new(second_metadata, Box::new(std::iter::empty()));
+        let second_commit = Commit::from_iterator(Box::new(std::iter::empty()), second_metadata);
         let second = committer.commit(&engine, second_commit).unwrap();
         assert!(matches!(second, CommitResponse::Conflict { version: 1 }));
     }

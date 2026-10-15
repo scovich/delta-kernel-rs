@@ -32,7 +32,14 @@ use derive_more::Constructor;
 pub use filesystem::FileSystemCommitter;
 pub use publish_types::{CatalogCommit, PublishMetadata};
 
+use crate::coroutine::engine::EngineConnector;
+use crate::coroutine::generator::GeneratorExt as _;
+use crate::coroutine::kernel::{static_generator_coroutine, StaticGeneratorCoroutine};
+use crate::coroutine::DeltaResultGenerator;
 use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, FilteredEngineData};
+
+/// An unpolled generator of commit actions.
+pub type CommitActions = StaticGeneratorCoroutine<FilteredEngineData>;
 
 /// A Delta log commit ready for a [`Committer`] to persist.
 #[derive(Constructor)]
@@ -41,10 +48,16 @@ pub struct Commit {
     actions: CommitActions,
 }
 
-/// Actions ready to be committed in Delta log order.
-pub type CommitActions = DeltaResultIteratorStatic<FilteredEngineData>;
-
 impl Commit {
+    /// Construct a prepared commit from an Engine compatibility iterator.
+    pub fn from_iterator(
+        actions: DeltaResultIteratorStatic<FilteredEngineData>,
+        metadata: CommitMetadata,
+    ) -> Self {
+        let actions = StaticGeneratorCoroutine::from_iterator(actions);
+        Self { metadata, actions }
+    }
+
     /// Validate the selected committer and return this commit's metadata and actions.
     pub fn try_into_parts(
         self,
@@ -52,6 +65,35 @@ impl Commit {
     ) -> DeltaResult<(CommitMetadata, CommitActions)> {
         self.metadata.validate_committer(is_catalog_committer)?;
         Ok((self.metadata, self.actions))
+    }
+
+    /// Validate the selected committer and return Engine-compatible metadata and actions.
+    pub fn try_into_engine_parts(
+        self,
+        engine: &dyn Engine,
+        is_catalog_committer: bool,
+    ) -> DeltaResult<(
+        CommitMetadata,
+        DeltaResultIteratorStatic<FilteredEngineData>,
+    )> {
+        let (metadata, actions) = self.try_into_parts(is_catalog_committer)?;
+        let actions = EngineConnector::new(engine).iterate_generator(actions);
+        Ok((metadata, Box::new(actions)))
+    }
+
+    /// Construct a prepared commit by promoting yielded action errors to generator errors.
+    pub(crate) fn from_result_generator(
+        metadata: CommitMetadata,
+        actions: impl DeltaResultGenerator<FilteredEngineData> + 'static,
+    ) -> Self {
+        let actions = static_generator_coroutine!(async move |channel| {
+            let mut actions = actions.bind(&channel);
+            while let Some(action) = actions.next().await? {
+                channel.yield_item(action?).await?;
+            }
+            Ok(())
+        });
+        Self { metadata, actions }
     }
 
     pub(crate) fn version(&self) -> crate::Version {

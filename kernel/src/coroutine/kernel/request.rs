@@ -12,7 +12,7 @@ use derive_more::{Constructor, From};
 use url::Url;
 
 use super::StaticGeneratorCoroutine;
-use crate::committer::PublishMetadata;
+use crate::committer::{Commit, CommitResponse, PublishMetadata};
 use crate::coroutine::{PageRequest, PagedOperation, PlanOperation, Reply};
 use crate::engine_data::EngineData;
 use crate::expressions::{ExpressionRef, PredicateRef, Scalar};
@@ -71,6 +71,8 @@ pub enum Request {
     WriteBytes(WriteBytes, Reply<()>),
     /// Atomically copy one immutable object to a new destination.
     CopyAtomic(CopyAtomic, Reply<()>),
+    /// Commit one prepared transaction through a connector-selected committer.
+    Commit(Box<Commit>, Reply<CommitResponse>),
     /// Publish catalog commits through the connector's catalog committer.
     Publish(PublishMetadata, Reply<()>),
 }

@@ -27,7 +27,7 @@ use super::{
     PlanRequest, Request,
 };
 use crate::cancellation::{check_cancelled, CancellationTokenRef};
-use crate::committer::Committer;
+use crate::committer::{Committer, FileSystemCommitter};
 use crate::engine_data::{EngineData, FilteredEngineData};
 #[cfg(feature = "declarative-plans")]
 use crate::plans::PlanExecutor;
@@ -362,7 +362,10 @@ impl EngineConnector {
             self.check_cancelled()?;
             match request {
                 Request::Publish(metadata, reply) => {
-                    reply.send(committer.publish(engine, metadata));
+                    reply.send(committer.publish(engine, metadata))
+                }
+                Request::Commit(operation, reply) => {
+                    reply.send(committer.commit(engine, *operation))
                 }
                 request => self.respond(request)?,
             }
@@ -429,6 +432,9 @@ impl EngineConnector {
 
     fn respond(&self, request: Request) -> DeltaResult<()> {
         match request {
+            Request::Commit(operation, reply) => {
+                reply.send(self.run(FileSystemCommitter::commit_workflow(*operation)))
+            }
             request @ (Request::ListDirectory(_)
             | Request::ListForward(_)
             | Request::ListBackward(_)
@@ -959,6 +965,7 @@ mod tests {
     #[cfg(feature = "default-engine-base")]
     mod json_write {
         use super::*;
+        use crate::committer::CommitActions;
         use crate::coroutine::kernel::request::FileWriteMode;
         use crate::engine::sync::SyncEngine;
         use crate::engine::test_delegating::DelegatingEngine;

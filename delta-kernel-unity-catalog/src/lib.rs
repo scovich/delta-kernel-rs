@@ -2,6 +2,7 @@
 
 mod committer;
 mod constants;
+pub mod coroutine;
 mod errors;
 mod utils;
 

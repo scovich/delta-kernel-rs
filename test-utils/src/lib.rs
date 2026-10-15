@@ -1229,7 +1229,7 @@ pub struct TestCatalogCommitter;
 
 impl Committer for TestCatalogCommitter {
     fn commit(&self, engine: &dyn Engine, commit: Commit) -> DeltaResult<CommitResponse> {
-        let (commit_metadata, actions) = commit.try_into_parts(true)?;
+        let (commit_metadata, actions) = commit.try_into_engine_parts(engine, true)?;
         let path = commit_metadata.published_commit_path()?;
         let written_size = engine
             .json_handler()

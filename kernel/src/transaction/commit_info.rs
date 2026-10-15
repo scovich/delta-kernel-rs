@@ -4,13 +4,17 @@ use std::sync::{Arc, LazyLock};
 use super::Transaction;
 use crate::actions::{CommitInfo, COMMIT_INFO_NAME, LOG_COMMIT_INFO_SCHEMA};
 use crate::coroutine::kernel::Channel;
-use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _};
+#[cfg(test)]
+use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::ChannelExt as _;
 use crate::engine_data::{GetData, MapItem, RowVisitor, TypedGetData as _};
 use crate::expressions::{lit, null_lit, MapData, Scalar};
 use crate::schema::{column_name, schema_ref, ColumnName, MapType, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::utils::require;
-use crate::{DataType, Engine, EngineData, Error, Expression, ExpressionRef};
+#[cfg(test)]
+use crate::Engine;
+use crate::{DataType, EngineData, Error, Expression, ExpressionRef};
 
 /// Builds a list of `(field_name, literal_expression)` pairs covering every [`CommitInfo`]
 /// field. Field names match the camelCase schema names produced by the `ToSchema` derive macro.
@@ -68,6 +72,7 @@ fn string_map_literal_expr(
 }
 
 impl<S> Transaction<S> {
+    #[cfg(test)]
     pub(super) fn generate_commit_info(
         &self,
         engine: &dyn Engine,

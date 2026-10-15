@@ -192,7 +192,9 @@ pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliati
 use cancellation::{check_cancelled, CancellableIterator};
 pub use cancellation::{CancellationToken, CancellationTokenRef, CancelledFuture};
 use coroutine::kernel::Channel;
-use coroutine::{run_coroutine_with_engine, ChannelExt as _};
+#[cfg(test)]
+use coroutine::run_coroutine_with_engine;
+use coroutine::ChannelExt as _;
 pub use delta_kernel_derive;
 pub use engine_data::{
     EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
@@ -582,6 +584,7 @@ pub trait EvaluationHandler: AsAny {
 /// Creates one row containing a single scalar value.
 ///
 /// `schema` must contain exactly one top-level field whose type matches `value`.
+#[cfg(test)]
 pub(crate) fn create_row(
     engine: &dyn Engine,
     schema: SchemaRef,
