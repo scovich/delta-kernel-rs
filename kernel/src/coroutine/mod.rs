@@ -119,13 +119,13 @@ pub use self::core::Reply;
 pub(crate) use self::core::{Channel, ChannelExchange, DeltaFuture};
 use self::generator::{unfold_mut, ChannelBinding};
 pub use self::generator::{
-    BoundGenerator, BoxedBoundGenerator, BoxedDeltaResultGenerator, Flatten, Generator,
-    GeneratorBody, GeneratorExt, GeneratorStep,
+    BoundGenerator, BoxedBoundGenerator, Flatten, Generator, GeneratorBody, GeneratorExt,
+    GeneratorStep,
 };
 #[doc(inline)]
 #[internal_api]
 pub(crate) use self::kernel::ChannelExt;
-pub use self::kernel::{DeltaResultGenerator, PlanRequest, Request};
+pub use self::kernel::{BoundDeltaResultGenerator, DeltaResultGenerator, PlanRequest, Request};
 #[cfg(feature = "declarative-plans")]
 pub use crate::plans::Operation as PlanOperation;
 use crate::utils::PhantomType;

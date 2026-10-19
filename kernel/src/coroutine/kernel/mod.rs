@@ -26,9 +26,11 @@ pub type Channel = super::Channel<Request>;
 /// `Generator<Request, Item = DeltaResult<T>, Output = O>`.
 ///
 /// Polling may fail before an item is yielded, each yielded item may independently be an error,
-/// and `O` is returned only after successful terminal completion.
+/// and `O` is returned only after successful terminal completion. Use `impl
+/// DeltaResultGenerator<T>` for pipelines. At type-erasure sites use
+/// `Box<dyn Generator<Request, Item = DeltaResult<T>, Output = ()>>`.
 pub trait DeltaResultGenerator<T, O = ()>:
-    generator::Generator<Request, Item = DeltaResult<T>, Output = O> + Sized
+    generator::Generator<Request, Item = DeltaResult<T>, Output = O>
 where
     T: Send,
     O: Send + 'static,
@@ -38,6 +40,28 @@ where
 impl<G, T, O> DeltaResultGenerator<T, O> for G
 where
     G: generator::Generator<Request, Item = DeltaResult<T>, Output = O>,
+    T: Send,
+    O: Send + 'static,
+{
+}
+
+/// Bound kernel generator equivalent to
+/// `BoundGenerator<Item = DeltaResult<T>, Output = O> + Unpin`.
+///
+/// Use `impl BoundDeltaResultGenerator<T>` after [`generator::Generator::bind`]. When json/parquet
+/// (or other) arms must share a type, erase as [`generator::BoxedBoundGenerator`] with
+/// `Item = DeltaResult<T>`.
+pub trait BoundDeltaResultGenerator<T, O = ()>:
+    generator::BoundGenerator<Item = DeltaResult<T>, Output = O> + Unpin
+where
+    T: Send,
+    O: Send + 'static,
+{
+}
+
+impl<G, T, O> BoundDeltaResultGenerator<T, O> for G
+where
+    G: generator::BoundGenerator<Item = DeltaResult<T>, Output = O> + Unpin,
     T: Send,
     O: Send + 'static,
 {

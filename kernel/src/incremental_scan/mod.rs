@@ -5,10 +5,10 @@ use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use crate::coroutine::engine::{EngineConnector, EngineResultGeneratorIterator};
-use crate::coroutine::generator::BoundGenerator;
 use crate::coroutine::kernel::{
-    static_coroutine, static_generator_coroutine, Channel, DeltaResultGenerator, GeneratorChannel,
-    GeneratorCoroutineStep, StaticCoroutine, StaticGeneratorCoroutine,
+    static_coroutine, static_generator_coroutine, BoundDeltaResultGenerator, Channel,
+    DeltaResultGenerator, GeneratorChannel, GeneratorCoroutineStep, StaticCoroutine,
+    StaticGeneratorCoroutine,
 };
 use crate::coroutine::{ChannelExt as _, GeneratorExt as _};
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor};
@@ -247,7 +247,7 @@ struct IncrementalScanState<A> {
 
 impl<G> IncrementalScanState<G>
 where
-    G: BoundGenerator<Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + Unpin,
+    G: BoundDeltaResultGenerator<Box<dyn EngineData>>,
 {
     async fn advance(
         &mut self,
@@ -306,9 +306,7 @@ impl<A> IncrementalScanState<A> {
     fn bind_actions<'a>(
         self,
         channel: &'a Channel,
-    ) -> IncrementalScanState<
-        impl BoundGenerator<Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + Unpin + 'a,
-    >
+    ) -> IncrementalScanState<impl BoundDeltaResultGenerator<Box<dyn EngineData>> + 'a>
     where
         A: DeltaResultGenerator<Box<dyn EngineData>> + 'a,
     {

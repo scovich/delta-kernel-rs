@@ -27,13 +27,13 @@ use crate::coroutine::generator::{
 use crate::coroutine::kernel::request::ReadParquetFiles;
 use crate::coroutine::kernel::{
     coroutine, generator_coroutine, static_coroutine, Channel, Coroutine, DeltaResultGenerator,
-    GeneratorCoroutine, StaticCoroutine,
+    GeneratorCoroutine, Request, StaticCoroutine,
 };
 #[cfg(feature = "declarative-plans")]
 use crate::coroutine::run_coroutine_with_engine;
 use crate::coroutine::{
     iterate_prepared_result_generator_with_engine, run_coroutine_with_storage, ChannelExt as _,
-    PageGenerator, Request,
+    PageGenerator,
 };
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef};
@@ -1025,10 +1025,8 @@ impl Scan {
         existing_version: Version,
         existing_data: impl DeltaResultGenerator<Box<dyn EngineData>> + 'static,
         existing_predicate: Option<PredicateRef>,
-    ) -> Coroutine<
-        '_,
-        Box<dyn Generator<Request, Item = DeltaResult<ScanMetadata>, Output = ()> + 'static>,
-    > {
+    ) -> Coroutine<'_, Box<dyn Generator<Request, Item = DeltaResult<ScanMetadata>, Output = ()>>>
+    {
         coroutine!(async move |channel| {
             self.scan_metadata_from_with_channel(
                 channel,
@@ -1046,9 +1044,8 @@ impl Scan {
         existing_version: Version,
         existing_data: impl DeltaResultGenerator<Box<dyn EngineData>> + 'static,
         _existing_predicate: Option<PredicateRef>,
-    ) -> DeltaResult<
-        Box<dyn Generator<Request, Item = DeltaResult<ScanMetadata>, Output = ()> + 'static>,
-    > {
+    ) -> DeltaResult<Box<dyn Generator<Request, Item = DeltaResult<ScanMetadata>, Output = ()>>>
+    {
         // TODO(#966): validate that the current predicate is compatible with the hint predicate.
         if existing_version > self.snapshot.version() {
             return Err(Error::Generic(format!(
@@ -1094,7 +1091,7 @@ impl Scan {
             let result = self
                 .scan_metadata_inner_with_channel(channel, actions_with_checkpoint_info)
                 .await?;
-            return Ok(result.into_boxed());
+            return Ok(Box::new(result));
         }
 
         // If the current log segment contains a checkpoint newer than the hint version
@@ -1104,7 +1101,7 @@ impl Scan {
         // from the log.
         if matches!(log_segment.checkpoint_version, Some(v) if v > existing_version) {
             let result = self.scan_metadata_with_channel(channel).await?;
-            return Ok(result.into_boxed());
+            return Ok(Box::new(result));
         }
 
         // create a new log segment containing only the commits added after the version hint.
@@ -1150,7 +1147,7 @@ impl Scan {
         let result = self
             .scan_metadata_inner_with_channel(channel, actions_with_checkpoint_info)
             .await?;
-        Ok(result.into_boxed())
+        Ok(Box::new(result))
     }
 
     async fn scan_metadata_inner_with_channel<'a>(

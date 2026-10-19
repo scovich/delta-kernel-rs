@@ -18,7 +18,7 @@ use itertools::Itertools;
 use crate::coroutine::generator::{
     generator_fn, BoundGenerator, Generator as _, GeneratorExt as _, GeneratorStep,
 };
-use crate::coroutine::kernel::{Channel, DeltaResultGenerator};
+use crate::coroutine::kernel::{BoundDeltaResultGenerator, Channel, DeltaResultGenerator};
 use crate::log_reader::checkpoint_manifest::checkpoint_manifest_reader_impl;
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
@@ -171,9 +171,8 @@ impl<C, M> SequentialPhase<C, M> {
 
     async fn next_action(&mut self) -> DeltaResult<Option<DeltaResult<ActionsBatch>>>
     where
-        C: BoundGenerator<Item = DeltaResult<ActionsBatch>, Output = ()> + Unpin,
-        M: BoundGenerator<Item = DeltaResult<ActionsBatch>, Output = DeltaResult<Vec<FileMeta>>>
-            + Unpin,
+        C: BoundDeltaResultGenerator<ActionsBatch>,
+        M: BoundDeltaResultGenerator<ActionsBatch, DeltaResult<Vec<FileMeta>>>,
     {
         if let Some(commit_phase) = self.commit_phase.as_mut() {
             match poll_fn(|context| Pin::new(&mut *commit_phase).poll_step(context)).await? {
@@ -202,10 +201,8 @@ impl<C, M> SequentialPhase<C, M> {
         self,
         channel: &'a Channel,
     ) -> SequentialPhase<
-        impl BoundGenerator<Item = DeltaResult<ActionsBatch>, Output = ()> + Unpin + 'a,
-        impl BoundGenerator<Item = DeltaResult<ActionsBatch>, Output = DeltaResult<Vec<FileMeta>>>
-            + Unpin
-            + 'a,
+        impl BoundDeltaResultGenerator<ActionsBatch> + 'a,
+        impl BoundDeltaResultGenerator<ActionsBatch, DeltaResult<Vec<FileMeta>>> + 'a,
     >
     where
         C: DeltaResultGenerator<ActionsBatch> + 'a,
@@ -236,9 +233,8 @@ async fn process_action_batch_with_channel(
 
 impl<C, M> SequentialPhase<C, M>
 where
-    C: BoundGenerator<Item = DeltaResult<ActionsBatch>, Output = ()> + Unpin,
-    M: BoundGenerator<Item = DeltaResult<ActionsBatch>, Output = DeltaResult<Vec<FileMeta>>>
-        + Unpin,
+    C: BoundDeltaResultGenerator<ActionsBatch>,
+    M: BoundDeltaResultGenerator<ActionsBatch, DeltaResult<Vec<FileMeta>>>,
 {
     async fn advance(
         &mut self,

@@ -11,10 +11,12 @@ use crate::actions::visitors::SidecarVisitor;
 use crate::coroutine::engine::EngineConnector;
 #[cfg(test)]
 use crate::coroutine::engine::EngineResultGeneratorIterator;
-use crate::coroutine::generator::{generator_fn, BoundGenerator, Generator, GeneratorExt as _};
+use crate::coroutine::generator::{generator_fn, Generator, GeneratorExt as _};
 #[cfg(test)]
 use crate::coroutine::kernel::{coroutine, StaticGeneratorCoroutine};
-use crate::coroutine::kernel::{Channel, ChannelExt as _, DeltaResultGenerator, GeneratorChannel};
+use crate::coroutine::kernel::{
+    BoundDeltaResultGenerator, Channel, ChannelExt as _, DeltaResultGenerator, GeneratorChannel,
+};
 use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
 use crate::schema::SchemaRef;
@@ -95,13 +97,11 @@ pub(crate) async fn checkpoint_manifest_reader_impl(
             .prepare_json_files(vec![manifest.location.clone()], read_schema.clone(), None)
             .await?
             .flatten()
-            .map_ok(|batch| ActionsBatch::new(batch, false))
             .into_boxed(),
         "parquet" => channel
             .prepare_parquet_files(vec![manifest.location.clone()], read_schema, None)
             .await?
             .flatten()
-            .map_ok(|batch| ActionsBatch::new(batch, false))
             .into_boxed(),
         extension => {
             return Err(Error::generic(format!(
@@ -109,6 +109,7 @@ pub(crate) async fn checkpoint_manifest_reader_impl(
             )));
         }
     };
+    let actions = actions.map_ok(|batch| ActionsBatch::new(batch, false));
     let state = CheckpointManifestState {
         actions,
         sidecar_visitor: SidecarVisitor::default(),
@@ -142,7 +143,7 @@ impl<A> CheckpointManifestState<A> {
 
 impl<G> CheckpointManifestState<G>
 where
-    G: BoundGenerator<Item = DeltaResult<ActionsBatch>, Output = ()> + Unpin,
+    G: BoundDeltaResultGenerator<ActionsBatch>,
 {
     async fn next(&mut self) -> DeltaResult<Option<DeltaResult<ActionsBatch>>> {
         let Some(result) = self.actions.next().await? else {
@@ -160,9 +161,7 @@ impl<A> CheckpointManifestState<A> {
     fn bind_actions<'a>(
         self,
         channel: &'a Channel,
-    ) -> CheckpointManifestState<
-        impl BoundGenerator<Item = DeltaResult<ActionsBatch>, Output = ()> + Unpin + 'a,
-    >
+    ) -> CheckpointManifestState<impl BoundDeltaResultGenerator<ActionsBatch> + 'a>
     where
         A: DeltaResultGenerator<ActionsBatch> + 'a,
     {

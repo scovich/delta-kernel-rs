@@ -22,7 +22,7 @@ use crate::coroutine::kernel::{coroutine, Channel, DeltaResultGenerator};
 use crate::coroutine::run_coroutine_with_engine;
 use crate::coroutine::{
     iterate_prepared_result_generator_with_engine, run_coroutine_with_storage, BoundGenerator as _,
-    BoxedDeltaResultGenerator, ChannelExt as _, Generator, GeneratorExt as _,
+    BoxedBoundGenerator, ChannelExt as _, Generator, GeneratorExt as _,
 };
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
@@ -42,8 +42,8 @@ use crate::utils::require;
 #[cfg(feature = "declarative-plans")]
 use crate::Scalar;
 use crate::{
-    DeltaResult, Engine, Error, FileMeta, Predicate, PredicateRef, RowVisitor, StorageHandler,
-    Version,
+    DeltaResult, Engine, EngineData, Error, FileMeta, Predicate, PredicateRef, RowVisitor,
+    StorageHandler, Version,
 };
 
 mod crc_replay;
@@ -1480,7 +1480,7 @@ impl LogSegment {
                 )));
             }
             // This is the case when there are no checkpoints in the log segment.
-            None => empty().into_boxed(),
+            None => Box::new(empty()),
         };
 
         // Read sidecars with the same schema as checkpoint (including stats_parsed if available).
@@ -1496,7 +1496,7 @@ impl LogSegment {
             let read = read.await?;
             read.flatten().into_boxed()
         } else {
-            empty().into_boxed()
+            Box::new(empty())
         };
 
         // Chain checkpoint batches with sidecar batches.
@@ -1525,13 +1525,16 @@ impl LogSegment {
     ) -> DeltaResult<Vec<FileMeta>> {
         // Read checkpoint with just the sidecar column
         let files = std::slice::from_ref(&checkpoint.location);
-        let mut batches: BoxedDeltaResultGenerator<'_, _> = match checkpoint.extension.as_str() {
-            "json" => Box::new(channel.read_json_files(files, Self::sidecar_read_schema(), None)),
-            "parquet" => {
-                Box::new(channel.read_parquet_files(files, Self::sidecar_read_schema(), None))
-            }
-            _ => return Ok(vec![]),
-        };
+        let mut batches: BoxedBoundGenerator<'_, DeltaResult<Box<dyn EngineData>>> =
+            match checkpoint.extension.as_str() {
+                "json" => {
+                    Box::new(channel.read_json_files(files, Self::sidecar_read_schema(), None))
+                }
+                "parquet" => {
+                    Box::new(channel.read_parquet_files(files, Self::sidecar_read_schema(), None))
+                }
+                _ => return Ok(vec![]),
+            };
 
         // Extract sidecar file references
         let mut visitor = SidecarVisitor::default();

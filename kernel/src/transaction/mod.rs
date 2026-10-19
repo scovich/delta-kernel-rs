@@ -23,10 +23,10 @@ use crate::coroutine::generator::{
     empty, map_async_witness, AsyncIntoIterator as _, Generator, GeneratorExt as _,
 };
 use crate::coroutine::kernel::request::EvaluationInput;
-use crate::coroutine::kernel::{coroutine, Channel, Coroutine, Request};
+use crate::coroutine::kernel::{coroutine, Channel, Coroutine};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::coroutine::AsyncOption as _;
-use crate::coroutine::{AsyncBool as _, ChannelExt as _, DeltaResultGenerator};
+use crate::coroutine::{AsyncBool as _, ChannelExt as _, DeltaResultGenerator, Request};
 use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
@@ -106,7 +106,7 @@ use update::{intermediate_dv_schema, new_dv_column_schema};
 pub use write_state::{BoundWriteContextBuilder, RowTrackingMetadataColumns, WriteState};
 
 type GeneratedAddActions =
-    Box<dyn Generator<Request, Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + 'static>;
+    Box<dyn Generator<Request, Item = DeltaResult<Box<dyn EngineData>>, Output = ()>>;
 
 /// The static instance referenced by [`add_files_schema`] that doesn't contain the dataChange
 /// column.
@@ -1463,7 +1463,7 @@ impl<S> Transaction<S> {
             // nothing row-tracking-related needs to be written.
             let row_tracking_dm = (assign_fresh_row_tracking_metadata && self.is_create_table())
                 .then(RowTrackingDomainMetadata::initial);
-            let add_actions = empty::<DeltaResult<Box<dyn EngineData>>>().into_boxed();
+            let add_actions = Box::new(empty::<DeltaResult<Box<dyn EngineData>>>());
             return Ok((add_actions, row_tracking_dm));
         }
 
@@ -1473,7 +1473,7 @@ impl<S> Transaction<S> {
             let (add_actions, row_tracking_dm) = self
                 .generate_adds_with_row_tracking_with_channel(channel, commit_version)
                 .await?;
-            Ok((add_actions.into_boxed(), row_tracking_dm))
+            Ok((Box::new(add_actions), row_tracking_dm))
         } else {
             let add_files_metadata = self.add_files_metadata.clone();
             let add_actions = build_add_actions_with_channel(
@@ -1483,7 +1483,7 @@ impl<S> Transaction<S> {
                 self.data_change,
             )
             .await?;
-            Ok((add_actions.into_boxed(), None))
+            Ok((Box::new(add_actions), None))
         }
     }
 

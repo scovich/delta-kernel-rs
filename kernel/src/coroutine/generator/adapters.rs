@@ -271,12 +271,6 @@ pub trait BoundGenerator: Send {
 pub type BoxedBoundGenerator<'a, Y, O = ()> =
     Box<dyn BoundGenerator<Item = Y, Output = O> + Unpin + 'a>;
 
-/// Type-erased generator that yields independently fallible items.
-///
-/// Polling the generator can fail before an item is yielded; each yielded item can independently
-/// be an [`Err`](Result::Err).
-pub type BoxedDeltaResultGenerator<'a, T, O = ()> = BoxedBoundGenerator<'a, DeltaResult<T>, O>;
-
 impl<'g, P: Send + 'static, Y: Send + 'g, O: Send + 'static> GeneratorExt
     for Box<dyn Generator<P, Item = Y, Output = O> + 'g>
 {
@@ -300,14 +294,17 @@ impl<'a, Y: Send + 'a, O: Send + 'static> BoundGenerator for GeneratorBody<'a, Y
     }
 }
 
-impl<'a, Y: Send + 'a, O: Send + 'static> BoundGenerator for BoxedBoundGenerator<'a, Y, O> {
-    type Item = Y;
-    type Output = O;
+impl<G> BoundGenerator for Box<G>
+where
+    G: BoundGenerator + Unpin + ?Sized,
+{
+    type Item = G::Item;
+    type Output = G::Output;
 
     fn poll_step(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
-    ) -> Poll<DeltaResult<GeneratorStep<Y, O>>> {
+    ) -> Poll<DeltaResult<GeneratorStep<G::Item, G::Output>>> {
         Pin::new(&mut **self.get_mut()).poll_step(context)
     }
 }

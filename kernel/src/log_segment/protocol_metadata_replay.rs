@@ -18,10 +18,10 @@ use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
 use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
 #[cfg(test)]
 use crate::coroutine::iterate_prepared_result_generator_with_engine;
-use crate::coroutine::kernel::{Channel, DeltaResultGenerator};
-use crate::coroutine::{BoundGenerator, Generator as _, GeneratorExt as _};
+use crate::coroutine::kernel::{BoundDeltaResultGenerator, Channel, DeltaResultGenerator};
 #[cfg(feature = "declarative-plans")]
 use crate::coroutine::{ChannelExt as _, PageGenerator};
+use crate::coroutine::{Generator as _, GeneratorExt as _};
 use crate::crc::Crc;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::ActionsBatch;
@@ -311,7 +311,7 @@ struct VersionedBatch {
 
 /// The newest Protocol and Metadata across `batches`.
 async fn resolve_pm_batches(
-    mut batches: impl BoundGenerator<Item = DeltaResult<VersionedBatch>, Output = ()> + Unpin,
+    mut batches: impl BoundDeltaResultGenerator<VersionedBatch>,
 ) -> DeltaResult<PmCandidate> {
     let mut metadata: Option<(i64, Metadata)> = None;
     let mut protocol: Option<(i64, Protocol)> = None;

@@ -17,7 +17,7 @@ use super::request::{
 };
 #[cfg(feature = "declarative-plans")]
 use super::PlanRequest;
-use super::{Channel, Request, StaticGeneratorCoroutine};
+use super::{BoundDeltaResultGenerator, Channel, Request, StaticGeneratorCoroutine};
 use crate::committer::{Commit, CommitResponse, PublishMetadata};
 use crate::coroutine::generator::{BoundGenerator, Generator as _, GeneratorExt as _};
 #[cfg(feature = "declarative-plans")]
@@ -34,7 +34,10 @@ use crate::plans::Operation;
 use crate::schema::{DataType, SchemaRef};
 use crate::{DeltaResult, FileIndex, FileMeta, FileSize, ParquetFooter};
 
-/// Typed kernel operations available on its request channel.
+/// Typed kernel operations posted through a request channel.
+///
+/// `read_*` and `flattened` contact the connector on first pull. `prepare_*` does that setup in
+/// the returned future, so setup errors can surface before the caller holds a generator.
 #[internal_api]
 pub(crate) trait ChannelExt: ChannelExchange<Request> {
     /// Read one small file, or one half-open byte range, completely into memory.
@@ -118,8 +121,7 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
         files: impl Into<Vec<FileMeta>>,
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> impl BoundGenerator<Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + Unpin + '_
-    {
+    ) -> impl BoundDeltaResultGenerator<Box<dyn EngineData>> + '_ {
         self.flattened(ReadJsonFiles::new(files, physical_schema, predicate))
     }
 
@@ -129,8 +131,7 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
         files: impl Into<Vec<FileMeta>>,
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> impl BoundGenerator<Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + Unpin + '_
-    {
+    ) -> impl BoundDeltaResultGenerator<Box<dyn EngineData>> + '_ {
         self.flattened(ReadParquetFiles::new(files, physical_schema, predicate))
     }
 

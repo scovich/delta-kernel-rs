@@ -61,9 +61,8 @@ use tracing::{error, Instrument as _, Span};
 
 pub use self::adapters::{
     empty, map_async_witness, unfold, AsyncIntoIterator, BoundGenerator, BoxedBoundGenerator,
-    BoxedDeltaResultGenerator, Chain, FilterMap, FilterOk, Flatten, FlattenBy, Generator,
-    GeneratorExt, GeneratorStep, Iter, Map, MapAsync, MapAsyncWitness, MapOk, OnComplete, Peekable,
-    Unfold,
+    Chain, FilterMap, FilterOk, Flatten, FlattenBy, Generator, GeneratorExt, GeneratorStep, Iter,
+    Map, MapAsync, MapAsyncWitness, MapOk, OnComplete, Peekable, Unfold,
 };
 pub(crate) use self::adapters::{unfold_mut_with, unfold_mut_witness};
 use super::core::{noop_context, Channel, DeltaFuture};
