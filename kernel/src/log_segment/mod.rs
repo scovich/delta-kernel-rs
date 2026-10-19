@@ -17,7 +17,6 @@ use crate::cancellation::CancellationTokenRef;
 use crate::committer::CatalogCommit;
 use crate::coroutine::engine::EngineConnector;
 use crate::coroutine::generator::empty;
-use crate::coroutine::kernel::request::ReadParquetFiles;
 use crate::coroutine::kernel::{coroutine, Channel, DeltaResultGenerator};
 #[cfg(test)]
 use crate::coroutine::run_coroutine_with_engine;
@@ -1528,11 +1527,9 @@ impl LogSegment {
         let files = std::slice::from_ref(&checkpoint.location);
         let mut batches: BoxedDeltaResultGenerator<'_, _> = match checkpoint.extension.as_str() {
             "json" => Box::new(channel.read_json_files(files, Self::sidecar_read_schema(), None)),
-            "parquet" => Box::new(channel.flattened(ReadParquetFiles::new(
-                files,
-                Self::sidecar_read_schema(),
-                None,
-            ))),
+            "parquet" => {
+                Box::new(channel.read_parquet_files(files, Self::sidecar_read_schema(), None))
+            }
             _ => return Ok(vec![]),
         };
 

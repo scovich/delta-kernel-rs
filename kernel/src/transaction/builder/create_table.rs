@@ -18,7 +18,9 @@ use crate::clustering::{create_clustering_domain_metadata, validate_clustering_c
 use crate::committer::Committer;
 use crate::coroutine::kernel::request::DirectoryListing;
 use crate::coroutine::kernel::{static_coroutine, Channel, StaticCoroutine};
-use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _, GeneratorExt as _, Pages};
+use crate::coroutine::{
+    run_coroutine_with_engine, ChannelExt as _, GeneratorExt as _, PageGenerator,
+};
 use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
 use crate::schema::variant_utils::schema_contains_variant_type;
@@ -159,7 +161,7 @@ async fn ensure_table_does_not_exist_with_channel(
     let listing = DirectoryListing::try_new(delta_log_url.clone())?;
     match channel.prepare_paged(listing).await {
         Ok(cursor) => {
-            let mut files = Pages::resume(channel, cursor).flatten();
+            let mut files = PageGenerator::resume(cursor).flatten().bind(channel);
             // files.next().await? returns Option<DeltaResult<FileMeta>>
             // - Some(Ok(_)) means a file exists -> table exists
             // - Some(Err(FileNotFound)) means path doesn't exist -> OK for new table

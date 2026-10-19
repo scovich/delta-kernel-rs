@@ -21,10 +21,10 @@ use url::Url;
 #[cfg(test)]
 use crate::cancellation::CancellationTokenRef;
 use crate::coroutine::kernel::request::{log_listing_bounds, ForwardListing};
-use crate::coroutine::kernel::Channel;
+use crate::coroutine::kernel::{Channel, Request};
 #[cfg(test)]
 use crate::coroutine::run_coroutine_with_storage;
-use crate::coroutine::{ChannelExt as _, Generator, GeneratorExt as _};
+use crate::coroutine::{GeneratorExt as _, IntoGenerator, PageGenerator};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
 use crate::path::{
@@ -74,15 +74,12 @@ pub(crate) struct LogSegmentFiles {
 /// `max_published_version`.
 #[internal_api]
 pub(crate) fn list_delta_log_generator<'a>(
-    channel: &'a Channel,
     log_root: &'a Url,
     start_version: Version,
     end_version: Version,
-) -> DeltaResult<impl Generator<Item = DeltaResult<ParsedLogPath>, Output = ()> + Unpin + 'a> {
+) -> DeltaResult<impl IntoGenerator<Request, Item = DeltaResult<ParsedLogPath>, Output = ()> + 'a> {
     let bounds = log_listing_bounds(log_root, start_version, end_version)?;
-    Ok(channel
-        .paged(ForwardListing::new(bounds))
-        .into_generator()
+    Ok(PageGenerator::new(ForwardListing::new(bounds))
         .map(move |page: Vec<DeltaResult<FileMeta>>| {
             parse_delta_log_listing(page.into_iter(), log_root, end_version)
         })
@@ -609,7 +606,7 @@ impl LogSegmentFiles {
         );
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);
-        let mut fs_iter = list_delta_log_generator(channel, log_root, start, end)?;
+        let mut fs_iter = list_delta_log_generator(log_root, start, end)?.bind(channel);
 
         let log_tail_start_version = log_tail.first().map(|f| f.version);
         let mut listed_commits = Vec::new();
@@ -729,7 +726,7 @@ impl LogSegmentFiles {
     ) -> DeltaResult<Self> {
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);
-        let mut fs_iter = list_delta_log_generator(channel, log_root, start, end)?;
+        let mut fs_iter = list_delta_log_generator(log_root, start, end)?.bind(channel);
         let mut builder = LogListingBuilder::new(log_tail, start, end_version, checkpoint_handling);
         while let Some(file) = fs_iter.next().await? {
             builder.extend_filesystem_files([file])?;
@@ -887,10 +884,10 @@ impl LogSegmentFiles {
         let mut upper = end_version + 1;
         while upper > 0 {
             let lower = upper.saturating_sub(BACKWARD_SCAN_WINDOW_SIZE);
-            let window_files: Vec<_> =
-                list_delta_log_generator(channel, log_root, lower, upper - 1)?
-                    .try_collect()
-                    .await?;
+            let window_files: Vec<_> = list_delta_log_generator(log_root, lower, upper - 1)?
+                .bind(channel)
+                .try_collect()
+                .await?;
 
             found_checkpoint_version = find_complete_checkpoint_version(&window_files);
             windows.push(window_files);

@@ -171,9 +171,12 @@ pub trait GeneratorExt {
     }
 
     /// Counterpart of [`Iterator::peekable`]: allows inspecting the next item before consuming it.
-    fn peekable<I, O>(self) -> Peekable<Self, I, O>
+    ///
+    /// Restricted to bound generators, mirroring [`Self::next`]/[`Self::collect`]: a peeked item
+    /// is held outside the unbound pipeline, so it cannot survive a later rebind.
+    fn peekable(self) -> Peekable<Self>
     where
-        Self: Sized,
+        Self: Generator + Sized + Unpin,
     {
         Peekable {
             inner: self,
@@ -285,7 +288,7 @@ impl<G, F> GeneratorExt for OnComplete<G, F> {}
 impl<G, F: FnOnce()> GeneratorExt for BoundOnComplete<G, F> {}
 impl<G, P, F, W, U> GeneratorExt for MapAsync<G, P, F, W, U> {}
 impl<G, Policy> GeneratorExt for FlattenBy<G, Policy> {}
-impl<G, I, O> GeneratorExt for Peekable<G, I, O> {}
+impl<G: Generator> GeneratorExt for Peekable<G> {}
 impl<A, B> GeneratorExt for Chain<A, B> {}
 impl<I> GeneratorExt for Iter<I> {}
 impl<S, F, Fut> GeneratorExt for Unfold<S, F, Fut> {}
@@ -819,29 +822,27 @@ where
 }
 
 /// Generator returned by [`GeneratorExt::peekable`].
-// WARNING: We manually impl `Unpin` for `Peekable` so `I` need not be `Unpin`. This is sound only
-// because `Peekable` does not structurally pin `peeked`; it is only moved through ordinary `Option`
-// operations.
-pub struct Peekable<G, I, O> {
+// WARNING: We manually impl `Unpin` for `Peekable` so `G::Item` need not be `Unpin`. This is sound
+// only because `Peekable` does not structurally pin `peeked`; it is only moved through ordinary
+// `Option` operations.
+pub struct Peekable<G: Generator> {
     inner: G,
-    peeked: Option<I>,
-    done: Option<O>,
+    peeked: Option<G::Item>,
+    done: Option<G::Output>,
 }
 
-impl<G: Unpin, I, O> Unpin for Peekable<G, I, O> {}
+impl<G: Generator + Unpin> Unpin for Peekable<G> {}
 
-impl<G, I, O> Peekable<G, I, O>
-where
-    G: Generator<Item = I, Output = O> + Unpin,
-    I: Send + 'static,
-    O: Send + 'static,
-{
-    fn poll_inner(&mut self, context: &mut Context<'_>) -> Poll<DeltaResult<GeneratorStep<I, O>>> {
+impl<G: Generator + Unpin> Peekable<G> {
+    fn poll_inner(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<DeltaResult<GeneratorStep<G::Item, G::Output>>> {
         Pin::new(&mut self.inner).poll_step(context)
     }
 
     /// Return the next item without consuming it, or `None` at completion.
-    pub async fn peek(&mut self) -> DeltaResult<Option<&I>> {
+    pub async fn peek(&mut self) -> DeltaResult<Option<&G::Item>> {
         if self.peeked.is_none() && self.done.is_none() {
             match poll_fn(|context| self.poll_inner(context)).await? {
                 GeneratorStep::Yield(item) => self.peeked = Some(item),
@@ -852,51 +853,14 @@ where
     }
 }
 
-impl<P, G, I, O> IntoGenerator<P> for Peekable<G, I, O>
-where
-    P: Send + 'static,
-    G: IntoGenerator<P, Item = I, Output = O>,
-    I: Send + 'static,
-    O: Send + 'static,
-{
-    type Item = I;
-    type Output = O;
-
-    fn bind_to<'a>(
-        self,
-        channel: ChannelBinding<'a, P>,
-    ) -> impl Generator<Item = I, Output = O> + Unpin + 'a
-    where
-        Self: 'a,
-    {
-        Peekable {
-            inner: self.inner.bind_to(channel),
-            peeked: self.peeked,
-            done: self.done,
-        }
-    }
-
-    fn bind_boxed<'a>(self: Box<Self>, channel: ChannelBinding<'a, P>) -> BoxedGenerator<'a, I, O>
-    where
-        Self: 'a,
-    {
-        Box::new((*self).bind_to(channel))
-    }
-}
-
-impl<G, I, O> Generator for Peekable<G, I, O>
-where
-    G: Generator<Item = I, Output = O> + Unpin,
-    I: Send + 'static,
-    O: Send + 'static,
-{
-    type Item = I;
-    type Output = O;
+impl<G: Generator + Unpin> Generator for Peekable<G> {
+    type Item = G::Item;
+    type Output = G::Output;
 
     fn poll_step(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
-    ) -> Poll<DeltaResult<GeneratorStep<I, O>>> {
+    ) -> Poll<DeltaResult<GeneratorStep<G::Item, G::Output>>> {
         let this = self.get_mut();
         if let Some(item) = this.peeked.take() {
             return Poll::Ready(Ok(GeneratorStep::Yield(item)));

@@ -19,11 +19,11 @@ use super::request::{
 use super::PlanRequest;
 use super::{Channel, Request, StaticGeneratorCoroutine};
 use crate::committer::{Commit, CommitResponse, PublishMetadata};
+use crate::coroutine::generator::{Generator, GeneratorExt as _};
 #[cfg(feature = "declarative-plans")]
 use crate::coroutine::PlanOperation;
 use crate::coroutine::{
-    ChannelExchange, Cursor, DeltaFuture, Generator, Page, PageGenerator, PageRequest,
-    PagedOperation, Pages,
+    ChannelExchange, Cursor, DeltaFuture, Page, PageGenerator, PageRequest, PagedOperation,
 };
 use crate::engine_data::{EngineData, FilteredEngineData};
 use crate::expressions::{ExpressionRef, PredicateRef, Scalar};
@@ -100,24 +100,6 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
         self.exchange(cursor, PageRequest::Continue)
     }
 
-    /// Iterate pages of `operation`, starting it on the first [`Pages::next`] call.
-    fn paged<Op>(&self, operation: Op) -> Pages<'_, Self, Op>
-    where
-        Op: PagedOperation,
-        PageRequest<Op>: Into<Request>,
-    {
-        Pages::start(self, operation)
-    }
-
-    /// Iterate remaining pages of `operation`, starting from `cursor`.
-    fn resume_paged<Op>(&self, cursor: Cursor<Op>) -> Pages<'_, Self, Op>
-    where
-        Op: PagedOperation,
-        PageRequest<Op>: Into<Request>,
-    {
-        Pages::resume(self, cursor)
-    }
-
     /// Iterate items of `operation`, flattening collection-valued pages.
     fn flattened<Op>(
         &self,
@@ -128,11 +110,7 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
         Op::Page: IntoIterator,
         <Op::Page as IntoIterator>::IntoIter: Send,
         <Op::Page as IntoIterator>::Item: Send + 'static,
-        PageRequest<Op>: Into<Request>,
-        Self: Sync + 'static,
-    {
-        self.paged(operation).flatten()
-    }
+        PageRequest<Op>: Into<Request>;
 
     /// Read JSON files as a stream of result batches.
     fn read_json_files(
@@ -140,11 +118,18 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
         files: impl Into<Vec<FileMeta>>,
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> impl Generator<Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + Unpin + '_
-    where
-        Self: Sync + 'static,
-    {
+    ) -> impl Generator<Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + Unpin + '_ {
         self.flattened(ReadJsonFiles::new(files, physical_schema, predicate))
+    }
+
+    /// Read Parquet files as a stream of result batches.
+    fn read_parquet_files(
+        &self,
+        files: impl Into<Vec<FileMeta>>,
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> impl Generator<Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + Unpin + '_ {
+        self.flattened(ReadParquetFiles::new(files, physical_schema, predicate))
     }
 
     /// Prepare a JSON read without fetching its first page.
@@ -294,4 +279,18 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
     }
 }
 
-impl ChannelExt for Channel {}
+impl ChannelExt for Channel {
+    fn flattened<Op>(
+        &self,
+        operation: Op,
+    ) -> impl Generator<Item = <Op::Page as IntoIterator>::Item, Output = ()> + Unpin + '_
+    where
+        Op: PagedOperation,
+        Op::Page: IntoIterator,
+        <Op::Page as IntoIterator>::IntoIter: Send,
+        <Op::Page as IntoIterator>::Item: Send + 'static,
+        PageRequest<Op>: Into<Request>,
+    {
+        PageGenerator::new(operation).flatten().bind(self)
+    }
+}

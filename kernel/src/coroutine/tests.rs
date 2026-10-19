@@ -697,10 +697,10 @@ fn compatible_adapters_preserve_terminal_output() {
     let items = items.map_async(map_async_witness, async move |_channel, item| {
         item.map(|value| value + 1)
     });
-    let items = items.filter_ok(|value: &i32| *value >= 5).peekable();
+    let items = items.filter_ok(|value: &i32| *value >= 5);
     let mut generator: StaticGeneratorCoroutine<DeltaResult<i32>, i32> =
         static_generator_coroutine!(Request, async move |channel| {
-            channel.yield_from(items.bind(&channel)).await
+            channel.yield_from(items.bind(&channel).peekable()).await
         });
 
     let GeneratorCoroutineStep::Yield(first) = generator.try_advance().unwrap() else {
@@ -961,11 +961,13 @@ fn engine_connector_pages_forward_listing() {
                 )
                 .await?;
         }
-        let mut pages = channel.flattened(ForwardListing::new(ListingBounds {
+        let mut pages = PageGenerator::new(ForwardListing::new(ListingBounds {
             prefix: root.clone(),
             low: root.join("00000000000000000000")?,
             high: root.join("00000000000000000004")?,
-        }));
+        }))
+        .flatten()
+        .bind(&channel);
         while let Some(entry) = pages.next().await? {
             channel.yield_item(entry?.location).await?;
         }
@@ -999,11 +1001,12 @@ fn engine_connector_pages_backward_listing() {
                 )
                 .await?;
         }
-        let mut pages = channel.paged(BackwardListing::new(ListingBounds {
+        let mut pages = PageGenerator::new(BackwardListing::new(ListingBounds {
             prefix: root.clone(),
             low: root.join("00000000000000000000")?,
             high: root.join("00000000000000000004")?,
-        }));
+        }))
+        .bind(channel);
         let mut files = Vec::new();
         while let Some(page) = pages.next().await? {
             assert!(page.known_version_boundary);

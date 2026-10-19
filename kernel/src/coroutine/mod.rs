@@ -632,8 +632,8 @@ pub(crate) enum PageGenerator<Op: PagedOperation> {
 }
 
 impl<Op: PagedOperation> PageGenerator<Op> {
-    /// Create a generator that starts a new paged operation.
-    pub(crate) fn start(operation: Op) -> Self {
+    /// Create a generator for a new paged operation.
+    pub(crate) fn new(operation: Op) -> Self {
         Self::Start(operation)
     }
 
@@ -688,86 +688,6 @@ impl<'a, P: Send + 'static, Op: PagedOperation> BoundPages<'a, P, Op> {
     async fn next(&mut self) -> DeltaResult<Option<Op::Page>>
     where
         PageRequest<Op>: Into<P>,
-    {
-        let page = match std::mem::replace(&mut self.state, PageGenerator::Done) {
-            PageGenerator::Start(operation) => {
-                self.channel.exchange(operation, PageRequest::Start).await?
-            }
-            PageGenerator::Next(cursor) => {
-                self.channel.exchange(cursor, PageRequest::Continue).await?
-            }
-            PageGenerator::Done => return Ok(None),
-        };
-        if let Some(cursor) = page.next {
-            self.state = PageGenerator::Next(cursor);
-        }
-        Ok(Some(page.data))
-    }
-}
-
-/// Pulls successive page payloads until the connector reports exhaustion.
-///
-/// Call sites iterate this helper and then walk [`PagedOperation::Page`] themselves. Flatten
-/// collection-valued pages with [`GeneratorExt::flatten`].
-#[internal_api]
-pub(crate) struct Pages<'a, C: ?Sized, Op: PagedOperation> {
-    channel: &'a C,
-    state: PageGenerator<Op>,
-}
-
-impl<'a, C: ?Sized, Op: PagedOperation> Pages<'a, C, Op> {
-    fn new(channel: &'a C, state: PageGenerator<Op>) -> Self {
-        Self { channel, state }
-    }
-
-    /// Iterate over the pages of `operation`.
-    #[internal_api]
-    pub(crate) fn start(channel: &'a C, operation: Op) -> Self {
-        Self::new(channel, PageGenerator::start(operation))
-    }
-
-    /// Iterate over the remaining pages of an in-progress operation, starting from `cursor`.
-    #[internal_api]
-    pub(crate) fn resume(channel: &'a C, cursor: Cursor<Op>) -> Self {
-        Self::new(channel, PageGenerator::resume(cursor))
-    }
-
-    /// Drive this page stream as a [`Generator`].
-    #[internal_api]
-    pub(crate) fn into_generator<P>(
-        self,
-    ) -> impl Generator<Item = Op::Page, Output = ()> + Unpin + 'a
-    where
-        PageRequest<Op>: Into<P>,
-        C: ChannelExchange<P> + Sync + 'static,
-        P: Send + 'static,
-    {
-        unfold_mut!(self, Pages::next)
-    }
-
-    /// Yield items from collection-valued pages.
-    #[internal_api]
-    pub(crate) fn flatten<P>(
-        self,
-    ) -> impl Generator<Item = <Op::Page as IntoIterator>::Item, Output = ()> + Unpin + 'a
-    where
-        Op::Page: IntoIterator,
-        <Op::Page as IntoIterator>::IntoIter: Send,
-        <Op::Page as IntoIterator>::Item: Send + 'static,
-        PageRequest<Op>: Into<P>,
-        C: ChannelExchange<P> + Sync + 'static,
-        P: Send + 'static,
-    {
-        self.into_generator().flatten()
-    }
-
-    /// Fetch the next page payload, or `None` after the last page.
-    #[internal_api]
-    pub(crate) async fn next<P>(&mut self) -> DeltaResult<Option<Op::Page>>
-    where
-        PageRequest<Op>: Into<P>,
-        C: ChannelExchange<P>,
-        P: Send + 'static,
     {
         let page = match std::mem::replace(&mut self.state, PageGenerator::Done) {
             PageGenerator::Start(operation) => {

@@ -1870,7 +1870,7 @@ fn precancelled_token_stops_listing_before_any_storage_call() {
     let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
 
     let result = run_coroutine_with_storage!(&storage, Some(token), async move |channel| {
-        let listing = list_delta_log_generator(channel, &log_root, 0, Version::MAX)?;
+        let listing = list_delta_log_generator(&log_root, 0, Version::MAX)?.bind(channel);
         let listed: Vec<_> = listing.try_collect().await?;
         Ok(listed)
     });
@@ -1888,7 +1888,7 @@ fn mid_listing_cancellation_yields_terminal_error_not_silent_truncation() {
     let token_ref: CancellationTokenRef = token.clone();
 
     let result = run_coroutine_with_storage!(&storage, Some(token_ref), async move |channel| {
-        let mut listing = list_delta_log_generator(channel, &log_root, 0, Version::MAX)?;
+        let mut listing = list_delta_log_generator(&log_root, 0, Version::MAX)?.bind(channel);
         assert!(matches!(listing.next().await?, Some(Ok(p)) if p.version == 0));
         assert!(matches!(listing.next().await?, Some(Ok(p)) if p.version == 1));
         token.cancel();
@@ -1906,7 +1906,7 @@ fn listing_without_token_is_unchanged() {
     let (log_root, _pulled, storage) = finite_listing_handler(5);
 
     let listed: Vec<_> = run_coroutine_with_storage!(&storage, None, async move |channel| {
-        let listing = list_delta_log_generator(channel, &log_root, 0, Version::MAX)?;
+        let listing = list_delta_log_generator(&log_root, 0, Version::MAX)?.bind(channel);
         listing.try_collect().await
     })
     .unwrap();
