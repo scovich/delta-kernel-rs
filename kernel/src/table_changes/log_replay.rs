@@ -12,7 +12,9 @@ use crate::actions::{
     Metadata, Protocol, ADD_FIELD, CDC_FIELD, COMMIT_INFO_NAME, METADATA_FIELD, PROTOCOL_FIELD,
     REMOVE_FIELD,
 };
-use crate::coroutine::generator::{map_async_witness, AsyncIntoIterator as _, GeneratorExt as _};
+use crate::coroutine::generator::{
+    map_async_witness, AsyncIntoIterator as _, BoundGenerator as _, GeneratorExt as _,
+};
 #[cfg(test)]
 use crate::coroutine::iterate_prepared_result_generator_with_engine;
 use crate::coroutine::kernel::{Channel, DeltaResultGenerator};

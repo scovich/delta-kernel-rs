@@ -11,7 +11,7 @@ use crate::actions::visitors::SidecarVisitor;
 use crate::coroutine::engine::EngineConnector;
 #[cfg(test)]
 use crate::coroutine::engine::EngineResultGeneratorIterator;
-use crate::coroutine::generator::{generator_fn, Generator, GeneratorExt as _, IntoGenerator};
+use crate::coroutine::generator::{generator_fn, BoundGenerator, Generator, GeneratorExt as _};
 #[cfg(test)]
 use crate::coroutine::kernel::{coroutine, StaticGeneratorCoroutine};
 use crate::coroutine::kernel::{Channel, ChannelExt as _, DeltaResultGenerator, GeneratorChannel};
@@ -142,7 +142,7 @@ impl<A> CheckpointManifestState<A> {
 
 impl<G> CheckpointManifestState<G>
 where
-    G: Generator<Item = DeltaResult<ActionsBatch>, Output = ()> + Unpin,
+    G: BoundGenerator<Item = DeltaResult<ActionsBatch>, Output = ()> + Unpin,
 {
     async fn next(&mut self) -> DeltaResult<Option<DeltaResult<ActionsBatch>>> {
         let Some(result) = self.actions.next().await? else {
@@ -161,7 +161,7 @@ impl<A> CheckpointManifestState<A> {
         self,
         channel: &'a Channel,
     ) -> CheckpointManifestState<
-        impl Generator<Item = DeltaResult<ActionsBatch>, Output = ()> + Unpin + 'a,
+        impl BoundGenerator<Item = DeltaResult<ActionsBatch>, Output = ()> + Unpin + 'a,
     >
     where
         A: DeltaResultGenerator<ActionsBatch> + 'a,

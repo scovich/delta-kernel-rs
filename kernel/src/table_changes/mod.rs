@@ -45,7 +45,9 @@ use scan_file::scan_metadata_to_scan_file_generator;
 use url::Url;
 
 use crate::coroutine::kernel::{static_coroutine, Channel, StaticCoroutine};
-use crate::coroutine::{run_coroutine_with_engine, GeneratorExt as _};
+use crate::coroutine::{
+    run_coroutine_with_engine, BoundGenerator as _, Generator as _, GeneratorExt as _,
+};
 use crate::log_segment::LogSegment;
 use crate::path::AsUrl;
 use crate::schema::compare::SchemaComparison as _;

@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use crate::coroutine::engine::{EngineConnector, EngineResultGeneratorIterator};
-use crate::coroutine::generator::Generator;
+use crate::coroutine::generator::BoundGenerator;
 use crate::coroutine::kernel::{
     static_coroutine, static_generator_coroutine, Channel, DeltaResultGenerator, GeneratorChannel,
     GeneratorCoroutineStep, StaticCoroutine, StaticGeneratorCoroutine,
@@ -247,7 +247,7 @@ struct IncrementalScanState<A> {
 
 impl<G> IncrementalScanState<G>
 where
-    G: Generator<Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + Unpin,
+    G: BoundGenerator<Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + Unpin,
 {
     async fn advance(
         &mut self,
@@ -307,7 +307,7 @@ impl<A> IncrementalScanState<A> {
         self,
         channel: &'a Channel,
     ) -> IncrementalScanState<
-        impl Generator<Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + Unpin + 'a,
+        impl BoundGenerator<Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + Unpin + 'a,
     >
     where
         A: DeltaResultGenerator<Box<dyn EngineData>> + 'a,

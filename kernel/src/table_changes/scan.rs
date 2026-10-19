@@ -10,7 +10,9 @@ use super::resolve_dvs::{resolve_scan_file_dv_with_channel, ResolvedCdfScanFile}
 use super::scan_file::scan_metadata_to_scan_file_generator;
 use super::{CdfMode, TableChanges};
 use crate::actions::deletion_vector::split_vector;
-use crate::coroutine::generator::{map_async_witness, AsyncIntoIterator as _, GeneratorExt as _};
+use crate::coroutine::generator::{
+    map_async_witness, AsyncIntoIterator as _, Generator as _, GeneratorExt as _,
+};
 use crate::coroutine::kernel::{
     generator_coroutine, Channel, DeltaResultGenerator, GeneratorCoroutine,
 };

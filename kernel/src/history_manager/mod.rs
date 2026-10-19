@@ -29,7 +29,10 @@ use tracing::{info, trace, warn};
 use url::Url;
 
 use crate::coroutine::kernel::{static_coroutine, Channel, StaticCoroutine};
-use crate::coroutine::{run_coroutine_with_engine, AsyncOption as _, GeneratorExt as _};
+use crate::coroutine::{
+    run_coroutine_with_engine, AsyncOption as _, BoundGenerator as _, Generator as _,
+    GeneratorExt as _,
+};
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::{list_delta_log_generator, should_process_log_file};
 use crate::path::{LogPathFileType, ParsedLogPath};
@@ -871,9 +874,9 @@ async fn get_earliest_published_commit_version_with_channel(
     earliest_ratified_commit_version: Option<Version>,
 ) -> DeltaResult<Version> {
     // TODO(#3188): thread a cancellation token through the history-manager entry points.
-    let listing = list_delta_log_generator(log_root, 0, Version::MAX)?.bind(channel);
-    listing
+    list_delta_log_generator(log_root, 0, Version::MAX)?
         .filter_ok(|f: &ParsedLogPath| f.file_type == LogPathFileType::Commit)
+        .bind(channel)
         .next()
         .await?
         .transpose()?

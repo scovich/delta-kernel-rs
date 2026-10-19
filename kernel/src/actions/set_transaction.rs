@@ -6,7 +6,7 @@ use crate::coroutine::iterate_prepared_result_generator_with_engine;
 use crate::coroutine::kernel::{Channel, DeltaResultGenerator};
 #[cfg(test)]
 use crate::coroutine::run_coroutine_with_engine;
-use crate::coroutine::GeneratorExt as _;
+use crate::coroutine::{BoundGenerator as _, Generator as _};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 #[cfg(test)]

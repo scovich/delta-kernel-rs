@@ -18,7 +18,7 @@ use url::Url;
 use super::engine::{drive_with_engine, run_coroutine_with_connector, EngineConnector};
 use super::generator::{
     empty, generator, map_async_witness, static_generator_coroutine, AsyncIntoIterator as _,
-    GeneratorExt as _, GeneratorStep,
+    BoundGenerator as _, Generator as _, GeneratorExt as _, GeneratorStep,
 };
 use super::kernel::request::{BackwardListing, ForwardListing, ListingBounds};
 use super::kernel::{
@@ -805,7 +805,7 @@ fn channel_taking_generator_supports_static_and_borrowed_state() {
     fn operation<'a>(
         channel: impl Deref<Target = Channel> + Send + 'a,
         prefix: impl Borrow<str> + Send + 'a,
-    ) -> BoundGenerator<'a, String> {
+    ) -> GeneratorBody<'a, String> {
         generator!(channel, async move |channel| {
             channel
                 .yield_item(format!("{} item", prefix.borrow()))
@@ -846,7 +846,7 @@ fn channel_taking_generator_supports_static_and_borrowed_state() {
 
 #[test]
 fn channel_taking_generator_can_yield_borrowed_items() {
-    fn borrowed<'a>(channel: &'a Channel, value: &'a str) -> BoundGenerator<'a, &'a str> {
+    fn borrowed<'a>(channel: &'a Channel, value: &'a str) -> GeneratorBody<'a, &'a str> {
         generator!(channel, async move |channel| {
             channel.yield_item(value).await
         })

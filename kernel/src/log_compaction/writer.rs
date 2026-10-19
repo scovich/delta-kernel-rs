@@ -12,7 +12,7 @@ use crate::action_reconciliation::{
     ActionReconciliationIterator, ActionReconciliationIteratorState, RetentionCalculator,
 };
 use crate::coroutine::engine::EngineConnector;
-use crate::coroutine::generator::GeneratorExt as _;
+use crate::coroutine::generator::{BoundGenerator as _, Generator as _, GeneratorExt as _};
 use crate::coroutine::kernel::{coroutine, Channel, Coroutine, DeltaResultGenerator};
 use crate::log_replay::HasSelectionVector;
 use crate::log_segment::LogSegment;

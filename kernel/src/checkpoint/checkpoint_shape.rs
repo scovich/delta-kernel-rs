@@ -11,7 +11,7 @@ use crate::actions::visitors::SidecarVisitor;
 use crate::actions::SIDECAR_NAME;
 use crate::coroutine::engine::drive_with_plan_executor;
 use crate::coroutine::kernel::{coroutine, Channel};
-use crate::coroutine::{ChannelExt as _, GeneratorExt as _};
+use crate::coroutine::{BoundGenerator as _, ChannelExt as _};
 use crate::engine_data::RowVisitor;
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::FileType;

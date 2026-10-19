@@ -24,7 +24,7 @@ use crate::coroutine::kernel::request::{log_listing_bounds, ForwardListing};
 use crate::coroutine::kernel::{Channel, Request};
 #[cfg(test)]
 use crate::coroutine::run_coroutine_with_storage;
-use crate::coroutine::{GeneratorExt as _, IntoGenerator, PageGenerator};
+use crate::coroutine::{BoundGenerator as _, Generator, GeneratorExt as _, PageGenerator};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
 use crate::path::{
@@ -77,7 +77,7 @@ pub(crate) fn list_delta_log_generator<'a>(
     log_root: &'a Url,
     start_version: Version,
     end_version: Version,
-) -> DeltaResult<impl IntoGenerator<Request, Item = DeltaResult<ParsedLogPath>, Output = ()> + 'a> {
+) -> DeltaResult<impl Generator<Request, Item = DeltaResult<ParsedLogPath>, Output = ()> + 'a> {
     let bounds = log_listing_bounds(log_root, start_version, end_version)?;
     Ok(PageGenerator::new(ForwardListing::new(bounds))
         .map(move |page: Vec<DeltaResult<FileMeta>>| {

@@ -19,16 +19,16 @@ pub use request::{PlanRequest, Request};
 /// Borrowed capability used by kernel operations to post requests through their parent coroutine.
 ///
 /// Coroutine implementations receive this channel as an ordinary async-function argument. Child
-/// generators use it for the lifetime of their [`BoundGenerator`].
+/// generators use it for the lifetime of their [`GeneratorBody`].
 pub type Channel = super::Channel<Request>;
 
 /// Unbound kernel generator equivalent to
-/// `IntoGenerator<Request, Item = DeltaResult<T>, Output = O>`.
+/// `Generator<Request, Item = DeltaResult<T>, Output = O>`.
 ///
 /// Polling may fail before an item is yielded, each yielded item may independently be an error,
 /// and `O` is returned only after successful terminal completion.
 pub trait DeltaResultGenerator<T, O = ()>:
-    generator::IntoGenerator<Request, Item = DeltaResult<T>, Output = O> + Sized
+    generator::Generator<Request, Item = DeltaResult<T>, Output = O> + Sized
 where
     T: Send,
     O: Send + 'static,
@@ -37,7 +37,7 @@ where
 
 impl<G, T, O> DeltaResultGenerator<T, O> for G
 where
-    G: generator::IntoGenerator<Request, Item = DeltaResult<T>, Output = O>,
+    G: generator::Generator<Request, Item = DeltaResult<T>, Output = O>,
     T: Send,
     O: Send + 'static,
 {
@@ -47,7 +47,7 @@ where
 ///
 /// Connector requests surface through the driver that owns the channel. The `'a` lifetime
 /// covers that channel and any state captured by the operation.
-pub type BoundGenerator<'a, Y, O = ()> = generator::BoundGenerator<'a, Y, O>;
+pub type GeneratorBody<'a, Y, O = ()> = generator::GeneratorBody<'a, Y, O>;
 
 /// Independently driven kernel generator that may borrow captured state.
 pub type GeneratorCoroutine<'a, Y, O = ()> = generator::GeneratorCoroutine<'a, Request, Y, O>;

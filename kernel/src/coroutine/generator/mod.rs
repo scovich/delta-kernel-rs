@@ -2,25 +2,25 @@
 //!
 //! # Unbound pipeline
 //!
-//! Kernel functions return [`IntoGenerator`]. Combinators on [`GeneratorExt`] run before a request
+//! Kernel functions return [`Generator`]. Combinators on [`GeneratorExt`] run before a request
 //! [`Channel`] exists: [`GeneratorExt::map`] transforms items, [`GeneratorExt::map_ok`] transforms
 //! successful result items, [`GeneratorExt::chain`] concatenates two generators, [`empty`] yields
 //! nothing, and [`AsyncIntoIterator::into_generator`] wraps an iterable. [`unfold`] and
 //! [`unfold_mut`] build a bound generator from owned state and a step future. Item-transforming
-//! combinators preserve terminal output; consuming helpers such as [`GeneratorExt::next`] require
+//! combinators preserve terminal output; consuming helpers such as [`BoundGenerator::next`] require
 //! `Output = ()`.
 //! [`generator_fn!`] builds an erased pipeline from an async body that later receives its channel.
 //!
 //! # Binding
 //!
-//! [`GeneratorExt::bind`] attaches a borrowed parent channel and produces a [`Generator`].
-//! [`Generator::poll_step`] returns [`GeneratorStep::Yield`] or [`GeneratorStep::Done`]. Connector
-//! requests posted by the body surface on that parent channel, not in `GeneratorStep`.
-//! [`GeneratorExt::next`] awaits items until `Output = ()` completion looks like exhaustion.
+//! [`Generator::bind`] attaches a borrowed parent channel and produces a [`BoundGenerator`].
+//! [`BoundGenerator::poll_step`] returns [`GeneratorStep::Yield`] or [`GeneratorStep::Done`].
+//! Connector requests posted by the body surface on that parent channel, not in `GeneratorStep`.
+//! [`BoundGenerator::next`] awaits items until `Output = ()` completion looks like exhaustion.
 //!
 //! [`generator!`] binds immediately: it takes a channel and an async body and returns a
-//! [`BoundGenerator`], the [`Generator`] used inside a parent coroutine. Await
-//! [`BoundGenerator::next`] (or [`GeneratorExt::next`]) for items; requests stay on the supplied
+//! [`GeneratorBody`], the [`BoundGenerator`] used inside a parent coroutine. Await
+//! [`GeneratorBody::next`] (or [`BoundGenerator::next`]) for items; requests stay on the supplied
 //! channel.
 //!
 //! # Independent driver
@@ -29,7 +29,7 @@
 //! a [`GeneratorCoroutine`] that owns its channel. [`GeneratorCoroutine::advance`] and
 //! [`GeneratorCoroutine::try_advance`] return [`GeneratorCoroutineStep`]: a yield, a request, or
 //! completion. [`StaticGeneratorCoroutine`] is the `'static` alias. A
-//! `Box<dyn IntoGenerator<...>>` converts into that wrapper via [`From`].
+//! `Box<dyn Generator<...>>` converts into that wrapper via [`From`].
 //!
 //! Adapter chains bind in place: no extra allocation or yield handshake per item. Polling after an
 //! error or completion is a logic error.
@@ -60,9 +60,10 @@ use delta_kernel_derive::internal_api;
 use tracing::{error, Instrument as _, Span};
 
 pub use self::adapters::{
-    empty, map_async_witness, unfold, AsyncIntoIterator, BoxedDeltaResultGenerator, BoxedGenerator,
-    Chain, FilterMap, FilterOk, Flatten, FlattenBy, Generator, GeneratorExt, GeneratorStep,
-    IntoGenerator, Iter, Map, MapAsync, MapAsyncWitness, MapOk, OnComplete, Peekable, Unfold,
+    empty, map_async_witness, unfold, AsyncIntoIterator, BoundGenerator, BoxedBoundGenerator,
+    BoxedDeltaResultGenerator, Chain, FilterMap, FilterOk, Flatten, FlattenBy, Generator,
+    GeneratorExt, GeneratorStep, Iter, Map, MapAsync, MapAsyncWitness, MapOk, OnComplete, Peekable,
+    Unfold,
 };
 pub(crate) use self::adapters::{unfold_mut_with, unfold_mut_witness};
 use super::core::{noop_context, Channel, DeltaFuture};
@@ -80,27 +81,27 @@ mod adapters;
 ///
 /// Use [`GeneratorCoroutine`] for an independently driven generator that exposes requests, yielded
 /// items, and completion to its driver.
-pub struct BoundGenerator<'a, Y: Send + 'a, O = ()> {
+pub struct GeneratorBody<'a, Y: Send + 'a, O = ()> {
     body: Option<Pin<Box<dyn DeltaFuture<O> + 'a>>>,
     yields: Arc<YieldQueue<Y>>,
     terminal: Option<DeltaResult<O>>,
 }
 
 // The body has its own stable heap address; no other field is structurally pinned.
-impl<'a, Y: Send + 'a, O> Unpin for BoundGenerator<'a, Y, O> {}
+impl<'a, Y: Send + 'a, O> Unpin for GeneratorBody<'a, Y, O> {}
 
-impl<'a, Y: Send + 'a> BoundGenerator<'a, Y> {
+impl<'a, Y: Send + 'a> GeneratorBody<'a, Y> {
     /// Waits for the next item, returning `None` if the generator is exhausted.
     ///
     /// Connector requests made while producing the item flow through the generator's channel.
     ///
     /// Calling this method after receiving anything other than `Ok(Some(_))` is a logic error.
     pub async fn next(&mut self) -> DeltaResult<Option<Y>> {
-        GeneratorExt::next(self).await
+        BoundGenerator::next(self).await
     }
 }
 
-impl<'a, Y: Send + 'a, O> BoundGenerator<'a, Y, O> {
+impl<'a, Y: Send + 'a, O> GeneratorBody<'a, Y, O> {
     fn new_with_witness<State, F, Fut>(state: State, witness: F) -> Self
     where
         F: FnOnce(State, Arc<YieldQueue<Y>>) -> Fut,
@@ -158,7 +159,7 @@ pub enum GeneratorCoroutineStep<P: Send + 'static, Y: Send, O: Send + 'static = 
 /// The generator owns its request channel and may borrow captured operation state for `'a`.
 pub struct GeneratorCoroutine<'a, P: Send + 'static, Y: Send + 'a, O: Send + 'static = ()> {
     requests: Arc<Channel<P>>,
-    generator: BoxedGenerator<'a, Y, O>,
+    generator: BoxedBoundGenerator<'a, Y, O>,
 }
 
 /// Independently driven generator that owns all captured state.
@@ -169,7 +170,7 @@ impl<'a, P: Send + 'static, Y: Send + 'a, O: Send + 'static> GeneratorCoroutine<
     ///
     /// `make_generator` runs immediately with the owned request channel. The returned generator
     /// remains unpolled until [`Self::advance`] or [`Self::try_advance`] is called.
-    pub fn new(make_generator: impl FnOnce(Arc<Channel<P>>) -> BoundGenerator<'a, Y, O>) -> Self {
+    pub fn new(make_generator: impl FnOnce(Arc<Channel<P>>) -> GeneratorBody<'a, Y, O>) -> Self {
         let channel = Arc::new(Channel::default());
         Self {
             requests: Arc::clone(&channel),
@@ -229,7 +230,7 @@ impl<'a, P: Send + 'static, Y: Send + 'a, O: Send + 'static> GeneratorCoroutine<
 /// The generator may borrow both its channel and caller state:
 ///
 /// ```
-/// use delta_kernel::coroutine::generator::{generator, BoundGenerator};
+/// use delta_kernel::coroutine::generator::{generator, GeneratorBody};
 /// use delta_kernel::coroutine::Channel;
 ///
 /// enum Request {}
@@ -237,7 +238,7 @@ impl<'a, P: Send + 'static, Y: Send + 'a, O: Send + 'static> GeneratorCoroutine<
 /// fn lengths<'a>(
 ///     channel: &'a Channel<Request>,
 ///     value: &'a str,
-/// ) -> BoundGenerator<'a, usize> {
+/// ) -> GeneratorBody<'a, usize> {
 ///     generator!(channel, async move |channel| {
 ///         channel.yield_item(value.len()).await
 ///     })
@@ -315,9 +316,9 @@ macro_rules! static_generator_coroutine {
     };
 }
 
-/// Creates an [`IntoGenerator`] from an async closure.
+/// Creates an [`Generator`] from an async closure.
 ///
-/// The request channel is supplied later by [`GeneratorExt::bind`].
+/// The request channel is supplied later by [`Generator::bind`].
 #[internal_api]
 macro_rules! generator_fn {
     ($body:expr) => {
@@ -335,7 +336,7 @@ macro_rules! map_async {
     };
 }
 
-/// Builds a [`Generator`] from owned state and an async `next(&mut state)` callback.
+/// Builds a [`BoundGenerator`] from owned state and an async `next(&mut state)` callback.
 ///
 /// Supplies the [`Send`] witness the same way [`generator!`] does. Each step boxes the
 /// compiler-generated future so the returned generator is [`Unpin`].
@@ -352,7 +353,7 @@ macro_rules! unfold_mut {
 
 impl<'a, P: Send + 'static, Y: Send + 'a, O: Send + 'static> GeneratorCoroutine<'a, P, Y, O> {
     /// Bind an unbound generator to an owned request channel.
-    pub fn from_generator(generator: impl IntoGenerator<P, Item = Y, Output = O> + 'a) -> Self {
+    pub fn from_generator(generator: impl Generator<P, Item = Y, Output = O> + 'a) -> Self {
         let requests = Arc::new(Channel::default());
         let generator = generator.bind_to(ChannelBinding::Owned(Arc::clone(&requests)));
         Self {
@@ -426,11 +427,11 @@ impl<F, P, Y, O> GeneratorFn<F, P, Y, O> {
     }
 }
 
-/// Erases a channel binder as `Box<dyn IntoGenerator<...>>`.
+/// Erases a channel binder as `Box<dyn Generator<...>>`.
 #[internal_api]
-pub(crate) fn box_generator<P, Y, O, F>(bind: F) -> Box<dyn IntoGenerator<P, Item = Y, Output = O>>
+pub(crate) fn box_generator<P, Y, O, F>(bind: F) -> Box<dyn Generator<P, Item = Y, Output = O>>
 where
-    F: for<'a> FnOnce(ChannelBinding<'a, P>) -> BoundGenerator<'a, Y, O> + Send + 'static,
+    F: for<'a> FnOnce(ChannelBinding<'a, P>) -> GeneratorBody<'a, Y, O> + Send + 'static,
     P: Send + 'static,
     Y: Send + 'static,
     O: Send + 'static,
@@ -440,9 +441,9 @@ where
 
 impl<F, P, Y, O> GeneratorExt for GeneratorFn<F, P, Y, O> {}
 
-impl<F, P, Y, O> IntoGenerator<P> for GeneratorFn<F, P, Y, O>
+impl<F, P, Y, O> Generator<P> for GeneratorFn<F, P, Y, O>
 where
-    F: for<'a> FnOnce(ChannelBinding<'a, P>) -> BoundGenerator<'a, Y, O> + Send + 'static,
+    F: for<'a> FnOnce(ChannelBinding<'a, P>) -> GeneratorBody<'a, Y, O> + Send + 'static,
     P: Send + 'static,
     Y: Send + 'static,
     O: Send + 'static,
@@ -453,14 +454,17 @@ where
     fn bind_to<'a>(
         self,
         channel: ChannelBinding<'a, P>,
-    ) -> impl Generator<Item = Y, Output = O> + Unpin + 'a
+    ) -> impl BoundGenerator<Item = Y, Output = O> + Unpin + 'a
     where
         Self: 'a,
     {
         (self.bind)(channel)
     }
 
-    fn bind_boxed<'a>(self: Box<Self>, channel: ChannelBinding<'a, P>) -> BoxedGenerator<'a, Y, O>
+    fn bind_boxed<'a>(
+        self: Box<Self>,
+        channel: ChannelBinding<'a, P>,
+    ) -> BoxedBoundGenerator<'a, Y, O>
     where
         Self: 'a,
     {
@@ -469,9 +473,9 @@ where
 }
 
 impl<'a, P: Send + 'static, Y: Send + 'a, O: Send + 'static>
-    From<Box<dyn IntoGenerator<P, Item = Y, Output = O> + 'a>> for GeneratorCoroutine<'a, P, Y, O>
+    From<Box<dyn Generator<P, Item = Y, Output = O> + 'a>> for GeneratorCoroutine<'a, P, Y, O>
 {
-    fn from(generator: Box<dyn IntoGenerator<P, Item = Y, Output = O> + 'a>) -> Self {
+    fn from(generator: Box<dyn Generator<P, Item = Y, Output = O> + 'a>) -> Self {
         let requests = Arc::new(Channel::default());
         Self {
             generator: generator.bind_boxed(ChannelBinding::Owned(Arc::clone(&requests))),
@@ -541,7 +545,7 @@ impl<'a, P: Send + 'static, Y: Send> GeneratorChannel<'a, P, Y> {
     /// Forward every item from a bound `generator` and return its completion.
     pub(crate) async fn yield_from<G, O: Send + 'static>(&self, mut generator: G) -> DeltaResult<O>
     where
-        G: Generator<Item = Y, Output = O> + Unpin,
+        G: BoundGenerator<Item = Y, Output = O> + Unpin,
     {
         loop {
             match poll_fn(|context| Pin::new(&mut generator).poll_step(context)).await? {
@@ -556,7 +560,7 @@ impl<'a, P: Send + 'static, Y: Send> GeneratorChannel<'a, P, Y> {
 /// [`static_generator_coroutine!`].
 ///
 /// Stores an uninvoked async function and the current tracing span until the macro constructs a
-/// [`BoundGenerator`]. This type is public only so exported macros can name it.
+/// [`GeneratorBody`]. This type is public only so exported macros can name it.
 #[doc(hidden)]
 #[internal_api]
 pub(crate) struct BodyFn<F, P, Y, O> {
@@ -572,7 +576,7 @@ pub(crate) struct BodyFn<F, P, Y, O> {
 // imposing another external lifetime requirement.
 //
 // `Self::into_generator_with` passes `self`, `channel`, and `Self::witness` to
-// `BoundGenerator::new_with_witness`; [`invoke_witness`] explains why the witness must remain
+// `GeneratorBody::new_with_witness`; [`invoke_witness`] explains why the witness must remain
 // separate. The returned future is instrumented with the captured span.
 impl<F, P: Send + 'static, Y: Send, O> BodyFn<F, P, Y, O> {
     /// Stores `body` without choosing its call-future proof path.
@@ -594,7 +598,7 @@ impl<F, P: Send + 'static, Y: Send, O> BodyFn<F, P, Y, O> {
         self,
         channel: C,
         witness: impl FnOnce(Self, C, Arc<YieldQueue<Y>>) -> Fut,
-    ) -> BoundGenerator<'generator, Y, O>
+    ) -> GeneratorBody<'generator, Y, O>
     where
         C: Deref<Target = Channel<P>> + Send + 'generator,
         Fut: DeltaFuture<O> + 'generator,
@@ -602,7 +606,7 @@ impl<F, P: Send + 'static, Y: Send, O> BodyFn<F, P, Y, O> {
         O: 'generator,
     {
         let witness = move |(this, channel), yields| witness(this, channel, yields);
-        BoundGenerator::new_with_witness((self, channel), witness)
+        GeneratorBody::new_with_witness((self, channel), witness)
     }
 
     /// Runs the body while exposing its concrete future to [`Self::into_generator_with`].

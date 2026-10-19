@@ -34,7 +34,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock};
 
-use crate::coroutine::generator::{generator_fn, Generator};
+use crate::coroutine::generator::{generator_fn, BoundGenerator};
 use crate::coroutine::kernel::DeltaResultGenerator;
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::deduplicator::{Deduplicator as _, FileActionInfo};
@@ -214,7 +214,7 @@ where
 
 impl<G, S> ActionReconciliationState<G, S>
 where
-    G: Generator<Item = DeltaResult<ActionReconciliationBatch>, Output = ()> + Unpin,
+    G: BoundGenerator<Item = DeltaResult<ActionReconciliationBatch>, Output = ()> + Unpin,
     S: Borrow<ActionReconciliationIteratorState>,
 {
     async fn advance(&mut self) -> DeltaResult<Option<DeltaResult<FilteredEngineData>>> {

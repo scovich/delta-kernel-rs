@@ -9,7 +9,7 @@ use crate::actions::{Metadata, Protocol, COMMIT_INFO_FIELD, METADATA_FIELD, PROT
 use crate::commit_range::with_version_context;
 use crate::coroutine::engine::EngineConnector;
 use crate::coroutine::kernel::{coroutine, Channel, Coroutine, DeltaResultGenerator};
-use crate::coroutine::{ChannelExt as _, GeneratorExt as _};
+use crate::coroutine::{BoundGenerator as _, ChannelExt as _, GeneratorExt as _};
 use crate::engine_data::RowVisitor as _;
 use crate::path::ParsedLogPath;
 use crate::schema::{lazy_schema_ref, SchemaRef};

@@ -23,8 +23,8 @@ use super::kernel::{
 #[cfg(feature = "declarative-plans")]
 use super::PlanOperation;
 use super::{
-    drive_coroutine, Cursor, GeneratorExt as _, Page, PageGenerator, PageRequest, PagedOperation,
-    PlanRequest, Request,
+    drive_coroutine, BoundGenerator as _, Cursor, GeneratorExt as _, Page, PageGenerator,
+    PageRequest, PagedOperation, PlanRequest, Request,
 };
 use crate::cancellation::{check_cancelled, CancellationTokenRef};
 use crate::committer::{Committer, FileSystemCommitter};

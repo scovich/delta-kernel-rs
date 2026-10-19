@@ -58,10 +58,10 @@
 //!
 //! A [`Coroutine`] already owns its request channel. For a streaming operation without a parent,
 //! pass owned inputs through [`generator::StaticGeneratorCoroutine::new`]. Its callback must return
-//! `BoundGenerator<'static, _>`, statically preventing borrowed state from escaping.
+//! `GeneratorBody<'static, _>`, statically preventing borrowed state from escaping.
 //!
 //! Kernel code that already has a [`kernel::Channel`] calls async implementations directly. Passing
-//! that channel to a streaming operation returns a [`BoundGenerator`] whose lifetime also covers
+//! that channel to a streaming operation returns a [`GeneratorBody`] whose lifetime also covers
 //! any other borrowed inputs. Requests then surface from the parent coroutine. Kernel may compose
 //! channel-provided futures with runtime-neutral future and stream combinators; every operation
 //! requiring connector work still passes through the channel.
@@ -119,8 +119,8 @@ pub use self::core::Reply;
 pub(crate) use self::core::{Channel, ChannelExchange, DeltaFuture};
 use self::generator::{unfold_mut, ChannelBinding};
 pub use self::generator::{
-    BoundGenerator, BoxedDeltaResultGenerator, BoxedGenerator, Flatten, Generator, GeneratorExt,
-    GeneratorStep, IntoGenerator,
+    BoundGenerator, BoxedBoundGenerator, BoxedDeltaResultGenerator, Flatten, Generator,
+    GeneratorBody, GeneratorExt, GeneratorStep,
 };
 #[doc(inline)]
 #[internal_api]
@@ -645,7 +645,7 @@ impl<Op: PagedOperation> PageGenerator<Op> {
 
 impl<Op: PagedOperation> GeneratorExt for PageGenerator<Op> {}
 
-impl<P, Op> IntoGenerator<P> for PageGenerator<Op>
+impl<P, Op> Generator<P> for PageGenerator<Op>
 where
     P: Send + 'static,
     Op: PagedOperation,
@@ -657,7 +657,7 @@ where
     fn bind_to<'a>(
         self,
         channel: ChannelBinding<'a, P>,
-    ) -> impl Generator<Item = Op::Page, Output = ()> + Unpin + 'a
+    ) -> impl BoundGenerator<Item = Op::Page, Output = ()> + Unpin + 'a
     where
         Self: 'a,
     {
@@ -667,7 +667,7 @@ where
     fn bind_boxed<'a>(
         self: Box<Self>,
         channel: ChannelBinding<'a, P>,
-    ) -> BoxedGenerator<'a, Op::Page>
+    ) -> BoxedBoundGenerator<'a, Op::Page>
     where
         Self: 'a,
     {

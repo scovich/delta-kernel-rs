@@ -22,7 +22,7 @@ use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 use crate::checkpoint::CheckpointShape;
 use crate::coroutine::engine::EngineConnector;
 use crate::coroutine::generator::{
-    map_async_witness, AsyncIntoIterator as _, GeneratorExt as _, IntoGenerator,
+    map_async_witness, AsyncIntoIterator as _, Generator, GeneratorExt as _,
 };
 use crate::coroutine::kernel::request::ReadParquetFiles;
 use crate::coroutine::kernel::{
@@ -1027,7 +1027,7 @@ impl Scan {
         existing_predicate: Option<PredicateRef>,
     ) -> Coroutine<
         '_,
-        Box<dyn IntoGenerator<Request, Item = DeltaResult<ScanMetadata>, Output = ()> + 'static>,
+        Box<dyn Generator<Request, Item = DeltaResult<ScanMetadata>, Output = ()> + 'static>,
     > {
         coroutine!(async move |channel| {
             self.scan_metadata_from_with_channel(
@@ -1047,7 +1047,7 @@ impl Scan {
         existing_data: impl DeltaResultGenerator<Box<dyn EngineData>> + 'static,
         _existing_predicate: Option<PredicateRef>,
     ) -> DeltaResult<
-        Box<dyn IntoGenerator<Request, Item = DeltaResult<ScanMetadata>, Output = ()> + 'static>,
+        Box<dyn Generator<Request, Item = DeltaResult<ScanMetadata>, Output = ()> + 'static>,
     > {
         // TODO(#966): validate that the current predicate is compatible with the hint predicate.
         if existing_version > self.snapshot.version() {

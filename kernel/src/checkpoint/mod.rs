@@ -120,7 +120,8 @@ use crate::actions::{
 };
 use crate::coroutine::engine::EngineConnector;
 use crate::coroutine::generator::{
-    map_async, AsyncIntoIterator as _, Generator, GeneratorExt as _, GeneratorStep,
+    map_async, AsyncIntoIterator as _, BoundGenerator, Generator as _, GeneratorExt as _,
+    GeneratorStep,
 };
 use crate::coroutine::kernel::request::{FileWriteMode, WriteParquetFile, WriteParquetFiles};
 use crate::coroutine::kernel::{

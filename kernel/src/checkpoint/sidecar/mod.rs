@@ -6,7 +6,7 @@ use std::sync::Arc;
 use itertools::Itertools;
 
 use crate::actions::{ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
-use crate::coroutine::generator::{Generator, GeneratorStep};
+use crate::coroutine::generator::{BoundGenerator, GeneratorStep};
 use crate::coroutine::kernel::request::{
     ExpressionEvaluatorHandle, PredicateEvaluatorHandle, WriteParquetFilesState,
 };
@@ -298,7 +298,7 @@ impl SidecarSplitter {
         checkpoint_data_iter: &mut G,
     ) -> DeltaResult<ControlFlow<(), Box<dyn EngineData>>>
     where
-        G: Generator<Item = DeltaResult<FilteredEngineData>, Output = ()> + Unpin,
+        G: BoundGenerator<Item = DeltaResult<FilteredEngineData>, Output = ()> + Unpin,
     {
         loop {
             let result =

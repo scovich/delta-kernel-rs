@@ -26,7 +26,9 @@ use crate::actions::{
 use crate::coroutine::kernel::Channel;
 #[cfg(test)]
 use crate::coroutine::run_coroutine_with_engine;
-use crate::coroutine::{AsyncOption as _, ChannelExt as _, DeltaFuture, GeneratorExt as _};
+use crate::coroutine::{
+    AsyncOption as _, BoundGenerator as _, ChannelExt as _, DeltaFuture, Generator as _,
+};
 use crate::crc::{
     is_incremental_safe_operation, read_crc_file_or_none_with_channel, size_to_u64, Crc, CrcDelta,
     FileSizeHistogram, FileStatsDelta,

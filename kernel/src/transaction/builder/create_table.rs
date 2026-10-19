@@ -19,7 +19,8 @@ use crate::committer::Committer;
 use crate::coroutine::kernel::request::DirectoryListing;
 use crate::coroutine::kernel::{static_coroutine, Channel, StaticCoroutine};
 use crate::coroutine::{
-    run_coroutine_with_engine, ChannelExt as _, GeneratorExt as _, PageGenerator,
+    run_coroutine_with_engine, BoundGenerator as _, ChannelExt as _, Generator as _,
+    GeneratorExt as _, PageGenerator,
 };
 use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;

@@ -13,7 +13,7 @@ use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 
 use crate::coroutine::engine::{EngineConnector, EngineResultGeneratorIterator};
-use crate::coroutine::generator::{map_async_witness, GeneratorExt as _};
+use crate::coroutine::generator::{map_async_witness, BoundGenerator as _, GeneratorExt as _};
 use crate::coroutine::kernel::{coroutine, Channel, ChannelExt as _, DeltaResultGenerator};
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::scan::CHECKPOINT_READ_SCHEMA;

@@ -12,7 +12,7 @@ use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::coroutine::kernel::Channel;
 #[cfg(test)]
 use crate::coroutine::run_coroutine_with_engine;
-use crate::coroutine::{ChannelExt as _, GeneratorExt as _};
+use crate::coroutine::{BoundGenerator as _, ChannelExt as _};
 use crate::engine_data::RowVisitor;
 use crate::utils::require;
 #[cfg(test)]

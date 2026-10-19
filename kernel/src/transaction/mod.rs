@@ -20,7 +20,7 @@ use crate::committer::{
 };
 use crate::coroutine::engine::EngineConnector;
 use crate::coroutine::generator::{
-    empty, map_async_witness, AsyncIntoIterator as _, GeneratorExt as _, IntoGenerator,
+    empty, map_async_witness, AsyncIntoIterator as _, Generator, GeneratorExt as _,
 };
 use crate::coroutine::kernel::request::EvaluationInput;
 use crate::coroutine::kernel::{coroutine, Channel, Coroutine, Request};
@@ -106,7 +106,7 @@ use update::{intermediate_dv_schema, new_dv_column_schema};
 pub use write_state::{BoundWriteContextBuilder, RowTrackingMetadataColumns, WriteState};
 
 type GeneratedAddActions =
-    Box<dyn IntoGenerator<Request, Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + 'static>;
+    Box<dyn Generator<Request, Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + 'static>;
 
 /// The static instance referenced by [`add_files_schema`] that doesn't contain the dataChange
 /// column.

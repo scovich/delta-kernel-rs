@@ -19,7 +19,7 @@ use super::request::{
 use super::PlanRequest;
 use super::{Channel, Request, StaticGeneratorCoroutine};
 use crate::committer::{Commit, CommitResponse, PublishMetadata};
-use crate::coroutine::generator::{Generator, GeneratorExt as _};
+use crate::coroutine::generator::{BoundGenerator, Generator as _, GeneratorExt as _};
 #[cfg(feature = "declarative-plans")]
 use crate::coroutine::PlanOperation;
 use crate::coroutine::{
@@ -104,7 +104,7 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
     fn flattened<Op>(
         &self,
         operation: Op,
-    ) -> impl Generator<Item = <Op::Page as IntoIterator>::Item, Output = ()> + Unpin + '_
+    ) -> impl BoundGenerator<Item = <Op::Page as IntoIterator>::Item, Output = ()> + Unpin + '_
     where
         Op: PagedOperation,
         Op::Page: IntoIterator,
@@ -118,7 +118,8 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
         files: impl Into<Vec<FileMeta>>,
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> impl Generator<Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + Unpin + '_ {
+    ) -> impl BoundGenerator<Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + Unpin + '_
+    {
         self.flattened(ReadJsonFiles::new(files, physical_schema, predicate))
     }
 
@@ -128,7 +129,8 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
         files: impl Into<Vec<FileMeta>>,
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> impl Generator<Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + Unpin + '_ {
+    ) -> impl BoundGenerator<Item = DeltaResult<Box<dyn EngineData>>, Output = ()> + Unpin + '_
+    {
         self.flattened(ReadParquetFiles::new(files, physical_schema, predicate))
     }
 
@@ -283,7 +285,7 @@ impl ChannelExt for Channel {
     fn flattened<Op>(
         &self,
         operation: Op,
-    ) -> impl Generator<Item = <Op::Page as IntoIterator>::Item, Output = ()> + Unpin + '_
+    ) -> impl BoundGenerator<Item = <Op::Page as IntoIterator>::Item, Output = ()> + Unpin + '_
     where
         Op: PagedOperation,
         Op::Page: IntoIterator,

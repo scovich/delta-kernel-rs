@@ -33,7 +33,7 @@ pub use filesystem::FileSystemCommitter;
 pub use publish_types::{CatalogCommit, PublishMetadata};
 
 use crate::coroutine::engine::EngineConnector;
-use crate::coroutine::generator::GeneratorExt as _;
+use crate::coroutine::generator::BoundGenerator as _;
 use crate::coroutine::kernel::{static_generator_coroutine, StaticGeneratorCoroutine};
 use crate::coroutine::DeltaResultGenerator;
 use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, FilteredEngineData};

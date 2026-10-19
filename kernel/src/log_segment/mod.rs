@@ -21,8 +21,8 @@ use crate::coroutine::kernel::{coroutine, Channel, DeltaResultGenerator};
 #[cfg(test)]
 use crate::coroutine::run_coroutine_with_engine;
 use crate::coroutine::{
-    iterate_prepared_result_generator_with_engine, run_coroutine_with_storage,
-    BoxedDeltaResultGenerator, ChannelExt as _, GeneratorExt as _, IntoGenerator,
+    iterate_prepared_result_generator_with_engine, run_coroutine_with_storage, BoundGenerator as _,
+    BoxedDeltaResultGenerator, ChannelExt as _, Generator, GeneratorExt as _,
 };
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};

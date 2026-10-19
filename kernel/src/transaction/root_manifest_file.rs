@@ -8,7 +8,7 @@ use crate::actions::{
 use crate::coroutine::kernel::Channel;
 #[cfg(test)]
 use crate::coroutine::run_coroutine_with_engine;
-use crate::coroutine::GeneratorExt as _;
+use crate::coroutine::{BoundGenerator as _, Generator as _};
 use crate::crc::{merge_domain_metadata, DomainMetadataState, SetTransactionState};
 use crate::error::Error;
 use crate::log_segment::DomainMetadataMap;

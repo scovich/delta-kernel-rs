@@ -17,7 +17,7 @@ use crate::coroutine::iterate_prepared_result_generator_with_engine;
 use crate::coroutine::kernel::{Channel, DeltaResultGenerator};
 #[cfg(test)]
 use crate::coroutine::run_coroutine_with_engine;
-use crate::coroutine::GeneratorExt as _;
+use crate::coroutine::{BoundGenerator as _, Generator as _};
 use crate::crc::merge_domain_metadata;
 use crate::log_replay::ActionsBatch;
 #[cfg(test)]
