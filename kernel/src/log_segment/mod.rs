@@ -17,11 +17,11 @@ use crate::cancellation::CancellationTokenRef;
 use crate::committer::CatalogCommit;
 use crate::coroutine::engine::EngineConnector;
 use crate::coroutine::generator::empty;
-use crate::coroutine::kernel::{coroutine, Channel, DeltaResultGenerator};
+use crate::coroutine::kernel::{workflow, Channel, DeltaResultGenerator};
 #[cfg(test)]
-use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::run_workflow_with_engine;
 use crate::coroutine::{
-    iterate_prepared_result_generator_with_engine, run_coroutine_with_storage, BoundGenerator as _,
+    iterate_prepared_result_generator_with_engine, run_workflow_with_storage, BoundGenerator as _,
     ChannelExt as _, Generator, GeneratorExt as _,
 };
 use crate::expressions::ColumnName;
@@ -455,7 +455,7 @@ impl LogSegment {
         metric_context: SnapshotLoadMetricContext,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
-        run_coroutine_with_storage!(storage, cancellation_token.cloned(), async move |channel| {
+        run_workflow_with_storage!(storage, cancellation_token.cloned(), async move |channel| {
             Self::for_snapshot_with_channel(
                 channel,
                 log_root,
@@ -523,7 +523,7 @@ impl LogSegment {
         time_travel_version: Option<Version>,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
-        run_coroutine_with_storage!(storage, cancellation_token.cloned(), async move |channel| {
+        run_workflow_with_storage!(storage, cancellation_token.cloned(), async move |channel| {
             Self::for_snapshot_impl_with_channel(
                 channel,
                 log_root,
@@ -605,7 +605,7 @@ impl LogSegment {
         end_version: impl Into<Option<Version>>,
     ) -> DeltaResult<Self> {
         let end_version = end_version.into();
-        run_coroutine_with_storage!(storage, None, async move |channel| {
+        run_workflow_with_storage!(storage, None, async move |channel| {
             Self::for_table_changes_with_channel(channel, log_root, start_version, end_version)
                 .await
         })
@@ -684,7 +684,7 @@ impl LogSegment {
         limit: Option<NonZero<usize>>,
         log_tail: Vec<ParsedLogPath>,
     ) -> DeltaResult<Self> {
-        run_coroutine_with_storage!(storage, None, async move |channel| {
+        run_workflow_with_storage!(storage, None, async move |channel| {
             Self::for_timestamp_conversion_with_channel(
                 channel,
                 log_root,
@@ -933,7 +933,7 @@ impl LogSegment {
     > {
         let connector =
             EngineConnector::new(engine).with_cancellation_token(cancellation_token.cloned());
-        let coroutine = coroutine!(async move |channel| {
+        let workflow = workflow!(async move |channel| {
             self.read_actions_with_projected_checkpoint_actions_with_channel(
                 channel,
                 commit_read_schema,
@@ -946,7 +946,7 @@ impl LogSegment {
         });
         let (actions, checkpoint_info) = connector
             .iterate_prepared_result_generator_with_companion(
-                coroutine,
+                workflow,
                 ActionsWithCheckpointInfo::into_parts,
             )?;
         Ok(ActionsWithCheckpointInfo {
@@ -1202,7 +1202,7 @@ impl LogSegment {
         engine: &dyn Engine,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<(Option<SchemaRef>, Vec<FileMeta>)> {
-        run_coroutine_with_engine!(engine, cancellation_token.cloned(), async move |channel| {
+        run_workflow_with_engine!(engine, cancellation_token.cloned(), async move |channel| {
             self.get_file_actions_schema_and_sidecars_with_channel(channel)
                 .await
         })
@@ -1326,7 +1326,7 @@ impl LogSegment {
     > {
         let connector =
             EngineConnector::new(engine).with_cancellation_token(cancellation_token.cloned());
-        let coroutine = coroutine!(async move |channel| {
+        let workflow = workflow!(async move |channel| {
             self.create_checkpoint_stream_with_channel(
                 channel,
                 action_schema,
@@ -1338,7 +1338,7 @@ impl LogSegment {
         });
         let (actions, checkpoint_info) = connector
             .iterate_prepared_result_generator_with_companion(
-                coroutine,
+                workflow,
                 ActionsWithCheckpointInfo::into_parts,
             )?;
         Ok(ActionsWithCheckpointInfo {

@@ -5,7 +5,7 @@ use super::Transaction;
 use crate::actions::{CommitInfo, COMMIT_INFO_NAME, LOG_COMMIT_INFO_SCHEMA};
 use crate::coroutine::kernel::Channel;
 #[cfg(test)]
-use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::run_workflow_with_engine;
 use crate::coroutine::ChannelExt as _;
 use crate::engine_data::{GetData, MapItem, RowVisitor, TypedGetData as _};
 use crate::expressions::{lit, null_lit, MapData, Scalar};
@@ -78,7 +78,7 @@ impl<S> Transaction<S> {
         engine: &dyn Engine,
         kernel_commit_info: CommitInfo,
     ) -> Result<Box<dyn EngineData>, Error> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.generate_commit_info_with_channel(channel, kernel_commit_info)
                 .await
         })

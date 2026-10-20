@@ -23,7 +23,7 @@ use crate::coroutine::generator::{
     empty, map_async_witness, AsyncIntoIterator as _, Generator, GeneratorExt as _,
 };
 use crate::coroutine::kernel::request::EvaluationInput;
-use crate::coroutine::kernel::{coroutine, Channel, Coroutine};
+use crate::coroutine::kernel::{workflow, Channel, Workflow};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::coroutine::AsyncOption as _;
 use crate::coroutine::{AsyncBool as _, ChannelExt as _, DeltaResultGenerator, Request};
@@ -393,7 +393,7 @@ impl<S> TransactionWithCommitter<S> {
     }
 
     /// Return the transaction's commit workflow and its bound committer.
-    pub fn commit_workflow<'a>(self) -> (Coroutine<'a, CommitResult<S>>, Box<dyn Committer>)
+    pub fn commit_workflow<'a>(self) -> (Workflow<'a, CommitResult<S>>, Box<dyn Committer>)
     where
         S: 'a,
     {
@@ -491,11 +491,11 @@ impl<S> Transaction<S> {
     /// - Ok(CommitResult) for either success or a recoverable error (includes the failed
     ///   transaction in case of a conflict so the user can retry, etc.)
     /// - Err(Error) indicates a non-retryable error (e.g. logic/validation error).
-    pub fn commit_workflow<'a>(self) -> Coroutine<'a, CommitResult<S>>
+    pub fn commit_workflow<'a>(self) -> Workflow<'a, CommitResult<S>>
     where
         S: 'a,
     {
-        coroutine!(async move |channel| self.commit_with_channel(channel).await)
+        workflow!(async move |channel| self.commit_with_channel(channel).await)
     }
 
     #[instrument(

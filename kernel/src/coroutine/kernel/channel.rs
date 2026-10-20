@@ -17,9 +17,7 @@ use super::request::{
 };
 #[cfg(feature = "declarative-plans")]
 use super::PlanRequest;
-use super::{
-    BoundDeltaResultGenerator, Channel, DeltaResultGenerator, Request, StaticGeneratorCoroutine,
-};
+use super::{BoundDeltaResultGenerator, Channel, DeltaResultGenerator, Request, StaticCoroutine};
 use crate::committer::{Commit, CommitResponse, PublishMetadata};
 use crate::coroutine::generator::{BoundGenerator, Flatten, Generator, GeneratorExt as _};
 use crate::coroutine::{
@@ -180,7 +178,7 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
         &self,
         url: &Url,
         mode: FileWriteMode,
-        input: StaticGeneratorCoroutine<FilteredEngineData>,
+        input: StaticCoroutine<FilteredEngineData>,
     ) -> impl DeltaFuture<FileSize> {
         let operation = WriteJsonFile::new(url.clone(), mode, input);
         self.exchange(Box::new(operation), Request::WriteJson)

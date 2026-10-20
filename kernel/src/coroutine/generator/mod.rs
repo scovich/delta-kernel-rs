@@ -19,35 +19,35 @@
 //! [`BoundGenerator::next`] awaits items until `Output = ()` completion looks like exhaustion.
 //!
 //! [`generator!`] binds immediately: it takes a channel and an async body and returns a
-//! [`GeneratorBody`], the [`BoundGenerator`] used inside a parent coroutine. Await
+//! [`GeneratorBody`], the [`BoundGenerator`] used with a parent [`Channel`]. Await
 //! [`GeneratorBody::next`] (or [`BoundGenerator::next`]) for items; requests stay on the supplied
 //! channel.
 //!
 //! # Independent driver
 //!
-//! With no parent channel, [`generator_coroutine!`] (or [`static_generator_coroutine!`]) constructs
-//! a [`GeneratorCoroutine`] that owns its channel. [`GeneratorCoroutine::advance`] and
-//! [`GeneratorCoroutine::try_advance`] return [`GeneratorCoroutineStep`]: a yield, a request, or
-//! completion. [`StaticGeneratorCoroutine`] is the `'static` alias. A
+//! With no parent channel, [`coroutine!`] (or [`static_coroutine!`]) constructs
+//! a [`Coroutine`] that owns its channel. [`Coroutine::advance`] and
+//! [`Coroutine::try_advance`] return [`CoroutineStep`]: a yield, a request, or
+//! completion. [`StaticCoroutine`] is the `'static` alias. A
 //! `Box<dyn Generator<...>>` converts into that wrapper via [`From`].
 //!
 //! Adapter chains bind in place: no extra allocation or yield handshake per item. Polling after an
 //! error or completion is a logic error.
 //!
-//! [`GeneratorCoroutine`]: generator::GeneratorCoroutine
-//! [`GeneratorCoroutine::new`]: generator::GeneratorCoroutine::new
-//! [`GeneratorCoroutine::advance`]: generator::GeneratorCoroutine::advance
-//! [`GeneratorCoroutine::try_advance`]: generator::GeneratorCoroutine::try_advance
-//! [`GeneratorCoroutineStep`]: generator::GeneratorCoroutineStep
-//! [`StaticGeneratorCoroutine`]: generator::StaticGeneratorCoroutine
+//! [`Coroutine`]: generator::Coroutine
+//! [`Coroutine::new`]: generator::Coroutine::new
+//! [`Coroutine::advance`]: generator::Coroutine::advance
+//! [`Coroutine::try_advance`]: generator::Coroutine::try_advance
+//! [`CoroutineStep`]: generator::CoroutineStep
+//! [`StaticCoroutine`]: generator::StaticCoroutine
 //! [`AsyncIntoIterator::into_generator`]: generator::AsyncIntoIterator::into_generator
 //! [`empty`]: generator::empty
 //! [`unfold`]: generator::unfold
 //! [`unfold_mut`]: generator::unfold_mut
 //! [`generator_fn!`]: generator::generator_fn
 //! [`generator!`]: generator::generator
-//! [`generator_coroutine!`]: generator::generator_coroutine
-//! [`static_generator_coroutine!`]: generator::static_generator_coroutine
+//! [`coroutine!`]: generator::coroutine
+//! [`static_coroutine!`]: generator::static_coroutine
 
 use std::collections::VecDeque;
 use std::future::{poll_fn, Future};
@@ -65,20 +65,20 @@ pub use self::adapters::{
     Map, MapAsync, MapAsyncWitness, MapOk, OnComplete, Peekable, Unfold,
 };
 pub(crate) use self::adapters::{unfold_mut_with, unfold_mut_witness};
-use super::core::{noop_context, Channel, DeltaFuture};
+use super::channel::{noop_context, Channel, DeltaFuture};
 use super::invoke_witness;
 use crate::utils::PhantomType;
 use crate::{DeltaResult, DeltaResultIteratorStatic, Error};
 
 mod adapters;
 
-/// Streaming coroutine that yields zero or more items to its caller before producing a final value.
+/// Bound generator that yields zero or more items to its caller before producing a final value.
 ///
 /// Connector requests surface through the driver that owns the supplied channel, while
 /// [`Self::next`] returns yielded items and reports successful completion as exhaustion. The `'a`
 /// lifetime covers the channel binding and any state borrowed by the operation.
 ///
-/// Use [`GeneratorCoroutine`] for an independently driven generator that exposes requests, yielded
+/// Use [`Coroutine`] for an independently driven generator that exposes requests, yielded
 /// items, and completion to its driver.
 pub struct GeneratorBody<'a, Y: Send + 'a, O = ()> {
     body: Option<Pin<Box<dyn DeltaFuture<O> + 'a>>>,
@@ -140,11 +140,11 @@ impl<'a, Y: Send + 'a, O> GeneratorBody<'a, Y, O> {
     }
 }
 
-/// Yield, request, or completion produced by advancing a [`GeneratorCoroutine`].
+/// Yield, request, or completion produced by advancing a [`Coroutine`].
 ///
 /// Yielded items are removed from the pending queue before this step returns. Requests carry their
 /// own replies.
-pub enum GeneratorCoroutineStep<P: Send + 'static, Y: Send, O: Send + 'static = ()> {
+pub enum CoroutineStep<P: Send + 'static, Y: Send, O: Send + 'static = ()> {
     /// A yielded item.
     Yield(Y),
     /// Connector work offered by the generator.
@@ -156,15 +156,15 @@ pub enum GeneratorCoroutineStep<P: Send + 'static, Y: Send, O: Send + 'static = 
 /// Independently driven generator with owned request state.
 ///
 /// The generator owns its request channel and may borrow captured operation state for `'a`.
-pub struct GeneratorCoroutine<'a, P: Send + 'static, Y: Send + 'a, O: Send + 'static = ()> {
+pub struct Coroutine<'a, P: Send + 'static, Y: Send + 'a, O: Send + 'static = ()> {
     requests: Arc<Channel<P>>,
     generator: BoxedBoundGenerator<'a, Y, O>,
 }
 
 /// Independently driven generator that owns all captured state.
-pub type StaticGeneratorCoroutine<P, Y, O = ()> = GeneratorCoroutine<'static, P, Y, O>;
+pub type StaticCoroutine<P, Y, O = ()> = Coroutine<'static, P, Y, O>;
 
-impl<'a, P: Send + 'static, Y: Send + 'a, O: Send + 'static> GeneratorCoroutine<'a, P, Y, O> {
+impl<'a, P: Send + 'static, Y: Send + 'a, O: Send + 'static> Coroutine<'a, P, Y, O> {
     /// Constructs a generator around an infallible channel-taking operation.
     ///
     /// `make_generator` runs immediately with the owned request channel. The returned generator
@@ -181,12 +181,12 @@ impl<'a, P: Send + 'static, Y: Send + 'a, O: Send + 'static> GeneratorCoroutine<
     ///
     /// Polls the generator once and returns with [`Error::WouldBlock`] if no next step is
     /// immediately available. This happens if the generator is blocked on one or more outstanding
-    /// [`GeneratorCoroutineStep::Request`]; callers can unblock the generator by responding to
+    /// [`CoroutineStep::Request`]; callers can unblock the generator by responding to
     /// previously-received requests by invoking their [`Reply::send`](super::Reply::send) (or
     /// dropping them) before calling this method again.
     ///
-    /// Calling this method after receiving [`GeneratorCoroutineStep::Done`] is a logic error.
-    pub fn try_advance(&mut self) -> DeltaResult<GeneratorCoroutineStep<P, Y, O>> {
+    /// Calling this method after receiving [`CoroutineStep::Done`] is a logic error.
+    pub fn try_advance(&mut self) -> DeltaResult<CoroutineStep<P, Y, O>> {
         match self.poll_step(&mut noop_context()) {
             Poll::Ready(step) => step,
             Poll::Pending => Err(Error::WouldBlock),
@@ -194,12 +194,12 @@ impl<'a, P: Send + 'static, Y: Send + 'a, O: Send + 'static> GeneratorCoroutine<
     }
 
     /// Advances to the next yielded item, request or completion, waiting asynchronously if the
-    /// generator is blocked on one or more outstanding [`GeneratorCoroutineStep::Request`]. Invoke
+    /// generator is blocked on one or more outstanding [`CoroutineStep::Request`]. Invoke
     /// the requests' [`Reply::send`](super::Reply::send) (or drop them) to unblock the
     /// generator.
     ///
-    /// Calling this method after receiving [`GeneratorCoroutineStep::Done`] is a logic error.
-    pub async fn advance(&mut self) -> DeltaResult<GeneratorCoroutineStep<P, Y, O>> {
+    /// Calling this method after receiving [`CoroutineStep::Done`] is a logic error.
+    pub async fn advance(&mut self) -> DeltaResult<CoroutineStep<P, Y, O>> {
         poll_fn(|context| self.poll_step(context)).await
     }
 
@@ -207,24 +207,24 @@ impl<'a, P: Send + 'static, Y: Send + 'a, O: Send + 'static> GeneratorCoroutine<
     fn poll_step(
         &mut self,
         context: &mut Context<'_>,
-    ) -> Poll<DeltaResult<GeneratorCoroutineStep<P, Y, O>>> {
+    ) -> Poll<DeltaResult<CoroutineStep<P, Y, O>>> {
         match Pin::new(&mut *self.generator).poll_step(context) {
             Poll::Ready(Ok(GeneratorStep::Yield(item))) => {
-                Poll::Ready(Ok(GeneratorCoroutineStep::Yield(item)))
+                Poll::Ready(Ok(CoroutineStep::Yield(item)))
             }
             Poll::Ready(Ok(GeneratorStep::Done(output))) => {
-                Poll::Ready(Ok(GeneratorCoroutineStep::Done(output)))
+                Poll::Ready(Ok(CoroutineStep::Done(output)))
             }
             Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
             Poll::Pending => match self.requests.pop() {
-                Some(request) => Poll::Ready(Ok(GeneratorCoroutineStep::Request(request))),
+                Some(request) => Poll::Ready(Ok(CoroutineStep::Request(request))),
                 None => Poll::Pending,
             },
         }
     }
 }
 
-/// Creates a generator coroutine using an existing request channel.
+/// Creates a bound generator using an existing request channel.
 ///
 /// The generator may borrow both its channel and caller state:
 ///
@@ -251,7 +251,7 @@ macro_rules! generator {
     };
 }
 
-/// Creates a [`GeneratorCoroutine`] for a specific request vocabulary.
+/// Creates a [`Coroutine`] for a specific request vocabulary.
 ///
 /// The coroutine owns its request channel but may borrow captured state.
 ///
@@ -259,7 +259,7 @@ macro_rules! generator {
 /// add typed operations with an extension trait over that channel:
 ///
 /// ```
-/// use delta_kernel::coroutine::generator::{generator_coroutine, GeneratorCoroutineStep};
+/// use delta_kernel::coroutine::generator::{coroutine, CoroutineStep};
 /// use delta_kernel::coroutine::{Channel, ChannelExchange, DeltaFuture, Reply};
 ///
 /// enum Request {
@@ -274,44 +274,44 @@ macro_rules! generator {
 ///
 /// impl ChannelExt for Channel<Request> {}
 ///
-/// let mut generator = generator_coroutine!(Request, async move |channel| {
+/// let mut generator = coroutine!(Request, async move |channel| {
 ///     let length = channel.length("delta".to_string()).await?;
 ///     channel.yield_item(length).await
 /// });
-/// let GeneratorCoroutineStep::Request(Request::Length(value, reply)) = generator.try_advance()? else {
+/// let CoroutineStep::Request(Request::Length(value, reply)) = generator.try_advance()? else {
 ///     unreachable!("generator did not request a length");
 /// };
 /// reply.send(Ok(value.len()));
-/// let GeneratorCoroutineStep::Yield(length) = generator.try_advance()? else {
+/// let CoroutineStep::Yield(length) = generator.try_advance()? else {
 ///     unreachable!("generator did not yield");
 /// };
 /// assert_eq!(length, 5);
-/// assert!(matches!(generator.try_advance()?, GeneratorCoroutineStep::Done(())));
+/// assert!(matches!(generator.try_advance()?, CoroutineStep::Done(())));
 /// # Ok::<(), delta_kernel::Error>(())
 /// ```
 #[internal_api]
-macro_rules! generator_coroutine {
+macro_rules! coroutine {
     ($request:ty, $body:expr) => {
-        $crate::coroutine::generator::GeneratorCoroutine::<$request, _, _>::new(move |channel| {
+        $crate::coroutine::generator::Coroutine::<$request, _, _>::new(move |channel| {
             $crate::coroutine::generator::generator!(channel, $body)
         })
     };
 }
 
-/// Creates a [`StaticGeneratorCoroutine`] that owns all captured state.
+/// Creates a [`StaticCoroutine`] that owns all captured state.
 ///
 /// ```
-/// use delta_kernel::coroutine::generator::{static_generator_coroutine, StaticGeneratorCoroutine};
+/// use delta_kernel::coroutine::generator::{static_coroutine, StaticCoroutine};
 ///
 /// enum Request {}
 ///
-/// let generator: StaticGeneratorCoroutine<Request, ()> =
-///     static_generator_coroutine!(Request, async move |_channel| Ok(()));
+/// let generator: StaticCoroutine<Request, ()> =
+///     static_coroutine!(Request, async move |_channel| Ok(()));
 /// ```
 #[internal_api]
-macro_rules! static_generator_coroutine {
+macro_rules! static_coroutine {
     ($request:ty, $body:expr) => {
-        $crate::coroutine::generator::generator_coroutine!($request, $body)
+        $crate::coroutine::generator::coroutine!($request, $body)
     };
 }
 
@@ -350,7 +350,7 @@ macro_rules! unfold_mut {
     };
 }
 
-impl<'a, P: Send + 'static, Y: Send + 'a, O: Send + 'static> GeneratorCoroutine<'a, P, Y, O> {
+impl<'a, P: Send + 'static, Y: Send + 'a, O: Send + 'static> Coroutine<'a, P, Y, O> {
     /// Bind an unbound generator to an owned request channel.
     pub fn from_generator(generator: impl Generator<P, Item = Y, Output = O> + 'a) -> Self {
         let requests = Arc::new(Channel::default());
@@ -362,12 +362,12 @@ impl<'a, P: Send + 'static, Y: Send + 'a, O: Send + 'static> GeneratorCoroutine<
     }
 }
 
-impl<P: Send + 'static, Y: Send + 'static> StaticGeneratorCoroutine<P, Y> {
+impl<P: Send + 'static, Y: Send + 'static> StaticCoroutine<P, Y> {
     /// Adapt a sendable iterator into a lazy generator.
     ///
     /// Advancing the generator polls `items` inline and propagates item errors.
     pub fn from_iterator(items: DeltaResultIteratorStatic<Y>) -> Self {
-        static_generator_coroutine!(P, async move |channel| {
+        static_coroutine!(P, async move |channel| {
             for item in items {
                 channel.yield_item(item?).await?;
             }
@@ -378,7 +378,7 @@ impl<P: Send + 'static, Y: Send + 'static> StaticGeneratorCoroutine<P, Y> {
 
 /// Request-channel ownership supplied when binding a generator.
 pub enum ChannelBinding<'a, P: 'static> {
-    /// Bind to a parent coroutine's request channel.
+    /// Bind to a borrowed parent request channel.
     Borrowed(&'a Channel<P>),
     /// Bind to an independently driven request channel.
     Owned(Arc<Channel<P>>),
@@ -472,7 +472,7 @@ where
 }
 
 impl<'a, P: Send + 'static, Y: Send + 'a, O: Send + 'static>
-    From<Box<dyn Generator<P, Item = Y, Output = O> + 'a>> for GeneratorCoroutine<'a, P, Y, O>
+    From<Box<dyn Generator<P, Item = Y, Output = O> + 'a>> for Coroutine<'a, P, Y, O>
 {
     fn from(generator: Box<dyn Generator<P, Item = Y, Output = O> + 'a>) -> Self {
         let requests = Arc::new(Channel::default());
@@ -555,8 +555,8 @@ impl<'a, P: Send + 'static, Y: Send> GeneratorChannel<'a, P, Y> {
     }
 }
 
-/// Hidden expansion state for [`generator!`], [`generator_coroutine!`], and
-/// [`static_generator_coroutine!`].
+/// Hidden expansion state for [`generator!`], [`coroutine!`], and
+/// [`static_coroutine!`].
 ///
 /// Stores an uninvoked async function and the current tracing span until the macro constructs a
 /// [`GeneratorBody`]. This type is public only so exported macros can name it.
@@ -621,7 +621,7 @@ impl<F, P: Send + 'static, Y: Send, O> BodyFn<F, P, Y, O> {
         let future = async move {
             let channel = GeneratorChannel::new(&channel, yields);
             let output = (self.body)(channel).await;
-            output.inspect_err(|err| error!(error = %err, "coroutine generator failed"))
+            output.inspect_err(|err| error!(error = %err, "generator failed"))
         };
         future.instrument(self.span)
     }

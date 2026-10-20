@@ -7,8 +7,8 @@ use tracing::{info, instrument};
 
 use crate::actions::{Metadata, Protocol};
 use crate::cancellation::CancellationTokenRef;
-use crate::coroutine::kernel::{static_coroutine, Channel, StaticCoroutine};
-use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::kernel::{static_workflow, Channel, StaticWorkflow};
+use crate::coroutine::run_workflow_with_engine;
 use crate::crc::Crc;
 use crate::error::SnapshotHintError;
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -430,7 +430,7 @@ impl<Mode> SnapshotBuilder<Mode> {
     // (see `IS_CATALOG_MANAGED_FIELD`).
     pub fn build(mut self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
         let cancellation_token = self.cancellation_token.take();
-        run_coroutine_with_engine!(engine, cancellation_token, async move |channel| {
+        run_workflow_with_engine!(engine, cancellation_token, async move |channel| {
             self.build_with_channel(channel).await
         })
     }
@@ -439,11 +439,11 @@ impl<Mode> SnapshotBuilder<Mode> {
     ///
     /// Cancellation is connector-owned. A caller that configured this builder with
     /// [`Self::with_cancellation_token`] must install the same token on the workflow driver.
-    pub fn build_workflow(self) -> StaticCoroutine<SnapshotRef>
+    pub fn build_workflow(self) -> StaticWorkflow<SnapshotRef>
     where
         Mode: 'static,
     {
-        static_coroutine!(async move |channel| self.build_with_channel(channel).await)
+        static_workflow!(async move |channel| self.build_with_channel(channel).await)
     }
 
     /// Build this snapshot through `channel`.

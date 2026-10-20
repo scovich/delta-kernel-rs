@@ -5,7 +5,7 @@
 //! advancing Kernel again; connectors that desire request concurrency can provide their own driver.
 //!
 //! Use [`AsyncEngineConnector::run`] when this connector should serve every kernel request. To
-//! intercept requests such as catalog commit and publish operations, drive the coroutine yourself,
+//! intercept requests such as catalog commit and publish operations, drive the workflow yourself,
 //! handle selected variants, and pass the rest to [`AsyncEngineConnector::reply`].
 //!
 //! This driver awaits native asynchronous I/O. [`crate::DefaultEngine`] instead implements
@@ -30,12 +30,10 @@ use delta_kernel::coroutine::kernel::request::{
     FileWriteMode, ForwardListing, ListingBounds, PredicateEvaluatorHandle, ReadJsonFiles,
     ReadParquetFiles, WriteJsonFile, WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
 };
-use delta_kernel::coroutine::kernel::{
-    GeneratorCoroutineStep, StaticCoroutine, StaticGeneratorCoroutine,
-};
+use delta_kernel::coroutine::kernel::{CoroutineStep, StaticCoroutine, StaticWorkflow};
 use delta_kernel::coroutine::{
-    drive_coroutine_async, AsyncResult as _, Cursor, Page, PageRequest, PagedOperation,
-    PlanRequest, Request,
+    drive_workflow_async, AsyncResult as _, Cursor, Page, PageRequest, PagedOperation, PlanRequest,
+    Request,
 };
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
@@ -61,7 +59,7 @@ use crate::json::read_json_files_impl;
 use crate::parquet::{read_parquet_files_impl, read_parquet_footer_impl};
 use crate::{DEFAULT_READ_BATCH_SIZE, DEFAULT_READ_BUFFER_SIZE};
 
-/// Drives kernel coroutines one request at a time through the default engine's native async I/O.
+/// Drives kernel workflows one request at a time through the default engine's native async I/O.
 ///
 /// This connector does not use [`delta_kernel::Engine`] or a
 /// [`crate::executor::TaskExecutor`]. Callers may handle selected [`Request`] variants themselves
@@ -149,16 +147,16 @@ impl AsyncEngineConnector {
         self
     }
 
-    /// Serve every request from `coroutine` until it completes.
-    pub async fn run<O: Send + 'static>(&self, coroutine: StaticCoroutine<O>) -> DeltaResult<O> {
-        Ok(drive_coroutine_async!(coroutine, |request| {
+    /// Serve every request from `workflow` until it completes.
+    pub async fn run<O: Send + 'static>(&self, workflow: StaticWorkflow<O>) -> DeltaResult<O> {
+        Ok(drive_workflow_async!(workflow, |request| {
             self.reply(request).await?
         }))
     }
 
-    /// Perform `request` and deliver its response to the suspended coroutine.
+    /// Perform `request` and deliver its response to the suspended caller.
     ///
-    /// Commit requests run the filesystem commit coroutine recursively. Publish requests are
+    /// Commit requests run the filesystem commit workflow recursively. Publish requests are
     /// rejected because they require a catalog-specific driver.
     pub async fn reply(&self, request: Request) -> DeltaResult<()> {
         self.check_cancelled()?;
@@ -327,11 +325,11 @@ impl AsyncEngineConnector {
         loop {
             self.check_cancelled()?;
             match input.advance().await? {
-                GeneratorCoroutineStep::Done(()) => break,
-                GeneratorCoroutineStep::Yield(data) => {
+                CoroutineStep::Done(()) => break,
+                CoroutineStep::Yield(data) => {
                     buffer.extend(to_json_bytes(std::iter::once(Ok(data)))?);
                 }
-                GeneratorCoroutineStep::Request(request) => {
+                CoroutineStep::Request(request) => {
                     self.reply(request).await?;
                 }
             }
@@ -354,13 +352,13 @@ impl AsyncEngineConnector {
         let first = loop {
             self.check_cancelled()?;
             match input.advance().await? {
-                GeneratorCoroutineStep::Done(()) => {
+                CoroutineStep::Done(()) => {
                     return Err(Error::generic(
                         "Cannot write parquet file with empty data generator",
                     ))
                 }
-                GeneratorCoroutineStep::Yield(data) => break data,
-                GeneratorCoroutineStep::Request(request) => self.reply(request).await?,
+                CoroutineStep::Yield(data) => break data,
+                CoroutineStep::Request(request) => self.reply(request).await?,
             }
         };
 
@@ -382,8 +380,8 @@ impl AsyncEngineConnector {
         loop {
             self.check_cancelled()?;
             match input.advance().await? {
-                GeneratorCoroutineStep::Done(()) => break,
-                GeneratorCoroutineStep::Yield(data) => {
+                CoroutineStep::Done(()) => break,
+                CoroutineStep::Yield(data) => {
                     let data = ArrowEngineData::try_from_engine_data(data)?;
                     let data: RecordBatch = (*data).into();
                     self.cancel(async {
@@ -392,7 +390,7 @@ impl AsyncEngineConnector {
                     })
                     .await?;
                 }
-                GeneratorCoroutineStep::Request(request) => self.reply(request).await?,
+                CoroutineStep::Request(request) => self.reply(request).await?,
             }
         }
         self.cancel(async {
@@ -417,13 +415,13 @@ impl AsyncEngineConnector {
         loop {
             self.check_cancelled()?;
             match input.advance().await? {
-                GeneratorCoroutineStep::Done(state) => {
+                CoroutineStep::Done(state) => {
                     if !batches.is_empty() {
                         files.push(self.write_parquet_chunk(&write, batches).await?);
                     }
                     return Ok((files, state));
                 }
-                GeneratorCoroutineStep::Yield(data) => {
+                CoroutineStep::Yield(data) => {
                     rows = rows.saturating_add(data.len());
                     batches.push(data);
                     if rows >= target_rows {
@@ -432,7 +430,7 @@ impl AsyncEngineConnector {
                         rows = 0;
                     }
                 }
-                GeneratorCoroutineStep::Request(request) => self.reply(request).await?,
+                CoroutineStep::Request(request) => self.reply(request).await?,
             }
         }
     }
@@ -443,7 +441,7 @@ impl AsyncEngineConnector {
         batches: Vec<Box<dyn EngineData>>,
     ) -> DeltaResult<Url> {
         let url = write.new_file_url()?;
-        let input = StaticGeneratorCoroutine::from_generator(batches.into_generator());
+        let input = StaticCoroutine::from_generator(batches.into_generator());
         self.write_parquet_file(WriteParquetFile::new(url.clone(), input))
             .await?;
         Ok(url)
@@ -756,7 +754,7 @@ fn emit_storage_list(elapsed: Duration, num_files: u64, _bytes_read: u64) {
 #[cfg(test)]
 mod tests {
     use delta_kernel::coroutine::generator::empty;
-    use delta_kernel::coroutine::kernel::StaticGeneratorCoroutine;
+    use delta_kernel::coroutine::kernel::StaticCoroutine;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::FilteredEngineData;
 
@@ -767,8 +765,7 @@ mod tests {
         let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
         let connector = AsyncEngineConnector::new(Arc::clone(&store));
         let url = Url::parse("memory:///empty.json").unwrap();
-        let input: StaticGeneratorCoroutine<FilteredEngineData> =
-            StaticGeneratorCoroutine::from_generator(empty());
+        let input: StaticCoroutine<FilteredEngineData> = StaticCoroutine::from_generator(empty());
 
         let size = connector
             .write_json_file(WriteJsonFile::new(

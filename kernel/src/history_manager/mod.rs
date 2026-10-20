@@ -28,9 +28,9 @@ use search::{binary_search_by_key_with_bounds, Bound, SearchError};
 use tracing::{info, trace, warn};
 use url::Url;
 
-use crate::coroutine::kernel::{static_coroutine, Channel, StaticCoroutine};
+use crate::coroutine::kernel::{static_workflow, Channel, StaticWorkflow};
 use crate::coroutine::{
-    run_coroutine_with_engine, AsyncOption as _, BoundGenerator as _, Generator as _,
+    run_workflow_with_engine, AsyncOption as _, BoundGenerator as _, Generator as _,
     GeneratorExt as _,
 };
 use crate::log_segment::LogSegment;
@@ -394,14 +394,14 @@ pub(crate) fn timestamp_to_version(
     bound: Bound,
     resolved_commit_type: HistoryCommitType,
 ) -> Result<CommitAt, LogHistoryError> {
-    run_coroutine_with_engine!(engine, async move |channel| {
+    run_workflow_with_engine!(engine, async move |channel| {
         timestamp_to_version_with_channel(snapshot, channel, timestamp, bound, resolved_commit_type)
             .await
             .map_err(DeltaError::from)
     })
     .map_err(|error| match error {
         DeltaError::LogHistory(error) => *error,
-        error => LogHistoryError::internal("timestamp conversion coroutine failed", error),
+        error => LogHistoryError::internal("timestamp conversion workflow failed", error),
     })
 }
 
@@ -563,7 +563,7 @@ pub fn latest_version_as_of(
     timestamp: Timestamp,
     resolved_commit_type: HistoryCommitType,
 ) -> DeltaResult<CommitAt> {
-    run_coroutine_with_engine!(engine, async move |channel| {
+    run_workflow_with_engine!(engine, async move |channel| {
         latest_version_as_of_with_channel(snapshot, channel, timestamp, resolved_commit_type).await
     })
 }
@@ -576,8 +576,8 @@ pub fn latest_version_as_of_workflow(
     snapshot: SnapshotRef,
     timestamp: Timestamp,
     resolved_commit_type: HistoryCommitType,
-) -> StaticCoroutine<CommitAt> {
-    static_coroutine!(async move |channel| {
+) -> StaticWorkflow<CommitAt> {
+    static_workflow!(async move |channel| {
         latest_version_as_of_with_channel(
             snapshot.as_ref(),
             channel,
@@ -636,7 +636,7 @@ pub fn first_version_after(
     timestamp: Timestamp,
     resolved_commit_type: HistoryCommitType,
 ) -> DeltaResult<CommitAt> {
-    run_coroutine_with_engine!(engine, async move |channel| {
+    run_workflow_with_engine!(engine, async move |channel| {
         first_version_after_with_channel(snapshot, channel, timestamp, resolved_commit_type).await
     })
 }
@@ -649,8 +649,8 @@ pub fn first_version_after_workflow(
     snapshot: SnapshotRef,
     timestamp: Timestamp,
     resolved_commit_type: HistoryCommitType,
-) -> StaticCoroutine<CommitAt> {
-    static_coroutine!(async move |channel| {
+) -> StaticWorkflow<CommitAt> {
+    static_workflow!(async move |channel| {
         first_version_after_with_channel(
             snapshot.as_ref(),
             channel,
@@ -728,7 +728,7 @@ pub fn timestamp_range_to_versions(
     start_timestamp: Timestamp,
     end_timestamp: Option<Timestamp>,
 ) -> DeltaResult<(Version, Option<Version>)> {
-    run_coroutine_with_engine!(engine, async move |channel| {
+    run_workflow_with_engine!(engine, async move |channel| {
         timestamp_range_to_versions_with_channel(snapshot, channel, start_timestamp, end_timestamp)
             .await
     })
@@ -743,8 +743,8 @@ pub fn timestamp_range_to_versions_workflow(
     snapshot: SnapshotRef,
     start_timestamp: Timestamp,
     end_timestamp: Option<Timestamp>,
-) -> StaticCoroutine<(Version, Option<Version>)> {
-    static_coroutine!(async move |channel| {
+) -> StaticWorkflow<(Version, Option<Version>)> {
+    static_workflow!(async move |channel| {
         timestamp_range_to_versions_with_channel(
             snapshot.as_ref(),
             channel,
@@ -852,7 +852,7 @@ fn get_earliest_published_commit_version(
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
 ) -> DeltaResult<Version> {
-    run_coroutine_with_engine!(engine, async move |channel| {
+    run_workflow_with_engine!(engine, async move |channel| {
         get_earliest_published_commit_version_with_channel(
             channel,
             log_root,
@@ -922,7 +922,7 @@ fn get_earliest_recreatable_commit(
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
 ) -> DeltaResult<Version> {
-    run_coroutine_with_engine!(engine, async move |channel| {
+    run_workflow_with_engine!(engine, async move |channel| {
         get_earliest_recreatable_commit_with_channel(
             channel,
             log_root,
@@ -1056,7 +1056,7 @@ pub fn get_earliest_commit(
     earliest_ratified_commit_version: Option<Version>,
     commit_type: HistoryCommitType,
 ) -> DeltaResult<Version> {
-    run_coroutine_with_engine!(engine, async move |channel| {
+    run_workflow_with_engine!(engine, async move |channel| {
         get_earliest_commit_with_channel(
             channel,
             log_root,
@@ -1102,8 +1102,8 @@ pub fn get_earliest_commit_workflow(
     log_root: Url,
     earliest_ratified_commit_version: Option<Version>,
     commit_type: HistoryCommitType,
-) -> StaticCoroutine<Version> {
-    static_coroutine!(async move |channel| {
+) -> StaticWorkflow<Version> {
+    static_workflow!(async move |channel| {
         get_earliest_commit_with_channel(
             channel,
             &log_root,

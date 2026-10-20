@@ -4,7 +4,7 @@ use super::scan_file::CdfScanFileType;
 use crate::actions::deletion_vector::{deletion_treemap_to_bools, selection_treemap_to_bools};
 use crate::coroutine::kernel::Channel;
 #[cfg(test)]
-use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::run_workflow_with_engine;
 use crate::coroutine::AsyncOption as _;
 use crate::table_changes::scan_file::CdfScanFile;
 #[cfg(test)]
@@ -45,7 +45,7 @@ pub(crate) fn resolve_scan_file_dv(
     table_root: &Url,
     scan_file: CdfScanFile,
 ) -> DeltaResult<impl Iterator<Item = ResolvedCdfScanFile>> {
-    run_coroutine_with_engine!(engine, async move |channel| {
+    run_workflow_with_engine!(engine, async move |channel| {
         resolve_scan_file_dv_with_channel(channel, table_root, scan_file).await
     })
 }

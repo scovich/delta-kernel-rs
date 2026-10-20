@@ -13,7 +13,7 @@ use crate::coroutine::engine::EngineConnector;
 use crate::coroutine::engine::EngineResultGeneratorIterator;
 use crate::coroutine::generator::{generator_fn, Generator, GeneratorExt as _};
 #[cfg(test)]
-use crate::coroutine::kernel::{coroutine, StaticGeneratorCoroutine};
+use crate::coroutine::kernel::{workflow, StaticCoroutine};
 use crate::coroutine::kernel::{
     BoundDeltaResultGenerator, Channel, ChannelExt as _, DeltaResultGenerator, GeneratorChannel,
 };
@@ -63,11 +63,11 @@ impl CheckpointManifestReader {
     ) -> DeltaResult<Self> {
         let connector = EngineConnector::new(engine.as_ref());
         let manifest_file = manifest.location.clone();
-        let coroutine = coroutine!(async move |channel| {
+        let workflow = workflow!(async move |channel| {
             checkpoint_manifest_reader_impl(channel, manifest, log_root, read_schema).await
         });
-        let generator = connector.drive(coroutine)?;
-        let generator = StaticGeneratorCoroutine::from_generator(generator);
+        let generator = connector.drive(workflow)?;
+        let generator = StaticCoroutine::from_generator(generator);
         let inner = connector.iterate_result_generator(generator);
         Ok(Self(inner, manifest_file))
     }

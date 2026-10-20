@@ -11,7 +11,7 @@ use bytes::Bytes;
 use derive_more::{Constructor, From};
 use url::Url;
 
-use super::StaticGeneratorCoroutine;
+use super::StaticCoroutine;
 use crate::committer::{Commit, CommitResponse, PublishMetadata};
 use crate::coroutine::{PageRequest, PagedOperation, PlanOperation, Reply};
 use crate::engine_data::EngineData;
@@ -441,7 +441,7 @@ pub type WriteParquetFilesState = Box<dyn Any + Send>;
 /// Files written from one input stream and its terminal state.
 ///
 /// Connectors must return the state received from
-/// [`super::GeneratorCoroutineStep::Done`](super::GeneratorCoroutineStep::Done) unchanged.
+/// [`super::CoroutineStep::Done`](super::CoroutineStep::Done) unchanged.
 pub type WriteParquetFilesResult = (Vec<Url>, WriteParquetFilesState);
 
 /// Controls how a file sink handles an existing destination.
@@ -467,7 +467,7 @@ pub struct WriteJsonFile {
     /// Existing-destination behavior.
     pub mode: FileWriteMode,
     /// Row batches to serialize in generator order.
-    pub input: StaticGeneratorCoroutine<FilteredEngineData>,
+    pub input: StaticCoroutine<FilteredEngineData>,
 }
 
 /// Writes row batches to one Parquet file.
@@ -476,7 +476,7 @@ pub struct WriteParquetFile {
     /// Destination URL.
     pub url: Url,
     /// Row batches to serialize in generator order.
-    pub input: StaticGeneratorCoroutine<Box<dyn EngineData>>,
+    pub input: StaticCoroutine<Box<dyn EngineData>>,
 }
 
 /// Writes one row stream to connector-selected Parquet files.
@@ -485,7 +485,7 @@ pub struct WriteParquetFiles {
     /// Connector-owned file placement and sizing policy.
     pub write: ParquetMultiFileWrite,
     /// Row batches to serialize in generator order and their opaque terminal state.
-    pub input: StaticGeneratorCoroutine<Box<dyn EngineData>, WriteParquetFilesState>,
+    pub input: StaticCoroutine<Box<dyn EngineData>, WriteParquetFilesState>,
 }
 
 /// Write the bytes of one complete storage object to the specified destination URL.

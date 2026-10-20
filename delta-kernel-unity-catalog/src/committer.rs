@@ -7,7 +7,7 @@ use delta_kernel::committer::{
 };
 use delta_kernel::coroutine::kernel::request::WriteJsonFile;
 use delta_kernel::coroutine::kernel::Channel;
-use delta_kernel::coroutine::{drive_coroutine, run_coroutine_with_engine, ChannelExt as _};
+use delta_kernel::coroutine::{drive_workflow, run_workflow_with_engine, ChannelExt as _};
 use delta_kernel::{DeltaResult, Engine, Error as DeltaError, FileMeta};
 use tracing::{debug, info};
 use uc::ChannelExt as _;
@@ -303,15 +303,15 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
     /// UC expects to be informed of the last known published version during commit.
     fn commit(&self, engine: &dyn Engine, commit: KernelCommit) -> DeltaResult<CommitResponse> {
         let workflow = self.commit_workflow(commit);
-        Ok(drive_coroutine!(workflow, |request| match request {
+        Ok(drive_workflow!(workflow, |request| match request {
             uc::Request::WriteJson(operation, reply) => {
                 let WriteJsonFile { url, mode, input } = *operation;
-                reply.send(run_coroutine_with_engine!(engine, async move |channel| {
+                reply.send(run_workflow_with_engine!(engine, async move |channel| {
                     channel.write_json_file(&url, mode, input).await
                 }));
             }
             uc::Request::Head(location, reply) => {
-                reply.send(run_coroutine_with_engine!(engine, async move |channel| {
+                reply.send(run_workflow_with_engine!(engine, async move |channel| {
                     channel.head(&location).await
                 }));
             }
@@ -326,7 +326,7 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
     }
 
     fn publish(&self, engine: &dyn Engine, publish_metadata: PublishMetadata) -> DeltaResult<()> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.publish_with_channel(channel, publish_metadata).await
         })
     }

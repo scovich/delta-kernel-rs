@@ -15,7 +15,7 @@ use std::sync::Arc;
 use delta_kernel::actions::{Metadata, Protocol};
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::Committer;
-use delta_kernel::coroutine::kernel::Coroutine;
+use delta_kernel::coroutine::kernel::Workflow;
 use delta_kernel::coroutine::{drive_with_engine, drive_with_engine_and_committer};
 use delta_kernel::history_manager::{
     first_version_after_workflow as kernel_first_version_after,
@@ -753,7 +753,7 @@ pub trait ExternEngine: Send + Sync {
 /// Drive a kernel workflow through the engine exposed by `extern_engine`.
 pub(crate) fn drive_kernel<O: Send + 'static>(
     extern_engine: &dyn ExternEngine,
-    workflow: Coroutine<'_, O>,
+    workflow: Workflow<'_, O>,
 ) -> DeltaResult<O> {
     let engine = extern_engine.engine();
     drive_with_engine(engine.as_ref(), None, workflow)
@@ -763,7 +763,7 @@ pub(crate) fn drive_kernel<O: Send + 'static>(
 pub(crate) fn drive_kernel_with_committer<O: Send + 'static>(
     extern_engine: &dyn ExternEngine,
     committer: &dyn Committer,
-    workflow: Coroutine<'_, O>,
+    workflow: Workflow<'_, O>,
 ) -> DeltaResult<O> {
     let engine = extern_engine.engine();
     drive_with_engine_and_committer(engine.as_ref(), committer, workflow)

@@ -19,7 +19,7 @@ use crate::coroutine::generator::{
 use crate::coroutine::iterate_prepared_result_generator_with_engine;
 use crate::coroutine::kernel::{Channel, DeltaResultGenerator};
 #[cfg(test)]
-use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::run_workflow_with_engine;
 use crate::coroutine::{AsyncOption as _, ChannelExt as _};
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{column_name, ColumnName};
@@ -239,7 +239,7 @@ impl LogReplayScanner {
         table_schema: &SchemaRef,
         mode: CdfMode,
     ) -> DeltaResult<Self> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             Self::try_new_with_channel(
                 channel,
                 table_configuration,

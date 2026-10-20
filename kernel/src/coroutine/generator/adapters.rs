@@ -207,7 +207,7 @@ pub trait BoundGenerator: Send {
     ///
     /// Restricted to [`Self::Output`] `()` so a real completion value cannot vanish in a
     /// `while let Some` loop. Callers that need `Output` poll [`Self::poll_step`] or drive a
-    /// [`super::GeneratorCoroutine`].
+    /// [`super::Coroutine`].
     fn next(&mut self) -> impl DeltaFuture<Option<Self::Item>> + '_
     where
         Self: Sized + Unpin + BoundGenerator<Output = ()>,

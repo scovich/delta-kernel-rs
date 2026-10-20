@@ -17,9 +17,9 @@ use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
 use crate::coroutine::kernel::request::DirectoryListing;
-use crate::coroutine::kernel::{static_coroutine, Channel, StaticCoroutine};
+use crate::coroutine::kernel::{static_workflow, Channel, StaticWorkflow};
 use crate::coroutine::{
-    run_coroutine_with_engine, BoundGenerator as _, ChannelExt as _, GeneratorExt as _,
+    run_workflow_with_engine, BoundGenerator as _, ChannelExt as _, GeneratorExt as _,
     PageGenerator,
 };
 use crate::expressions::ColumnName;
@@ -952,14 +952,14 @@ impl CreateTableTransactionBuilder {
     /// - The data layout is invalid
     /// - Unsupported delta properties or feature flags are specified
     pub fn build(self, engine: &dyn Engine) -> DeltaResult<CreateTableTransaction> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.build_with_channel(channel).await
         })
     }
 
     /// Return a lazy workflow that builds this create-table transaction.
-    pub fn build_workflow(self) -> StaticCoroutine<CreateTableTransaction> {
-        static_coroutine!(async move |channel| self.build_with_channel(channel).await)
+    pub fn build_workflow(self) -> StaticWorkflow<CreateTableTransaction> {
+        static_workflow!(async move |channel| self.build_with_channel(channel).await)
     }
 
     async fn build_with_channel(self, channel: &Channel) -> DeltaResult<CreateTableTransaction> {

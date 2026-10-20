@@ -13,7 +13,7 @@ use crate::action_reconciliation::{
 };
 use crate::coroutine::engine::EngineConnector;
 use crate::coroutine::generator::{BoundGenerator as _, Generator as _, GeneratorExt as _};
-use crate::coroutine::kernel::{coroutine, Channel, Coroutine, DeltaResultGenerator};
+use crate::coroutine::kernel::{workflow, Channel, DeltaResultGenerator, Workflow};
 use crate::log_replay::HasSelectionVector;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
@@ -108,10 +108,10 @@ impl LogCompactionWriter {
         engine: &dyn Engine,
     ) -> DeltaResult<ActionReconciliationIterator> {
         let connector = EngineConnector::new(engine);
-        let coroutine = coroutine!(async move |channel| {
+        let workflow = workflow!(async move |channel| {
             self.compaction_data_actions_with_channel(channel).await
         });
-        let actions = connector.iterate_prepared_result_generator(coroutine)?;
+        let actions = connector.iterate_prepared_result_generator(workflow)?;
         // Wrap the iterator to track action counts lazily
         Ok(ActionReconciliationIterator::new(Box::new(actions)))
     }
@@ -124,11 +124,11 @@ impl LogCompactionWriter {
     /// [`Self::compaction_data`].
     pub fn compaction_data_workflow(
         &mut self,
-    ) -> Coroutine<
+    ) -> Workflow<
         '_,
         impl DeltaResultGenerator<FilteredEngineData, ActionReconciliationIteratorState> + 'static,
     > {
-        coroutine!(async move |channel| {
+        workflow!(async move |channel| {
             let actions = self.compaction_data_actions_with_channel(channel).await?;
             let state = ActionReconciliationIteratorState::default();
             Ok(ActionReconciliationState::new(actions, state)

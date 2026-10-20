@@ -34,12 +34,12 @@ pub use publish_types::{CatalogCommit, PublishMetadata};
 
 use crate::coroutine::engine::EngineConnector;
 use crate::coroutine::generator::BoundGenerator as _;
-use crate::coroutine::kernel::{static_generator_coroutine, StaticGeneratorCoroutine};
+use crate::coroutine::kernel::{static_coroutine, StaticCoroutine};
 use crate::coroutine::DeltaResultGenerator;
 use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, FilteredEngineData};
 
 /// An unpolled generator of commit actions.
-pub type CommitActions = StaticGeneratorCoroutine<FilteredEngineData>;
+pub type CommitActions = StaticCoroutine<FilteredEngineData>;
 
 /// A Delta log commit ready for a [`Committer`] to persist.
 #[derive(Constructor)]
@@ -54,7 +54,7 @@ impl Commit {
         actions: DeltaResultIteratorStatic<FilteredEngineData>,
         metadata: CommitMetadata,
     ) -> Self {
-        let actions = StaticGeneratorCoroutine::from_iterator(actions);
+        let actions = StaticCoroutine::from_iterator(actions);
         Self { metadata, actions }
     }
 
@@ -86,7 +86,7 @@ impl Commit {
         metadata: CommitMetadata,
         actions: impl DeltaResultGenerator<FilteredEngineData> + 'static,
     ) -> Self {
-        let actions = static_generator_coroutine!(async move |channel| {
+        let actions = static_coroutine!(async move |channel| {
             let mut actions = actions.bind(&channel);
             while let Some(action) = actions.next().await? {
                 channel.yield_item(action?).await?;

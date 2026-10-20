@@ -1869,7 +1869,7 @@ fn precancelled_token_stops_listing_before_any_storage_call() {
 
     let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
 
-    let result = run_coroutine_with_storage!(&storage, Some(token), async move |channel| {
+    let result = run_workflow_with_storage!(&storage, Some(token), async move |channel| {
         let listing = list_delta_log_generator(channel, &log_root, 0, Version::MAX)
             .await?
             .bind(channel);
@@ -1889,7 +1889,7 @@ fn mid_listing_cancellation_yields_terminal_error_not_silent_truncation() {
     let token = Arc::new(TestCancellationToken::default());
     let token_ref: CancellationTokenRef = token.clone();
 
-    let result = run_coroutine_with_storage!(&storage, Some(token_ref), async move |channel| {
+    let result = run_workflow_with_storage!(&storage, Some(token_ref), async move |channel| {
         let mut listing = list_delta_log_generator(channel, &log_root, 0, Version::MAX)
             .await?
             .bind(channel);
@@ -1909,7 +1909,7 @@ fn mid_listing_cancellation_yields_terminal_error_not_silent_truncation() {
 fn listing_without_token_is_unchanged() {
     let (log_root, _pulled, storage) = finite_listing_handler(5);
 
-    let listed: Vec<_> = run_coroutine_with_storage!(&storage, None, async move |channel| {
+    let listed: Vec<_> = run_workflow_with_storage!(&storage, None, async move |channel| {
         let listing = list_delta_log_generator(channel, &log_root, 0, Version::MAX)
             .await?
             .bind(channel);

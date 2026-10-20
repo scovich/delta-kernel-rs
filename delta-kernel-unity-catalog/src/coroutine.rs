@@ -5,7 +5,7 @@
 
 use delta_kernel::committer::{Commit, CommitActions, CommitResponse};
 use delta_kernel::coroutine::kernel::request::{FileWriteMode, WriteJsonFile};
-use delta_kernel::coroutine::{coroutine, ChannelExchange, Coroutine, DeltaFuture, Reply};
+use delta_kernel::coroutine::{workflow, ChannelExchange, DeltaFuture, Reply, Workflow};
 use delta_kernel::{FileMeta, FileSize};
 use unity_catalog_delta_client_api::{TableIdentifier, UpdateTableClient, UpdateTableRequest};
 use url::Url;
@@ -53,12 +53,12 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
 impl ChannelExt for Channel {}
 
 /// Connector-driven Unity Catalog commit workflow.
-pub type CommitWorkflow<'a> = Coroutine<'a, Request, CommitResponse>;
+pub type CommitWorkflow<'a> = Workflow<'a, Request, CommitResponse>;
 
 impl<C: UpdateTableClient + 'static> UCCommitter<C> {
     /// Return a lazy workflow that commits `commit` through Unity Catalog.
     pub fn commit_workflow(&self, commit: Commit) -> CommitWorkflow<'_> {
-        coroutine!(Request, async move |channel| {
+        workflow!(Request, async move |channel| {
             let (commit_metadata, actions) = commit.try_into_parts(true)?;
             self.commit_impl(channel, actions, commit_metadata).await
         })

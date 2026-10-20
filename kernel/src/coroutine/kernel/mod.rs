@@ -1,8 +1,8 @@
 //! Kernel coroutines and generators post [`Request`]s through a [`Channel`] and await connector
 //! replies.
 //!
-//! Each operation owns the receiving end of its request channel. Generator bodies receive the
-//! same request channel plus a separate lane for yielded items.
+//! Workflows own their request channel. Generator bodies receive a parent channel plus a
+//! separate lane for yielded items.
 use delta_kernel_derive::internal_api;
 
 use crate::coroutine::generator;
@@ -16,10 +16,10 @@ pub mod request;
 pub(crate) use channel::ChannelExt;
 pub use request::{PlanRequest, Request};
 
-/// Borrowed capability used by kernel operations to post requests through their parent coroutine.
+/// Borrowed capability used by kernel operations to post requests to a connector driver.
 ///
-/// Coroutine implementations receive this channel as an ordinary async-function argument. Child
-/// generators use it for the lifetime of their [`GeneratorBody`].
+/// Workflow and coroutine bodies receive this channel as an ordinary async-function argument.
+/// Child generators use it for the lifetime of their [`GeneratorBody`].
 pub type Channel = super::Channel<Request>;
 
 /// Unbound kernel generator equivalent to
@@ -74,65 +74,59 @@ where
 pub type GeneratorBody<'a, Y, O = ()> = generator::GeneratorBody<'a, Y, O>;
 
 /// Independently driven kernel generator that may borrow captured state.
-pub type GeneratorCoroutine<'a, Y, O = ()> = generator::GeneratorCoroutine<'a, Request, Y, O>;
+pub type Coroutine<'a, Y, O = ()> = generator::Coroutine<'a, Request, Y, O>;
 
 /// Kernel generator that owns all captured state and its request channel.
-pub type StaticGeneratorCoroutine<Y, O = ()> = generator::StaticGeneratorCoroutine<Request, Y, O>;
+pub type StaticCoroutine<Y, O = ()> = generator::StaticCoroutine<Request, Y, O>;
 
-/// Yield, request, or completion from a kernel [`StaticGeneratorCoroutine`].
+/// Yield, request, or completion from a kernel [`StaticCoroutine`].
 ///
 /// Yielded items are removed from the pending queue before this step returns. Requests carry their
 /// own replies.
-pub type GeneratorCoroutineStep<Y, O = ()> = generator::GeneratorCoroutineStep<Request, Y, O>;
+pub type CoroutineStep<Y, O = ()> = generator::CoroutineStep<Request, Y, O>;
 
 /// Independently driven kernel operation with an owned request channel.
 ///
 /// Process each returned request and complete its reply.
-pub type Coroutine<'a, O> = super::Coroutine<'a, Request, O>;
+pub type Workflow<'a, O> = super::Workflow<'a, Request, O>;
 
-/// Kernel coroutine that owns all captured state.
-pub type StaticCoroutine<O> = super::StaticCoroutine<Request, O>;
+/// Kernel workflow that owns all captured state.
+pub type StaticWorkflow<O> = super::StaticWorkflow<Request, O>;
 
-/// Request or completion from a kernel [`Coroutine`].
-pub type CoroutineStep<O> = super::CoroutineStep<Request, O>;
+/// Request or completion from a kernel [`Workflow`].
+pub type WorkflowStep<O> = super::WorkflowStep<Request, O>;
 
 pub(crate) type GeneratorChannel<'a, Y> = generator::GeneratorChannel<'a, Request, Y>;
 pub(crate) use generator::generator_fn;
 
 /// Creates an independently driven generator that may borrow captured state.
 #[internal_api]
-macro_rules! generator_coroutine {
-    ($body:expr) => {
-        $crate::coroutine::generator::generator_coroutine!(
-            $crate::coroutine::kernel::Request,
-            $body
-        )
-    };
-}
-
-/// Creates an unpolled [`StaticGeneratorCoroutine`] from a static generator body.
-#[internal_api]
-macro_rules! static_generator_coroutine {
-    ($body:expr) => {
-        $crate::coroutine::generator::static_generator_coroutine!(
-            $crate::coroutine::kernel::Request,
-            $body
-        )
-    };
-}
-
-/// Creates a [`Coroutine`] that may borrow captured state.
-#[internal_api]
 macro_rules! coroutine {
     ($body:expr) => {
-        $crate::coroutine::coroutine!($crate::coroutine::kernel::Request, $body)
+        $crate::coroutine::generator::coroutine!($crate::coroutine::kernel::Request, $body)
     };
 }
 
-/// Creates an unpolled [`StaticCoroutine`] from a static coroutine body.
+/// Creates an unpolled [`StaticCoroutine`] from a static generator body.
 #[internal_api]
 macro_rules! static_coroutine {
     ($body:expr) => {
-        $crate::coroutine::static_coroutine!($crate::coroutine::kernel::Request, $body)
+        $crate::coroutine::generator::static_coroutine!($crate::coroutine::kernel::Request, $body)
+    };
+}
+
+/// Creates a [`Workflow`] that may borrow captured state.
+#[internal_api]
+macro_rules! workflow {
+    ($body:expr) => {
+        $crate::coroutine::workflow!($crate::coroutine::kernel::Request, $body)
+    };
+}
+
+/// Creates an unpolled [`StaticWorkflow`] from a static workflow body.
+#[internal_api]
+macro_rules! static_workflow {
+    ($body:expr) => {
+        $crate::coroutine::static_workflow!($crate::coroutine::kernel::Request, $body)
     };
 }

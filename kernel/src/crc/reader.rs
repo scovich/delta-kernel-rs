@@ -7,7 +7,7 @@ use tracing::instrument;
 use super::Crc;
 use crate::coroutine::kernel::Channel;
 #[cfg(test)]
-use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::run_workflow_with_engine;
 use crate::coroutine::ChannelExt as _;
 use crate::metrics::events::CRC_READ_COMPLETED_SPAN;
 use crate::path::{AsUrl as _, ParsedLogPath};
@@ -26,7 +26,7 @@ use crate::{DeltaResult, Error};
 /// Reports metrics: `CrcReadSuccess` or `CrcReadFailure`.
 #[cfg(test)]
 pub(crate) fn try_read_crc_file(engine: &dyn Engine, crc_path: &ParsedLogPath) -> DeltaResult<Crc> {
-    run_coroutine_with_engine!(engine, async move |channel| {
+    run_workflow_with_engine!(engine, async move |channel| {
         try_read_crc_file_with_channel(channel, crc_path).await
     })
 }

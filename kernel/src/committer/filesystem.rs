@@ -9,7 +9,7 @@ use super::publish_types::PublishMetadata;
 use super::{Commit, Committer};
 use crate::coroutine::engine::EngineConnector;
 use crate::coroutine::kernel::request::FileWriteMode;
-use crate::coroutine::kernel::{static_coroutine, Channel, StaticCoroutine};
+use crate::coroutine::kernel::{static_workflow, Channel, StaticWorkflow};
 use crate::coroutine::ChannelExt as _;
 use crate::{DeltaResult, Engine, Error, FileMeta};
 
@@ -27,8 +27,8 @@ impl FileSystemCommitter {
     }
 
     /// Return a lazy workflow that commits a prepared path-based transaction.
-    pub fn commit_workflow(commit: Commit) -> StaticCoroutine<CommitResponse> {
-        static_coroutine!(async move |channel| Self::commit_impl(channel, commit).await)
+    pub fn commit_workflow(commit: Commit) -> StaticWorkflow<CommitResponse> {
+        static_workflow!(async move |channel| Self::commit_impl(channel, commit).await)
     }
 
     #[instrument(

@@ -18,7 +18,7 @@ use crate::checkpoint::tests::{
 use crate::checkpoint::CheckpointWriter;
 use crate::coroutine::kernel::request::WriteParquetFiles;
 use crate::coroutine::kernel::Channel;
-use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _};
+use crate::coroutine::{run_workflow_with_engine, ChannelExt as _};
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::sync::SyncEngine;
 use crate::object_store::memory::InMemory;
@@ -44,7 +44,7 @@ fn generate_checkpoint_parts(
     engine: &dyn Engine,
     file_actions_per_sidecar_hint: usize,
 ) -> DeltaResult<CheckpointParts> {
-    run_coroutine_with_engine!(engine, async move |channel| {
+    run_workflow_with_engine!(engine, async move |channel| {
         generate_checkpoint_parts_impl(writer, channel, file_actions_per_sidecar_hint).await
     })
 }

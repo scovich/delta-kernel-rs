@@ -13,9 +13,9 @@ use super::log_replay::SCAN_ROW_SCHEMA;
 use super::ScanMetadata;
 use crate::actions::deletion_vector::{deletion_treemap_to_bools, DeletionVectorDescriptor};
 use crate::actions::visitors::visit_deletion_vector_at;
-use crate::coroutine::kernel::{static_coroutine, Channel, StaticCoroutine};
+use crate::coroutine::kernel::{static_workflow, Channel, StaticWorkflow};
 use crate::coroutine::{
-    run_coroutine_with_engine, run_coroutine_with_storage, AsyncOption as _, ChannelExt as _,
+    run_workflow_with_engine, run_workflow_with_storage, AsyncOption as _, ChannelExt as _,
 };
 use crate::engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData};
 use crate::scan::get_transform_for_row;
@@ -65,7 +65,7 @@ impl DvInfo {
         engine: &dyn Engine,
         table_root: &url::Url,
     ) -> DeltaResult<Option<Vec<bool>>> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.get_selection_vector_with_channel(channel, table_root)
                 .await
         })
@@ -76,10 +76,10 @@ impl DvInfo {
     pub(crate) fn get_selection_vector_workflow(
         &self,
         table_root: &url::Url,
-    ) -> StaticCoroutine<Option<Vec<bool>>> {
+    ) -> StaticWorkflow<Option<Vec<bool>>> {
         let dv_info = self.clone();
         let table_root = table_root.clone();
-        static_coroutine!(async move |channel| {
+        static_workflow!(async move |channel| {
             dv_info
                 .get_selection_vector_with_channel(channel, &table_root)
                 .await
@@ -106,7 +106,7 @@ impl DvInfo {
             return Ok(None);
         }
         let storage = engine.storage_handler();
-        run_coroutine_with_storage!(storage.as_ref(), None, async move |channel| {
+        run_workflow_with_storage!(storage.as_ref(), None, async move |channel| {
             self.get_row_indexes_with_channel(channel, table_root).await
         })
     }
@@ -116,10 +116,10 @@ impl DvInfo {
     pub(crate) fn get_row_indexes_workflow(
         &self,
         table_root: &url::Url,
-    ) -> StaticCoroutine<Option<Vec<u64>>> {
+    ) -> StaticWorkflow<Option<Vec<u64>>> {
         let dv_info = self.clone();
         let table_root = table_root.clone();
-        static_coroutine!(async move |channel| {
+        static_workflow!(async move |channel| {
             dv_info
                 .get_row_indexes_with_channel(channel, &table_root)
                 .await
@@ -149,7 +149,7 @@ pub fn transform_to_logical(
     logical_schema: &Schema,
     transform: Option<ExpressionRef>,
 ) -> DeltaResult<Box<dyn EngineData>> {
-    run_coroutine_with_engine!(engine, async move |channel| {
+    run_workflow_with_engine!(engine, async move |channel| {
         transform_to_logical_with_channel(
             channel,
             physical_data,

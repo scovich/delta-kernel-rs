@@ -28,8 +28,8 @@
 use std::collections::{HashMap, HashSet};
 
 use delta_kernel::actions::Protocol;
-use delta_kernel::coroutine::kernel::{static_coroutine, Channel, StaticCoroutine};
-use delta_kernel::coroutine::run_coroutine_with_engine;
+use delta_kernel::coroutine::kernel::{static_workflow, Channel, StaticWorkflow};
+use delta_kernel::coroutine::run_workflow_with_engine;
 use delta_kernel::{DeltaResult, Engine, Error, Snapshot, SnapshotRef};
 use unity_catalog_delta_client_api::{
     CreateTableRequest, Protocol as WireProtocol, StorageCredential,
@@ -120,7 +120,7 @@ pub fn build_uc_create_table_request(
     table_name: impl Into<String>,
 ) -> DeltaResult<CreateTableRequest> {
     let table_name = table_name.into();
-    run_coroutine_with_engine!(engine, async move |channel| {
+    run_workflow_with_engine!(engine, async move |channel| {
         build_uc_create_table_request_impl(snapshot, channel, table_name).await
     })
 }
@@ -129,9 +129,9 @@ pub fn build_uc_create_table_request(
 pub fn build_uc_create_table_request_workflow(
     snapshot: SnapshotRef,
     table_name: impl Into<String>,
-) -> StaticCoroutine<CreateTableRequest> {
+) -> StaticWorkflow<CreateTableRequest> {
     let table_name = table_name.into();
-    static_coroutine!(async move |channel| {
+    static_workflow!(async move |channel| {
         build_uc_create_table_request_impl(snapshot.as_ref(), channel, table_name).await
     })
 }

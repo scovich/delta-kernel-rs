@@ -44,9 +44,9 @@ use scan::TableChangesScanBuilder;
 use scan_file::scan_metadata_to_scan_file_generator;
 use url::Url;
 
-use crate::coroutine::kernel::{static_coroutine, Channel, StaticCoroutine};
+use crate::coroutine::kernel::{static_workflow, Channel, StaticWorkflow};
 use crate::coroutine::{
-    run_coroutine_with_engine, BoundGenerator as _, Generator as _, GeneratorExt as _,
+    run_workflow_with_engine, BoundGenerator as _, Generator as _, GeneratorExt as _,
 };
 use crate::log_segment::LogSegment;
 use crate::path::AsUrl;
@@ -271,8 +271,8 @@ impl TableChanges {
         table_root: Url,
         start_version: Version,
         end_version: Option<Version>,
-    ) -> StaticCoroutine<Self> {
-        static_coroutine!(async move |channel| {
+    ) -> StaticWorkflow<Self> {
+        static_workflow!(async move |channel| {
             Self::try_new_internal_with_channel(
                 table_root,
                 channel,
@@ -332,7 +332,7 @@ impl TableChanges {
         end_version: Option<Version>,
         mode: CdfMode,
     ) -> DeltaResult<Self> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             Self::try_new_internal_with_channel(
                 table_root,
                 channel,
@@ -558,7 +558,7 @@ impl TableChanges {
         engine: Arc<dyn Engine>,
         mode: TableChangesListingMode,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesFileAction>>> {
-        let actions = run_coroutine_with_engine!(engine.as_ref(), async move |channel| {
+        let actions = run_workflow_with_engine!(engine.as_ref(), async move |channel| {
             self.scan_file_listing_with_channel(channel, mode).await
         })?;
         Ok(actions.into_iter().map(Ok))
@@ -570,8 +570,8 @@ impl TableChanges {
     pub(crate) fn scan_file_listing_workflow(
         self: Arc<Self>,
         mode: TableChangesListingMode,
-    ) -> StaticCoroutine<Vec<TableChangesFileAction>> {
-        static_coroutine!(async move |channel| {
+    ) -> StaticWorkflow<Vec<TableChangesFileAction>> {
+        static_workflow!(async move |channel| {
             self.scan_file_listing_with_channel(channel, mode).await
         })
     }

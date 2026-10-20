@@ -5,7 +5,7 @@ use crate::actions::{SetTransaction, LOG_TXN_SCHEMA};
 use crate::coroutine::iterate_prepared_result_generator_with_engine;
 use crate::coroutine::kernel::{Channel, DeltaResultGenerator};
 #[cfg(test)]
-use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::run_workflow_with_engine;
 use crate::coroutine::{BoundGenerator as _, Generator as _};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
@@ -32,7 +32,7 @@ impl SetTransactionScanner {
         application_id: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<SetTransaction>> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             Self::get_one_with_channel(log_segment, application_id, channel).await
         })
     }
@@ -55,7 +55,7 @@ impl SetTransactionScanner {
         log_segment: &LogSegment,
         engine: &dyn Engine,
     ) -> DeltaResult<SetTransactionMap> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             Self::get_all_with_channel(log_segment, channel).await
         })
     }

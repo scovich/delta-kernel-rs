@@ -13,7 +13,7 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::coroutine::kernel::Channel;
-use crate::coroutine::{run_coroutine_with_storage, ChannelExt as _};
+use crate::coroutine::{run_workflow_with_storage, ChannelExt as _};
 use crate::schema::DataType;
 use crate::utils::require;
 use crate::{DeltaResult, Error, StorageHandler};
@@ -347,7 +347,7 @@ impl DeletionVectorDescriptor {
         storage: Arc<dyn StorageHandler>,
         parent: &Url,
     ) -> DeltaResult<RoaringTreemap> {
-        run_coroutine_with_storage!(storage.as_ref(), None, async move |channel| {
+        run_workflow_with_storage!(storage.as_ref(), None, async move |channel| {
             self.read_with_channel(channel, parent).await
         })
     }
@@ -503,7 +503,7 @@ impl DeletionVectorDescriptor {
         storage: Arc<dyn StorageHandler>,
         parent: &Url,
     ) -> DeltaResult<Vec<u64>> {
-        run_coroutine_with_storage!(storage.as_ref(), None, async move |channel| {
+        run_workflow_with_storage!(storage.as_ref(), None, async move |channel| {
             self.row_indexes_with_channel(channel, parent).await
         })
     }

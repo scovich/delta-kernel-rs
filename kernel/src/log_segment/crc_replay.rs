@@ -25,7 +25,7 @@ use crate::actions::{
 };
 use crate::coroutine::kernel::Channel;
 #[cfg(test)]
-use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::run_workflow_with_engine;
 use crate::coroutine::{
     AsyncOption as _, BoundGenerator as _, ChannelExt as _, DeltaFuture, Generator as _,
 };
@@ -105,7 +105,7 @@ impl LogSegment {
         engine: &dyn Engine,
         in_memory_base: Option<&Arc<Crc>>,
     ) -> Option<Arc<Crc>> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             Ok(self
                 .pick_latest_base_crc_with_channel(channel, in_memory_base)
                 .await)
@@ -151,7 +151,7 @@ impl LogSegment {
         engine: &dyn Engine,
         base_crc: &Crc,
     ) -> DeltaResult<Crc> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.build_crc_from_base_with_channel(channel, base_crc)
                 .await
         })
@@ -232,7 +232,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<Crc>> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.build_crc_from_version_zero_with_channel(channel).await
         })
     }
@@ -274,7 +274,7 @@ impl LogSegment {
         base_version: Version,
         seed_histogram: Option<FileSizeHistogram>,
     ) -> DeltaResult<CrcDelta> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.build_crc_delta_from_base_with_channel(channel, base_version, seed_histogram)
                 .await
         })

@@ -18,8 +18,8 @@ use crate::checkpoint::{CheckpointSpec, CheckpointWriter, V2CheckpointConfig};
 use crate::clustering::{parse_clustering_columns, ClusteringColumnInfo, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
 use crate::coroutine::engine::EngineConnector;
-use crate::coroutine::kernel::{coroutine, static_coroutine, Channel, Coroutine, StaticCoroutine};
-use crate::coroutine::{run_coroutine_with_engine, ChannelExt as _};
+use crate::coroutine::kernel::{static_workflow, workflow, Channel, StaticWorkflow, Workflow};
+use crate::coroutine::{run_workflow_with_engine, ChannelExt as _};
 use crate::crc::{
     try_write_crc_file_with_channel, Crc, CrcDelta, DomainMetadataState, FileSizeHistogram,
     FileStats, SetTransactionState,
@@ -564,7 +564,7 @@ impl Snapshot {
         application_id: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<i64>> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.get_app_id_version_with_channel(application_id, channel)
                 .await
         })
@@ -654,10 +654,10 @@ impl Snapshot {
     pub fn get_app_id_version_workflow(
         self: &Arc<Self>,
         application_id: impl Into<String>,
-    ) -> StaticCoroutine<Option<i64>> {
+    ) -> StaticWorkflow<Option<i64>> {
         let snapshot = Arc::clone(self);
         let application_id = application_id.into();
-        static_coroutine!(async move |channel| {
+        static_workflow!(async move |channel| {
             snapshot
                 .get_app_id_version_with_channel(&application_id, channel)
                 .await
@@ -687,7 +687,7 @@ impl Snapshot {
         domain: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<String>> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.get_domain_metadata_with_channel(domain, channel).await
         })
     }
@@ -712,10 +712,10 @@ impl Snapshot {
     pub fn get_domain_metadata_workflow(
         self: &Arc<Self>,
         domain: impl Into<String>,
-    ) -> StaticCoroutine<Option<String>> {
+    ) -> StaticWorkflow<Option<String>> {
         let domain = domain.into();
         let snapshot = Arc::clone(self);
-        static_coroutine!(async move |channel| {
+        static_workflow!(async move |channel| {
             snapshot
                 .get_domain_metadata_with_channel(&domain, channel)
                 .await
@@ -734,7 +734,7 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<i64>> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.get_row_tracking_high_water_mark_with_channel(channel)
                 .await
         })
@@ -756,9 +756,9 @@ impl Snapshot {
     /// Return a lazy workflow that gets the row-tracking high-water mark.
     pub fn get_row_tracking_high_water_mark_workflow(
         self: &Arc<Self>,
-    ) -> StaticCoroutine<Option<i64>> {
+    ) -> StaticWorkflow<Option<i64>> {
         let snapshot = Arc::clone(self);
-        static_coroutine!(async move |channel| {
+        static_workflow!(async move |channel| {
             snapshot
                 .get_row_tracking_high_water_mark_with_channel(channel)
                 .await
@@ -788,7 +788,7 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<Vec<ClusteringColumnInfo>>> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.get_clustering_column_infos_with_channel(channel).await
         })
     }
@@ -826,9 +826,9 @@ impl Snapshot {
     #[allow(unused)]
     pub(crate) fn get_clustering_column_infos_workflow(
         self: &Arc<Self>,
-    ) -> StaticCoroutine<Option<Vec<ClusteringColumnInfo>>> {
+    ) -> StaticWorkflow<Option<Vec<ClusteringColumnInfo>>> {
         let snapshot = Arc::clone(self);
-        static_coroutine!(async move |channel| {
+        static_workflow!(async move |channel| {
             snapshot
                 .get_clustering_column_infos_with_channel(channel)
                 .await
@@ -850,7 +850,7 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<Vec<ColumnName>>> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.get_physical_clustering_columns_with_channel(channel)
                 .await
         })
@@ -901,7 +901,7 @@ impl Snapshot {
         engine: &dyn Engine,
         domains: Option<&HashSet<&str>>,
     ) -> DeltaResult<DomainMetadataMap> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.get_domain_metadatas_internal_with_channel(channel, domains)
                 .await
         })
@@ -1014,7 +1014,7 @@ impl Snapshot {
         domain: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<String>> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.get_domain_metadata_internal_with_channel(domain, channel)
                 .await
         })
@@ -1043,7 +1043,7 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Vec<DomainMetadata>> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.get_all_domain_metadata_with_channel(channel).await
         })
     }
@@ -1068,9 +1068,9 @@ impl Snapshot {
     #[allow(unused)]
     pub(crate) fn get_all_domain_metadata_workflow(
         self: &Arc<Self>,
-    ) -> StaticCoroutine<Vec<DomainMetadata>> {
+    ) -> StaticWorkflow<Vec<DomainMetadata>> {
         let snapshot = Arc::clone(self);
-        static_coroutine!(async move |channel| {
+        static_workflow!(async move |channel| {
             snapshot.get_all_domain_metadata_with_channel(channel).await
         })
     }
@@ -1095,7 +1095,7 @@ impl Snapshot {
     #[cfg_attr(not(feature = "internal-api"), cfg(test))]
     #[internal_api]
     pub(crate) fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.get_in_commit_timestamp_with_channel(channel).await
         })
     }
@@ -1168,7 +1168,7 @@ impl Snapshot {
     /// [`get_in_commit_timestamp`]: Self::get_in_commit_timestamp
     #[allow(unused)]
     pub fn get_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.get_timestamp_with_channel(channel).await
         })
     }
@@ -1176,9 +1176,9 @@ impl Snapshot {
     /// Return a lazy workflow that gets this snapshot's timestamp.
     #[internal_api]
     #[allow(unused)]
-    pub(crate) fn get_timestamp_workflow(self: &Arc<Self>) -> StaticCoroutine<i64> {
+    pub(crate) fn get_timestamp_workflow(self: &Arc<Self>) -> StaticWorkflow<i64> {
         let snapshot = Arc::clone(self);
-        static_coroutine!(async move |channel| {
+        static_workflow!(async move |channel| {
             snapshot.get_timestamp_with_channel(channel).await
         })
     }
@@ -1237,14 +1237,14 @@ impl Snapshot {
     /// Note: For tables with clustering enabled, this performs log replay to read clustering
     /// columns from domain metadata, which may have a performance cost.
     pub fn transaction(self: Arc<Self>, engine: &dyn Engine) -> DeltaResult<Transaction> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             Transaction::try_new_existing_table_with_channel(self, channel).await
         })
     }
 
     /// Return a lazy workflow that creates a [`Transaction`] for this snapshot.
-    pub fn transaction_workflow(self: Arc<Self>) -> StaticCoroutine<Transaction> {
-        static_coroutine!(async move |channel| {
+    pub fn transaction_workflow(self: Arc<Self>) -> StaticWorkflow<Transaction> {
+        static_workflow!(async move |channel| {
             Transaction::try_new_existing_table_with_channel(self, channel).await
         })
     }
@@ -1300,8 +1300,8 @@ impl Snapshot {
     ///
     /// When driven, returns the validation errors described by
     /// [`Self::create_checkpoint_writer`], or connector errors while loading clustering metadata.
-    pub fn create_checkpoint_writer_workflow(self: Arc<Self>) -> StaticCoroutine<CheckpointWriter> {
-        static_coroutine!(async move |channel| {
+    pub fn create_checkpoint_writer_workflow(self: Arc<Self>) -> StaticWorkflow<CheckpointWriter> {
+        static_workflow!(async move |channel| {
             CheckpointWriter::try_new_with_channel(self, channel).await
         })
     }
@@ -1358,7 +1358,7 @@ impl Snapshot {
         self: &SnapshotRef,
         engine: &dyn Engine,
     ) -> DeltaResult<(ChecksumWriteResult, SnapshotRef)> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.write_checksum_with_channel(channel).await
         })
     }
@@ -1366,9 +1366,9 @@ impl Snapshot {
     /// Return a lazy workflow that writes this snapshot's version checksum.
     pub fn write_checksum_workflow(
         self: &SnapshotRef,
-    ) -> StaticCoroutine<(ChecksumWriteResult, SnapshotRef)> {
+    ) -> StaticWorkflow<(ChecksumWriteResult, SnapshotRef)> {
         let snapshot = Arc::clone(self);
-        static_coroutine!(async move |channel| {
+        static_workflow!(async move |channel| {
             snapshot.write_checksum_with_channel(channel).await
         })
     }
@@ -1550,7 +1550,7 @@ impl Snapshot {
         engine: &dyn Engine,
         spec: Option<&CheckpointSpec>,
     ) -> DeltaResult<(CheckpointWriteResult, SnapshotRef)> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.checkpoint_impl(channel, spec).await
         })
     }
@@ -1563,8 +1563,8 @@ impl Snapshot {
     pub fn checkpoint_workflow<'a>(
         self: &'a SnapshotRef,
         spec: Option<&'a CheckpointSpec>,
-    ) -> Coroutine<'a, (CheckpointWriteResult, SnapshotRef)> {
-        coroutine!(async move |channel| { self.checkpoint_impl(channel, spec).await })
+    ) -> Workflow<'a, (CheckpointWriteResult, SnapshotRef)> {
+        workflow!(async move |channel| { self.checkpoint_impl(channel, spec).await })
     }
 
     #[instrument(parent = &self.span, name = "snap.checkpoint", skip_all, err)]
@@ -1700,7 +1700,7 @@ impl Snapshot {
         committer: &dyn Committer,
     ) -> DeltaResult<SnapshotRef> {
         let is_catalog_committer = committer.is_catalog_committer();
-        let publish = coroutine!(async move |channel| {
+        let publish = workflow!(async move |channel| {
             self.publish_with_channel(channel, is_catalog_committer)
                 .await
         });
@@ -1713,9 +1713,9 @@ impl Snapshot {
     pub(crate) fn publish_workflow(
         self: &SnapshotRef,
         is_catalog_committer: bool,
-    ) -> StaticCoroutine<SnapshotRef> {
+    ) -> StaticWorkflow<SnapshotRef> {
         let snapshot = Arc::clone(self);
-        static_coroutine!(async move |channel| {
+        static_workflow!(async move |channel| {
             snapshot
                 .publish_with_channel(channel, is_catalog_committer)
                 .await

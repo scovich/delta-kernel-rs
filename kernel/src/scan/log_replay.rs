@@ -15,11 +15,11 @@ use crate::coroutine::engine::EngineConnector;
 #[cfg(test)]
 use crate::coroutine::generator::AsyncIntoIterator as _;
 use crate::coroutine::generator::{map_async_witness, GeneratorExt as _};
-#[cfg(test)]
-use crate::coroutine::kernel::coroutine;
 use crate::coroutine::kernel::request::ExpressionEvaluatorHandle;
+#[cfg(test)]
+use crate::coroutine::kernel::workflow;
 use crate::coroutine::kernel::{Channel, ChannelExt as _, DeltaResultGenerator};
-use crate::coroutine::{run_coroutine_with_engine, DeltaFuture};
+use crate::coroutine::{run_workflow_with_engine, DeltaFuture};
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
     col, column_expr_ref, column_name, null_lit, ColumnName, Expression, ExpressionRef,
@@ -219,7 +219,7 @@ impl ScanLogReplayProcessor {
         stats_options: ScanStatsOptions,
         partition_values_options: ScanPartitionValuesOptions,
     ) -> DeltaResult<Self> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             Self::new_with_channel(
                 channel,
                 state_info,
@@ -273,7 +273,7 @@ impl ScanLogReplayProcessor {
         stats_options: ScanStatsOptions,
         partition_values_options: ScanPartitionValuesOptions,
     ) -> DeltaResult<Self> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             Self::new_with_seen_files_with_channel(
                 channel,
                 state_info,
@@ -504,7 +504,7 @@ impl ScanLogReplayProcessor {
         engine: &dyn Engine,
         state: SerializableScanState,
     ) -> DeltaResult<Self> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             Self::from_serializable_state_with_channel(channel, state).await
         })
     }
@@ -1140,7 +1140,7 @@ impl ScanLogReplayProcessor {
         engine: &dyn Engine,
         actions_batch: ActionsBatch,
     ) -> DeltaResult<ScanMetadata> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.process_actions_batch_with_channel(channel, actions_batch)
                 .await
         })
@@ -1298,7 +1298,7 @@ pub(crate) fn scan_action_iter<'a>(
     Arc<ScanMetrics>,
 )> {
     let connector = EngineConnector::new(engine);
-    let coroutine = coroutine!(async move |channel| {
+    let workflow = workflow!(async move |channel| {
         scan_action_iter_with_channel(
             channel,
             action_iter.into_generator(),
@@ -1309,7 +1309,7 @@ pub(crate) fn scan_action_iter<'a>(
         )
         .await
     });
-    connector.iterate_prepared_result_generator_with_companion(coroutine, std::convert::identity)
+    connector.iterate_prepared_result_generator_with_companion(workflow, std::convert::identity)
 }
 
 pub(super) async fn scan_action_iter_with_channel<'a>(

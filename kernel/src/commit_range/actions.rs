@@ -8,7 +8,7 @@ use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::actions::{Metadata, Protocol, COMMIT_INFO_FIELD, METADATA_FIELD, PROTOCOL_FIELD};
 use crate::commit_range::with_version_context;
 use crate::coroutine::engine::EngineConnector;
-use crate::coroutine::kernel::{coroutine, Channel, Coroutine, DeltaResultGenerator};
+use crate::coroutine::kernel::{workflow, Channel, DeltaResultGenerator, Workflow};
 use crate::coroutine::{BoundGenerator as _, ChannelExt as _};
 use crate::engine_data::RowVisitor as _;
 use crate::path::ParsedLogPath;
@@ -227,16 +227,16 @@ impl CommitAction {
     /// translation is applied.
     pub fn get_actions(&self, engine: &dyn Engine) -> DeltaResult<FileDataReadResultIterator> {
         let connector = EngineConnector::new(engine).with_cancellation_token(None);
-        let actions = connector.iterate_prepared_result_generator(self.get_actions_coroutine())?;
+        let actions = connector.iterate_prepared_result_generator(self.get_actions_workflow())?;
         Ok(Box::new(actions))
     }
 
     /// Return a lazy workflow that prepares this commit's action generator.
     #[internal_api]
-    pub(crate) fn get_actions_coroutine(
+    pub(crate) fn get_actions_workflow(
         &self,
-    ) -> Coroutine<'_, impl DeltaResultGenerator<Box<dyn EngineData>> + 'static> {
-        coroutine!(async move |channel| self.get_actions_generator(channel).await)
+    ) -> Workflow<'_, impl DeltaResultGenerator<Box<dyn EngineData>> + 'static> {
+        workflow!(async move |channel| self.get_actions_generator(channel).await)
     }
 
     /// Return a generator over this commit's action batches.

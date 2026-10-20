@@ -26,13 +26,13 @@ use crate::coroutine::generator::{
 };
 use crate::coroutine::kernel::request::ReadParquetFiles;
 use crate::coroutine::kernel::{
-    coroutine, generator_coroutine, static_coroutine, Channel, Coroutine, DeltaResultGenerator,
-    GeneratorCoroutine, Request, StaticCoroutine,
+    coroutine, static_workflow, workflow, Channel, Coroutine, DeltaResultGenerator, Request,
+    StaticWorkflow, Workflow,
 };
 #[cfg(feature = "declarative-plans")]
-use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::run_workflow_with_engine;
 use crate::coroutine::{
-    iterate_prepared_result_generator_with_engine, run_coroutine_with_storage, ChannelExt as _,
+    iterate_prepared_result_generator_with_engine, run_workflow_with_storage, ChannelExt as _,
     PageGenerator,
 };
 use crate::engine_data::FilteredEngineData;
@@ -938,8 +938,8 @@ impl Scan {
     #[internal_api]
     pub(crate) fn scan_metadata_workflow(
         &self,
-    ) -> Coroutine<'_, impl DeltaResultGenerator<ScanMetadata> + 'static> {
-        coroutine!(async move |channel| { self.scan_metadata_with_channel(channel).await })
+    ) -> Workflow<'_, impl DeltaResultGenerator<ScanMetadata> + 'static> {
+        workflow!(async move |channel| { self.scan_metadata_with_channel(channel).await })
     }
 
     async fn scan_metadata_with_channel(
@@ -1025,9 +1025,9 @@ impl Scan {
         existing_version: Version,
         existing_data: impl DeltaResultGenerator<Box<dyn EngineData>> + 'static,
         existing_predicate: Option<PredicateRef>,
-    ) -> Coroutine<'_, Box<dyn Generator<Request, Item = DeltaResult<ScanMetadata>, Output = ()>>>
+    ) -> Workflow<'_, Box<dyn Generator<Request, Item = DeltaResult<ScanMetadata>, Output = ()>>>
     {
-        coroutine!(async move |channel| {
+        workflow!(async move |channel| {
             self.scan_metadata_from_with_channel(
                 channel,
                 existing_version,
@@ -1213,7 +1213,7 @@ impl Scan {
     /// Returns an error if the engine provides no [`PlanExecutor`](crate::plans::PlanExecutor),
     /// or if log discovery, checkpoint inspection, or plan construction fails.
     pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.declarative_metadata_scan_plan_with_channel(channel)
                 .await
         })
@@ -1224,9 +1224,9 @@ impl Scan {
     #[allow(unused)]
     pub(crate) fn declarative_metadata_scan_plan_workflow(
         self: &Arc<Self>,
-    ) -> StaticCoroutine<Option<Plan>> {
+    ) -> StaticWorkflow<Option<Plan>> {
         let scan = Arc::clone(self);
-        static_coroutine!(async move |channel| {
+        static_workflow!(async move |channel| {
             scan.declarative_metadata_scan_plan_with_channel(channel)
                 .await
         })
@@ -1266,12 +1266,12 @@ impl Scan {
     > {
         let connector =
             EngineConnector::new(engine).with_cancellation_token(self.cancellation_token.clone());
-        let coroutine = coroutine!(async move |channel| {
+        let workflow = workflow!(async move |channel| {
             self.replay_for_scan_metadata_with_channel(channel).await
         });
         let (actions, checkpoint_info) = connector
             .iterate_prepared_result_generator_with_companion(
-                coroutine,
+                workflow,
                 ActionsWithCheckpointInfo::into_parts,
             )?;
         Ok(ActionsWithCheckpointInfo {
@@ -1429,8 +1429,8 @@ impl Scan {
     }
 
     #[internal_api]
-    pub(crate) fn parallel_scan_metadata_workflow(&self) -> Coroutine<'_, SequentialScanMetadata> {
-        coroutine!(async move |channel| { self.parallel_scan_metadata_with_channel(channel).await })
+    pub(crate) fn parallel_scan_metadata_workflow(&self) -> Workflow<'_, SequentialScanMetadata> {
+        workflow!(async move |channel| { self.parallel_scan_metadata_with_channel(channel).await })
     }
 
     async fn parallel_scan_metadata_with_channel(
@@ -1501,8 +1501,8 @@ impl Scan {
     }
 
     /// Return a connector-driven generator over logical table-data batches.
-    pub fn execute_generator(&self) -> GeneratorCoroutine<'_, DeltaResult<Box<dyn EngineData>>> {
-        generator_coroutine!(async move |channel| {
+    pub fn execute_generator(&self) -> Coroutine<'_, DeltaResult<Box<dyn EngineData>>> {
+        coroutine!(async move |channel| {
             let batches = self.execute_with_channel(&channel).await?;
             channel.yield_from(batches.bind(&channel)).await
         })
@@ -1685,7 +1685,7 @@ pub fn selection_vector(
     table_root: &Url,
 ) -> DeltaResult<Vec<bool>> {
     let storage = engine.storage_handler();
-    run_coroutine_with_storage!(storage.as_ref(), None, async move |channel| {
+    run_workflow_with_storage!(storage.as_ref(), None, async move |channel| {
         selection_vector_with_channel(channel, descriptor, table_root).await
     })
 }
@@ -1695,10 +1695,10 @@ pub fn selection_vector(
 pub(crate) fn selection_vector_workflow(
     descriptor: &DeletionVectorDescriptor,
     table_root: &Url,
-) -> StaticCoroutine<Vec<bool>> {
+) -> StaticWorkflow<Vec<bool>> {
     let descriptor = descriptor.clone();
     let table_root = table_root.clone();
-    static_coroutine!(async move |channel| {
+    static_workflow!(async move |channel| {
         selection_vector_with_channel(channel, &descriptor, &table_root).await
     })
 }

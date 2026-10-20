@@ -12,7 +12,7 @@ use super::{IncrementalReplay, Snapshot};
 use crate::cancellation::CancellationTokenRef;
 use crate::coroutine::kernel::Channel;
 #[cfg(test)]
-use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::run_workflow_with_engine;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::metrics::{
@@ -119,7 +119,7 @@ impl Snapshot {
         built_as_latest: bool,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Arc<Self>> {
-        run_coroutine_with_engine!(engine, cancellation_token.cloned(), async move |channel| {
+        run_workflow_with_engine!(engine, cancellation_token.cloned(), async move |channel| {
             Self::try_new_from_with_channel(
                 existing_snapshot,
                 log_tail,

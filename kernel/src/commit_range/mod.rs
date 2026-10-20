@@ -62,7 +62,7 @@ use crate::actions::{
 };
 use crate::coroutine::engine::EngineConnector;
 use crate::coroutine::generator::{map_async, AsyncIntoIterator as _, GeneratorExt as _};
-use crate::coroutine::kernel::{Channel, StaticGeneratorCoroutine};
+use crate::coroutine::kernel::{Channel, StaticCoroutine};
 use crate::path::ParsedLogPath;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::{Snapshot, SnapshotRef};
@@ -148,7 +148,7 @@ impl CommitRange {
         &self,
         start_snapshot: Option<&Snapshot>,
         actions: &[DeltaAction],
-    ) -> DeltaResult<StaticGeneratorCoroutine<DeltaResult<CommitAction>>> {
+    ) -> DeltaResult<StaticCoroutine<DeltaResult<CommitAction>>> {
         if actions.is_empty() {
             return Err(Error::generic("at least one DeltaAction must be requested"));
         }
@@ -195,7 +195,7 @@ impl CommitRange {
             self.commit_files.clone().into_generator(),
             async move |channel, log_path| state.try_advance(channel, log_path).await,
         );
-        Ok(StaticGeneratorCoroutine::from_generator(commits))
+        Ok(StaticCoroutine::from_generator(commits))
     }
 }
 

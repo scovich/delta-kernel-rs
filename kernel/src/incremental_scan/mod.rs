@@ -6,9 +6,8 @@ use std::sync::{Arc, LazyLock};
 
 use crate::coroutine::engine::{EngineConnector, EngineResultGeneratorIterator};
 use crate::coroutine::kernel::{
-    static_coroutine, static_generator_coroutine, BoundDeltaResultGenerator, Channel,
-    DeltaResultGenerator, GeneratorChannel, GeneratorCoroutineStep, StaticCoroutine,
-    StaticGeneratorCoroutine,
+    static_coroutine, static_workflow, BoundDeltaResultGenerator, Channel, CoroutineStep,
+    DeltaResultGenerator, GeneratorChannel, StaticCoroutine, StaticWorkflow,
 };
 use crate::coroutine::ChannelExt as _;
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor};
@@ -97,8 +96,8 @@ impl IncrementalScanBuilder {
     /// # Errors
     ///
     /// When driven, returns the errors documented by [`Self::build`].
-    pub fn build_workflow(self) -> StaticCoroutine<Option<IncrementalScanStream>> {
-        static_coroutine!(async move |channel| self.build_with_channel(channel).await)
+    pub fn build_workflow(self) -> StaticWorkflow<Option<IncrementalScanStream>> {
+        static_workflow!(async move |channel| self.build_with_channel(channel).await)
     }
 
     async fn build_with_channel(
@@ -327,9 +326,7 @@ fn incremental_scan_generator<G>(state: IncrementalScanState<G>) -> IncrementalS
 where
     G: DeltaResultGenerator<Box<dyn EngineData>> + 'static,
 {
-    static_generator_coroutine!(async move |channel| {
-        incremental_scan_impl(channel, state).await
-    })
+    static_coroutine!(async move |channel| { incremental_scan_impl(channel, state).await })
 }
 
 async fn incremental_scan_impl<G>(
@@ -347,7 +344,7 @@ where
 }
 
 type IncrementalScanGenerator =
-    StaticGeneratorCoroutine<DeltaResult<FilteredEngineData>, DeltaResult<IncrementalScanSummary>>;
+    StaticCoroutine<DeltaResult<FilteredEngineData>, DeltaResult<IncrementalScanSummary>>;
 type IncrementalScanEngineIterator =
     EngineResultGeneratorIterator<'static, FilteredEngineData, DeltaResult<IncrementalScanSummary>>;
 
@@ -364,10 +361,7 @@ impl IncrementalScanStream {
     pub fn try_advance(
         &mut self,
     ) -> DeltaResult<
-        GeneratorCoroutineStep<
-            DeltaResult<FilteredEngineData>,
-            DeltaResult<IncrementalScanSummary>,
-        >,
+        CoroutineStep<DeltaResult<FilteredEngineData>, DeltaResult<IncrementalScanSummary>>,
     > {
         self.0.try_advance()
     }
@@ -380,10 +374,7 @@ impl IncrementalScanStream {
     pub async fn advance(
         &mut self,
     ) -> DeltaResult<
-        GeneratorCoroutineStep<
-            DeltaResult<FilteredEngineData>,
-            DeltaResult<IncrementalScanSummary>,
-        >,
+        CoroutineStep<DeltaResult<FilteredEngineData>, DeltaResult<IncrementalScanSummary>>,
     > {
         self.0.advance().await
     }

@@ -125,10 +125,9 @@ use crate::coroutine::generator::{
 };
 use crate::coroutine::kernel::request::{FileWriteMode, WriteParquetFile, WriteParquetFiles};
 use crate::coroutine::kernel::{
-    coroutine, static_generator_coroutine, Channel, Coroutine, DeltaResultGenerator,
-    StaticGeneratorCoroutine,
+    static_coroutine, workflow, Channel, DeltaResultGenerator, StaticCoroutine, Workflow,
 };
-use crate::coroutine::{run_coroutine_with_engine, AsyncBool as _, ChannelExt as _};
+use crate::coroutine::{run_workflow_with_engine, AsyncBool as _, ChannelExt as _};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ExpressionRef, Scalar, StructData};
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -381,7 +380,7 @@ impl RetentionCalculator for CheckpointWriter {
 impl CheckpointWriter {
     /// Creates a new [`CheckpointWriter`] for the given snapshot.
     pub(crate) fn try_new(snapshot: SnapshotRef, engine: &dyn Engine) -> DeltaResult<Self> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             Self::try_new_with_channel(snapshot, channel).await
         })
     }
@@ -479,10 +478,10 @@ impl CheckpointWriter {
         engine: &dyn Engine,
     ) -> DeltaResult<ActionReconciliationIterator> {
         let connector = EngineConnector::new(engine);
-        let coroutine = coroutine!(async move |channel| {
+        let workflow = workflow!(async move |channel| {
             self.checkpoint_data_actions_with_channel(channel).await
         });
-        let actions = connector.iterate_prepared_result_generator(coroutine)?;
+        let actions = connector.iterate_prepared_result_generator(workflow)?;
         Ok(ActionReconciliationIterator::new(Box::new(actions)))
     }
 
@@ -495,11 +494,11 @@ impl CheckpointWriter {
     /// When driven, returns log-read or evaluator-creation errors.
     pub fn checkpoint_data_workflow(
         &self,
-    ) -> Coroutine<
+    ) -> Workflow<
         '_,
         impl DeltaResultGenerator<FilteredEngineData, ActionReconciliationIteratorState> + 'static,
     > {
-        coroutine!(async move |channel| {
+        workflow!(async move |channel| {
             let state = ActionReconciliationIteratorState::default();
             self.checkpoint_data_generator_with_channel(channel, state)
                 .await
@@ -607,7 +606,7 @@ impl CheckpointWriter {
         engine: &dyn Engine,
         last_checkpoint_stats: &LastCheckpointHintStats,
     ) -> DeltaResult<()> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.finalize_with_channel(channel, last_checkpoint_stats)
                 .await
         })
@@ -646,7 +645,7 @@ impl CheckpointWriter {
         // Write the `_last_checkpoint` file to `table/_delta_log/_last_checkpoint`
         let filtered_data = FilteredEngineData::with_all_rows_selected(data?);
         let input = std::iter::once(filtered_data).into_generator();
-        let input = StaticGeneratorCoroutine::from_generator(input);
+        let input = StaticCoroutine::from_generator(input);
         channel
             .write_json_file(&last_checkpoint_path, FileWriteMode::Overwrite, input)
             .await?;
@@ -710,7 +709,7 @@ impl CheckpointWriter {
         // Write main checkpoint file: non-file actions + sidecar references
         let checkpoint_path = self.checkpoint_path()?;
         let main_data = non_file_batches.into_iter().chain(sidecar_batch);
-        let main_data = StaticGeneratorCoroutine::from_generator(main_data.into_generator());
+        let main_data = StaticCoroutine::from_generator(main_data.into_generator());
         channel
             .write_parquet_file(WriteParquetFile::new(checkpoint_path.clone(), main_data))
             .await?;
@@ -744,7 +743,7 @@ impl CheckpointWriter {
         let lazy_data = data_iter
             .map(|r: DeltaResult<FilteredEngineData>| r.and_then(|f| f.apply_selection_vector()));
         // Adapt to the sink's infallible-item/unit-output contract by promoting item errors.
-        let lazy_data = static_generator_coroutine!(async move |channel| {
+        let lazy_data = static_coroutine!(async move |channel| {
             let mut lazy_data = lazy_data.bind(&channel);
             loop {
                 match poll_fn(|context| Pin::new(&mut lazy_data).poll_step(context)).await? {
@@ -793,7 +792,7 @@ impl CheckpointWriter {
         engine: &dyn Engine,
         schema: &SchemaRef,
     ) -> DeltaResult<ActionReconciliationBatch> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.create_checkpoint_metadata_batch_with_channel(channel, schema)
                 .await
         })
@@ -900,7 +899,7 @@ pub(crate) fn create_last_checkpoint_data(
     add_actions_counter: i64,
     size_in_bytes: i64,
 ) -> DeltaResult<Box<dyn EngineData>> {
-    run_coroutine_with_engine!(engine, async move |channel| {
+    run_workflow_with_engine!(engine, async move |channel| {
         create_last_checkpoint_data_with_channel(
             channel,
             version,

@@ -1,8 +1,8 @@
 use url::Url;
 
 use crate::commit_range::CommitRange;
-use crate::coroutine::kernel::{static_coroutine, Channel, StaticCoroutine};
-use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::kernel::{static_workflow, Channel, StaticWorkflow};
+use crate::coroutine::run_workflow_with_engine;
 use crate::log_segment::{validate_catalog_managed_log_tail, LogSegment};
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::SnapshotRef;
@@ -90,14 +90,14 @@ impl CommitRangeBuilder {
     /// non-contiguous, or the requested start version is unavailable from both the filesystem and
     /// the supplied catalog tail.
     pub fn build(&self, engine: &dyn Engine) -> DeltaResult<CommitRange> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.build_with_channel(channel).await
         })
     }
 
     /// Return a lazy workflow that builds this commit range.
-    pub fn build_workflow(self) -> StaticCoroutine<CommitRange> {
-        static_coroutine!(async move |channel| self.build_with_channel(channel).await)
+    pub fn build_workflow(self) -> StaticWorkflow<CommitRange> {
+        static_workflow!(async move |channel| self.build_with_channel(channel).await)
     }
 
     async fn build_with_channel(&self, channel: &Channel) -> DeltaResult<CommitRange> {

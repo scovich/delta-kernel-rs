@@ -5,7 +5,7 @@ use url::Url;
 use super::Crc;
 use crate::coroutine::kernel::Channel;
 #[cfg(test)]
-use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::run_workflow_with_engine;
 use crate::coroutine::ChannelExt as _;
 use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
 use crate::utils::require;
@@ -26,7 +26,7 @@ use crate::{DeltaResult, Error};
 /// `Err(Error::FileAlreadyExists)`.
 #[cfg(test)]
 pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> DeltaResult<()> {
-    run_coroutine_with_engine!(engine, async move |channel| {
+    run_workflow_with_engine!(engine, async move |channel| {
         try_write_crc_file_with_channel(channel, path, crc).await
     })
 }

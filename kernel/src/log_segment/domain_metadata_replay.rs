@@ -16,7 +16,7 @@ use crate::actions::{DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA};
 use crate::coroutine::iterate_prepared_result_generator_with_engine;
 use crate::coroutine::kernel::{Channel, DeltaResultGenerator};
 #[cfg(test)]
-use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::run_workflow_with_engine;
 use crate::coroutine::{BoundGenerator as _, Generator as _};
 use crate::crc::merge_domain_metadata;
 use crate::log_replay::ActionsBatch;
@@ -39,7 +39,7 @@ impl LogSegment {
         domains: Option<&HashSet<&str>>,
         engine: &dyn Engine,
     ) -> DeltaResult<DomainMetadataMap> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.scan_domain_metadatas_with_channel(domains, channel)
                 .await
         })
@@ -108,7 +108,7 @@ impl LogSegment {
         domains: Option<&HashSet<&str>>,
         engine: &dyn Engine,
     ) -> DeltaResult<DomainMetadataMap> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.scan_tail_including_tombstones_with_channel(domains, channel)
                 .await
         })

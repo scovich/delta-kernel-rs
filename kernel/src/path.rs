@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::coroutine::kernel::Channel;
 #[cfg(test)]
-use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::run_workflow_with_engine;
 use crate::coroutine::{BoundGenerator as _, ChannelExt as _};
 use crate::engine_data::RowVisitor;
 use crate::utils::require;
@@ -389,7 +389,7 @@ impl ParsedLogPath<FileMeta> {
     /// Callers should handle enablement version checks before calling this method.
     #[cfg(test)]
     pub(crate) fn read_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.read_in_commit_timestamp_with_channel(channel).await
         })
     }

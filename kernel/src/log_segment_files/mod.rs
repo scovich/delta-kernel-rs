@@ -23,7 +23,7 @@ use crate::cancellation::CancellationTokenRef;
 use crate::coroutine::kernel::request::{log_listing_bounds, ForwardListing};
 use crate::coroutine::kernel::{Channel, Request};
 #[cfg(test)]
-use crate::coroutine::run_coroutine_with_storage;
+use crate::coroutine::run_workflow_with_storage;
 use crate::coroutine::{
     BoundGenerator as _, ChannelExt as _, Generator, GeneratorExt as _, PageGenerator,
 };
@@ -591,7 +591,7 @@ impl LogSegmentFiles {
         end_version: Option<Version>,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
-        run_coroutine_with_storage!(storage, cancellation_token.cloned(), async move |channel| {
+        run_workflow_with_storage!(storage, cancellation_token.cloned(), async move |channel| {
             Self::list_commits_with_channel(channel, log_root, log_tail, start_version, end_version)
                 .await
         })
@@ -674,7 +674,7 @@ impl LogSegmentFiles {
         end_version: Option<Version>,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
-        run_coroutine_with_storage!(storage, cancellation_token.cloned(), async move |channel| {
+        run_workflow_with_storage!(storage, cancellation_token.cloned(), async move |channel| {
             Self::list_with_channel(channel, log_root, log_tail, start_version, end_version).await
         })
     }
@@ -709,7 +709,7 @@ impl LogSegmentFiles {
         checkpoint_handling: CheckpointHandling,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
-        run_coroutine_with_storage!(storage, cancellation_token.cloned(), async move |channel| {
+        run_workflow_with_storage!(storage, cancellation_token.cloned(), async move |channel| {
             Self::list_with_checkpoint_handling_with_channel(
                 channel,
                 log_root,
@@ -759,7 +759,7 @@ impl LogSegmentFiles {
         end_version: Option<Version>,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
-        run_coroutine_with_storage!(storage, cancellation_token.cloned(), async move |channel| {
+        run_workflow_with_storage!(storage, cancellation_token.cloned(), async move |channel| {
             Self::list_with_checkpoint_hint_with_channel(
                 checkpoint_metadata,
                 channel,
@@ -859,7 +859,7 @@ impl LogSegmentFiles {
         end_version: Version,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
-        run_coroutine_with_storage!(storage, cancellation_token.cloned(), async move |channel| {
+        run_workflow_with_storage!(storage, cancellation_token.cloned(), async move |channel| {
             Self::list_with_backward_checkpoint_scan_with_channel(
                 channel,
                 log_root,

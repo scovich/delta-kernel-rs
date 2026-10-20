@@ -16,7 +16,7 @@ use crate::actions::{
 use crate::cancellation::CancellationTokenRef;
 use crate::coroutine::kernel::Channel;
 #[cfg(test)]
-use crate::coroutine::run_coroutine_with_storage;
+use crate::coroutine::run_workflow_with_storage;
 use crate::coroutine::ChannelExt as _;
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
@@ -243,7 +243,7 @@ impl LastCheckpointHint {
         log_root: &Url,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Option<LastCheckpointHint>> {
-        run_coroutine_with_storage!(storage, cancellation_token.cloned(), async move |channel| {
+        run_workflow_with_storage!(storage, cancellation_token.cloned(), async move |channel| {
             Self::try_read_with_channel(channel, log_root).await
         })
     }

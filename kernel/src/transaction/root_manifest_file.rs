@@ -7,7 +7,7 @@ use crate::actions::{
 };
 use crate::coroutine::kernel::Channel;
 #[cfg(test)]
-use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::run_workflow_with_engine;
 use crate::coroutine::{BoundGenerator as _, Generator as _};
 use crate::crc::{merge_domain_metadata, DomainMetadataState, SetTransactionState};
 use crate::error::Error;
@@ -53,7 +53,7 @@ impl RootManifestFile {
         dm_changes: &[DomainMetadata],
         set_transactions: &[SetTransaction],
     ) -> DeltaResult<CheckpointAction> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.compute_checkpoint_action_with_channel(
                 channel,
                 commit_version,
@@ -135,7 +135,7 @@ impl RootManifestFile {
         SetTransactionMap,
         Option<CheckpointAction>,
     )> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.scan_non_content_metadata_with_channel(channel).await
         })
     }

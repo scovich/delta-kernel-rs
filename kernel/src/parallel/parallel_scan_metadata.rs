@@ -7,10 +7,9 @@ use tracing::{info_span, Instrument as _, Span};
 use crate::coroutine::engine::{EngineConnector, EngineResultGeneratorIterator};
 use crate::coroutine::generator::AsyncIntoIterator as _;
 use crate::coroutine::kernel::{
-    static_coroutine, Channel, DeltaResultGenerator, GeneratorCoroutineStep, StaticCoroutine,
-    StaticGeneratorCoroutine,
+    static_workflow, Channel, CoroutineStep, DeltaResultGenerator, StaticCoroutine, StaticWorkflow,
 };
-use crate::coroutine::{run_coroutine_with_engine, DeltaFuture};
+use crate::coroutine::{run_workflow_with_engine, DeltaFuture};
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
@@ -35,7 +34,7 @@ pub enum AfterSequentialScanMetadata {
 }
 
 type SequentialScanGenerator =
-    StaticGeneratorCoroutine<DeltaResult<ScanMetadata>, DeltaResult<AfterSequential>>;
+    StaticCoroutine<DeltaResult<ScanMetadata>, DeltaResult<AfterSequential>>;
 type SequentialScanEngineIterator =
     EngineResultGeneratorIterator<'static, ScanMetadata, DeltaResult<AfterSequential>>;
 
@@ -55,7 +54,7 @@ impl SequentialScanMetadata {
         correlation_id: Option<Arc<str>>,
     ) -> Self {
         Self {
-            inner: StaticGeneratorCoroutine::from_generator(sequential),
+            inner: StaticCoroutine::from_generator(sequential),
             operation_id: MetricId::new(),
             correlation_id,
             start: Instant::now(),
@@ -73,7 +72,7 @@ impl SequentialScanMetadata {
     pub fn try_advance(
         &mut self,
     ) -> DeltaResult<
-        GeneratorCoroutineStep<DeltaResult<ScanMetadata>, DeltaResult<AfterSequentialScanMetadata>>,
+        CoroutineStep<DeltaResult<ScanMetadata>, DeltaResult<AfterSequentialScanMetadata>>,
     > {
         let _guard = self.span.enter();
         let step = self.inner.try_advance()?;
@@ -93,7 +92,7 @@ impl SequentialScanMetadata {
     pub async fn advance(
         &mut self,
     ) -> DeltaResult<
-        GeneratorCoroutineStep<DeltaResult<ScanMetadata>, DeltaResult<AfterSequentialScanMetadata>>,
+        CoroutineStep<DeltaResult<ScanMetadata>, DeltaResult<AfterSequentialScanMetadata>>,
     > {
         let step = self.inner.advance().instrument(self.span.clone()).await?;
         let _guard = self.span.enter();
@@ -160,17 +159,17 @@ impl Iterator for SequentialScanMetadataIterator {
 }
 
 fn finish_sequential_step(
-    step: GeneratorCoroutineStep<DeltaResult<ScanMetadata>, DeltaResult<AfterSequential>>,
+    step: CoroutineStep<DeltaResult<ScanMetadata>, DeltaResult<AfterSequential>>,
     operation_id: MetricId,
     correlation_id: &mut Option<Arc<str>>,
     start: Instant,
-) -> GeneratorCoroutineStep<DeltaResult<ScanMetadata>, DeltaResult<AfterSequentialScanMetadata>> {
+) -> CoroutineStep<DeltaResult<ScanMetadata>, DeltaResult<AfterSequentialScanMetadata>> {
     match step {
-        GeneratorCoroutineStep::Yield(item) => GeneratorCoroutineStep::Yield(item),
-        GeneratorCoroutineStep::Request(request) => GeneratorCoroutineStep::Request(request),
-        GeneratorCoroutineStep::Done(after) => {
+        CoroutineStep::Yield(item) => CoroutineStep::Yield(item),
+        CoroutineStep::Request(request) => CoroutineStep::Request(request),
+        CoroutineStep::Done(after) => {
             let correlation_id = correlation_id.take();
-            GeneratorCoroutineStep::Done(after.map(|after| {
+            CoroutineStep::Done(after.map(|after| {
                 finish_sequential_scan_metadata(after, operation_id, correlation_id, start)
             }))
         }
@@ -320,7 +319,7 @@ impl ParallelState {
         engine: &dyn Engine,
         state: SerializableScanState,
     ) -> DeltaResult<Self> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             Self::from_serializable_state_with_channel(channel, state).await
         })
     }
@@ -373,7 +372,7 @@ impl ParallelState {
     }
 }
 
-type ParallelScanGenerator = StaticGeneratorCoroutine<DeltaResult<ScanMetadata>>;
+type ParallelScanGenerator = StaticCoroutine<DeltaResult<ScanMetadata>>;
 type ParallelScanEngineIterator = EngineResultGeneratorIterator<'static, ScanMetadata>;
 
 /// Connector-driven parallel scan metadata processing.
@@ -391,8 +390,8 @@ impl ParallelScanMetadata {
     pub fn try_new_workflow(
         state: Arc<ParallelState>,
         leaf_files: Vec<FileMeta>,
-    ) -> StaticCoroutine<Self> {
-        static_coroutine!(async move |channel| {
+    ) -> StaticWorkflow<Self> {
+        static_workflow!(async move |channel| {
             Self::try_new_impl(channel, state, leaf_files).await
         })
     }
@@ -406,7 +405,7 @@ impl ParallelScanMetadata {
         let generator =
             ParallelPhase::try_new_with_channel(channel, state, leaf_files, read_schema).await?;
         Ok(Self {
-            inner: StaticGeneratorCoroutine::from_generator(generator),
+            inner: StaticCoroutine::from_generator(generator),
             // TODO: Associate the same scan ID from sequential phase to correlate phases
             span: info_span!("parallel_scan_metadata"),
         })
@@ -419,7 +418,7 @@ impl ParallelScanMetadata {
     ) -> Self {
         let generator = ParallelPhase::process_batches(Arc::clone(&state), iter.into_generator());
         Self {
-            inner: StaticGeneratorCoroutine::from_generator(generator),
+            inner: StaticCoroutine::from_generator(generator),
             // TODO: Associate the same scan ID from sequential phase to correlate phases
             span: info_span!("parallel_scan_metadata"),
         }
@@ -430,9 +429,7 @@ impl ParallelScanMetadata {
     /// # Errors
     ///
     /// Returns processing errors, or [`Error::WouldBlock`] if processing cannot make progress.
-    pub fn try_advance(
-        &mut self,
-    ) -> DeltaResult<GeneratorCoroutineStep<DeltaResult<ScanMetadata>>> {
+    pub fn try_advance(&mut self) -> DeltaResult<CoroutineStep<DeltaResult<ScanMetadata>>> {
         let _guard = self.span.enter();
         self.inner.try_advance()
     }
@@ -442,9 +439,7 @@ impl ParallelScanMetadata {
     /// # Errors
     ///
     /// Returns connector or processing errors.
-    pub async fn advance(
-        &mut self,
-    ) -> DeltaResult<GeneratorCoroutineStep<DeltaResult<ScanMetadata>>> {
+    pub async fn advance(&mut self) -> DeltaResult<CoroutineStep<DeltaResult<ScanMetadata>>> {
         self.inner.advance().instrument(self.span.clone()).await
     }
 

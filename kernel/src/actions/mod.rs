@@ -19,7 +19,7 @@ use crate::content_tree::resolve_amt_location;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::coroutine::kernel::Channel;
 #[cfg(all(feature = "adaptive-metadata-in-dev", test))]
-use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::run_workflow_with_engine;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::create_row_with_channel;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1495,7 +1495,7 @@ impl CheckpointAction {
     #[cfg(test)]
     #[internal_api]
     pub(crate) fn into_engine_data(self, engine: &dyn Engine) -> DeltaResult<Box<dyn EngineData>> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             self.into_engine_data_with_channel(channel).await
         })
     }

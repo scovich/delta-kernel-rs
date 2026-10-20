@@ -11,11 +11,10 @@ use crate::coroutine::kernel::request::{
     ExpressionEvaluatorHandle, PredicateEvaluatorHandle, WriteParquetFilesState,
 };
 use crate::coroutine::kernel::{
-    static_generator_coroutine, BoundDeltaResultGenerator, Channel, DeltaResultGenerator,
-    StaticGeneratorCoroutine,
+    static_coroutine, BoundDeltaResultGenerator, Channel, DeltaResultGenerator, StaticCoroutine,
 };
 #[cfg(test)]
-use crate::coroutine::run_coroutine_with_engine;
+use crate::coroutine::run_workflow_with_engine;
 use crate::coroutine::ChannelExt as _;
 use crate::engine_data::filter_by_predicate;
 use crate::expressions::{
@@ -173,7 +172,7 @@ pub(super) struct SidecarSplitter {
 impl SidecarSplitter {
     #[cfg(test)]
     pub(super) fn new(engine: &dyn Engine, checkpoint_data_schema: SchemaRef) -> DeltaResult<Self> {
-        run_coroutine_with_engine!(engine, async move |channel| {
+        run_workflow_with_engine!(engine, async move |channel| {
             Self::new_with_channel(channel, checkpoint_data_schema).await
         })
     }
@@ -272,11 +271,11 @@ impl SidecarSplitter {
     pub(super) fn file_action_batches<G>(
         mut splitter: Self,
         checkpoint_data_iter: G,
-    ) -> StaticGeneratorCoroutine<Box<dyn EngineData>, WriteParquetFilesState>
+    ) -> StaticCoroutine<Box<dyn EngineData>, WriteParquetFilesState>
     where
         G: DeltaResultGenerator<FilteredEngineData> + 'static,
     {
-        static_generator_coroutine!(async move |channel| {
+        static_coroutine!(async move |channel| {
             let mut checkpoint_data_iter = checkpoint_data_iter.bind(&channel);
             loop {
                 match splitter

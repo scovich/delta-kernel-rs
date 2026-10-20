@@ -14,7 +14,7 @@ use itertools::Itertools;
 
 use crate::coroutine::engine::{EngineConnector, EngineResultGeneratorIterator};
 use crate::coroutine::generator::{map_async_witness, BoundGenerator as _, GeneratorExt as _};
-use crate::coroutine::kernel::{coroutine, Channel, ChannelExt as _, DeltaResultGenerator};
+use crate::coroutine::kernel::{workflow, Channel, ChannelExt as _, DeltaResultGenerator};
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::scan::CHECKPOINT_READ_SCHEMA;
 use crate::schema::SchemaRef;
@@ -58,10 +58,10 @@ impl ParallelPhase {
         P::Output: Send + 'static,
     {
         let connector = EngineConnector::new(engine.as_ref());
-        let coroutine = coroutine!(async move |channel| {
+        let workflow = workflow!(async move |channel| {
             Self::try_new_with_channel(channel, processor, leaf_files, read_schema).await
         });
-        connector.iterate_prepared_result_generator(coroutine)
+        connector.iterate_prepared_result_generator(workflow)
     }
 
     pub(crate) async fn try_new_with_channel<P>(

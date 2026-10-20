@@ -13,9 +13,7 @@ use crate::actions::deletion_vector::split_vector;
 use crate::coroutine::generator::{
     map_async_witness, AsyncIntoIterator as _, Generator as _, GeneratorExt as _,
 };
-use crate::coroutine::kernel::{
-    generator_coroutine, Channel, DeltaResultGenerator, GeneratorCoroutine,
-};
+use crate::coroutine::kernel::{coroutine, Channel, Coroutine, DeltaResultGenerator};
 use crate::coroutine::{
     iterate_prepared_result_generator_with_engine, AsyncOption as _, ChannelExt as _,
 };
@@ -235,8 +233,8 @@ impl TableChangesScan {
     }
 
     /// Return a connector-driven generator over change data feed batches.
-    pub fn execute_generator(&self) -> GeneratorCoroutine<'_, DeltaResult<Box<dyn EngineData>>> {
-        generator_coroutine!(async move |channel| {
+    pub fn execute_generator(&self) -> Coroutine<'_, DeltaResult<Box<dyn EngineData>>> {
+        coroutine!(async move |channel| {
             let batches = self.execute_with_channel(&channel).await?;
             channel.yield_from(batches.bind(&channel)).await
         })

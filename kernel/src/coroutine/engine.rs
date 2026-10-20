@@ -17,12 +17,12 @@ use super::kernel::request::{
     WriteJsonFile, WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
 };
 use super::kernel::{
-    coroutine, Coroutine, DeltaResultGenerator, GeneratorCoroutine, GeneratorCoroutineStep,
-    StaticCoroutine, StaticGeneratorCoroutine,
+    workflow, Coroutine, CoroutineStep, DeltaResultGenerator, StaticCoroutine, StaticWorkflow,
+    Workflow,
 };
 #[cfg(feature = "declarative-plans")]
 use super::PlanOperation;
-use super::{drive_coroutine, Cursor, Page, PageRequest, PagedOperation, PlanRequest, Request};
+use super::{drive_workflow, Cursor, Page, PageRequest, PagedOperation, PlanRequest, Request};
 use crate::cancellation::{check_cancelled, CancellationTokenRef};
 use crate::committer::{Committer, FileSystemCommitter};
 use crate::engine_data::{EngineData, FilteredEngineData};
@@ -121,7 +121,7 @@ pub(crate) struct EngineResultGeneratorIterator<
 }
 
 enum GeneratorState<'a, Item: Send + 'static, O: Send + 'static> {
-    Active(GeneratorCoroutine<'a, Item, O>),
+    Active(Coroutine<'a, Item, O>),
     Complete(O),
     Failed,
 }
@@ -159,54 +159,54 @@ fn take_generator_output<O>(
         .ok_or_else(|| Error::internal_error(incomplete_message))
 }
 
-/// Drive a coroutine using only storage operations.
+/// Drive a workflow using only storage operations.
 #[internal_api]
 pub(crate) fn drive_with_storage<O>(
     storage: &dyn StorageHandler,
     cancellation_token: Option<CancellationTokenRef>,
-    coroutine: Coroutine<'_, O>,
+    workflow: Workflow<'_, O>,
 ) -> DeltaResult<O> {
     let connector = StorageConnector::new(storage, cancellation_token.clone());
-    Ok(drive_coroutine!(coroutine, |request| {
+    Ok(drive_workflow!(workflow, |request| {
         check_cancelled(cancellation_token.as_ref())?;
         connector.respond(request)?
     }))
 }
 
-/// Drive `coroutine` through `engine`.
+/// Drive `workflow` through `engine`.
 ///
 /// Pass a cancellation token to install it on the engine connector. `None` matches the
-/// two-argument [`run_coroutine_with_engine`] form.
+/// two-argument [`run_workflow_with_engine`] form.
 #[internal_api]
 pub(crate) fn drive_with_engine<O>(
     engine: &dyn Engine,
     cancellation_token: impl Into<Option<CancellationTokenRef>>,
-    coroutine: Coroutine<'_, O>,
+    workflow: Workflow<'_, O>,
 ) -> DeltaResult<O> {
     let connector = EngineConnector::new(engine).with_cancellation_token(cancellation_token);
-    Ok(drive_coroutine!(coroutine, |request| {
+    Ok(drive_workflow!(workflow, |request| {
         connector.check_cancelled()?;
         connector.respond(request)?
     }))
 }
 
-/// Drive a coroutine through `engine`, delegating commit and publish requests to `committer`.
+/// Drive a workflow through `engine`, delegating commit and publish requests to `committer`.
 #[internal_api]
 pub(crate) fn drive_with_engine_and_committer<O>(
     engine: &dyn Engine,
     committer: &dyn Committer,
-    coroutine: Coroutine<'_, O>,
+    workflow: Workflow<'_, O>,
 ) -> DeltaResult<O> {
-    EngineConnector::new(engine).drive_with_committer(coroutine, engine, committer)
+    EngineConnector::new(engine).drive_with_committer(workflow, engine, committer)
 }
 
 #[cfg(feature = "declarative-plans")]
 pub(crate) fn drive_with_plan_executor<O>(
     executor: &dyn PlanExecutor,
-    coroutine: Coroutine<'_, O>,
+    workflow: Workflow<'_, O>,
 ) -> DeltaResult<O> {
     let connector = PlanExecutorConnector { executor };
-    Ok(drive_coroutine!(coroutine, |request| {
+    Ok(drive_workflow!(workflow, |request| {
         connector.respond(request)?
     }))
 }
@@ -230,7 +230,7 @@ impl StorageConnector<'_> {
             )),
             _ => {
                 return Err(Error::internal_error(
-                    "storage-only coroutine requested a non-storage operation",
+                    "storage-only workflow requested a non-storage operation",
                 ));
             }
         }
@@ -262,7 +262,7 @@ impl PlanExecutorConnector<'_> {
             Request::ExecutePlan(PlanRequest::Query(request)) => respond_paged(self, request),
             _ => {
                 return Err(Error::internal_error(
-                    "plan-executor coroutine requested a non-plan operation",
+                    "plan-executor workflow requested a non-plan operation",
                 ))
             }
         }
@@ -293,14 +293,14 @@ impl EngineConnector {
         self
     }
 
-    /// Drive `coroutine` through this connector.
-    pub(crate) fn run<O: Send + 'static>(&self, coroutine: StaticCoroutine<O>) -> DeltaResult<O> {
-        self.drive(coroutine)
+    /// Drive `workflow` through this connector.
+    pub(crate) fn run<O: Send + 'static>(&self, workflow: StaticWorkflow<O>) -> DeltaResult<O> {
+        self.drive(workflow)
     }
 
-    /// Drive an existing coroutine through this connector.
-    pub(crate) fn drive<O>(&self, coroutine: Coroutine<'_, O>) -> DeltaResult<O> {
-        Ok(drive_coroutine!(coroutine, |request| {
+    /// Drive an existing workflow through this connector.
+    pub(crate) fn drive<O>(&self, workflow: Workflow<'_, O>) -> DeltaResult<O> {
+        Ok(drive_workflow!(workflow, |request| {
             self.check_cancelled()?;
             self.respond(request)?
         }))
@@ -309,39 +309,39 @@ impl EngineConnector {
     /// Prepare a fallible generator and return an iterator that drives it and its requests.
     pub(crate) fn iterate_prepared_result_generator<'a, G, Item>(
         self,
-        coroutine: Coroutine<'_, G>,
+        workflow: Workflow<'_, G>,
     ) -> DeltaResult<EngineResultGeneratorIterator<'a, Item>>
     where
         G: DeltaResultGenerator<Item> + 'a,
         Item: Send + 'static,
     {
-        let generator = GeneratorCoroutine::from_generator(self.drive(coroutine)?);
+        let generator = Coroutine::from_generator(self.drive(workflow)?);
         Ok(self.iterate_result_generator(generator))
     }
 
     /// Prepare a fallible generator and return its iterator and eager companion value.
     pub(crate) fn iterate_prepared_result_generator_with_companion<'a, R, G, Item, Companion>(
         self,
-        coroutine: Coroutine<'_, R>,
+        workflow: Workflow<'_, R>,
         into_parts: impl FnOnce(R) -> (G, Companion),
     ) -> DeltaResult<(EngineResultGeneratorIterator<'a, Item>, Companion)>
     where
         G: DeltaResultGenerator<Item> + 'a,
         Item: Send + 'static,
     {
-        let (generator, companion) = into_parts(self.drive(coroutine)?);
-        let generator = GeneratorCoroutine::from_generator(generator);
+        let (generator, companion) = into_parts(self.drive(workflow)?);
+        let generator = Coroutine::from_generator(generator);
         Ok((self.iterate_result_generator(generator), companion))
     }
 
-    /// Drive a coroutine whose catalog requests are handled by `committer`.
+    /// Drive a workflow whose catalog requests are handled by `committer`.
     pub(crate) fn drive_with_committer<O>(
         &self,
-        coroutine: Coroutine<'_, O>,
+        workflow: Workflow<'_, O>,
         engine: &dyn Engine,
         committer: &dyn Committer,
     ) -> DeltaResult<O> {
-        Ok(drive_coroutine!(coroutine, |request| {
+        Ok(drive_workflow!(workflow, |request| {
             self.check_cancelled()?;
             match request {
                 Request::Publish(metadata, reply) => {
@@ -358,7 +358,7 @@ impl EngineConnector {
     /// Return an iterator that drives `generator` and its connector requests.
     pub(crate) fn iterate_generator<'a, Item: Send + 'static, O: Send + 'static>(
         self,
-        generator: impl Into<GeneratorCoroutine<'a, Item, O>>,
+        generator: impl Into<Coroutine<'a, Item, O>>,
     ) -> EngineGeneratorIterator<'a, Item, O> {
         EngineGeneratorIterator {
             connector: self,
@@ -369,7 +369,7 @@ impl EngineConnector {
     /// Like [`iterate_generator`], but for generators that yield [`DeltaResult`] items.
     pub(crate) fn iterate_result_generator<'a, Item: Send + 'static, O: Send + 'static>(
         self,
-        generator: impl Into<GeneratorCoroutine<'a, DeltaResult<Item>, O>>,
+        generator: impl Into<Coroutine<'a, DeltaResult<Item>, O>>,
     ) -> EngineResultGeneratorIterator<'a, Item, O> {
         EngineResultGeneratorIterator {
             inner: self.iterate_generator(generator),
@@ -541,7 +541,7 @@ impl EngineConnector {
 #[internal_api]
 pub(crate) fn iterate_result_generator_with_engine<'a, Item: Send + 'static, O: Send + 'static>(
     engine: &dyn Engine,
-    generator: impl Into<GeneratorCoroutine<'a, DeltaResult<Item>, O>>,
+    generator: impl Into<Coroutine<'a, DeltaResult<Item>, O>>,
 ) -> impl Iterator<Item = DeltaResult<Item>> + Send + 'a {
     EngineConnector::new(engine).iterate_result_generator(generator)
 }
@@ -552,70 +552,70 @@ pub(crate) fn iterate_result_generator_with_engine<'a, Item: Send + 'static, O: 
 pub(crate) fn iterate_prepared_result_generator_with_engine<'a, G, Item>(
     engine: &dyn Engine,
     cancellation_token: impl Into<Option<CancellationTokenRef>>,
-    coroutine: Coroutine<'_, G>,
+    workflow: Workflow<'_, G>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<Item>> + Send + 'a>
 where
     G: DeltaResultGenerator<Item> + 'a,
     Item: Send + 'static,
 {
     let connector = EngineConnector::new(engine).with_cancellation_token(cancellation_token);
-    connector.iterate_prepared_result_generator(coroutine)
+    connector.iterate_prepared_result_generator(workflow)
 }
 
 /// Construct, prepare, and iterate a fallible generator through `engine`.
 #[internal_api]
 macro_rules! iterate_prepared_result_generator_with_engine {
     ($engine:expr, $cancellation_token:expr, $body:expr) => {{
-        let coroutine = $crate::coroutine::kernel::coroutine!($body);
+        let workflow = $crate::coroutine::kernel::workflow!($body);
         $crate::coroutine::iterate_prepared_result_generator_with_engine(
             $engine,
             $cancellation_token,
-            coroutine,
+            workflow,
         )
     }};
 }
 
-/// Construct and drive a coroutine through an [`Engine`].
+/// Construct and drive a workflow through an [`Engine`].
 ///
 /// The two-argument form does not propagate cancellation. Pass a token as the second argument
 /// to install it when the engine connector is first captured.
 #[internal_api]
-macro_rules! run_coroutine_with_engine {
+macro_rules! run_workflow_with_engine {
     ($engine:expr, $body:expr) => {
         $crate::coroutine::drive_with_engine(
             $engine,
             None,
-            $crate::coroutine::kernel::coroutine!($body),
+            $crate::coroutine::kernel::workflow!($body),
         )
     };
     ($engine:expr, $cancellation_token:expr, $body:expr) => {
         $crate::coroutine::drive_with_engine(
             $engine,
             $cancellation_token,
-            $crate::coroutine::kernel::coroutine!($body),
+            $crate::coroutine::kernel::workflow!($body),
         )
     };
 }
 
-/// Construct and drive a coroutine through a storage handler.
+/// Construct and drive a workflow through a storage handler.
 #[internal_api]
-macro_rules! run_coroutine_with_storage {
+macro_rules! run_workflow_with_storage {
     ($storage:expr, $cancellation_token:expr, $body:expr) => {
         $crate::coroutine::drive_with_storage(
             $storage,
             $cancellation_token,
-            $crate::coroutine::kernel::coroutine!($body),
+            $crate::coroutine::kernel::workflow!($body),
         )
     };
 }
 
-/// Construct and drive a coroutine through an existing [`EngineConnector`].
-macro_rules! run_coroutine_with_connector {
+/// Construct and drive a workflow through an existing [`EngineConnector`].
+macro_rules! run_workflow_with_connector {
     ($connector:expr, $body:expr) => {
-        $connector.drive($crate::coroutine::kernel::coroutine!($body))
+        $connector.drive($crate::coroutine::kernel::workflow!($body))
     };
 }
-pub(crate) use run_coroutine_with_connector;
+pub(crate) use run_workflow_with_connector;
 
 fn expression_evaluator(
     handle: &ExpressionEvaluatorHandle,
@@ -827,12 +827,12 @@ fn next_generator<Item: Send + 'static, O: Send + 'static>(
     }
     loop {
         match generator.try_advance() {
-            Ok(GeneratorCoroutineStep::Done(output)) => {
+            Ok(CoroutineStep::Done(output)) => {
                 *state = GeneratorState::Complete(output);
                 return None;
             }
-            Ok(GeneratorCoroutineStep::Yield(item)) => return Some(Ok(item)),
-            Ok(GeneratorCoroutineStep::Request(request)) => {
+            Ok(CoroutineStep::Yield(item)) => return Some(Ok(item)),
+            Ok(CoroutineStep::Request(request)) => {
                 if let Err(err) = connector.respond(request) {
                     *state = GeneratorState::Failed;
                     return Some(Err(err));
@@ -960,7 +960,7 @@ mod tests {
             let inner: Arc<dyn Engine> = Arc::new(SyncEngine::new());
             let engine =
                 DelegatingEngine::new(inner).with_json_handler(Arc::new(EarlyReturnJsonHandler));
-            let input = StaticGeneratorCoroutine::from_generator(empty());
+            let input = StaticCoroutine::from_generator(empty());
             let operation = WriteJsonFile::new(
                 Url::parse("memory:///_delta_log/0.json").unwrap(),
                 FileWriteMode::CreateNew,

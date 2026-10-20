@@ -193,7 +193,7 @@ use cancellation::{check_cancelled, CancellableIterator};
 pub use cancellation::{CancellationToken, CancellationTokenRef, CancelledFuture};
 use coroutine::kernel::Channel;
 #[cfg(test)]
-use coroutine::run_coroutine_with_engine;
+use coroutine::run_workflow_with_engine;
 use coroutine::ChannelExt as _;
 pub use delta_kernel_derive;
 pub use engine_data::{
@@ -591,7 +591,7 @@ pub(crate) fn create_row(
     value: impl Into<Scalar>,
 ) -> DeltaResult<Box<dyn EngineData>> {
     let value = value.into();
-    run_coroutine_with_engine!(engine, async move |channel| {
+    run_workflow_with_engine!(engine, async move |channel| {
         create_row_with_channel(channel, schema, value).await
     })
 }

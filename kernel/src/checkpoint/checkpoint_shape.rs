@@ -10,7 +10,7 @@ use url::Url;
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::SIDECAR_NAME;
 use crate::coroutine::engine::drive_with_plan_executor;
-use crate::coroutine::kernel::{coroutine, Channel};
+use crate::coroutine::kernel::{workflow, Channel};
 use crate::coroutine::{BoundGenerator as _, ChannelExt as _};
 use crate::engine_data::RowVisitor;
 use crate::log_segment::LogSegment;
@@ -49,7 +49,7 @@ impl CheckpointShape {
         snapshot: &Snapshot,
         stats_schema: Option<&SchemaRef>,
     ) -> DeltaResult<CheckpointShape> {
-        let try_new = coroutine!(async move |channel| {
+        let try_new = workflow!(async move |channel| {
             Self::try_new_with_channel(channel, snapshot, stats_schema).await
         });
         drive_with_plan_executor(exec, try_new)
@@ -169,7 +169,7 @@ impl CheckpointShape {
         file_type: FileType,
         stats_schema: Option<&SchemaRef>,
     ) -> DeltaResult<Option<CheckpointShape>> {
-        let from_hint = coroutine!(async move |channel| {
+        let from_hint = workflow!(async move |channel| {
             Self::from_v2_checkpoint_hint_with_channel(
                 channel,
                 segment,
@@ -245,7 +245,7 @@ impl CheckpointShape {
         stats_schema: Option<&SchemaRef>,
         hint_sidecar_schema: Option<StructType>,
     ) -> DeltaResult<CheckpointShape> {
-        let try_new = coroutine!(async move |channel| {
+        let try_new = workflow!(async move |channel| {
             Self::try_new_manifest_with_channel(channel, sidecar, stats_schema, hint_sidecar_schema)
                 .await
         });
