@@ -1591,9 +1591,10 @@ async fn read_scan_file_with_channel(
     // https://github.com/delta-io/delta-kernel-rs/issues/434 for more details.
     //
     // TODO(#860): we disable predicate pushdown until we support row indexes.
-    let mut page = channel
-        .start_paged(ReadParquetFiles::new([meta], physical_schema.clone(), None))
+    let cursor = channel
+        .prepare_paged(ReadParquetFiles::new([meta], physical_schema.clone(), None))
         .await?;
+    let mut page = channel.next_page(cursor).await?;
 
     // Only flag an empty iterator as a connector bug when stats are present and report
     // a positive row count. When stats are absent we cannot distinguish a legitimate
@@ -1603,7 +1604,7 @@ async fn read_scan_file_with_channel(
     // `peek` because that requires a bound generator and we must produce an unbound generator.
     while expect_data && page.data.is_empty() {
         if let Some(cursor) = page.next {
-            page = channel.continue_paged(cursor).await?;
+            page = channel.next_page(cursor).await?;
             continue;
         }
         return Err(Error::internal_error(format!(
@@ -1614,7 +1615,7 @@ async fn read_scan_file_with_channel(
         )));
     }
 
-    let remainder = page.next.map_or(PageGenerator::Done, PageGenerator::resume);
+    let remainder = page.next.map_or(PageGenerator::Done, PageGenerator::Next);
     let read_result_iter = page.data.into_generator().chain(remainder.flatten());
 
     let physical_schema_inner = physical_schema.clone();

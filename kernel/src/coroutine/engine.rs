@@ -17,15 +17,12 @@ use super::kernel::request::{
     WriteJsonFile, WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
 };
 use super::kernel::{
-    coroutine, ChannelExt as _, Coroutine, DeltaResultGenerator, GeneratorCoroutine,
-    GeneratorCoroutineStep, StaticCoroutine, StaticGeneratorCoroutine,
+    coroutine, Coroutine, DeltaResultGenerator, GeneratorCoroutine, GeneratorCoroutineStep,
+    StaticCoroutine, StaticGeneratorCoroutine,
 };
 #[cfg(feature = "declarative-plans")]
 use super::PlanOperation;
-use super::{
-    drive_coroutine, BoundGenerator as _, Cursor, GeneratorExt as _, Page, PageGenerator,
-    PageRequest, PagedOperation, PlanRequest, Request,
-};
+use super::{drive_coroutine, Cursor, Page, PageRequest, PagedOperation, PlanRequest, Request};
 use crate::cancellation::{check_cancelled, CancellationTokenRef};
 use crate::committer::{Committer, FileSystemCommitter};
 use crate::engine_data::{EngineData, FilteredEngineData};
@@ -55,21 +52,9 @@ struct BackwardListingState {
 trait EnginePagination<Op: PagedOperation> {
     type State: Any + Send;
 
-    fn initialize(&self, operation: Op) -> DeltaResult<Self::State>;
+    fn prepare(&self, operation: Op) -> DeltaResult<Self::State>;
 
-    fn next_page(&self, state: Self::State) -> DeltaResult<Page<Op>>;
-
-    fn start(&self, operation: Op) -> DeltaResult<Page<Op>> {
-        self.continue_from(self.prepare(operation)?)
-    }
-
-    fn prepare(&self, operation: Op) -> DeltaResult<Cursor<Op>> {
-        Ok(Cursor::new(self.initialize(operation)?))
-    }
-
-    fn continue_from(&self, cursor: Cursor<Op>) -> DeltaResult<Page<Op>> {
-        self.next_page(cursor.into_inner()?)
-    }
+    fn next(&self, state: Self::State) -> DeltaResult<Page<Op>>;
 }
 
 fn respond_paged<C, Op>(connector: &C, request: PageRequest<Op>)
@@ -78,14 +63,12 @@ where
     Op: PagedOperation,
 {
     match request {
-        PageRequest::Start(operation, reply) => {
-            reply.send(C::start(connector, operation));
-        }
         PageRequest::Prepare(operation, reply) => {
-            reply.send(C::prepare(connector, operation));
+            reply.send(C::prepare(connector, operation).map(Cursor::new));
         }
-        PageRequest::Continue(cursor, reply) => {
-            reply.send(C::continue_from(connector, cursor));
+        PageRequest::Next(cursor, reply) => {
+            let inner = cursor.into_inner();
+            reply.send(inner.and_then(|state| C::next(connector, state)));
         }
     }
 }
@@ -393,35 +376,6 @@ impl EngineConnector {
         }
     }
 
-    /// Initialize `operation` and return its continuation cursor without fetching a page.
-    pub(crate) fn prepare_paged<Op>(&self, operation: Op) -> DeltaResult<Cursor<Op>>
-    where
-        Op: PagedOperation,
-        PageRequest<Op>: Into<Request>,
-    {
-        self.drive(coroutine!(async move |channel| {
-            channel.prepare_paged(operation).await
-        }))
-    }
-
-    /// Prepare `operation` and flatten its remaining pages into an independently driven generator.
-    pub(crate) fn prepare_flattened_generator<Op>(
-        &self,
-        operation: Op,
-    ) -> DeltaResult<StaticGeneratorCoroutine<<Op::Page as IntoIterator>::Item>>
-    where
-        Op: PagedOperation,
-        Op::Page: IntoIterator,
-        <Op::Page as IntoIterator>::IntoIter: Send + 'static,
-        <Op::Page as IntoIterator>::Item: Send + 'static,
-        PageRequest<Op>: Into<Request>,
-    {
-        let cursor = self.prepare_paged(operation)?;
-        Ok(StaticGeneratorCoroutine::from_generator(
-            PageGenerator::resume(cursor).flatten(),
-        ))
-    }
-
     fn storage_connector(&self) -> StorageConnector<'_> {
         StorageConnector::new(self.storage.as_ref(), self.cancellation_token.clone())
     }
@@ -473,9 +427,8 @@ impl EngineConnector {
             Request::ExecutePlan(PlanRequest::Query(request)) => {
                 let err = Error::unsupported("declarative plans are disabled");
                 match request {
-                    PageRequest::Start(_, reply) => reply.send(Err(err)),
                     PageRequest::Prepare(_, reply) => reply.send(Err(err)),
-                    PageRequest::Continue(_, reply) => reply.send(Err(err)),
+                    PageRequest::Next(_, reply) => reply.send(Err(err)),
                 }
             }
             #[cfg(not(feature = "declarative-plans"))]
@@ -683,7 +636,7 @@ fn predicate_evaluator(
 impl EnginePagination<DirectoryListing> for StorageConnector<'_> {
     type State = ListingIterator;
 
-    fn initialize(&self, listing: DirectoryListing) -> DeltaResult<Self::State> {
+    fn prepare(&self, listing: DirectoryListing) -> DeltaResult<Self::State> {
         let prefix = listing.prefix().clone();
         let entries = self
             .storage
@@ -692,7 +645,7 @@ impl EnginePagination<DirectoryListing> for StorageConnector<'_> {
         Ok(Box::new(entries))
     }
 
-    fn next_page(&self, mut listing: Self::State) -> DeltaResult<Page<DirectoryListing>> {
+    fn next(&self, mut listing: Self::State) -> DeltaResult<Page<DirectoryListing>> {
         let data = Vec::from_iter(listing.by_ref().take(FORWARD_LISTING_PAGE_SIZE));
         let next = (data.len() == FORWARD_LISTING_PAGE_SIZE).then(|| Cursor::new(listing));
         Ok(Page { data, next })
@@ -702,7 +655,7 @@ impl EnginePagination<DirectoryListing> for StorageConnector<'_> {
 impl EnginePagination<ForwardListing> for StorageConnector<'_> {
     type State = ListingIterator;
 
-    fn initialize(&self, ForwardListing(bounds): ForwardListing) -> DeltaResult<Self::State> {
+    fn prepare(&self, ForwardListing(bounds): ForwardListing) -> DeltaResult<Self::State> {
         let listing = self
             .storage
             .list_from_with_cancellation(&bounds.low, self.cancellation_token.clone())?
@@ -710,7 +663,7 @@ impl EnginePagination<ForwardListing> for StorageConnector<'_> {
         Ok(Box::new(listing))
     }
 
-    fn next_page(&self, mut listing: ListingIterator) -> DeltaResult<Page<ForwardListing>> {
+    fn next(&self, mut listing: ListingIterator) -> DeltaResult<Page<ForwardListing>> {
         let data = Vec::from_iter(listing.by_ref().take(FORWARD_LISTING_PAGE_SIZE));
         let next = (data.len() == FORWARD_LISTING_PAGE_SIZE).then(|| Cursor::new(listing));
         Ok(Page { data, next })
@@ -720,14 +673,14 @@ impl EnginePagination<ForwardListing> for StorageConnector<'_> {
 impl EnginePagination<BackwardListing> for StorageConnector<'_> {
     type State = BackwardListingState;
 
-    fn initialize(&self, BackwardListing(bounds): BackwardListing) -> DeltaResult<Self::State> {
+    fn prepare(&self, BackwardListing(bounds): BackwardListing) -> DeltaResult<Self::State> {
         Ok(BackwardListingState {
             high: bounds.high_version()?,
             bounds: Box::new(*bounds),
         })
     }
 
-    fn next_page(&self, state: Self::State) -> DeltaResult<Page<BackwardListing>> {
+    fn next(&self, state: Self::State) -> DeltaResult<Page<BackwardListing>> {
         let BackwardListingState { bounds, high } = state;
         let window = bounds.backward_window(high, BackwardListing::DEFAULT_WINDOW_SIZE)?;
         let next_high = window.next_high;
@@ -748,7 +701,7 @@ impl EnginePagination<BackwardListing> for StorageConnector<'_> {
 impl EnginePagination<ReadJsonFiles> for EngineConnector {
     type State = EngineDataIterator;
 
-    fn initialize(&self, read: ReadJsonFiles) -> DeltaResult<Self::State> {
+    fn prepare(&self, read: ReadJsonFiles) -> DeltaResult<Self::State> {
         self.json.read_json_files_with_cancellation(
             &read.files,
             read.physical_schema,
@@ -757,7 +710,7 @@ impl EnginePagination<ReadJsonFiles> for EngineConnector {
         )
     }
 
-    fn next_page(&self, state: Self::State) -> DeltaResult<Page<ReadJsonFiles>> {
+    fn next(&self, state: Self::State) -> DeltaResult<Page<ReadJsonFiles>> {
         next_engine_data(state)
     }
 }
@@ -765,7 +718,7 @@ impl EnginePagination<ReadJsonFiles> for EngineConnector {
 impl EnginePagination<ReadParquetFiles> for EngineConnector {
     type State = EngineDataIterator;
 
-    fn initialize(&self, read: ReadParquetFiles) -> DeltaResult<Self::State> {
+    fn prepare(&self, read: ReadParquetFiles) -> DeltaResult<Self::State> {
         self.parquet.read_parquet_files_with_cancellation(
             &read.files,
             read.physical_schema,
@@ -774,7 +727,7 @@ impl EnginePagination<ReadParquetFiles> for EngineConnector {
         )
     }
 
-    fn next_page(&self, state: Self::State) -> DeltaResult<Page<ReadParquetFiles>> {
+    fn next(&self, state: Self::State) -> DeltaResult<Page<ReadParquetFiles>> {
         next_engine_data(state)
     }
 }
@@ -783,7 +736,7 @@ impl EnginePagination<ReadParquetFiles> for EngineConnector {
 impl EnginePagination<PlanOperation> for EngineConnector {
     type State = EngineDataIterator;
 
-    fn initialize(&self, operation: PlanOperation) -> DeltaResult<Self::State> {
+    fn prepare(&self, operation: PlanOperation) -> DeltaResult<Self::State> {
         self.plan_executor
             .as_deref()
             .ok_or_else(|| Error::unsupported("this engine does not provide a PlanExecutor"))?
@@ -791,7 +744,7 @@ impl EnginePagination<PlanOperation> for EngineConnector {
             .into_data()
     }
 
-    fn next_page(&self, state: Self::State) -> DeltaResult<Page<PlanOperation>> {
+    fn next(&self, state: Self::State) -> DeltaResult<Page<PlanOperation>> {
         next_engine_data(state)
     }
 }
@@ -800,11 +753,11 @@ impl EnginePagination<PlanOperation> for EngineConnector {
 impl EnginePagination<PlanOperation> for PlanExecutorConnector<'_> {
     type State = EngineDataIterator;
 
-    fn initialize(&self, operation: PlanOperation) -> DeltaResult<Self::State> {
+    fn prepare(&self, operation: PlanOperation) -> DeltaResult<Self::State> {
         self.executor.execute_op(operation)?.into_data()
     }
 
-    fn next_page(&self, state: Self::State) -> DeltaResult<Page<PlanOperation>> {
+    fn next(&self, state: Self::State) -> DeltaResult<Page<PlanOperation>> {
         next_engine_data(state)
     }
 }

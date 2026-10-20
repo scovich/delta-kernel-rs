@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use super::{ChannelBinding, GeneratorBody};
-use crate::coroutine::Channel;
+use crate::coroutine::{Channel, DeltaFuture};
 use crate::utils::PhantomType;
 use crate::{DeltaResult, Error};
 
@@ -208,7 +208,7 @@ pub trait BoundGenerator: Send {
     /// Restricted to [`Self::Output`] `()` so a real completion value cannot vanish in a
     /// `while let Some` loop. Callers that need `Output` poll [`Self::poll_step`] or drive a
     /// [`super::GeneratorCoroutine`].
-    fn next(&mut self) -> impl Future<Output = DeltaResult<Option<Self::Item>>> + Send + '_
+    fn next(&mut self) -> impl DeltaFuture<Option<Self::Item>> + '_
     where
         Self: Sized + Unpin + BoundGenerator<Output = ()>,
     {
@@ -224,7 +224,7 @@ pub trait BoundGenerator: Send {
 
     /// Counterpart of `Itertools::try_collect`: collects successful yielded items, stopping at the
     /// first item or generator error.
-    fn try_collect<T, C>(mut self) -> impl Future<Output = DeltaResult<C>> + Send
+    fn try_collect<T, C>(mut self) -> impl DeltaFuture<C>
     where
         Self: Sized + Unpin + BoundGenerator<Item = DeltaResult<T>, Output = ()>,
         T: Send + 'static,
@@ -240,7 +240,7 @@ pub trait BoundGenerator: Send {
     }
 
     /// Counterpart of [`Iterator::collect`]: collects every yielded item.
-    fn collect<C>(mut self) -> impl Future<Output = DeltaResult<C>> + Send
+    fn collect<C>(mut self) -> impl DeltaFuture<C>
     where
         Self: Sized + Unpin + BoundGenerator<Output = ()>,
         C: Default + Extend<Self::Item> + Send,
@@ -264,6 +264,14 @@ pub trait BoundGenerator: Send {
             peeked: None,
             done: None,
         }
+    }
+
+    /// Type-erases this bound generator as [`BoxedBoundGenerator`].
+    fn into_boxed<'a>(self) -> BoxedBoundGenerator<'a, Self::Item, Self::Output>
+    where
+        Self: Sized + Unpin + 'a,
+    {
+        Box::new(self)
     }
 }
 

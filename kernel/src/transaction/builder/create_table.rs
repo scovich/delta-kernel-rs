@@ -19,8 +19,8 @@ use crate::committer::Committer;
 use crate::coroutine::kernel::request::DirectoryListing;
 use crate::coroutine::kernel::{static_coroutine, Channel, StaticCoroutine};
 use crate::coroutine::{
-    run_coroutine_with_engine, BoundGenerator as _, ChannelExt as _, Generator as _,
-    GeneratorExt as _, PageGenerator,
+    run_coroutine_with_engine, BoundGenerator as _, ChannelExt as _, GeneratorExt as _,
+    PageGenerator,
 };
 use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
@@ -162,8 +162,8 @@ async fn ensure_table_does_not_exist_with_channel(
     let listing = DirectoryListing::try_new(delta_log_url.clone())?;
     match channel.prepare_paged(listing).await {
         Ok(cursor) => {
-            let mut files = PageGenerator::resume(cursor).flatten().bind(channel);
-            // files.next().await? returns Option<DeltaResult<FileMeta>>
+            let mut files = channel.bind(PageGenerator::Next(cursor).flatten());
+            // files.next() returns Option<DeltaResult<FileMeta>>
             // - Some(Ok(_)) means a file exists -> table exists
             // - Some(Err(FileNotFound)) means path doesn't exist -> OK for new table
             // - Some(Err(other)) means real error -> propagate

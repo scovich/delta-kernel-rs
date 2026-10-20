@@ -10,7 +10,7 @@ use crate::coroutine::kernel::{
     DeltaResultGenerator, GeneratorChannel, GeneratorCoroutineStep, StaticCoroutine,
     StaticGeneratorCoroutine,
 };
-use crate::coroutine::{ChannelExt as _, GeneratorExt as _};
+use crate::coroutine::ChannelExt as _;
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor};
 use crate::expressions::{column_name, ColumnName};
 use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
@@ -167,8 +167,7 @@ impl IncrementalScanBuilder {
 
         let actions = channel
             .prepare_json_files(commit_locations, COMMIT_READ_SCHEMA.clone(), None)
-            .await?
-            .flatten();
+            .await?;
         let state = IncrementalScanState {
             base_version: self.base_version,
             target_version,

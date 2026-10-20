@@ -49,8 +49,8 @@ where
 /// `BoundGenerator<Item = DeltaResult<T>, Output = O> + Unpin`.
 ///
 /// Use `impl BoundDeltaResultGenerator<T>` after [`generator::Generator::bind`]. When json/parquet
-/// (or other) arms must share a type, erase as [`generator::BoxedBoundGenerator`] with
-/// `Item = DeltaResult<T>`.
+/// (or other) arms must share a type, erase with [`generator::BoundGenerator::into_boxed`] to
+/// [`generator::BoxedBoundGenerator`] with `Item = DeltaResult<T>`.
 pub trait BoundDeltaResultGenerator<T, O = ()>:
     generator::BoundGenerator<Item = DeltaResult<T>, Output = O> + Unpin
 where

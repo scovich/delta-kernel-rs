@@ -79,20 +79,18 @@
 //! a paginated request model. Kernel consumes a logical stream of results while the connector
 //! controls in-flight memory and can terminate the operation if resource limits are hit.
 //!
-//! Paged operations have three phases:
+//! Paged operations have two phases:
 //!
-//! - [`PageRequest::Start`] initializes the operation and returns its first [`Page`] of output.
-//! - [`PageRequest::Continue`] consumes a cursor and returns the next page, with `Some(cursor)`
-//!   when more pages remain.
 //! - [`PageRequest::Prepare`] initializes an operation and returns a [`Cursor`] without producing a
 //!   first page. This lets the connector begin work in the background while waiting for the first
-//!   [`PageRequest::Continue`] from kernel.
+//!   [`PageRequest::Next`] from kernel.
+//! - [`PageRequest::Next`] consumes a cursor and returns the next [`Page`] of output, with
+//!   `Some(cursor)` when more pages remain.
 //!
-//! Every response to a pagination request carries the requested data and an optional [`Cursor`] for
-//! continuing. `None` ends pagination; an empty page with a live cursor does not. Connectors choose
-//! page boundaries and cursor representation; cursor payloads are opaque to kernel, forwarded
-//! blindly back to connector with each continuation request (or dropped if kernel abandoned the
-//! operation).
+//! [`PageRequest::Next`] returns a [`Page`]: payload plus an optional [`Cursor`]. `None` ends
+//! pagination; an empty page with a live cursor does not. Connectors choose page boundaries and
+//! cursor representation; cursor payloads are opaque to kernel, forwarded blindly back to the
+//! connector with each continuation request (or dropped if kernel abandoned the operation).
 //!
 //! # Error handling
 //!
@@ -118,7 +116,9 @@ pub use self::core::Reply;
 #[internal_api]
 pub(crate) use self::core::{Channel, ChannelExchange, DeltaFuture};
 use self::generator::{unfold_mut, ChannelBinding};
-pub use self::generator::{
+#[doc(inline)]
+#[internal_api]
+pub(crate) use self::generator::{
     BoundGenerator, BoxedBoundGenerator, Flatten, Generator, GeneratorBody, GeneratorExt,
     GeneratorStep,
 };
@@ -143,6 +143,9 @@ pub enum PlanOperation {}
 mod async_ext;
 mod core;
 pub(crate) mod engine;
+#[doc(inline)]
+#[internal_api]
+pub(crate) use self::async_ext::AsyncResult;
 pub(crate) use self::async_ext::{AsyncBool, AsyncOption};
 // cbindgen ignores cfg gates on module declarations. Ignore both arms so coroutine-only generic
 // aliases are not registered or monomorphized into the C API.
@@ -574,7 +577,7 @@ pub trait PagedOperation: Send + Sized + 'static {
 pub struct Page<Op: PagedOperation> {
     /// Data returned in this page.
     pub data: Op::Page,
-    /// Cursor to pass to [`PageRequest::Continue`], or `None` when the operation is exhausted.
+    /// Cursor to pass to [`PageRequest::Next`], or `None` when the operation is exhausted.
     ///
     /// An empty payload with `Some(cursor)` is not exhaustion.
     pub next: Option<Cursor<Op>>,
@@ -612,35 +615,19 @@ impl<Op> Cursor<Op> {
 
 /// One phase of a paginated connector operation.
 pub enum PageRequest<Op: PagedOperation> {
-    /// Initialize the operation and return its first page.
-    Start(Op, Reply<Page<Op>>),
     /// Initialize the operation and return a cursor without fetching the first page.
     Prepare(Op, Reply<Cursor<Op>>),
     /// Consume a cursor and return the next page.
-    Continue(Cursor<Op>, Reply<Page<Op>>),
+    Next(Cursor<Op>, Reply<Page<Op>>),
 }
 
-/// Unbound generator of page payloads.
+/// Unbound generator of page payloads from a prepared cursor.
 #[internal_api]
 pub(crate) enum PageGenerator<Op: PagedOperation> {
-    /// Start a new paged operation.
-    Start(Op),
-    /// Resume an initialized operation from `cursor`.
+    /// Stream pages from `cursor`.
     Next(Cursor<Op>),
     /// The operation is exhausted.
     Done,
-}
-
-impl<Op: PagedOperation> PageGenerator<Op> {
-    /// Create a generator for a new paged operation.
-    pub(crate) fn new(operation: Op) -> Self {
-        Self::Start(operation)
-    }
-
-    /// Create a generator that resumes an initialized paged operation.
-    pub(crate) fn resume(cursor: Cursor<Op>) -> Self {
-        Self::Next(cursor)
-    }
 }
 
 impl<Op: PagedOperation> GeneratorExt for PageGenerator<Op> {}
@@ -689,15 +676,11 @@ impl<'a, P: Send + 'static, Op: PagedOperation> BoundPages<'a, P, Op> {
     where
         PageRequest<Op>: Into<P>,
     {
-        let page = match std::mem::replace(&mut self.state, PageGenerator::Done) {
-            PageGenerator::Start(operation) => {
-                self.channel.exchange(operation, PageRequest::Start).await?
-            }
-            PageGenerator::Next(cursor) => {
-                self.channel.exchange(cursor, PageRequest::Continue).await?
-            }
+        let cursor = match std::mem::replace(&mut self.state, PageGenerator::Done) {
+            PageGenerator::Next(cursor) => cursor,
             PageGenerator::Done => return Ok(None),
         };
+        let page = self.channel.exchange(cursor, PageRequest::Next).await?;
         if let Some(cursor) = page.next {
             self.state = PageGenerator::Next(cursor);
         }

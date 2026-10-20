@@ -20,7 +20,7 @@ use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
 use crate::coroutine::iterate_prepared_result_generator_with_engine;
 use crate::coroutine::kernel::{BoundDeltaResultGenerator, Channel, DeltaResultGenerator};
 #[cfg(feature = "declarative-plans")]
-use crate::coroutine::{ChannelExt as _, PageGenerator};
+use crate::coroutine::ChannelExt as _;
 use crate::coroutine::{Generator as _, GeneratorExt as _};
 use crate::crc::Crc;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
@@ -32,7 +32,7 @@ use crate::plans::ir::nodes::Agg;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::FileType;
 #[cfg(feature = "declarative-plans")]
-use crate::plans::{Operation, PlanBuilder};
+use crate::plans::PlanBuilder;
 use crate::schema::{
     column_name, schema_ref, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec,
     StructField, StructType,
@@ -228,8 +228,7 @@ impl LogSegment {
             })?
             .build()?;
 
-        let cursor = channel.prepare_paged(Operation::QueryPlan(plan)).await?;
-        let batches = PageGenerator::resume(cursor).flatten();
+        let batches = channel.prepare_query_plan(plan).await?;
         Ok(batches.map(|batch| {
             // Mark as a log batch so the checkpoint action is read from it.
             let batch = ActionsBatch::new(batch?, true);

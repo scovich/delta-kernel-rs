@@ -408,8 +408,9 @@ impl ParsedLogPath<FileMeta> {
         }
 
         let files = slice::from_ref(&self.location);
-        let mut action_iter =
-            channel.read_json_files(files, InCommitTimestampVisitor::schema(), None);
+        let mut action_iter = channel
+            .read_json_files(files, InCommitTimestampVisitor::schema(), None)
+            .await?;
 
         // Process the actions to find inCommitTimestamp
         // According to protocol, CommitInfo MUST be the first action when ICT is enabled,

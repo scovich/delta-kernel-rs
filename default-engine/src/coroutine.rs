@@ -34,7 +34,8 @@ use delta_kernel::coroutine::kernel::{
     GeneratorCoroutineStep, StaticCoroutine, StaticGeneratorCoroutine,
 };
 use delta_kernel::coroutine::{
-    drive_coroutine_async, Cursor, Page, PageRequest, PagedOperation, PlanRequest, Request,
+    drive_coroutine_async, AsyncResult as _, Cursor, Page, PageRequest, PagedOperation,
+    PlanRequest, Request,
 };
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
@@ -180,9 +181,8 @@ impl AsyncEngineConnector {
             Request::ExecutePlan(PlanRequest::Query(request)) => {
                 let err = Error::unsupported("Default engine does not execute plans");
                 match request {
-                    PageRequest::Start(_, reply) => reply.send(Err(err)),
                     PageRequest::Prepare(_, reply) => reply.send(Err(err)),
-                    PageRequest::Continue(_, reply) => reply.send(Err(err)),
+                    PageRequest::Next(_, reply) => reply.send(Err(err)),
                 }
             }
             Request::ExecutePlan(PlanRequest::ParquetFooter(_, reply)) => {
@@ -500,21 +500,9 @@ type ResultStream<T> = BoxStream<'static, DeltaResult<T>>;
 trait AsyncPagination<Op: PagedOperation> {
     type State: Any + Send;
 
-    async fn initialize(&self, operation: Op) -> DeltaResult<Self::State>;
+    async fn prepare(&self, operation: Op) -> DeltaResult<Self::State>;
 
-    async fn next_page(&self, state: Self::State) -> DeltaResult<Page<Op>>;
-
-    async fn start(&self, operation: Op) -> DeltaResult<Page<Op>> {
-        self.continue_from(self.prepare(operation).await?).await
-    }
-
-    async fn prepare(&self, operation: Op) -> DeltaResult<Cursor<Op>> {
-        Ok(Cursor::new(self.initialize(operation).await?))
-    }
-
-    async fn continue_from(&self, cursor: Cursor<Op>) -> DeltaResult<Page<Op>> {
-        self.next_page(cursor.into_inner()?).await
-    }
+    async fn next(&self, state: Self::State) -> DeltaResult<Page<Op>>;
 }
 
 async fn respond_paged<C, Op>(connector: &C, request: PageRequest<Op>)
@@ -523,16 +511,17 @@ where
     Op: PagedOperation,
 {
     match request {
-        PageRequest::Start(operation, reply) => {
-            reply.send(AsyncPagination::start(connector, operation).await);
-        }
-
         PageRequest::Prepare(operation, reply) => {
-            reply.send(AsyncPagination::prepare(connector, operation).await);
+            let result = AsyncPagination::prepare(connector, operation).await;
+            reply.send(result.map(Cursor::new));
         }
 
-        PageRequest::Continue(cursor, reply) => {
-            reply.send(AsyncPagination::continue_from(connector, cursor).await);
+        PageRequest::Next(cursor, reply) => {
+            let result = cursor
+                .into_inner()
+                .and_then_async(|state| AsyncPagination::next(connector, state))
+                .await;
+            reply.send(result);
         }
     }
 }
@@ -540,20 +529,16 @@ where
 impl AsyncPagination<ForwardListing> for AsyncEngineConnector {
     type State = ResultStream<FileMeta>;
 
-    async fn initialize(&self, ForwardListing(bounds): ForwardListing) -> DeltaResult<Self::State> {
+    async fn prepare(&self, ForwardListing(bounds): ForwardListing) -> DeltaResult<Self::State> {
         let start = Instant::now();
-        let stream = self
-            .cancel(list_from_impl(
-                self.object_store.clone(),
-                bounds.low.clone(),
-            ))
-            .await?;
+        let stream = list_from_impl(self.object_store.clone(), bounds.low.clone());
+        let stream = self.cancel(stream).await?;
         let stream = metered_stream(stream, start, observe_file, emit_storage_list);
         let stream = stream.take_while(move |entry| std::future::ready(bounds.contains(entry)));
         Ok(Box::pin(stream))
     }
 
-    async fn next_page(&self, stream: Self::State) -> DeltaResult<Page<ForwardListing>> {
+    async fn next(&self, stream: Self::State) -> DeltaResult<Page<ForwardListing>> {
         self.next_listing_page(stream).await
     }
 }
@@ -561,7 +546,7 @@ impl AsyncPagination<ForwardListing> for AsyncEngineConnector {
 impl AsyncPagination<DirectoryListing> for AsyncEngineConnector {
     type State = ResultStream<FileMeta>;
 
-    async fn initialize(&self, listing: DirectoryListing) -> DeltaResult<Self::State> {
+    async fn prepare(&self, listing: DirectoryListing) -> DeltaResult<Self::State> {
         let start = Instant::now();
         let stream = self
             .cancel(list_from_impl(
@@ -574,7 +559,7 @@ impl AsyncPagination<DirectoryListing> for AsyncEngineConnector {
         Ok(Box::pin(stream))
     }
 
-    async fn next_page(&self, stream: Self::State) -> DeltaResult<Page<DirectoryListing>> {
+    async fn next(&self, stream: Self::State) -> DeltaResult<Page<DirectoryListing>> {
         self.next_listing_page(stream).await
     }
 }
@@ -582,11 +567,11 @@ impl AsyncPagination<DirectoryListing> for AsyncEngineConnector {
 impl AsyncPagination<BackwardListing> for AsyncEngineConnector {
     type State = BackwardListingState;
 
-    async fn initialize(&self, operation: BackwardListing) -> DeltaResult<Self::State> {
+    async fn prepare(&self, operation: BackwardListing) -> DeltaResult<Self::State> {
         initialize_backward_listing(operation)
     }
 
-    async fn next_page(&self, state: Self::State) -> DeltaResult<Page<BackwardListing>> {
+    async fn next(&self, state: Self::State) -> DeltaResult<Page<BackwardListing>> {
         let BackwardListingState { bounds, high } = state;
         let window = bounds.backward_window(high, self.backward_listing_window_size.get())?;
         let next_high = window.next_high;
@@ -613,7 +598,7 @@ impl AsyncPagination<BackwardListing> for AsyncEngineConnector {
 impl AsyncPagination<ReadJsonFiles> for AsyncEngineConnector {
     type State = ResultStream<Box<dyn EngineData>>;
 
-    async fn initialize(&self, read: ReadJsonFiles) -> DeltaResult<Self::State> {
+    async fn prepare(&self, read: ReadJsonFiles) -> DeltaResult<Self::State> {
         let num_files = read.files.len() as u64;
         let bytes_read = read.files.iter().map(|file| file.size).sum();
         let stream = self
@@ -634,7 +619,7 @@ impl AsyncPagination<ReadJsonFiles> for AsyncEngineConnector {
         ))
     }
 
-    async fn next_page(&self, stream: Self::State) -> DeltaResult<Page<ReadJsonFiles>> {
+    async fn next(&self, stream: Self::State) -> DeltaResult<Page<ReadJsonFiles>> {
         self.next_data(stream).await
     }
 }
@@ -642,7 +627,7 @@ impl AsyncPagination<ReadJsonFiles> for AsyncEngineConnector {
 impl AsyncPagination<ReadParquetFiles> for AsyncEngineConnector {
     type State = ResultStream<Box<dyn EngineData>>;
 
-    async fn initialize(&self, read: ReadParquetFiles) -> DeltaResult<Self::State> {
+    async fn prepare(&self, read: ReadParquetFiles) -> DeltaResult<Self::State> {
         let num_files = read.files.len() as u64;
         let bytes_read = read.files.iter().map(|file| file.size).sum();
         let stream = self
@@ -663,7 +648,7 @@ impl AsyncPagination<ReadParquetFiles> for AsyncEngineConnector {
         ))
     }
 
-    async fn next_page(&self, stream: Self::State) -> DeltaResult<Page<ReadParquetFiles>> {
+    async fn next(&self, stream: Self::State) -> DeltaResult<Page<ReadParquetFiles>> {
         self.next_data(stream).await
     }
 }

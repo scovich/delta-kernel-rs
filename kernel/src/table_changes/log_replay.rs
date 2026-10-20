@@ -275,6 +275,7 @@ impl LogReplayScanner {
                 visitor_schema,
                 None, // not safe to apply data skipping yet
             )
+            .await?
             .peekable();
 
         let mut in_commit_timestamp_opt = None;
@@ -419,8 +420,7 @@ impl LogReplayScanner {
         let schema = FileActionSelectionVisitor::schema();
         let action_iter = channel
             .prepare_json_files([commit_file.location], schema.clone(), None)
-            .await?
-            .flatten();
+            .await?;
         let commit_version = commit_file
             .version
             .try_into()

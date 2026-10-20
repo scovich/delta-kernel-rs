@@ -874,7 +874,8 @@ async fn get_earliest_published_commit_version_with_channel(
     earliest_ratified_commit_version: Option<Version>,
 ) -> DeltaResult<Version> {
     // TODO(#3188): thread a cancellation token through the history-manager entry points.
-    list_delta_log_generator(log_root, 0, Version::MAX)?
+    list_delta_log_generator(channel, log_root, 0, Version::MAX)
+        .await?
         .filter_ok(|f: &ParsedLogPath| f.file_type == LogPathFileType::Commit)
         .bind(channel)
         .next()
@@ -944,7 +945,9 @@ async fn get_earliest_recreatable_commit_with_channel(
     let mut earliest_commit_version: Option<Version> = None;
 
     // TODO(#3188): thread a cancellation token through the history-manager entry points.
-    let mut listing = list_delta_log_generator(log_root, 0, Version::MAX)?.bind(channel);
+    let mut listing = list_delta_log_generator(channel, log_root, 0, Version::MAX)
+        .await?
+        .bind(channel);
     while let Some(parsed_result) = listing.next().await? {
         let parsed_log_path = parsed_result?;
         if !should_process_log_file(&parsed_log_path) {

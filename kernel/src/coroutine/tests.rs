@@ -420,7 +420,7 @@ fn prepare_threads_opaque_state_to_continue() {
     };
     let mut coroutine = coroutine!(async move |channel| {
         let cursor = channel.prepare_paged(ForwardListing::new(bounds)).await?;
-        let page = channel.continue_paged(cursor).await?;
+        let page = channel.next_page(cursor).await?;
         assert!(page.next.is_none());
         Ok(page.data.len())
     });
@@ -434,12 +434,9 @@ fn prepare_threads_opaque_state_to_continue() {
             ))) => {
                 reply.send(Ok(Cursor::new(7_i64)));
             }
-            CoroutineStep::Request(Request::ListForward(PageRequest::Continue(cursor, reply))) => {
+            CoroutineStep::Request(Request::ListForward(PageRequest::Next(cursor, reply))) => {
                 assert_eq!(cursor.into_inner::<i64>().unwrap(), 7);
                 reply.send(Ok(Page::new(Vec::new(), None)));
-            }
-            CoroutineStep::Request(Request::ListForward(PageRequest::Start(..))) => {
-                panic!("coroutine unexpectedly started listing eagerly")
             }
             CoroutineStep::Request(_) => {
                 panic!("coroutine requested an unexpected operation")
@@ -961,13 +958,14 @@ fn engine_connector_pages_forward_listing() {
                 )
                 .await?;
         }
-        let mut pages = PageGenerator::new(ForwardListing::new(ListingBounds {
-            prefix: root.clone(),
-            low: root.join("00000000000000000000")?,
-            high: root.join("00000000000000000004")?,
-        }))
-        .flatten()
-        .bind(&channel);
+        let cursor = channel
+            .prepare_paged(ForwardListing::new(ListingBounds {
+                prefix: root.clone(),
+                low: root.join("00000000000000000000")?,
+                high: root.join("00000000000000000004")?,
+            }))
+            .await?;
+        let mut pages = PageGenerator::Next(cursor).flatten().bind(&channel);
         while let Some(entry) = pages.next().await? {
             channel.yield_item(entry?.location).await?;
         }
@@ -1001,12 +999,14 @@ fn engine_connector_pages_backward_listing() {
                 )
                 .await?;
         }
-        let mut pages = PageGenerator::new(BackwardListing::new(ListingBounds {
-            prefix: root.clone(),
-            low: root.join("00000000000000000000")?,
-            high: root.join("00000000000000000004")?,
-        }))
-        .bind(channel);
+        let cursor = channel
+            .prepare_paged(BackwardListing::new(ListingBounds {
+                prefix: root.clone(),
+                low: root.join("00000000000000000000")?,
+                high: root.join("00000000000000000004")?,
+            }))
+            .await?;
+        let mut pages = PageGenerator::Next(cursor).bind(channel);
         let mut files = Vec::new();
         while let Some(page) = pages.next().await? {
             assert!(page.known_version_boundary);

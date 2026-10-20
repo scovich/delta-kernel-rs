@@ -76,8 +76,7 @@ impl ParallelPhase {
     {
         let batches = channel
             .prepare_parquet_files(leaf_files, read_schema, None)
-            .await?
-            .flatten();
+            .await?;
         Ok(Self::process_batches(processor, batches))
     }
 

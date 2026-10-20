@@ -22,7 +22,7 @@ use crate::coroutine::kernel::{coroutine, Channel, DeltaResultGenerator};
 use crate::coroutine::run_coroutine_with_engine;
 use crate::coroutine::{
     iterate_prepared_result_generator_with_engine, run_coroutine_with_storage, BoundGenerator as _,
-    BoxedBoundGenerator, ChannelExt as _, Generator, GeneratorExt as _,
+    ChannelExt as _, Generator, GeneratorExt as _,
 };
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
@@ -42,8 +42,8 @@ use crate::utils::require;
 #[cfg(feature = "declarative-plans")]
 use crate::Scalar;
 use crate::{
-    DeltaResult, Engine, EngineData, Error, FileMeta, Predicate, PredicateRef, RowVisitor,
-    StorageHandler, Version,
+    DeltaResult, Engine, Error, FileMeta, Predicate, PredicateRef, RowVisitor, StorageHandler,
+    Version,
 };
 
 mod crc_replay;
@@ -1056,7 +1056,6 @@ impl LogSegment {
         let actions = channel
             .prepare_json_files(commit_files, schema, None)
             .await?
-            .flatten()
             .map_ok(|batch| ActionsBatch::new(batch, true));
         Ok(actions)
     }
@@ -1461,8 +1460,7 @@ impl LogSegment {
                     augmented_checkpoint_read_schema.clone(),
                     meta_predicate.clone(),
                 );
-                let read = read.await?;
-                read.flatten().into_boxed()
+                read.await?.into_boxed()
             }
             Some(parsed_log_path) if parsed_log_path.extension == "parquet" => {
                 let read = channel.prepare_parquet_files(
@@ -1470,8 +1468,7 @@ impl LogSegment {
                     augmented_checkpoint_read_schema.clone(),
                     meta_predicate.clone(),
                 );
-                let read = read.await?;
-                read.flatten().into_boxed()
+                read.await?.into_boxed()
             }
             Some(parsed_log_path) => {
                 return Err(Error::invalid_checkpoint(format!(
@@ -1488,13 +1485,14 @@ impl LogSegment {
         // Both checkpoint and sidecar parquet files share the same `add.stats_parsed.*` column
         // layout, so we reuse the same predicate for row group skipping.
         let sidecar_batches = if !sidecar_files.is_empty() {
-            let read = channel.prepare_parquet_files(
-                sidecar_files,
-                augmented_checkpoint_read_schema.clone(),
-                meta_predicate,
-            );
-            let read = read.await?;
-            read.flatten().into_boxed()
+            channel
+                .prepare_parquet_files(
+                    sidecar_files,
+                    augmented_checkpoint_read_schema.clone(),
+                    meta_predicate,
+                )
+                .await?
+                .into_boxed()
         } else {
             Box::new(empty())
         };
@@ -1524,17 +1522,25 @@ impl LogSegment {
         checkpoint: &ParsedLogPath,
     ) -> DeltaResult<Vec<FileMeta>> {
         // Read checkpoint with just the sidecar column
-        let files = std::slice::from_ref(&checkpoint.location);
-        let mut batches: BoxedBoundGenerator<'_, DeltaResult<Box<dyn EngineData>>> =
-            match checkpoint.extension.as_str() {
-                "json" => {
-                    Box::new(channel.read_json_files(files, Self::sidecar_read_schema(), None))
-                }
-                "parquet" => {
-                    Box::new(channel.read_parquet_files(files, Self::sidecar_read_schema(), None))
-                }
-                _ => return Ok(vec![]),
-            };
+        let mut batches = match checkpoint.extension.as_str() {
+            "json" => channel
+                .read_json_files(
+                    std::slice::from_ref(&checkpoint.location),
+                    Self::sidecar_read_schema(),
+                    None,
+                )
+                .await?
+                .into_boxed(),
+            "parquet" => channel
+                .read_parquet_files(
+                    std::slice::from_ref(&checkpoint.location),
+                    Self::sidecar_read_schema(),
+                    None,
+                )
+                .await?
+                .into_boxed(),
+            _ => return Ok(vec![]),
+        };
 
         // Extract sidecar file references
         let mut visitor = SidecarVisitor::default();

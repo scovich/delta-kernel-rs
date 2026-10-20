@@ -17,11 +17,11 @@ use super::request::{
 };
 #[cfg(feature = "declarative-plans")]
 use super::PlanRequest;
-use super::{BoundDeltaResultGenerator, Channel, Request, StaticGeneratorCoroutine};
+use super::{
+    BoundDeltaResultGenerator, Channel, DeltaResultGenerator, Request, StaticGeneratorCoroutine,
+};
 use crate::committer::{Commit, CommitResponse, PublishMetadata};
-use crate::coroutine::generator::{BoundGenerator, Generator as _, GeneratorExt as _};
-#[cfg(feature = "declarative-plans")]
-use crate::coroutine::PlanOperation;
+use crate::coroutine::generator::{BoundGenerator, Flatten, Generator, GeneratorExt as _};
 use crate::coroutine::{
     ChannelExchange, Cursor, DeltaFuture, Page, PageGenerator, PageRequest, PagedOperation,
 };
@@ -34,11 +34,16 @@ use crate::plans::Operation;
 use crate::schema::{DataType, SchemaRef};
 use crate::{DeltaResult, FileIndex, FileMeta, FileSize, ParquetFooter};
 
+type FlattenedPages<Op> =
+    Flatten<PageGenerator<Op>, std::vec::IntoIter<DeltaResult<Box<dyn EngineData>>>>;
+
 /// Typed kernel operations posted through a request channel.
 ///
-/// `read_*` and `flattened` contact the connector on first pull. `prepare_*` does that setup in
-/// the returned future, so setup errors can surface before the caller holds a generator.
+/// Paged reads initialize the connector operation before returning a generator so initialization
+/// errors surface at the call. `read_*` returns a bound generator; `prepare_*` returns an unbound
+/// generator for composition before [`Self::bind`].
 #[internal_api]
+#[allow(async_fn_in_trait)]
 pub(crate) trait ChannelExt: ChannelExchange<Request> {
     /// Read one small file, or one half-open byte range, completely into memory.
     fn read_small_file(
@@ -54,15 +59,6 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
         self.exchange(file.clone(), Request::ReadParquetFooter)
     }
 
-    /// Initialize `operation` and return its first page.
-    fn start_paged<Op>(&self, operation: Op) -> impl DeltaFuture<Page<Op>>
-    where
-        Op: PagedOperation,
-        PageRequest<Op>: Into<Request>,
-    {
-        self.exchange(operation, PageRequest::Start)
-    }
-
     /// Verify that the connector provides a declarative plan executor.
     #[cfg(feature = "declarative-plans")]
     fn require_plan_executor(&self) -> impl DeltaFuture<()> {
@@ -71,10 +67,24 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
         })
     }
 
-    /// Initialize execution of `plan` and return its first output page.
+    /// Execute `plan`, streaming its output batches.
     #[cfg(feature = "declarative-plans")]
-    fn start_query_plan(&self, plan: Plan) -> impl DeltaFuture<Page<PlanOperation>> {
-        self.start_paged(Operation::QueryPlan(plan))
+    async fn execute_query_plan(
+        &self,
+        plan: Plan,
+    ) -> DeltaResult<impl BoundDeltaResultGenerator<Box<dyn EngineData>> + '_> {
+        let cursor = self.prepare_paged(Operation::QueryPlan(plan)).await?;
+        Ok(self.bind(PageGenerator::Next(cursor).flatten()))
+    }
+
+    /// Prepare `plan` without fetching output. The returned generator streams output batches.
+    #[cfg(feature = "declarative-plans")]
+    async fn prepare_query_plan(
+        &self,
+        plan: Plan,
+    ) -> DeltaResult<impl DeltaResultGenerator<Box<dyn EngineData>> + use<Self>> {
+        let cursor = self.prepare_paged(Operation::QueryPlan(plan)).await?;
+        Ok(PageGenerator::Next(cursor).flatten())
     }
 
     /// Read one Parquet footer through the declarative plan executor.
@@ -94,79 +104,70 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
         self.exchange(operation, PageRequest::Prepare)
     }
 
-    /// Continue the paged operation represented by `cursor`.
-    fn continue_paged<Op>(&self, cursor: Cursor<Op>) -> impl DeltaFuture<Page<Op>>
+    /// Fetch the next page for `cursor`.
+    fn next_page<Op>(&self, cursor: Cursor<Op>) -> impl DeltaFuture<Page<Op>>
     where
         Op: PagedOperation,
         PageRequest<Op>: Into<Request>,
     {
-        self.exchange(cursor, PageRequest::Continue)
+        self.exchange(cursor, PageRequest::Next)
     }
 
-    /// Iterate items of `operation`, flattening collection-valued pages.
-    fn flattened<Op>(
-        &self,
-        operation: Op,
-    ) -> impl BoundGenerator<Item = <Op::Page as IntoIterator>::Item, Output = ()> + Unpin + '_
+    /// Bind `generator` so its connector requests post through this channel.
+    fn bind<'a, G>(
+        &'a self,
+        generator: G,
+    ) -> impl BoundGenerator<Item = G::Item, Output = G::Output> + Unpin + 'a
     where
-        Op: PagedOperation,
-        Op::Page: IntoIterator,
-        <Op::Page as IntoIterator>::IntoIter: Send,
-        <Op::Page as IntoIterator>::Item: Send + 'static,
-        PageRequest<Op>: Into<Request>;
+        G: Generator<Request> + 'a,
+        G::Item: 'a;
 
     /// Read JSON files as a stream of result batches.
-    fn read_json_files(
+    async fn read_json_files(
         &self,
         files: impl Into<Vec<FileMeta>>,
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> impl BoundDeltaResultGenerator<Box<dyn EngineData>> + '_ {
-        self.flattened(ReadJsonFiles::new(files, physical_schema, predicate))
+    ) -> DeltaResult<impl BoundDeltaResultGenerator<Box<dyn EngineData>> + '_> {
+        let operation = ReadJsonFiles::new(files, physical_schema, predicate);
+        let cursor = self.prepare_paged(operation).await?;
+        Ok(self.bind(PageGenerator::Next(cursor).flatten()))
     }
 
     /// Read Parquet files as a stream of result batches.
-    fn read_parquet_files(
+    async fn read_parquet_files(
         &self,
         files: impl Into<Vec<FileMeta>>,
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> impl BoundDeltaResultGenerator<Box<dyn EngineData>> + '_ {
-        self.flattened(ReadParquetFiles::new(files, physical_schema, predicate))
+    ) -> DeltaResult<impl BoundDeltaResultGenerator<Box<dyn EngineData>> + '_> {
+        let operation = ReadParquetFiles::new(files, physical_schema, predicate);
+        let cursor = self.prepare_paged(operation).await?;
+        Ok(self.bind(PageGenerator::Next(cursor).flatten()))
     }
 
     /// Prepare a JSON read without fetching its first page.
-    fn prepare_json_files(
+    async fn prepare_json_files(
         &self,
         files: impl Into<Vec<FileMeta>>,
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> impl DeltaFuture<PageGenerator<ReadJsonFiles>> + '_
-    where
-        Self: Sync,
-    {
+    ) -> DeltaResult<FlattenedPages<ReadJsonFiles>> {
         let operation = ReadJsonFiles::new(files, physical_schema, predicate);
-        async move {
-            let cursor = self.prepare_paged(operation).await?;
-            Ok(PageGenerator::resume(cursor))
-        }
+        let cursor = self.prepare_paged(operation).await?;
+        Ok(PageGenerator::Next(cursor).flatten())
     }
 
     /// Prepare a Parquet read without fetching its first page.
-    fn prepare_parquet_files(
+    async fn prepare_parquet_files(
         &self,
         files: impl Into<Vec<FileMeta>>,
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> impl DeltaFuture<PageGenerator<ReadParquetFiles>> + '_
-    where
-        Self: Sync,
-    {
+    ) -> DeltaResult<FlattenedPages<ReadParquetFiles>> {
         let operation = ReadParquetFiles::new(files, physical_schema, predicate);
-        async move {
-            let cursor = self.prepare_paged(operation).await?;
-            Ok(PageGenerator::resume(cursor))
-        }
+        let cursor = self.prepare_paged(operation).await?;
+        Ok(PageGenerator::Next(cursor).flatten())
     }
 
     /// Fetch metadata for one object.
@@ -283,17 +284,14 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
 }
 
 impl ChannelExt for Channel {
-    fn flattened<Op>(
-        &self,
-        operation: Op,
-    ) -> impl BoundGenerator<Item = <Op::Page as IntoIterator>::Item, Output = ()> + Unpin + '_
+    fn bind<'a, G>(
+        &'a self,
+        generator: G,
+    ) -> impl BoundGenerator<Item = G::Item, Output = G::Output> + Unpin + 'a
     where
-        Op: PagedOperation,
-        Op::Page: IntoIterator,
-        <Op::Page as IntoIterator>::IntoIter: Send,
-        <Op::Page as IntoIterator>::Item: Send + 'static,
-        PageRequest<Op>: Into<Request>,
+        G: Generator<Request> + 'a,
+        G::Item: 'a,
     {
-        PageGenerator::new(operation).flatten().bind(self)
+        generator.bind(self)
     }
 }

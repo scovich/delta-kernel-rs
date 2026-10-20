@@ -9,7 +9,7 @@ use crate::actions::{Metadata, Protocol, COMMIT_INFO_FIELD, METADATA_FIELD, PROT
 use crate::commit_range::with_version_context;
 use crate::coroutine::engine::EngineConnector;
 use crate::coroutine::kernel::{coroutine, Channel, Coroutine, DeltaResultGenerator};
-use crate::coroutine::{BoundGenerator as _, ChannelExt as _, GeneratorExt as _};
+use crate::coroutine::{BoundGenerator as _, ChannelExt as _};
 use crate::engine_data::RowVisitor as _;
 use crate::path::ParsedLogPath;
 use crate::schema::{lazy_schema_ref, SchemaRef};
@@ -135,7 +135,9 @@ impl CommitAction {
         channel: &Channel,
     ) -> DeltaResult<Option<i64>> {
         let files = slice::from_ref(&self.log_path.location);
-        let mut json_iter = channel.read_json_files(files, HEADER_READ_SCHEMA.clone(), None);
+        let mut json_iter = channel
+            .read_json_files(files, HEADER_READ_SCHEMA.clone(), None)
+            .await?;
 
         let mut extracted_protocol: Option<Protocol> = None;
         let mut extracted_metadata: Option<Metadata> = None;
@@ -243,13 +245,12 @@ impl CommitAction {
         &self,
         channel: &Channel,
     ) -> DeltaResult<impl DeltaResultGenerator<Box<dyn EngineData>> + 'static> {
-        let pages = channel
+        channel
             .prepare_json_files(
                 slice::from_ref(&self.log_path.location),
                 self.read_schema.clone(),
                 None,
             )
-            .await?;
-        Ok(pages.flatten())
+            .await
     }
 }

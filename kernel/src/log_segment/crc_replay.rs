@@ -342,7 +342,9 @@ impl LogSegment {
         seed_histogram: Option<FileSizeHistogram>,
     ) -> DeltaResult<CrcDelta> {
         let mut acc = CrcReplayAccumulator::new(seed_histogram);
-        let mut batches = channel.read_json_files(locations, REPLAY_SCHEMA.clone(), None);
+        let mut batches = channel
+            .read_json_files(locations, REPLAY_SCHEMA.clone(), None)
+            .await?;
 
         while let Some(batch_result) = batches.next().await? {
             // Transient visitor borrows the shared accumulator for the duration of the

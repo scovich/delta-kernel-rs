@@ -15,7 +15,7 @@ use crate::coroutine::{BoundGenerator as _, ChannelExt as _};
 use crate::engine_data::RowVisitor;
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::FileType;
-use crate::plans::{Operation, PlanBuilder, PlanExecutor};
+use crate::plans::{PlanBuilder, PlanExecutor};
 use crate::schema::{SchemaRef, StructType};
 use crate::snapshot::Snapshot;
 use crate::{DeltaResult, FileMeta};
@@ -342,7 +342,7 @@ async fn collect_single_sidecar_with_channel(
         FileType::Json => PlanBuilder::scan_json([file.clone()], &[], read_schema),
     }?
     .build()?;
-    let mut data = channel.flattened(Operation::QueryPlan(plan));
+    let mut data = channel.execute_query_plan(plan).await?;
 
     let mut visitor = SidecarVisitor::default();
     while let Some(batch) = data.next().await? {
@@ -371,7 +371,7 @@ mod tests {
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
     use crate::log_segment_files::LogSegmentFiles;
-    use crate::plans::{IoOperation, PlanResult};
+    use crate::plans::{IoOperation, Operation, PlanResult};
     use crate::schema::{schema, schema_ref};
     use crate::unit_test_utils::{create_log_path, create_log_path_with_size, load_test_table};
 

@@ -330,7 +330,7 @@ async fn read_scan_file_with_channel(
     };
     // TODO(#860): we disable predicate pushdown until we support row indexes.
     let read_result_iter = channel.prepare_parquet_files([file], physical_schema, None);
-    let read_result_iter = read_result_iter.await?.flatten();
+    let read_result_iter = read_result_iter.await?;
 
     let result = read_result_iter.map_async(map_async_witness, async move |channel, batch| {
         let batch = batch?;

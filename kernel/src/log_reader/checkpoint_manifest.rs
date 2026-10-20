@@ -96,12 +96,10 @@ pub(crate) async fn checkpoint_manifest_reader_impl(
         "json" => channel
             .prepare_json_files(vec![manifest.location.clone()], read_schema.clone(), None)
             .await?
-            .flatten()
             .into_boxed(),
         "parquet" => channel
             .prepare_parquet_files(vec![manifest.location.clone()], read_schema, None)
             .await?
-            .flatten()
             .into_boxed(),
         extension => {
             return Err(Error::generic(format!(
@@ -182,7 +180,7 @@ fn checkpoint_manifest_generator<G>(
 where
     G: DeltaResultGenerator<ActionsBatch> + 'static,
 {
-    generator_fn!(async move |channel| { checkpoint_manifest_impl(channel, state).await })
+    generator_fn!(async move |channel| checkpoint_manifest_impl(channel, state).await)
 }
 
 async fn checkpoint_manifest_impl<G>(
