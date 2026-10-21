@@ -505,6 +505,8 @@ pub trait RowVisitor {
     }
 }
 
+/// A cheaply clonable set of rows in the engine's native format.
+///
 /// Any type that an engine wants to return as "data" needs to implement this trait. The bulk of the
 /// work is in the [`EngineData::visit_rows`] method. See the docs for that method for more details.
 /// ```rust
@@ -533,6 +535,9 @@ pub trait RowVisitor {
 ///   }
 ///   fn len(&self) -> usize {
 ///     todo!() // actually get the len here
+///   }
+///   fn clone_data(&self) -> Box<dyn EngineData> {
+///     todo!() // cheap clone: copy the batch header, share column buffers
 ///   }
 ///   fn append_columns(
 ///     &self,
@@ -572,6 +577,12 @@ pub trait EngineData: AsAny {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Returns a boxed clone of the erased type that backs this data.
+    ///
+    /// This should be cheap. Engines whose native format is not already cheaply clonable should
+    /// implement `EngineData` for a reference-counted wrapper.
+    fn clone_data(&self) -> Box<dyn EngineData>;
 
     /// Append new columns provided by Kernel to the existing data.
     ///
@@ -620,6 +631,13 @@ pub trait EngineData: AsAny {
     fn has_field(&self, name: &ColumnName) -> bool;
 }
 
+/// Shares the underlying native data through [`EngineData::clone_data`].
+impl Clone for Box<dyn EngineData> {
+    fn clone(&self) -> Self {
+        self.clone_data()
+    }
+}
+
 /// Evaluates a predicate on the batch, extracts the resulting selection vector, and applies
 /// it to filter out rows that don't satisfy the predicate.
 pub(crate) fn filter_by_predicate(
@@ -663,6 +681,15 @@ mod tests {
         Box::new(ArrowEngineData::new(
             RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(data))]).unwrap(),
         ))
+    }
+
+    #[test]
+    fn clone_data_preserves_original() {
+        let data = get_engine_data(3);
+        let cloned = data.clone_data();
+        assert_eq!(cloned.len(), 3);
+        assert_eq!(data.len(), 3);
+        assert_eq!(data.clone().len(), 3);
     }
 
     #[test]
