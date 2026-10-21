@@ -4851,6 +4851,7 @@ dependencies = [
 name = "test_utils"
 version = "0.30.0"
 dependencies = [
+ "bytes",
  "delta_kernel",
  "delta_kernel_default_engine",
  "itertools 0.14.0",

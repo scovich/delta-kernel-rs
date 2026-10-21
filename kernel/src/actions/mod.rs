@@ -2104,8 +2104,9 @@ mod tests {
     };
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use crate::arrow::json::ReaderBuilder;
+    use crate::create_row;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
-    use crate::engine::arrow_expression::ArrowEvaluationHandler;
+    use crate::engine::sync::SyncEngine;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::engine::to_json_bytes;
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -2115,9 +2116,6 @@ mod tests {
     use crate::unit_test_utils::assert_result_error_with_message;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::FileSize;
-    use crate::{
-        create_row, Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
-    };
 
     #[rstest]
     #[case::add(ADD_NAME, Some("path"))]
@@ -2133,33 +2131,6 @@ mod tests {
     #[case::unknown_action("futureAction", None)]
     fn test_action_presence_leaf(#[case] action_name: &str, #[case] expected_leaf: Option<&str>) {
         assert_eq!(action_presence_leaf(action_name), expected_leaf);
-    }
-
-    // duplicated
-    struct ExprEngine(Arc<dyn EvaluationHandler>);
-
-    impl ExprEngine {
-        fn new() -> Self {
-            ExprEngine(Arc::new(ArrowEvaluationHandler))
-        }
-    }
-
-    impl Engine for ExprEngine {
-        fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-            self.0.clone()
-        }
-
-        fn json_handler(&self) -> Arc<dyn JsonHandler> {
-            unimplemented!()
-        }
-
-        fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-            unimplemented!()
-        }
-
-        fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-            unimplemented!()
-        }
     }
 
     #[rstest]
@@ -2892,7 +2863,7 @@ mod tests {
 
     #[test]
     fn test_metadata_with_log_schema() {
-        let engine = ExprEngine::new();
+        let engine = SyncEngine::new();
         let schema = schema_ref! { not_null "id": INTEGER };
 
         let metadata = Metadata::try_new(
@@ -2940,7 +2911,7 @@ mod tests {
 
     #[test]
     fn test_protocol_creates_log_row() {
-        let engine = ExprEngine::new();
+        let engine = SyncEngine::new();
         let protocol = Protocol::try_new_modern(
             [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
             [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
@@ -3321,7 +3292,7 @@ mod tests {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
     fn test_checkpoint_action_scalar_round_trip() -> KernelResult<()> {
-        let engine = ExprEngine::new();
+        let engine = SyncEngine::new();
         let action = sample_checkpoint_action();
         let scalar = action.clone().try_into_scalar()?;
         let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
@@ -3356,7 +3327,7 @@ mod tests {
         // pin the exact bytes. This is the only guard on the wire format: element order, camelCase
         // field names, the sidecar `type` discriminator, and the JSON writer's null omission (the
         // null union siblings collapse each element to a single-key tagged object).
-        let engine = ExprEngine::new();
+        let engine = SyncEngine::new();
         let scalar = sample_checkpoint_action().try_into_scalar()?;
         let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
         let filtered = FilteredEngineData::with_all_rows_selected(data);
@@ -3442,7 +3413,7 @@ mod tests {
             txn_sidecars: vec![sidecar("t1.parquet"), sidecar("t2.parquet")],
             domain_metadata_sidecars: vec![],
         };
-        let engine = ExprEngine::new();
+        let engine = SyncEngine::new();
         let scalar = action.clone().try_into_scalar()?;
         let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
         let back = CheckpointAction::try_new_from_data(data.as_ref())?
@@ -3465,7 +3436,7 @@ mod tests {
             ),
             ..sample_checkpoint_action()
         };
-        let engine = ExprEngine::new();
+        let engine = SyncEngine::new();
         let scalar = action.clone().try_into_scalar()?;
         let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
         let back = CheckpointAction::try_new_from_data(data.as_ref())?

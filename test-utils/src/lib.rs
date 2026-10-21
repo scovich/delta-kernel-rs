@@ -1,6 +1,7 @@
 //! A number of utilities useful for testing that we want to use in multiple crates
 
 pub mod column_mapping_fixtures;
+pub mod counting_engine;
 pub mod counting_reporter;
 pub mod engine_contract;
 pub mod table_builder;
@@ -195,6 +196,7 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
 use std::sync::{Arc, Mutex};
 
+pub use counting_engine::{CountingEngine, CountingHandler, CountingHandlers};
 pub use counting_reporter::{
     ensure_metrics_compatible_global_subscriber, install_thread_local_metrics_reporter,
     CapturingReporter, CountingReporter, RelaxedCounter, SnapshotCompletionStatus,

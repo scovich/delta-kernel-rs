@@ -229,6 +229,8 @@ This list is non-exhaustive: when in doubt, browse the source files directly
   variant under `#[tokio::test(flavor = "multi_thread")]`. Required whenever a test calls
   `snapshot.checkpoint()`: it issues nested `block_on` calls that deadlock on a single-threaded
   runtime / `TokioBackgroundExecutor`.
+- `CountingEngine`: delegates to an inner engine and counts actual handler operations without
+ counting handler access. Use it to assert that a fast path avoids I/O or evaluation.
 - `engine_store_setup(table_name, local_directory)`: returns
   `(store, engine, table_location)` when a test needs direct object-store access.
 - `setup_test_tables(...)`: multiple pre-built tables for read/scan tests.
