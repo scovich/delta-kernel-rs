@@ -564,12 +564,11 @@ impl DeletionVectorDescriptor {
                             "size_in_bytes doesn't fit in usize for {path}"
                         ))))?;
 
-                let dv_data = storage
-                    .read_files(vec![(path.clone(), None)])?
-                    .next()
-                    .ok_or(KernelError::missing_data(format!(
-                        "No deletion vector data for {path}"
-                    )))??;
+                let dv_data =
+                    storage.read_small_file_with_cancellation((path.clone(), None), None)?;
+                let dv_data = dv_data.ok_or(KernelError::missing_data(format!(
+                    "No deletion vector data for {path}"
+                )))?;
                 let dv_data_len = dv_data.len();
 
                 let mut cursor = Cursor::new(dv_data);

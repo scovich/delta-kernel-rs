@@ -617,6 +617,22 @@ pub trait StorageHandler: AsAny {
         Ok(Box::new(CancellableIterator::new(iter, cancellation_token)))
     }
 
+    /// Reads one complete file or byte range, returning `None` if the handler produces no result.
+    fn read_small_file_with_cancellation(
+        &self,
+        file: FileSlice,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> KernelResult<Option<Bytes>> {
+        let mut reads = self.read_files_with_cancellation(vec![file], cancellation_token)?;
+        let data = reads.next().transpose()?;
+        if reads.next().transpose()?.is_some() {
+            return Err(KernelError::internal_error(
+                "single-file read returned more than one result",
+            ));
+        }
+        Ok(data)
+    }
+
     /// Copy a file atomically from source to destination. If the destination file already exists,
     /// it must return Err(KernelError::FileAlreadyExists).
     fn copy_atomic(&self, src: &Url, dest: &Url) -> KernelResult<()>;

@@ -452,8 +452,8 @@ impl LastCheckpointHint {
     ) -> KernelResult<Option<LastCheckpointHint>> {
         let file_path = Self::path(log_root)?;
         match storage
-            .read_files_with_cancellation(vec![(file_path, None)], cancellation_token.cloned())?
-            .next()
+            .read_small_file_with_cancellation((file_path, None), cancellation_token.cloned())
+            .transpose()
         {
             Some(Ok(data)) => {
                 let result = Self::from_bytes_with_oversized_fields_dropped(&data)
