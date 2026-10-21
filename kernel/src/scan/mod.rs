@@ -19,6 +19,9 @@ use crate::actions::{Add, ADD_FIELD, ADD_NAME, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
+use crate::coroutine::kernel::{
+    run_workflow_with_storage, static_workflow, Channel, StaticWorkflow,
+};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef};
 use crate::kernel_predicates::{
@@ -1706,7 +1709,29 @@ pub fn selection_vector(
     table_root: &Url,
 ) -> KernelResult<Vec<bool>> {
     let storage = engine.storage_handler();
-    let dv_treemap = descriptor.read(storage, table_root)?;
+    run_workflow_with_storage!(storage.as_ref(), None, |channel| {
+        selection_vector_with_channel(channel, descriptor, table_root)
+    })
+}
+
+/// Return a lazy workflow that materializes a deletion vector as a selection vector.
+#[internal_api]
+#[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
+pub(crate) fn selection_vector_workflow(
+    descriptor: &DeletionVectorDescriptor,
+    table_root: &Url,
+) -> StaticWorkflow<Vec<bool>> {
+    let descriptor = descriptor.clone();
+    let table_root = table_root.clone();
+    static_workflow!(|channel| selection_vector_with_channel(channel, &descriptor, &table_root))
+}
+
+async fn selection_vector_with_channel(
+    channel: &Channel,
+    descriptor: &DeletionVectorDescriptor,
+    table_root: &Url,
+) -> KernelResult<Vec<bool>> {
+    let dv_treemap = descriptor.read_with_channel(channel, table_root).await?;
     Ok(deletion_treemap_to_bools(dv_treemap))
 }
 

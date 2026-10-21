@@ -14,6 +14,9 @@ use url::Url;
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::amt_path_util::{resolve_table_relative, validate_table_relative};
+use crate::coroutine::kernel::{
+    run_workflow_with_storage, static_workflow, Channel, ChannelExt as _, StaticWorkflow,
+};
 use crate::path_encoding::uri_decode_path;
 use crate::schema::DataType;
 use crate::snapshot::Snapshot;
@@ -529,6 +532,25 @@ impl DeletionVectorDescriptor {
         storage: Arc<dyn StorageHandler>,
         parent: &Url,
     ) -> KernelResult<RoaringTreemap> {
+        run_workflow_with_storage!(storage.as_ref(), None, |channel| {
+            self.read_with_channel(channel, parent)
+        })
+    }
+
+    /// Return a lazy workflow that reads this deletion vector.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
+    pub(crate) fn read_workflow(&self, parent: &Url) -> StaticWorkflow<RoaringTreemap> {
+        let descriptor = self.clone();
+        let parent = parent.clone();
+        static_workflow!(|channel| descriptor.read_with_channel(channel, &parent))
+    }
+
+    pub(crate) async fn read_with_channel(
+        &self,
+        channel: &Channel,
+        parent: &Url,
+    ) -> KernelResult<RoaringTreemap> {
         match self.absolute_path(parent)? {
             None => {
                 let byte_slice = z85::decode(&self.path_or_inline_dv)
@@ -564,8 +586,7 @@ impl DeletionVectorDescriptor {
                             "size_in_bytes doesn't fit in usize for {path}"
                         ))))?;
 
-                let dv_data =
-                    storage.read_small_file_with_cancellation((path.clone(), None), None)?;
+                let dv_data = channel.read_small_file(path.clone(), None).await?;
                 let dv_data = dv_data.ok_or(KernelError::missing_data(format!(
                     "No deletion vector data for {path}"
                 )))?;
@@ -681,7 +702,27 @@ impl DeletionVectorDescriptor {
         storage: Arc<dyn StorageHandler>,
         parent: &Url,
     ) -> KernelResult<Vec<u64>> {
-        Ok(self.read(storage, parent)?.into_iter().collect())
+        run_workflow_with_storage!(storage.as_ref(), None, |channel| {
+            self.row_indexes_with_channel(channel, parent)
+        })
+    }
+
+    /// Return a lazy workflow that materializes this deletion vector's row indexes.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
+    pub(crate) fn row_indexes_workflow(&self, parent: &Url) -> StaticWorkflow<Vec<u64>> {
+        let descriptor = self.clone();
+        let parent = parent.clone();
+        static_workflow!(|channel| descriptor.row_indexes_with_channel(channel, &parent))
+    }
+
+    pub(crate) async fn row_indexes_with_channel(
+        &self,
+        channel: &Channel,
+        parent: &Url,
+    ) -> KernelResult<Vec<u64>> {
+        let treemap = self.read_with_channel(channel, parent).await?;
+        Ok(treemap.into_iter().collect())
     }
 }
 

@@ -5,9 +5,14 @@ use std::sync::Arc;
 use tracing::instrument;
 
 use super::Crc;
+#[cfg(test)]
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::{Channel, ChannelExt as _};
 use crate::metrics::events::CRC_READ_COMPLETED_SPAN;
 use crate::path::{AsUrl as _, ParsedLogPath};
-use crate::{Engine, KernelError, KernelResult};
+#[cfg(test)]
+use crate::Engine;
+use crate::{KernelError, KernelResult};
 
 /// Attempt to read and parse a CRC file.
 ///
@@ -18,15 +23,25 @@ use crate::{Engine, KernelError, KernelResult};
 /// replay.
 ///
 /// Reports metrics: `CrcReadSuccess` or `CrcReadFailure`.
-#[instrument(name = CRC_READ_COMPLETED_SPAN, err(level = "warn"), skip_all, fields(report, enable_call_frame, bytes_read, path = ?crc_path.location.location))]
+#[cfg(test)]
 pub(crate) fn try_read_crc_file(
     engine: &dyn Engine,
     crc_path: &ParsedLogPath,
 ) -> KernelResult<Crc> {
-    let storage = engine.storage_handler();
+    run_workflow_with_engine!(engine, |channel| {
+        try_read_crc_file_with_channel(channel, crc_path)
+    })
+}
+
+#[instrument(name = CRC_READ_COMPLETED_SPAN, err(level = "warn"), skip_all, fields(report, enable_call_frame, bytes_read, path = ?crc_path.location.location))]
+pub(crate) async fn try_read_crc_file_with_channel(
+    channel: &Channel,
+    crc_path: &ParsedLogPath,
+) -> KernelResult<Crc> {
     let url = crc_path.location.as_url().clone();
-    let data = storage
-        .read_small_file_with_cancellation((url, None), None)?
+    let data = channel
+        .read_small_file(url, None)
+        .await?
         .ok_or_else(|| KernelError::generic("CRC file read returned no data"))?;
     tracing::Span::current().record("bytes_read", data.len() as u64);
     Crc::try_from_json_bytes(&data, crc_path.version)
@@ -35,16 +50,26 @@ pub(crate) fn try_read_crc_file(
 /// Read an optional CRC, propagating cancellation and ignoring other read failures.
 ///
 /// CRC files are optional, so an unreadable one is not an error: the caller proceeds without
-/// it. The failure is logged and metered by [`try_read_crc_file`]'s instrumentation.
-pub(crate) fn read_crc_file_or_none(
-    engine: &dyn Engine,
+/// it. The failure is logged and metered by [`try_read_crc_file_with_channel`]'s instrumentation.
+pub(crate) async fn read_crc_file_or_none_with_channel(
+    channel: &Channel,
     crc_file: &ParsedLogPath,
 ) -> KernelResult<Option<Arc<Crc>>> {
-    match try_read_crc_file(engine, crc_file) {
+    match try_read_crc_file_with_channel(channel, crc_file).await {
         Ok(crc) => Ok(Some(Arc::new(crc))),
         Err(KernelError::Cancelled) => Err(KernelError::Cancelled),
         Err(_) => Ok(None),
     }
+}
+
+#[cfg(test)]
+pub(crate) fn read_crc_file_or_none(
+    engine: &dyn Engine,
+    crc_file: &ParsedLogPath,
+) -> KernelResult<Option<Arc<Crc>>> {
+    run_workflow_with_engine!(engine, |channel| {
+        read_crc_file_or_none_with_channel(channel, crc_file)
+    })
 }
 
 #[cfg(test)]

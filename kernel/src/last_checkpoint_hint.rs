@@ -15,6 +15,7 @@ use crate::actions::{
     CheckpointMetadata, DomainMetadata, Metadata, Protocol, SetTransaction, Sidecar,
 };
 use crate::cancellation::CancellationTokenRef;
+use crate::coroutine::kernel::{run_workflow_with_storage, Channel, ChannelExt as _};
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
 use crate::{FileMeta, KernelError, KernelResult, StorageHandler, Version};
@@ -439,22 +440,28 @@ impl LastCheckpointHint {
     /// are assumed to cause failure.
     // TODO(#1047): weird that we propagate FileNotFound as part of the iterator instead of top-
     // level result coming from storage.read_files
+    pub(crate) fn try_read(
+        storage: &dyn StorageHandler,
+        log_root: &Url,
+        cancellation_token: Option<&CancellationTokenRef>,
+    ) -> KernelResult<Option<LastCheckpointHint>> {
+        run_workflow_with_storage!(storage, cancellation_token.cloned(), |channel| {
+            Self::try_read_with_channel(channel, log_root)
+        })
+    }
+
     #[instrument(
         name = "last_checkpoint.read",
         skip_all,
         fields(enable_call_frame),
         err
     )]
-    pub(crate) fn try_read(
-        storage: &dyn StorageHandler,
+    pub(crate) async fn try_read_with_channel(
+        channel: &Channel,
         log_root: &Url,
-        cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<Option<LastCheckpointHint>> {
         let file_path = Self::path(log_root)?;
-        match storage
-            .read_small_file_with_cancellation((file_path, None), cancellation_token.cloned())
-            .transpose()
-        {
+        match channel.read_small_file(file_path, None).await.transpose() {
             Some(Ok(data)) => {
                 let result = Self::from_bytes_with_oversized_fields_dropped(&data)
                     .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))

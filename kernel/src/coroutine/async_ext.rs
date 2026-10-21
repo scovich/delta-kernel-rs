@@ -8,6 +8,23 @@ use std::future::Future;
 
 use delta_kernel_derive::internal_api;
 
+/// Async counterparts of [`Option`] combinators.
+pub(crate) trait AsyncOption<T> {
+    /// Async counterpart of [`Option::map`].
+    async fn map_async<U, Fut>(self, f: impl FnOnce(T) -> Fut) -> Option<U>
+    where
+        Fut: Future<Output = U>;
+}
+
+impl<T> AsyncOption<T> for Option<T> {
+    async fn map_async<U, Fut>(self, f: impl FnOnce(T) -> Fut) -> Option<U>
+    where
+        Fut: Future<Output = U>,
+    {
+        Some(f(self?).await)
+    }
+}
+
 /// Async counterparts of [`Result`] combinators.
 #[internal_api]
 #[allow(async_fn_in_trait)]

@@ -100,6 +100,7 @@ use std::task::{Context, Poll, Waker};
 
 use delta_kernel_derive::{internal_api, pub_macro};
 
+pub(crate) use self::async_ext::AsyncOption;
 #[doc(inline)]
 #[internal_api]
 pub(crate) use self::async_ext::AsyncResult;
