@@ -1,17 +1,22 @@
 use std::slice;
 use std::sync::LazyLock;
 
+use delta_kernel_derive::internal_api;
 use url::Url;
 
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::actions::{Metadata, Protocol, COMMIT_INFO_FIELD, METADATA_FIELD, PROTOCOL_FIELD};
 use crate::commit_range::with_version_context;
+use crate::coroutine::kernel::engine::EngineConnector;
+use crate::coroutine::kernel::{
+    workflow, Channel, ChannelExt as _, KernelResultGenerator, Workflow,
+};
 use crate::engine_data::RowVisitor as _;
 use crate::path::ParsedLogPath;
 use crate::schema::{lazy_schema_ref, SchemaRef};
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{ensure_table_can_be_read, Operation};
-use crate::{Engine, FileDataReadResultIterator, KernelError, KernelResult, Version};
+use crate::{Engine, EngineData, FileDataReadResultIterator, KernelError, KernelResult, Version};
 
 /// A Delta log action kind.
 ///
@@ -218,10 +223,28 @@ impl CommitAction {
     /// Batches contain raw actions exactly as recorded in the commit JSON; no column-mapping
     /// translation is applied.
     pub fn get_actions(&self, engine: &dyn Engine) -> KernelResult<FileDataReadResultIterator> {
-        engine.json_handler().read_json_files(
-            slice::from_ref(&self.log_path.location),
+        let connector = EngineConnector::new(engine);
+        let actions = connector.iterate_prepared_result_coroutine(self.get_actions_workflow())?;
+        Ok(Box::new(actions))
+    }
+
+    /// Returns a lazy workflow that prepares this commit's action generator.
+    #[internal_api]
+    pub(crate) fn get_actions_workflow(
+        &self,
+    ) -> Workflow<'_, impl KernelResultGenerator<Box<dyn EngineData>> + 'static> {
+        workflow!(|channel| self.get_actions_generator(channel))
+    }
+
+    async fn get_actions_generator(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<impl KernelResultGenerator<Box<dyn EngineData>> + 'static> {
+        let actions = channel.prepare_json_files(
+            slice::from_ref(&self.log_path.location).to_vec(),
             self.read_schema.clone(),
             None,
-        )
+        );
+        actions.await
     }
 }

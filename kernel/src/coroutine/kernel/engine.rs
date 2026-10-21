@@ -3,16 +3,46 @@
 //! This adapter backs Engine-compatible entry points and coroutine iterators. It handles requests
 //! synchronously through Engine handlers; connector-native async execution uses its own driver.
 
+use std::any::Any;
 use std::borrow::Borrow;
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 use derive_more::Constructor;
 
+use super::request::ReadJsonFiles;
 use super::{Coroutine, CoroutineStep, KernelResultGenerator, Request, Workflow};
 use crate::cancellation::{check_cancelled, CancellationTokenRef};
-use crate::coroutine::{drive_workflow, Reply};
-use crate::{Engine, KernelError, KernelResult, StorageHandler};
+use crate::coroutine::{drive_workflow, Cursor, Page, PageRequest, PagedOperation, Reply};
+use crate::{
+    Engine, EngineData, FileDataReadResultIterator, JsonHandler, KernelError, KernelResult,
+    StorageHandler,
+};
+
+/// Maps a paged request onto synchronous Engine state stored in an opaque cursor.
+trait EnginePagination<Op: PagedOperation> {
+    type State: Any + Send;
+
+    fn prepare(&self, operation: Op) -> KernelResult<Self::State>;
+
+    fn next(&self, state: Self::State) -> KernelResult<Page<Op>>;
+}
+
+fn respond_paged<C, Op>(connector: &C, request: PageRequest<Op>) -> KernelResult<()>
+where
+    C: EnginePagination<Op>,
+    Op: PagedOperation,
+{
+    match request {
+        PageRequest::Prepare(operation, reply) => {
+            complete(reply, connector.prepare(operation).map(Cursor::new))
+        }
+        PageRequest::Next(cursor, reply) => complete(
+            reply,
+            cursor.into_inner().and_then(|state| connector.next(state)),
+        ),
+    }
+}
 
 /// Serves coroutine requests through handlers captured from an [`Engine`].
 ///
@@ -20,6 +50,7 @@ use crate::{Engine, KernelError, KernelResult, StorageHandler};
 #[derive(Clone)]
 pub(crate) struct EngineConnector {
     storage: Arc<dyn StorageHandler>,
+    json: Arc<dyn JsonHandler>,
     cancellation_token: Option<CancellationTokenRef>,
 }
 
@@ -28,6 +59,7 @@ impl EngineConnector {
     pub(crate) fn new(engine: &dyn Engine) -> Self {
         Self {
             storage: engine.storage_handler(),
+            json: engine.json_handler(),
             cancellation_token: None,
         }
     }
@@ -94,6 +126,7 @@ impl EngineConnector {
     fn respond(&self, request: Request) -> KernelResult<()> {
         match request {
             Request::ReadSmallFile(..) => self.storage_connector().respond(request)?,
+            Request::ReadJson(request) => respond_paged(self, request)?,
         }
         Ok(())
     }
@@ -260,6 +293,9 @@ impl StorageConnector<'_> {
                 self.storage
                     .read_small_file_with_cancellation(file, self.cancellation_token.clone()),
             ),
+            Request::ReadJson(_) => Err(KernelError::internal_error(
+                "JSON reads require an Engine connector",
+            )),
         }
     }
 }
@@ -287,6 +323,23 @@ impl CancellationLatch {
     }
 }
 
+impl EnginePagination<ReadJsonFiles> for EngineConnector {
+    type State = FileDataReadResultIterator;
+
+    fn prepare(&self, read: ReadJsonFiles) -> KernelResult<Self::State> {
+        self.json.read_json_files_with_cancellation(
+            &read.files,
+            read.physical_schema,
+            read.predicate,
+            self.cancellation_token.clone(),
+        )
+    }
+
+    fn next(&self, state: Self::State) -> KernelResult<Page<ReadJsonFiles>> {
+        next_engine_data(state)
+    }
+}
+
 fn complete<In: Send + 'static>(reply: Reply<In>, result: KernelResult<In>) -> KernelResult<()> {
     let cancelled = matches!(result, Err(KernelError::Cancelled));
     reply.send(result);
@@ -295,6 +348,18 @@ fn complete<In: Send + 'static>(reply: Reply<In>, result: KernelResult<In>) -> K
     } else {
         Ok(())
     }
+}
+
+fn next_engine_data<Op>(mut reads: FileDataReadResultIterator) -> KernelResult<Page<Op>>
+where
+    Op: PagedOperation<Page = Vec<KernelResult<Box<dyn EngineData>>>>,
+{
+    let (data, next) = match reads.next() {
+        Some(Err(KernelError::Cancelled)) => return Err(KernelError::Cancelled),
+        Some(data) => (vec![data], Some(Cursor::new(reads))),
+        None => (Vec::new(), None),
+    };
+    Ok(Page { data, next })
 }
 
 fn next_coroutine<Item: Send + 'static, O: Send + 'static>(

@@ -99,6 +99,9 @@ async fn selectively_polled_channel_futures_keep_every_request_live() {
                 requests += 1;
                 reply.send(Ok(Some(Bytes::from(vec![0; requests]))));
             }
+            WorkflowStep::Request(_) => {
+                panic!("workflow requested an unexpected request")
+            }
         }
     };
 
@@ -341,6 +344,9 @@ fn parent_intercepts_child_items_while_child_io_reaches_connector() {
                 assert_eq!(range, None);
                 connector_inputs.push(location.path().to_string());
                 reply.send(Ok(Some(Bytes::copy_from_slice(location.path().as_bytes()))));
+            }
+            WorkflowStep::Request(_) => {
+                panic!("workflow requested an unexpected request")
             }
         }
     };

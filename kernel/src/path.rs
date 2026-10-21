@@ -14,6 +14,8 @@ use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::actions::visitors::LastManifestCommitVisitor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{LastManifestCommit, COMMIT_INFO_NAME, LAST_MANIFEST_COMMIT_FIELD};
+use crate::coroutine::generator::BoundGenerator as _;
+use crate::coroutine::kernel::{run_workflow_with_engine, Channel, ChannelExt as _};
 use crate::engine_data::RowVisitor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::schema::lazy_schema_ref;
@@ -396,9 +398,25 @@ impl ParsedLogPath<FileMeta> {
     ///
     /// Returns the inCommitTimestamp value, or an error if ICT is not found or cannot be read.
     /// Callers should handle enablement version checks before calling this method.
-    #[tracing::instrument(skip(engine), ret, fields(version = self.version, path = %self.location.as_url()))]
     pub(crate) fn read_in_commit_timestamp(&self, engine: &dyn Engine) -> KernelResult<i64> {
-        let actions = self.read_commit_info_batch(engine, InCommitTimestampVisitor::schema())?;
+        run_workflow_with_engine!(engine, |channel| {
+            self.read_in_commit_timestamp_with_channel(channel)
+        })
+    }
+
+    #[tracing::instrument(
+        name = "read_in_commit_timestamp",
+        skip(channel),
+        ret,
+        fields(version = self.version, path = %self.location.as_url())
+    )]
+    pub(crate) async fn read_in_commit_timestamp_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<i64> {
+        let actions = self
+            .read_commit_info_batch_with_channel(channel, InCommitTimestampVisitor::schema())
+            .await?;
         in_commit_timestamp_from(actions.as_ref())
     }
 
@@ -410,11 +428,26 @@ impl ParsedLogPath<FileMeta> {
     /// this is not a commit file, the file cannot be read, the In-Commit Timestamp is missing, or
     /// the `lastManifestCommit` is invalid, including a pointer to a manifest commit newer than
     /// this commit.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[tracing::instrument(skip(engine), ret, fields(version = self.version, path = %self.location.as_url()))]
+    #[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
     pub(crate) fn read_ict_and_last_manifest_commit(
         &self,
         engine: &dyn Engine,
+    ) -> KernelResult<(i64, Option<LastManifestCommit>)> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.read_ict_and_last_manifest_commit_with_channel(channel)
+        })
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[tracing::instrument(
+        name = "read_ict_and_last_manifest_commit",
+        skip(channel),
+        ret,
+        fields(version = self.version, path = %self.location.as_url())
+    )]
+    pub(crate) async fn read_ict_and_last_manifest_commit_with_channel(
+        &self,
+        channel: &Channel,
     ) -> KernelResult<(i64, Option<LastManifestCommit>)> {
         static SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
             nullable COMMIT_INFO_NAME: {
@@ -422,7 +455,9 @@ impl ParsedLogPath<FileMeta> {
                 (&LAST_MANIFEST_COMMIT_FIELD),
             },
         };
-        let actions = self.read_commit_info_batch(engine, SCHEMA.clone())?;
+        let actions = self
+            .read_commit_info_batch_with_channel(channel, SCHEMA.clone())
+            .await?;
         let in_commit_timestamp = in_commit_timestamp_from(actions.as_ref())?;
         let mut visitor = LastManifestCommitVisitor::default();
         visitor.visit_rows_of(actions.as_ref())?;
@@ -435,20 +470,19 @@ impl ParsedLogPath<FileMeta> {
     /// Reads the first batch of this commit log file's actions with `schema`. When In-Commit
     /// Timestamps are enabled, commitInfo is the first action, so this batch holds it. Errors if
     /// this is not a commit file or the file has no actions.
-    fn read_commit_info_batch(
+    async fn read_commit_info_batch_with_channel(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         schema: SchemaRef,
     ) -> KernelResult<Box<dyn EngineData>> {
         require!(
             self.is_commit(),
             KernelError::generic(format!("expected a commit file, got: {:?}", self.file_type))
         );
-        let mut actions =
-            engine
-                .json_handler()
-                .read_json_files(slice::from_ref(&self.location), schema, None)?;
-        match actions.next() {
+        let mut actions = channel
+            .read_json_files(slice::from_ref(&self.location), schema, None)
+            .await?;
+        match actions.next().await? {
             Some(actions) => actions,
             None => Err(KernelError::generic("Commit file contains no actions")),
         }

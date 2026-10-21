@@ -12,10 +12,15 @@ use bytes::Bytes;
 use delta_kernel_derive::internal_api;
 use url::Url;
 
+use super::request::ReadJsonFiles;
 use super::Request;
-use crate::coroutine::generator::{self, BoundGenerator, Generator};
-use crate::coroutine::{ChannelExchange, Cursor, KernelFuture, Page, PageRequest, PagedOperation};
-use crate::FileIndex;
+use crate::coroutine::generator::{self, BoundGenerator, Flatten, Generator, GeneratorExt as _};
+use crate::coroutine::{
+    ChannelExchange, Cursor, KernelFuture, Page, PageGenerator, PageRequest, PagedOperation,
+};
+use crate::expressions::PredicateRef;
+use crate::schema::SchemaRef;
+use crate::{EngineData, FileIndex, FileMeta, KernelResult};
 
 /// Kernel's [`crate::coroutine::Channel`] specialized to [`Request`].
 ///
@@ -23,6 +28,9 @@ use crate::FileIndex;
 /// it for the lifetime of their [`GeneratorBody`].
 #[internal_api]
 pub(crate) type Channel = crate::coroutine::Channel<Request>;
+
+type FlattenedPages<Op> =
+    Flatten<PageGenerator<Op>, std::vec::IntoIter<KernelResult<Box<dyn EngineData>>>>;
 
 /// Typed Kernel operations posted through a request channel.
 ///
@@ -40,6 +48,31 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
         range: Option<Range<FileIndex>>,
     ) -> impl KernelFuture<Option<Bytes>> {
         self.exchange((url, range), Request::ReadSmallFile)
+    }
+
+    /// Reads JSON files via [`Request::ReadJson`] as a stream of result batches.
+    async fn read_json_files<'a>(
+        &'a self,
+        files: impl Into<Vec<FileMeta>> + 'a,
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> KernelResult<
+        impl BoundGenerator<Item = KernelResult<Box<dyn EngineData>>, Output = ()> + Unpin + 'a,
+    > {
+        let prepare_json_files = self.prepare_json_files(files, physical_schema, predicate);
+        Ok(self.bind(prepare_json_files.await?))
+    }
+
+    /// Prepares a JSON read as an unbound stream of result batches.
+    async fn prepare_json_files(
+        &self,
+        files: impl Into<Vec<FileMeta>>,
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> KernelResult<FlattenedPages<ReadJsonFiles>> {
+        let operation = ReadJsonFiles::new(files, physical_schema, predicate);
+        let cursor = self.prepare_paged(operation).await?;
+        Ok(PageGenerator::Next(cursor).flatten())
     }
 
     /// Initialize `operation` via [`PageRequest::Prepare`] without fetching its first page.
