@@ -1,0 +1,395 @@
+//! Drives Kernel coroutines by serving requests through an [`Engine`].
+//!
+//! This adapter backs Engine-compatible entry points and coroutine iterators. It handles requests
+//! synchronously through Engine handlers; connector-native async execution uses its own driver.
+
+use std::borrow::Borrow;
+use std::sync::Arc;
+
+use delta_kernel_derive::internal_api;
+use derive_more::Constructor;
+
+use super::{Coroutine, CoroutineStep, KernelResultGenerator, Request, Workflow};
+use crate::cancellation::{check_cancelled, CancellationTokenRef};
+use crate::coroutine::{drive_workflow, Reply};
+use crate::{Engine, KernelError, KernelResult, StorageHandler};
+
+/// Serves coroutine requests through handlers captured from an [`Engine`].
+///
+/// Engine only exposes handlers through borrowed access, so this adapter captures them eagerly.
+#[derive(Clone)]
+pub(crate) struct EngineConnector {
+    storage: Arc<dyn StorageHandler>,
+    cancellation_token: Option<CancellationTokenRef>,
+}
+
+impl EngineConnector {
+    /// Capture the handlers exposed by `engine`.
+    pub(crate) fn new(engine: &dyn Engine) -> Self {
+        Self {
+            storage: engine.storage_handler(),
+            cancellation_token: None,
+        }
+    }
+
+    /// Configure the cancellation token propagated to Engine handlers.
+    pub(crate) fn with_cancellation_token(
+        mut self,
+        cancellation_token: impl Into<Option<CancellationTokenRef>>,
+    ) -> Self {
+        self.cancellation_token = cancellation_token.into();
+        self
+    }
+
+    /// Drive an existing workflow through this connector.
+    pub(crate) fn drive<O>(&self, workflow: Workflow<'_, O>) -> KernelResult<O> {
+        let mut cancellation = CancellationLatch::default();
+        let output = drive_workflow!(workflow, |request| {
+            cancellation.record(self.respond(request))?
+        });
+        cancellation.finish(output)
+    }
+
+    /// Prepare a fallible result coroutine and return an iterator that drives it and its requests.
+    pub(crate) fn iterate_prepared_result_coroutine<'a, G, Item>(
+        self,
+        workflow: Workflow<'_, G>,
+    ) -> KernelResult<EngineResultCoroutineIterator<'a, Item>>
+    where
+        G: KernelResultGenerator<Item> + 'a,
+        Item: Send + 'static,
+    {
+        let coroutine = Coroutine::from_generator(self.drive(workflow)?);
+        Ok(self.iterate_result_coroutine(coroutine))
+    }
+
+    /// Return an iterator that drives `coroutine` and its connector requests.
+    pub(crate) fn iterate_coroutine<'a, Item: Send + 'static, O: Send + 'static>(
+        self,
+        coroutine: impl Into<Coroutine<'a, Item, O>>,
+    ) -> EngineCoroutineIterator<'a, Item, O> {
+        EngineCoroutineIterator {
+            connector: self,
+            state: CoroutineState::Active(coroutine.into()),
+        }
+    }
+
+    /// Like [`iterate_coroutine`](Self::iterate_coroutine), but for coroutines that yield
+    /// [`KernelResult`] items.
+    pub(crate) fn iterate_result_coroutine<'a, Item: Send + 'static, O: Send + 'static>(
+        self,
+        coroutine: impl Into<Coroutine<'a, KernelResult<Item>, O>>,
+    ) -> EngineResultCoroutineIterator<'a, Item, O> {
+        EngineResultCoroutineIterator(self.iterate_coroutine(coroutine))
+    }
+
+    fn storage_connector(&self) -> StorageConnector<'_> {
+        StorageConnector::new(self.storage.as_ref(), self.cancellation_token.clone())
+    }
+
+    fn check_cancelled(&self) -> KernelResult<()> {
+        check_cancelled(self.cancellation_token.as_ref())
+    }
+
+    fn respond(&self, request: Request) -> KernelResult<()> {
+        match request {
+            Request::ReadSmallFile(..) => self.storage_connector().respond(request)?,
+        }
+        Ok(())
+    }
+}
+
+/// Drive a workflow using only storage operations.
+#[internal_api]
+pub(crate) fn drive_with_storage<O>(
+    storage: &dyn StorageHandler,
+    cancellation_token: Option<CancellationTokenRef>,
+    workflow: Workflow<'_, O>,
+) -> KernelResult<O> {
+    let connector = StorageConnector::new(storage, cancellation_token.clone());
+    let mut cancellation = CancellationLatch::default();
+    let output = drive_workflow!(workflow, |request| {
+        cancellation.record(connector.respond(request))?
+    });
+    cancellation.finish(output)
+}
+
+/// Drive `workflow` through `engine`.
+///
+/// Pass a cancellation token to install it on the Engine connector. `None` matches the
+/// two-argument [`run_workflow_with_engine`] form.
+#[internal_api]
+pub(crate) fn drive_with_engine<O>(
+    engine: &dyn Engine,
+    cancellation_token: impl Into<Option<CancellationTokenRef>>,
+    workflow: Workflow<'_, O>,
+) -> KernelResult<O> {
+    let connector = EngineConnector::new(engine).with_cancellation_token(cancellation_token);
+    connector.drive(workflow)
+}
+
+/// Return an iterator that drives a fallible result coroutine through `engine`.
+#[internal_api]
+pub(crate) fn iterate_result_coroutine_with_engine<'a, Item: Send + 'static, O: Send + 'static>(
+    engine: &dyn Engine,
+    coroutine: impl Into<Coroutine<'a, KernelResult<Item>, O>>,
+) -> impl Iterator<Item = KernelResult<Item>> + Send + 'a {
+    EngineConnector::new(engine).iterate_result_coroutine(coroutine)
+}
+
+/// Prepare and iterate a fallible result coroutine through one connector captured from `engine`.
+#[doc(hidden)]
+#[internal_api]
+pub(crate) fn iterate_prepared_result_coroutine_with_engine<'a, G, Item>(
+    engine: &dyn Engine,
+    cancellation_token: impl Into<Option<CancellationTokenRef>>,
+    workflow: Workflow<'_, G>,
+) -> KernelResult<impl Iterator<Item = KernelResult<Item>> + Send + 'a>
+where
+    G: KernelResultGenerator<Item> + 'a,
+    Item: Send + 'static,
+{
+    let connector = EngineConnector::new(engine).with_cancellation_token(cancellation_token);
+    connector.iterate_prepared_result_coroutine(workflow)
+}
+
+/// Construct, prepare, and iterate a fallible result coroutine through `engine`.
+#[internal_api]
+macro_rules! iterate_prepared_result_coroutine_with_engine {
+    ($engine:expr, $cancellation_token:expr, $($body:tt)+) => {{
+        let workflow = $crate::coroutine::kernel::workflow!($($body)+);
+        $crate::coroutine::kernel::iterate_prepared_result_coroutine_with_engine(
+            $engine,
+            $cancellation_token,
+            workflow,
+        )
+    }};
+}
+
+/// Construct and drive a workflow through an [`Engine`].
+///
+/// The two-argument form does not propagate cancellation. Pass a token as the second argument to
+/// install it when the Engine connector is first captured.
+#[internal_api]
+macro_rules! run_workflow_with_engine {
+    ($engine:expr, $cancellation_token:expr, $($body:tt)+) => {
+        $crate::coroutine::kernel::drive_with_engine(
+            $engine,
+            $cancellation_token,
+            $crate::coroutine::kernel::workflow!($($body)+),
+        )
+    };
+    ($engine:expr, $($body:tt)+) => {
+        $crate::coroutine::kernel::drive_with_engine(
+            $engine,
+            None,
+            $crate::coroutine::kernel::workflow!($($body)+),
+        )
+    };
+}
+
+/// Construct and drive a workflow through a storage handler.
+#[internal_api]
+macro_rules! run_workflow_with_storage {
+    ($storage:expr, $cancellation_token:expr, $($body:tt)+) => {
+        $crate::coroutine::kernel::drive_with_storage(
+            $storage,
+            $cancellation_token,
+            $crate::coroutine::kernel::workflow!($($body)+),
+        )
+    };
+}
+
+/// Iterator over yielded items that serves the coroutine's connector requests.
+pub(crate) struct EngineCoroutineIterator<
+    'a,
+    Item: Send + 'static,
+    O: Send + 'static = (),
+    C = EngineConnector,
+> {
+    connector: C,
+    state: CoroutineState<'a, Item, O>,
+}
+
+/// Iterator over fallible yielded items that also serves coroutine requests.
+pub(crate) struct EngineResultCoroutineIterator<
+    'a,
+    Item: Send + 'static,
+    O: Send + 'static = (),
+    C = EngineConnector,
+>(EngineCoroutineIterator<'a, KernelResult<Item>, O, C>);
+
+impl<C: Borrow<EngineConnector>, Item: Send + 'static, O: Send + 'static> Iterator
+    for EngineCoroutineIterator<'_, Item, O, C>
+{
+    type Item = KernelResult<Item>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        next_coroutine(self.connector.borrow(), &mut self.state)
+    }
+}
+
+impl<C: Borrow<EngineConnector>, Item: Send + 'static, O: Send + 'static> Iterator
+    for EngineResultCoroutineIterator<'_, Item, O, C>
+{
+    type Item = KernelResult<Item>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|result| result?)
+    }
+}
+
+enum CoroutineState<'a, Item: Send + 'static, O: Send + 'static> {
+    Active(Coroutine<'a, Item, O>),
+    Complete(O),
+    Failed,
+}
+
+/// Serves entry points that intentionally require only storage access.
+#[derive(Constructor)]
+struct StorageConnector<'a> {
+    storage: &'a dyn StorageHandler,
+    cancellation_token: Option<CancellationTokenRef>,
+}
+
+impl StorageConnector<'_> {
+    fn respond(&self, request: Request) -> KernelResult<()> {
+        match request {
+            Request::ReadSmallFile(file, reply) => complete(
+                reply,
+                self.storage
+                    .read_small_file_with_cancellation(file, self.cancellation_token.clone()),
+            ),
+        }
+    }
+}
+
+#[derive(Default)]
+struct CancellationLatch(bool);
+
+impl CancellationLatch {
+    fn record(&mut self, result: KernelResult<()>) -> KernelResult<()> {
+        match result {
+            Err(KernelError::Cancelled) => {
+                self.0 = true;
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    fn finish<O>(self, output: O) -> KernelResult<O> {
+        if self.0 {
+            Err(KernelError::Cancelled)
+        } else {
+            Ok(output)
+        }
+    }
+}
+
+fn complete<In: Send + 'static>(reply: Reply<In>, result: KernelResult<In>) -> KernelResult<()> {
+    let cancelled = matches!(result, Err(KernelError::Cancelled));
+    reply.send(result);
+    if cancelled {
+        Err(KernelError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn next_coroutine<Item: Send + 'static, O: Send + 'static>(
+    connector: &EngineConnector,
+    state: &mut CoroutineState<'_, Item, O>,
+) -> Option<KernelResult<Item>> {
+    let CoroutineState::Active(coroutine) = state else {
+        return None;
+    };
+    if let Err(err) = connector.check_cancelled() {
+        *state = CoroutineState::Failed;
+        return Some(Err(err));
+    }
+    loop {
+        match coroutine.try_advance() {
+            Ok(CoroutineStep::Done(output)) => {
+                *state = CoroutineState::Complete(output);
+                return None;
+            }
+            Ok(CoroutineStep::Yield(item)) => return Some(Ok(item)),
+            Ok(CoroutineStep::Request(request)) => {
+                if let Err(err) = connector.respond(request) {
+                    *state = CoroutineState::Failed;
+                    return Some(Err(err));
+                }
+            }
+            Err(err) => {
+                *state = CoroutineState::Failed;
+                return Some(Err(err));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use url::Url;
+
+    use super::*;
+    use crate::coroutine::kernel::{workflow, ChannelExt as _};
+    use crate::unit_test_utils::TestCancellationToken;
+    use crate::{FileMeta, FileSlice, KernelResultIterator};
+
+    struct CancelAfterFirstRead {
+        token: Arc<TestCancellationToken>,
+    }
+
+    impl StorageHandler for CancelAfterFirstRead {
+        fn list_from(&self, _path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+            Err(KernelError::generic("unused listing"))
+        }
+
+        fn read_files(
+            &self,
+            _files: Vec<FileSlice>,
+        ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
+            let token = Arc::clone(&self.token);
+            Ok(Box::new(std::iter::once_with(move || {
+                token.cancel();
+                Ok(Bytes::from_static(b"data"))
+            })))
+        }
+
+        fn copy_atomic(&self, _src: &Url, _dest: &Url) -> KernelResult<()> {
+            Err(KernelError::generic("unused copy"))
+        }
+
+        fn put(&self, _path: &Url, _data: Bytes, _overwrite: bool) -> KernelResult<()> {
+            Err(KernelError::generic("unused write"))
+        }
+
+        fn head(&self, _path: &Url) -> KernelResult<FileMeta> {
+            Err(KernelError::generic("unused head"))
+        }
+
+        fn delete(&self, _path: &Url) -> KernelResult<()> {
+            Err(KernelError::generic("unused delete"))
+        }
+    }
+
+    #[test]
+    fn storage_driver_does_not_let_workflow_swallow_cancellation() {
+        let token = Arc::new(TestCancellationToken::default());
+        let cancellation_token: CancellationTokenRef = token.clone();
+        let storage = CancelAfterFirstRead { token };
+        let workflow = workflow!(async move |channel| {
+            let _ = channel
+                .read_small_file(Url::parse("memory:///data")?, None)
+                .await;
+            Ok(())
+        });
+
+        let result = drive_with_storage(&storage, Some(cancellation_token), workflow);
+
+        assert!(matches!(result, Err(KernelError::Cancelled)));
+    }
+}

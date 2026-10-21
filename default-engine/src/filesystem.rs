@@ -95,7 +95,7 @@ async fn list_from_impl(
 }
 
 /// Native async implementation for read_files
-async fn read_files_impl(
+pub(crate) async fn read_files_impl(
     store: Arc<DynObjectStore>,
     files: Vec<FileSlice>,
     readahead: usize,

@@ -281,6 +281,14 @@ pub enum KernelError {
     #[error("Internal error {0}. This is a kernel bug, please report.")]
     InternalError(String),
 
+    /// A non-blocking operation could not make immediate progress.
+    #[error("Operation would block")]
+    WouldBlock,
+
+    /// The connector rejected a request.
+    #[error("Request rejected by the connector")]
+    RequestRejected,
+
     /// An error enountered while working with parquet data
     #[cfg(feature = "default-engine-base")]
     #[error("Arrow error: {0}")]
