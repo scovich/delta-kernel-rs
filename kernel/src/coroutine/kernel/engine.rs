@@ -918,7 +918,6 @@ mod tests {
     #[cfg(feature = "default-engine-base")]
     mod json_write {
         use super::*;
-        use crate::committer::CommitActions;
         use crate::coroutine::kernel::request::FileWriteMode;
         use crate::engine::sync::SyncEngine;
         use crate::engine::test_delegating::DelegatingEngine;

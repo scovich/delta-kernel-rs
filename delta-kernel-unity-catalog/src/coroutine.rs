@@ -29,6 +29,7 @@ pub(crate) type Channel = delta_kernel::coroutine::Channel<Request>;
 pub(crate) trait ChannelExt: ChannelExchange<Request> {
     /// Write generated commit actions to a new newline-delimited JSON file.
     fn write_commit_file(&self, url: &Url, actions: CommitActions) -> impl DeltaFuture<FileSize> {
+        let actions = actions.into_coroutine();
         let operation = WriteJsonFile::new(url.clone(), FileWriteMode::CreateNew, actions);
         self.exchange(Box::new(operation), Request::WriteJson)
     }

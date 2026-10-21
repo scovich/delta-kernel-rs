@@ -28,17 +28,53 @@ mod filesystem;
 mod publish_types;
 
 pub use commit_types::{CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType};
+use delta_kernel_derive::internal_api;
 use derive_more::Constructor;
 pub use filesystem::FileSystemCommitter;
 pub use publish_types::{CatalogCommit, PublishMetadata};
 
-use crate::coroutine::generator::BoundGenerator as _;
+use crate::coroutine::generator::{AsyncIntoIterator as _, BoundGenerator as _, ChannelBinding};
 use crate::coroutine::kernel::engine::EngineConnector;
 use crate::coroutine::kernel::{static_coroutine, DeltaResultGenerator, StaticCoroutine};
 use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, FilteredEngineData};
 
-/// An unpolled generator of commit actions.
-pub type CommitActions = StaticCoroutine<FilteredEngineData>;
+/// Unstarted stream of commit action batches.
+///
+/// [`Self::into_coroutine`] binds the stream to an owned request channel so a connector can drive
+/// it, typically as the input of a JSON write. Item errors become coroutine errors, so the bound
+/// stream yields [`FilteredEngineData`].
+pub struct CommitActions {
+    inner: Box<dyn DeltaResultGenerator<FilteredEngineData>>,
+}
+
+impl CommitActions {
+    /// Bind this stream to an owned request channel.
+    pub fn into_coroutine(self) -> StaticCoroutine<FilteredEngineData> {
+        static_coroutine!(async move |channel| {
+            let mut actions = self.inner.bind_boxed(ChannelBinding::Borrowed(&channel));
+            while let Some(action) = actions.next().await? {
+                channel.yield_item(action?).await?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Wrap an unbound kernel result stream of commit actions.
+    #[internal_api]
+    pub(crate) fn from_generator(
+        actions: impl DeltaResultGenerator<FilteredEngineData> + 'static,
+    ) -> Self {
+        Self {
+            inner: Box::new(actions),
+        }
+    }
+
+    /// Return the unbound kernel result stream of commit actions.
+    #[internal_api]
+    pub(crate) fn into_generator(self) -> Box<dyn DeltaResultGenerator<FilteredEngineData>> {
+        self.inner
+    }
+}
 
 /// A Delta log commit ready for a [`Committer`] to persist.
 #[derive(Constructor)]
@@ -53,7 +89,7 @@ impl Commit {
         actions: DeltaResultIteratorStatic<FilteredEngineData>,
         metadata: CommitMetadata,
     ) -> Self {
-        let actions = StaticCoroutine::from_iterator(actions);
+        let actions = CommitActions::from_generator(actions.into_generator());
         Self { metadata, actions }
     }
 
@@ -76,22 +112,16 @@ impl Commit {
         DeltaResultIteratorStatic<FilteredEngineData>,
     )> {
         let (metadata, actions) = self.try_into_parts(is_catalog_committer)?;
-        let actions = EngineConnector::new(engine).iterate_coroutine(actions);
+        let actions = EngineConnector::new(engine).iterate_coroutine(actions.into_coroutine());
         Ok((metadata, Box::new(actions)))
     }
 
-    /// Construct a prepared commit by promoting yielded action errors to generator errors.
+    /// Construct a prepared commit from an unbound kernel result stream of action batches.
     pub(crate) fn from_result_generator(
         metadata: CommitMetadata,
         actions: impl DeltaResultGenerator<FilteredEngineData> + 'static,
     ) -> Self {
-        let actions = static_coroutine!(async move |channel| {
-            let mut actions = actions.bind(&channel);
-            while let Some(action) = actions.next().await? {
-                channel.yield_item(action?).await?;
-            }
-            Ok(())
-        });
+        let actions = CommitActions::from_generator(actions);
         Self { metadata, actions }
     }
 

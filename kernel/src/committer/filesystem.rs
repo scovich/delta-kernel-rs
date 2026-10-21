@@ -41,6 +41,7 @@ impl FileSystemCommitter {
         let version = commit_metadata.version();
         let published_commit_path = commit_metadata.published_commit_path()?;
 
+        let actions = actions.into_coroutine();
         match channel
             .write_json_file(&published_commit_path, FileWriteMode::CreateNew, actions)
             .await
