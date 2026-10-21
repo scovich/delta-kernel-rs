@@ -13,6 +13,8 @@ use crate::actions::{
     Metadata, Protocol, ADD_FIELD, CDC_FIELD, COMMIT_INFO_NAME, METADATA_FIELD, PROTOCOL_FIELD,
     REMOVE_FIELD,
 };
+use crate::coroutine::generator::BoundGenerator as _;
+use crate::coroutine::kernel::{run_workflow_with_engine, Channel, ChannelExt as _};
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{column_name, ColumnName};
 use crate::path::{AsUrl, ParsedLogPath};
@@ -185,6 +187,24 @@ impl LogReplayScanner {
         table_schema: &SchemaRef,
         mode: CdfMode,
     ) -> KernelResult<Self> {
+        run_workflow_with_engine!(engine, |channel| {
+            Self::try_new_with_channel(
+                channel,
+                table_configuration,
+                commit_file,
+                table_schema,
+                mode,
+            )
+        })
+    }
+
+    async fn try_new_with_channel(
+        channel: &Channel,
+        table_configuration: &mut TableConfiguration,
+        commit_file: ParsedLogPath,
+        table_schema: &SchemaRef,
+        mode: CdfMode,
+    ) -> KernelResult<Self> {
         let visitor_schema = PreparePhaseVisitor::schema();
 
         // Note: We do not perform data skipping yet because we need to visit all add and
@@ -196,17 +216,17 @@ impl LogReplayScanner {
         // As a result, we would read the file path for the remove action, which is unnecessary
         // because all of the rows will be filtered by the predicate. Instead, we wait until
         // deletion vectors are resolved so that we can skip both actions in the pair.
-        let mut action_iter = engine
-            .json_handler()
+        let mut action_iter = channel
             .read_json_files(
-                slice::from_ref(&commit_file.location),
+                slice::from_ref(&commit_file.location).to_vec(),
                 visitor_schema,
                 None, // not safe to apply data skipping yet
-            )?
+            )
+            .await?
             .peekable();
 
         let mut in_commit_timestamp_opt = None;
-        if let Some(Ok(actions)) = action_iter.peek() {
+        if let Some(Ok(actions)) = action_iter.peek().await? {
             let mut visitor = InCommitTimestampVisitor::default();
             visitor.visit_rows_of(actions.as_ref())?;
             in_commit_timestamp_opt = visitor.in_commit_timestamp;
@@ -216,7 +236,7 @@ impl LogReplayScanner {
         let mut add_paths = HashSet::default();
         let mut has_cdc_action = false;
 
-        for actions in action_iter {
+        while let Some(actions) = action_iter.next().await? {
             let actions = actions?;
 
             let mut visitor = PreparePhaseVisitor {

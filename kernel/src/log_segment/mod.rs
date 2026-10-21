@@ -17,6 +17,10 @@ use crate::actions::{
 use crate::actions::{CheckpointAction, LastManifestCommit, LOG_CHECKPOINT_SCHEMA};
 use crate::cancellation::CancellationTokenRef;
 use crate::committer::CatalogCommit;
+use crate::coroutine::generator::GeneratorExt as _;
+use crate::coroutine::kernel::{
+    iterate_prepared_result_coroutine_with_engine, Channel, ChannelExt as _, KernelResultGenerator,
+};
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
 use crate::log_replay::ActionsBatch;
@@ -984,15 +988,24 @@ impl LogSegment {
         schema: SchemaRef,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<impl KernelResultIterator<ActionsBatch>> {
+        iterate_prepared_result_coroutine_with_engine!(
+            engine,
+            cancellation_token.cloned(),
+            |channel| self.read_commit_actions_generator(channel, schema)
+        )
+    }
+
+    /// Generates this segment's commit-cover action batches in descending version order.
+    #[internal_api]
+    pub(crate) async fn read_commit_actions_generator(
+        &self,
+        channel: &Channel,
+        schema: SchemaRef,
+    ) -> KernelResult<impl KernelResultGenerator<ActionsBatch> + 'static> {
         let commit_files = self.find_commit_cover();
-        let actions = engine
-            .json_handler()
-            .read_json_files_with_cancellation(
-                &commit_files,
-                schema,
-                None,
-                cancellation_token.cloned(),
-            )?
+        let actions = channel
+            .prepare_json_files(commit_files, schema, None)
+            .await?
             .map_ok(|batch| ActionsBatch::new(batch, true));
         Ok(actions)
     }

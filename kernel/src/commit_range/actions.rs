@@ -7,9 +7,10 @@ use url::Url;
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::actions::{Metadata, Protocol, COMMIT_INFO_FIELD, METADATA_FIELD, PROTOCOL_FIELD};
 use crate::commit_range::with_version_context;
+use crate::coroutine::generator::BoundGenerator as _;
 use crate::coroutine::kernel::engine::EngineConnector;
 use crate::coroutine::kernel::{
-    workflow, Channel, ChannelExt as _, KernelResultGenerator, Workflow,
+    run_workflow_with_engine, workflow, Channel, ChannelExt as _, KernelResultGenerator, Workflow,
 };
 use crate::engine_data::RowVisitor as _;
 use crate::path::ParsedLogPath;
@@ -76,6 +77,27 @@ impl CommitAction {
         seed_protocol: Option<Protocol>,
         seed_metadata: Option<Metadata>,
     ) -> KernelResult<Self> {
+        run_workflow_with_engine!(engine, async move |channel| {
+            Self::try_new_with_channel(
+                channel,
+                table_root,
+                log_path,
+                read_schema,
+                seed_protocol,
+                seed_metadata,
+            )
+            .await
+        })
+    }
+
+    pub(crate) async fn try_new_with_channel(
+        channel: &Channel,
+        table_root: Url,
+        log_path: ParsedLogPath,
+        read_schema: SchemaRef,
+        seed_protocol: Option<Protocol>,
+        seed_metadata: Option<Metadata>,
+    ) -> KernelResult<Self> {
         let timestamp = log_path.location.last_modified;
         let mut this = Self {
             table_root,
@@ -85,7 +107,7 @@ impl CommitAction {
             metadata: seed_metadata,
             timestamp,
         };
-        let extracted_ict = this.read_commit_header(engine)?;
+        let extracted_ict = this.read_commit_header_with_channel(channel).await?;
         // Build the effective table configuration once (when both protocol and metadata are
         // known) and reuse it for both validation and timestamp resolution.
         let table_config = match (&this.protocol, &this.metadata) {
@@ -131,17 +153,22 @@ impl CommitAction {
     /// Read the commit header projected to `[protocol, metadata, commitInfo]`, overlay any
     /// `Protocol` / `Metadata` the commit carries onto `self` (a `None` extraction does NOT clear
     /// the inherited value), and return the commit's `inCommitTimestamp` if present.
-    fn read_commit_header(&mut self, engine: &dyn Engine) -> KernelResult<Option<i64>> {
-        let json_iter = engine.json_handler().read_json_files(
+    async fn read_commit_header_with_channel(
+        &mut self,
+        channel: &Channel,
+    ) -> KernelResult<Option<i64>> {
+        let json_iter = channel.read_json_files(
             slice::from_ref(&self.log_path.location),
             HEADER_READ_SCHEMA.clone(),
             None,
-        )?;
+        );
+        let json_iter = json_iter.await?;
 
         let mut extracted_protocol: Option<Protocol> = None;
         let mut extracted_metadata: Option<Metadata> = None;
         let mut ict_visitor = InCommitTimestampVisitor::default();
-        for (batch_index, batch_res) in json_iter.enumerate() {
+        let mut json_iter = json_iter.enumerate();
+        while let Some((batch_index, batch_res)) = json_iter.next().await? {
             let batch = batch_res?;
             // The protocol requires commitInfo to be the first action when in-commit timestamps
             // are enabled, so it lives in the first batch (the visitor inspects only its first

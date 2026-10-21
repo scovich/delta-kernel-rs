@@ -1,6 +1,6 @@
 //! Generator adapters and synchronous iterator sources.
 
-use std::future::Future;
+use std::future::{poll_fn, Future};
 use std::ops::{AsyncFnMut, ControlFlow};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -21,6 +21,157 @@ macro_rules! ready_yield {
             Err(err) => return Poll::Ready(Err(err)),
         }
     };
+}
+
+#[doc(hidden)]
+pub trait Step<I> {
+    type Out;
+
+    fn step(&mut self, item: I) -> Option<Self::Out>;
+}
+
+/// Mapping policy used by [`GeneratorExt::map`].
+pub struct Map<F>(F);
+
+impl<F> Map<F> {
+    pub(super) fn new(map: F) -> Self {
+        Self(map)
+    }
+}
+
+impl<F, T, U> Step<T> for Map<F>
+where
+    F: FnMut(T) -> U,
+{
+    type Out = U;
+
+    fn step(&mut self, item: T) -> Option<U> {
+        Some((self.0)(item))
+    }
+}
+
+/// Mapping policy used by [`GeneratorExt::map_ok`].
+pub struct MapOk<F>(F);
+
+impl<F> MapOk<F> {
+    pub(super) fn new(map: F) -> Self {
+        Self(map)
+    }
+}
+
+impl<F, T, U> Step<KernelResult<T>> for MapOk<F>
+where
+    F: FnMut(T) -> U,
+{
+    type Out = KernelResult<U>;
+
+    fn step(&mut self, item: KernelResult<T>) -> Option<KernelResult<U>> {
+        Some(item.map(&mut self.0))
+    }
+}
+
+/// Generator returned by [`GeneratorExt::map`] and [`GeneratorExt::map_ok`].
+// This struct's manual `impl Unpin` is conditional on `G: Unpin` and valid because it does not use
+// structural field pinning.
+pub struct FilterMap<G, S>(G, S);
+
+impl<G, S> FilterMap<G, S> {
+    pub(super) fn new(inner: G, step: S) -> Self {
+        Self(inner, step)
+    }
+}
+
+impl<G: Unpin, S> Unpin for FilterMap<G, S> {}
+
+impl<G, S> GeneratorExt for FilterMap<G, S> {}
+
+impl<P, G, S> Generator<P> for FilterMap<G, S>
+where
+    P: Send + 'static,
+    G: Generator<P>,
+    S: Step<G::Item> + Send,
+    S::Out: Send + 'static,
+{
+    type Item = S::Out;
+    type Output = G::Output;
+
+    fn bind_to<'a>(
+        self,
+        channel: ChannelBinding<'a, P>,
+    ) -> impl BoundGenerator<Item = S::Out, Output = G::Output> + Unpin + 'a
+    where
+        Self: 'a,
+    {
+        FilterMap(self.0.bind_to(channel), self.1)
+    }
+
+    fn bind_boxed<'a>(
+        self: Box<Self>,
+        channel: ChannelBinding<'a, P>,
+    ) -> BoxedBoundGenerator<'a, S::Out, G::Output>
+    where
+        Self: 'a,
+    {
+        Box::new((*self).bind_to(channel))
+    }
+}
+
+impl<G, S> BoundGenerator for FilterMap<G, S>
+where
+    G: BoundGenerator + Unpin,
+    S: Step<G::Item> + Send,
+    S::Out: Send + 'static,
+{
+    type Item = S::Out;
+    type Output = G::Output;
+
+    fn poll_step(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<KernelResult<GeneratorStep<S::Out, G::Output>>> {
+        let FilterMap(inner, step) = self.get_mut();
+        loop {
+            let item = ready_yield!(Pin::new(&mut *inner).poll_step(context));
+            if let Some(item) = step.step(item) {
+                return Poll::Ready(Ok(GeneratorStep::Yield(item)));
+            }
+        }
+    }
+}
+
+/// Generator returned by [`BoundGenerator::enumerate`].
+// This struct's manual `impl Unpin` is conditional on `G: Unpin` and valid because it does not use
+// structural field pinning.
+pub struct Enumerate<G: BoundGenerator> {
+    inner: G,
+    next: usize,
+}
+
+impl<G: BoundGenerator> Enumerate<G> {
+    pub(super) fn new(inner: G) -> Self {
+        Self { inner, next: 0 }
+    }
+}
+
+impl<G: BoundGenerator + Unpin> Unpin for Enumerate<G> {}
+
+impl<G> BoundGenerator for Enumerate<G>
+where
+    G: BoundGenerator + Unpin,
+{
+    type Item = (usize, G::Item);
+    type Output = G::Output;
+
+    fn poll_step(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<KernelResult<GeneratorStep<Self::Item, Self::Output>>> {
+        let this = self.get_mut();
+        let item = ready_yield!(Pin::new(&mut this.inner).poll_step(context));
+        let index = this.next;
+        this.next += 1;
+        Poll::Ready(Ok(GeneratorStep::Yield((index, item))))
+    }
 }
 
 /// Generator returned by [`GeneratorExt::flatten`].
@@ -99,6 +250,64 @@ where
             let page = ready_yield!(Pin::new(&mut this.inner).poll_step(context));
             this.rest = Some(page.into_iter());
         }
+    }
+}
+
+/// Bound generator returned by [`BoundGenerator::peekable`].
+// This struct's manual `impl Unpin` is conditional on `G: Unpin` and valid because it does not use
+// structural field pinning.
+pub struct Peekable<G: BoundGenerator> {
+    inner: G,
+    peeked: Option<G::Item>,
+    done: Option<G::Output>,
+}
+
+impl<G: BoundGenerator + Unpin> Peekable<G> {
+    pub(super) fn new(inner: G) -> Self {
+        Self {
+            inner,
+            peeked: None,
+            done: None,
+        }
+    }
+
+    fn poll_inner(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<KernelResult<GeneratorStep<G::Item, G::Output>>> {
+        Pin::new(&mut self.inner).poll_step(context)
+    }
+
+    /// Returns the next item without consuming it, or `None` at completion.
+    pub async fn peek(&mut self) -> KernelResult<Option<&G::Item>> {
+        if self.peeked.is_none() && self.done.is_none() {
+            match poll_fn(|context| self.poll_inner(context)).await? {
+                GeneratorStep::Yield(item) => self.peeked = Some(item),
+                GeneratorStep::Done(output) => self.done = Some(output),
+            }
+        }
+        Ok(self.peeked.as_ref())
+    }
+}
+
+impl<G: BoundGenerator + Unpin> Unpin for Peekable<G> {}
+
+impl<G: BoundGenerator + Unpin> BoundGenerator for Peekable<G> {
+    type Item = G::Item;
+    type Output = G::Output;
+
+    fn poll_step(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<KernelResult<GeneratorStep<Self::Item, Self::Output>>> {
+        let this = self.get_mut();
+        if let Some(item) = this.peeked.take() {
+            return Poll::Ready(Ok(GeneratorStep::Yield(item)));
+        }
+        if let Some(output) = this.done.take() {
+            return Poll::Ready(Ok(GeneratorStep::Done(output)));
+        }
+        this.poll_inner(context)
     }
 }
 

@@ -31,7 +31,10 @@ use std::task::{ready, Context, Poll};
 use delta_kernel_derive::internal_api;
 use tracing::{error, Instrument as _, Span};
 
-pub use self::adapters::{empty, unfold, AsyncIntoIterator, Flatten, Iter, Unfold};
+pub use self::adapters::{
+    empty, unfold, AsyncIntoIterator, Enumerate, FilterMap, Flatten, Iter, Map, MapOk, Peekable,
+    Unfold,
+};
 pub(crate) use self::adapters::{unfold_mut_with, unfold_mut_witness};
 use super::witness::invoke_witness;
 use super::{Channel, KernelFuture};
@@ -54,6 +57,22 @@ pub enum GeneratorStep<Y, O> {
 /// type `P`, and naming `P` on a combinator would force it to be inferred before
 /// [`Generator::bind`]. Bound consume helpers live on [`BoundGenerator`].
 pub trait GeneratorExt {
+    /// Counterpart of [`Iterator::map`]: transforms each yielded item.
+    fn map<F>(self, map: F) -> FilterMap<Self, Map<F>>
+    where
+        Self: Sized,
+    {
+        FilterMap::new(self, Map::new(map))
+    }
+
+    /// Counterpart of [`itertools::Itertools::map_ok`]: transforms each successful yielded item.
+    fn map_ok<F>(self, map: F) -> FilterMap<Self, MapOk<F>>
+    where
+        Self: Sized,
+    {
+        FilterMap::new(self, MapOk::new(map))
+    }
+
     /// Counterpart of [`Iterator::flatten`]: yields the elements of each collection-valued item.
     ///
     /// Page-request failures remain control-plane `Err`. Collection elements are yielded as-is,
@@ -147,6 +166,22 @@ pub trait BoundGenerator: Send {
                 GeneratorStep::Done(()) => None,
             }))
         })
+    }
+
+    /// Counterpart of [`Iterator::peekable`]: allows inspecting the next item without consuming it.
+    fn peekable(self) -> Peekable<Self>
+    where
+        Self: Sized + Unpin,
+    {
+        Peekable::new(self)
+    }
+
+    /// Counterpart of [`Iterator::enumerate`]: pairs each yielded item with its index.
+    fn enumerate(self) -> Enumerate<Self>
+    where
+        Self: Sized + Unpin,
+    {
+        Enumerate::new(self)
     }
 }
 
