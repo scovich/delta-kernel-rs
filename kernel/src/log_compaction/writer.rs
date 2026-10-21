@@ -11,8 +11,8 @@ use crate::action_reconciliation::log_replay::{
 use crate::action_reconciliation::{
     ActionReconciliationIterator, ActionReconciliationIteratorState, RetentionCalculator,
 };
-use crate::coroutine::engine::EngineConnector;
 use crate::coroutine::generator::{BoundGenerator as _, Generator as _, GeneratorExt as _};
+use crate::coroutine::kernel::engine::EngineConnector;
 use crate::coroutine::kernel::{workflow, Channel, DeltaResultGenerator, Workflow};
 use crate::log_replay::HasSelectionVector;
 use crate::log_segment::LogSegment;
@@ -111,7 +111,7 @@ impl LogCompactionWriter {
         let workflow = workflow!(async move |channel| {
             self.compaction_data_actions_with_channel(channel).await
         });
-        let actions = connector.iterate_prepared_result_generator(workflow)?;
+        let actions = connector.iterate_prepared_result_coroutine(workflow)?;
         // Wrap the iterator to track action counts lazily
         Ok(ActionReconciliationIterator::new(Box::new(actions)))
     }

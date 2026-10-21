@@ -18,15 +18,17 @@ use crate::committer::{
     Commit, CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
     FileSystemCommitter,
 };
-use crate::coroutine::engine::EngineConnector;
 use crate::coroutine::generator::{
     empty, map_async_witness, AsyncIntoIterator as _, Generator, GeneratorExt as _,
 };
+use crate::coroutine::kernel::engine::EngineConnector;
 use crate::coroutine::kernel::request::EvaluationInput;
-use crate::coroutine::kernel::{workflow, Channel, Workflow};
+use crate::coroutine::kernel::{
+    workflow, Channel, ChannelExt as _, DeltaResultGenerator, Request, Workflow,
+};
+use crate::coroutine::AsyncBool as _;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::coroutine::AsyncOption as _;
-use crate::coroutine::{AsyncBool as _, ChannelExt as _, DeltaResultGenerator, Request};
 use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;

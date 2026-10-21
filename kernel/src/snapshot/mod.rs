@@ -17,9 +17,11 @@ use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::{CheckpointSpec, CheckpointWriter, V2CheckpointConfig};
 use crate::clustering::{parse_clustering_columns, ClusteringColumnInfo, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
-use crate::coroutine::engine::EngineConnector;
-use crate::coroutine::kernel::{static_workflow, workflow, Channel, StaticWorkflow, Workflow};
-use crate::coroutine::{run_workflow_with_engine, ChannelExt as _};
+use crate::coroutine::kernel::engine::EngineConnector;
+use crate::coroutine::kernel::{
+    run_workflow_with_engine, static_workflow, workflow, Channel, ChannelExt as _, StaticWorkflow,
+    Workflow,
+};
 use crate::crc::{
     try_write_crc_file_with_channel, Crc, CrcDelta, DomainMetadataState, FileSizeHistogram,
     FileStats, SetTransactionState,

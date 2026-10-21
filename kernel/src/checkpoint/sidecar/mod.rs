@@ -10,12 +10,12 @@ use crate::coroutine::generator::GeneratorStep;
 use crate::coroutine::kernel::request::{
     ExpressionEvaluatorHandle, PredicateEvaluatorHandle, WriteParquetFilesState,
 };
-use crate::coroutine::kernel::{
-    static_coroutine, BoundDeltaResultGenerator, Channel, DeltaResultGenerator, StaticCoroutine,
-};
 #[cfg(test)]
-use crate::coroutine::run_workflow_with_engine;
-use crate::coroutine::ChannelExt as _;
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::{
+    static_coroutine, BoundDeltaResultGenerator, Channel, ChannelExt as _, DeltaResultGenerator,
+    StaticCoroutine,
+};
 use crate::engine_data::filter_by_predicate;
 use crate::expressions::{
     col, null_lit, Expression, ExpressionStructPatchBuilder, Predicate, Scalar, StructData,

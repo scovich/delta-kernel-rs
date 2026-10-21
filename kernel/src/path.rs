@@ -9,10 +9,10 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::actions::visitors::InCommitTimestampVisitor;
-use crate::coroutine::kernel::Channel;
 #[cfg(test)]
-use crate::coroutine::run_workflow_with_engine;
-use crate::coroutine::{BoundGenerator as _, ChannelExt as _};
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::{Channel, ChannelExt as _};
+use crate::coroutine::BoundGenerator as _;
 use crate::engine_data::RowVisitor;
 use crate::utils::require;
 #[cfg(test)]

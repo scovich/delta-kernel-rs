@@ -7,8 +7,9 @@ use tracing::{info, instrument};
 
 use crate::actions::{Metadata, Protocol};
 use crate::cancellation::CancellationTokenRef;
-use crate::coroutine::kernel::{static_workflow, Channel, StaticWorkflow};
-use crate::coroutine::run_workflow_with_engine;
+use crate::coroutine::kernel::{
+    run_workflow_with_engine, static_workflow, Channel, StaticWorkflow,
+};
 use crate::crc::Crc;
 use crate::error::SnapshotHintError;
 use crate::last_checkpoint_hint::LastCheckpointHint;

@@ -16,11 +16,11 @@ use crate::coroutine::generator::{
     map_async_witness, AsyncIntoIterator as _, BoundGenerator as _, GeneratorExt as _,
 };
 #[cfg(test)]
-use crate::coroutine::iterate_prepared_result_generator_with_engine;
-use crate::coroutine::kernel::{Channel, DeltaResultGenerator};
+use crate::coroutine::kernel::iterate_prepared_result_coroutine_with_engine;
 #[cfg(test)]
-use crate::coroutine::run_workflow_with_engine;
-use crate::coroutine::{AsyncOption as _, ChannelExt as _};
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::{Channel, ChannelExt as _, DeltaResultGenerator};
+use crate::coroutine::AsyncOption as _;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{column_name, ColumnName};
 use crate::path::{AsUrl, ParsedLogPath};
@@ -110,7 +110,7 @@ pub(crate) fn table_changes_action_iter_with_mode<'a>(
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
     mode: CdfMode,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>> + 'a> {
-    iterate_prepared_result_generator_with_engine!(engine.as_ref(), None, async move |channel| {
+    iterate_prepared_result_coroutine_with_engine!(engine.as_ref(), None, async move |channel| {
         table_changes_action_iter_with_mode_and_channel(
             channel,
             start_table_configuration,

@@ -1,8 +1,7 @@
-//! Kernel request vocabulary posted through a [`super::Channel`].
+//! Kernel's connector [`Request`]s and their operation payloads.
 //!
-//! Each variant pairs a connector operation with the reply that completes it. Paginated reads and
-//! listings use [`PageRequest`]; JSON and Parquet writes carry a generator so the connector can
-//! pull row batches while it owns the write.
+//! Paginated reads and listings use [`PageRequest`]; JSON and Parquet writes carry a
+//! [`StaticCoroutine`] so the connector can pull row batches while it owns the write.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -13,10 +12,12 @@ use url::Url;
 
 use super::StaticCoroutine;
 use crate::committer::{Commit, CommitResponse, PublishMetadata};
-use crate::coroutine::{PageRequest, PagedOperation, PlanOperation, Reply};
+use crate::coroutine::{PageRequest, PagedOperation, Reply};
 use crate::engine_data::EngineData;
 use crate::expressions::{ExpressionRef, PredicateRef, Scalar};
 use crate::path::may_begin_listable_log_path;
+#[cfg(feature = "declarative-plans")]
+pub use crate::plans::Operation as PlanOperation;
 use crate::schema::{DataType, SchemaRef};
 use crate::{
     DeltaResult, Error, FileMeta, FileSize, FileSlice, FilteredEngineData, ParquetFooter,
@@ -92,6 +93,15 @@ impl From<PageRequest<PlanOperation>> for Request {
         Self::ExecutePlan(PlanRequest::Query(request))
     }
 }
+
+/// Uninhabited plan operation used when declarative plans are disabled.
+///
+/// The placeholder keeps [`Request`]'s variant set independent of Cargo feature unification. A
+/// dependency can enable `delta_kernel/declarative-plans` without enabling a connector crate's
+/// corresponding feature, so cfg-gating `Request::ExecutePlan` would make exhaustive connector
+/// matches depend on features selected elsewhere in the dependency graph.
+#[cfg(not(feature = "declarative-plans"))]
+pub enum PlanOperation {}
 
 // === Listing ===
 
@@ -309,6 +319,7 @@ pub struct ReadJsonFiles {
 }
 
 impl ReadJsonFiles {
+    /// Create a JSON read operation from its fields.
     pub fn new(
         files: impl Into<Vec<FileMeta>>,
         physical_schema: SchemaRef,
@@ -338,6 +349,7 @@ pub struct ReadParquetFiles {
 }
 
 impl ReadParquetFiles {
+    /// Create a Parquet read operation from its fields.
     pub fn new(
         files: impl Into<Vec<FileMeta>>,
         physical_schema: SchemaRef,
@@ -441,7 +453,7 @@ pub type WriteParquetFilesState = Box<dyn Any + Send>;
 /// Files written from one input stream and its terminal state.
 ///
 /// Connectors must return the state received from
-/// [`super::CoroutineStep::Done`](super::CoroutineStep::Done) unchanged.
+/// [`CoroutineStep::Done`](super::CoroutineStep::Done) unchanged.
 pub type WriteParquetFilesResult = (Vec<Url>, WriteParquetFilesState);
 
 /// Controls how a file sink handles an existing destination.
@@ -466,7 +478,7 @@ pub struct WriteJsonFile {
     pub url: Url,
     /// Existing-destination behavior.
     pub mode: FileWriteMode,
-    /// Row batches to serialize in generator order.
+    /// Row batches to serialize in yield order.
     pub input: StaticCoroutine<FilteredEngineData>,
 }
 
@@ -475,7 +487,7 @@ pub struct WriteJsonFile {
 pub struct WriteParquetFile {
     /// Destination URL.
     pub url: Url,
-    /// Row batches to serialize in generator order.
+    /// Row batches to serialize in yield order.
     pub input: StaticCoroutine<Box<dyn EngineData>>,
 }
 
@@ -484,7 +496,7 @@ pub struct WriteParquetFile {
 pub struct WriteParquetFiles {
     /// Connector-owned file placement and sizing policy.
     pub write: ParquetMultiFileWrite,
-    /// Row batches to serialize in generator order and their opaque terminal state.
+    /// Row batches to serialize in yield order and their opaque terminal state.
     pub input: StaticCoroutine<Box<dyn EngineData>, WriteParquetFilesState>,
 }
 

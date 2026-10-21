@@ -60,8 +60,8 @@ use crate::actions::{
     DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD, SET_TRANSACTION_FIELD,
     SIDECAR_FIELD,
 };
-use crate::coroutine::engine::EngineConnector;
 use crate::coroutine::generator::{map_async, AsyncIntoIterator as _, GeneratorExt as _};
+use crate::coroutine::kernel::engine::EngineConnector;
 use crate::coroutine::kernel::{Channel, StaticCoroutine};
 use crate::path::ParsedLogPath;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
@@ -139,7 +139,7 @@ impl CommitRange {
         actions: &[DeltaAction],
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<CommitAction>> + Send> {
         let commits = self.commits_generator(start_snapshot.as_deref(), actions)?;
-        Ok(EngineConnector::new(engine.as_ref()).iterate_result_generator(commits))
+        Ok(EngineConnector::new(engine.as_ref()).iterate_result_coroutine(commits))
     }
 
     /// Return a lazy generator over the commits in this range.

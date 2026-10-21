@@ -2,10 +2,10 @@ pub(crate) use crate::actions::visitors::SetTransactionMap;
 use crate::actions::visitors::SetTransactionVisitor;
 use crate::actions::{SetTransaction, LOG_TXN_SCHEMA};
 #[cfg(test)]
-use crate::coroutine::iterate_prepared_result_generator_with_engine;
-use crate::coroutine::kernel::{Channel, DeltaResultGenerator};
+use crate::coroutine::kernel::iterate_prepared_result_coroutine_with_engine;
 #[cfg(test)]
-use crate::coroutine::run_workflow_with_engine;
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::{Channel, DeltaResultGenerator};
 use crate::coroutine::{BoundGenerator as _, Generator as _};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
@@ -124,7 +124,7 @@ fn replay_for_app_ids(
     log_segment: &LogSegment,
     engine: &dyn Engine,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-    iterate_prepared_result_generator_with_engine!(engine, None, async move |channel| {
+    iterate_prepared_result_coroutine_with_engine!(engine, None, async move |channel| {
         replay_for_app_ids_with_channel(log_segment, channel).await
     })
 }

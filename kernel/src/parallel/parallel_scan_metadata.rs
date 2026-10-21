@@ -4,12 +4,13 @@ use std::time::Instant;
 use delta_kernel_derive::internal_api;
 use tracing::{info_span, Instrument as _, Span};
 
-use crate::coroutine::engine::{EngineConnector, EngineResultGeneratorIterator};
 use crate::coroutine::generator::AsyncIntoIterator as _;
+use crate::coroutine::kernel::engine::{EngineConnector, EngineResultCoroutineIterator};
 use crate::coroutine::kernel::{
-    static_workflow, Channel, CoroutineStep, DeltaResultGenerator, StaticCoroutine, StaticWorkflow,
+    run_workflow_with_engine, static_workflow, Channel, CoroutineStep, DeltaResultGenerator,
+    StaticCoroutine, StaticWorkflow,
 };
-use crate::coroutine::{run_workflow_with_engine, DeltaFuture};
+use crate::coroutine::DeltaFuture;
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
@@ -36,7 +37,7 @@ pub enum AfterSequentialScanMetadata {
 type SequentialScanGenerator =
     StaticCoroutine<DeltaResult<ScanMetadata>, DeltaResult<AfterSequential>>;
 type SequentialScanEngineIterator =
-    EngineResultGeneratorIterator<'static, ScanMetadata, DeltaResult<AfterSequential>>;
+    EngineResultCoroutineIterator<'static, ScanMetadata, DeltaResult<AfterSequential>>;
 
 /// Connector-driven sequential scan metadata processing.
 pub struct SequentialScanMetadata {
@@ -109,7 +110,7 @@ impl SequentialScanMetadata {
         connector: EngineConnector,
     ) -> SequentialScanMetadataIterator {
         SequentialScanMetadataIterator {
-            inner: connector.iterate_result_generator(self.inner),
+            inner: connector.iterate_result_coroutine(self.inner),
             operation_id: self.operation_id,
             correlation_id: self.correlation_id,
             start: self.start,
@@ -373,7 +374,7 @@ impl ParallelState {
 }
 
 type ParallelScanGenerator = StaticCoroutine<DeltaResult<ScanMetadata>>;
-type ParallelScanEngineIterator = EngineResultGeneratorIterator<'static, ScanMetadata>;
+type ParallelScanEngineIterator = EngineResultCoroutineIterator<'static, ScanMetadata>;
 
 /// Connector-driven parallel scan metadata processing.
 pub struct ParallelScanMetadata {
@@ -445,7 +446,7 @@ impl ParallelScanMetadata {
 
     fn into_engine_iterator(self, connector: EngineConnector) -> ParallelScanMetadataIterator {
         ParallelScanMetadataIterator {
-            inner: connector.iterate_result_generator(self.inner),
+            inner: connector.iterate_result_coroutine(self.inner),
             span: self.span,
         }
     }

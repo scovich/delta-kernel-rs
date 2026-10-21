@@ -44,10 +44,10 @@ use scan::TableChangesScanBuilder;
 use scan_file::scan_metadata_to_scan_file_generator;
 use url::Url;
 
-use crate::coroutine::kernel::{static_workflow, Channel, StaticWorkflow};
-use crate::coroutine::{
-    run_workflow_with_engine, BoundGenerator as _, Generator as _, GeneratorExt as _,
+use crate::coroutine::kernel::{
+    run_workflow_with_engine, static_workflow, Channel, StaticWorkflow,
 };
+use crate::coroutine::{BoundGenerator as _, Generator as _, GeneratorExt as _};
 use crate::log_segment::LogSegment;
 use crate::path::AsUrl;
 use crate::schema::compare::SchemaComparison as _;

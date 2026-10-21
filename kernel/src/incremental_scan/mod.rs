@@ -4,12 +4,11 @@
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
-use crate::coroutine::engine::{EngineConnector, EngineResultGeneratorIterator};
+use crate::coroutine::kernel::engine::{EngineConnector, EngineResultCoroutineIterator};
 use crate::coroutine::kernel::{
-    static_coroutine, static_workflow, BoundDeltaResultGenerator, Channel, CoroutineStep,
-    DeltaResultGenerator, GeneratorChannel, StaticCoroutine, StaticWorkflow,
+    static_coroutine, static_workflow, BoundDeltaResultGenerator, Channel, ChannelExt as _,
+    CoroutineStep, DeltaResultGenerator, GeneratorChannel, StaticCoroutine, StaticWorkflow,
 };
-use crate::coroutine::ChannelExt as _;
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor};
 use crate::expressions::{column_name, ColumnName};
 use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
@@ -346,7 +345,7 @@ where
 type IncrementalScanGenerator =
     StaticCoroutine<DeltaResult<FilteredEngineData>, DeltaResult<IncrementalScanSummary>>;
 type IncrementalScanEngineIterator =
-    EngineResultGeneratorIterator<'static, FilteredEngineData, DeltaResult<IncrementalScanSummary>>;
+    EngineResultCoroutineIterator<'static, FilteredEngineData, DeltaResult<IncrementalScanSummary>>;
 
 /// Connector-driven incremental scan over `(base_version, target_version]`.
 pub struct IncrementalScanStream(IncrementalScanGenerator);
@@ -380,7 +379,7 @@ impl IncrementalScanStream {
     }
 
     fn into_engine_iterator(self, connector: EngineConnector) -> IncrementalScanIterator {
-        IncrementalScanIterator(connector.iterate_result_generator(self.0))
+        IncrementalScanIterator(connector.iterate_result_coroutine(self.0))
     }
 }
 

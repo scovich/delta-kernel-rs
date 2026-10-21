@@ -23,12 +23,10 @@ use crate::actions::{
     DomainMetadata, SetTransaction, ADD_NAME, COMMIT_INFO_NAME, DOMAIN_METADATA_FIELD,
     METADATA_FIELD, PROTOCOL_FIELD, REMOVE_NAME, SET_TRANSACTION_FIELD,
 };
-use crate::coroutine::kernel::Channel;
 #[cfg(test)]
-use crate::coroutine::run_workflow_with_engine;
-use crate::coroutine::{
-    AsyncOption as _, BoundGenerator as _, ChannelExt as _, DeltaFuture, Generator as _,
-};
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::{Channel, ChannelExt as _};
+use crate::coroutine::{AsyncOption as _, BoundGenerator as _, DeltaFuture, Generator as _};
 use crate::crc::{
     is_incremental_safe_operation, read_crc_file_or_none_with_channel, size_to_u64, Crc, CrcDelta,
     FileSizeHistogram, FileStatsDelta,

@@ -5,9 +5,9 @@ use crate::actions::visitors::SetTransactionMap;
 use crate::actions::{
     CheckpointAction, ContentRoot, DomainMetadata, SetTransaction, CHECKPOINT_ACTION_FIELD,
 };
-use crate::coroutine::kernel::Channel;
 #[cfg(test)]
-use crate::coroutine::run_workflow_with_engine;
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::Channel;
 use crate::coroutine::{BoundGenerator as _, Generator as _};
 use crate::crc::{merge_domain_metadata, DomainMetadataState, SetTransactionState};
 use crate::error::Error;

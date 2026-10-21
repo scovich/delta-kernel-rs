@@ -13,10 +13,11 @@ use crate::actions::deletion_vector::split_vector;
 use crate::coroutine::generator::{
     map_async_witness, AsyncIntoIterator as _, Generator as _, GeneratorExt as _,
 };
-use crate::coroutine::kernel::{coroutine, Channel, Coroutine, DeltaResultGenerator};
-use crate::coroutine::{
-    iterate_prepared_result_generator_with_engine, AsyncOption as _, ChannelExt as _,
+use crate::coroutine::kernel::{
+    coroutine, iterate_prepared_result_coroutine_with_engine, Channel, ChannelExt as _, Coroutine,
+    DeltaResultGenerator,
 };
+use crate::coroutine::AsyncOption as _;
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
 use crate::scan::state_info::StateInfo;
 use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions};
@@ -225,7 +226,7 @@ impl TableChangesScan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
-        iterate_prepared_result_generator_with_engine!(
+        iterate_prepared_result_coroutine_with_engine!(
             engine.as_ref(),
             None,
             async move |channel| { self.execute_with_channel(channel).await }

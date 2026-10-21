@@ -5,9 +5,9 @@ use delta_kernel::committer::{
     Commit as KernelCommit, CommitActions, CommitMetadata, CommitResponse, CommitType, Committer,
     PublishMetadata,
 };
+use delta_kernel::coroutine::drive_workflow;
 use delta_kernel::coroutine::kernel::request::WriteJsonFile;
-use delta_kernel::coroutine::kernel::Channel;
-use delta_kernel::coroutine::{drive_workflow, run_workflow_with_engine, ChannelExt as _};
+use delta_kernel::coroutine::kernel::{run_workflow_with_engine, Channel, ChannelExt as _};
 use delta_kernel::{DeltaResult, Engine, Error as DeltaError, FileMeta};
 use tracing::{debug, info};
 use uc::ChannelExt as _;

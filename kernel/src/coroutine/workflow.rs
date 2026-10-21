@@ -11,7 +11,8 @@ use delta_kernel_derive::{internal_api, pub_macro};
 use tracing::{error, Instrument as _, Span};
 
 use super::channel::noop_context;
-use super::{invoke_witness, Channel, DeltaFuture, Reply};
+use super::witness::invoke_witness;
+use super::{Channel, DeltaFuture, Reply};
 use crate::utils::PhantomType;
 use crate::{DeltaResult, Error};
 

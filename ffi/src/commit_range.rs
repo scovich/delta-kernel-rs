@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use delta_kernel::commit_range::{CommitAction, CommitRange, DeltaAction as KernelDeltaAction};
-use delta_kernel::coroutine::{
-    iterate_prepared_result_generator_with_engine, iterate_result_generator_with_engine,
+use delta_kernel::coroutine::kernel::{
+    iterate_prepared_result_coroutine_with_engine, iterate_result_coroutine_with_engine,
 };
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, Error, LogPath, Version};
@@ -316,7 +316,7 @@ fn commit_action_get_actions_impl(
     let kernel_engine = engine.engine();
     let workflow = commit_action.get_actions_workflow();
     let actions =
-        iterate_prepared_result_generator_with_engine(kernel_engine.as_ref(), None, workflow)?;
+        iterate_prepared_result_coroutine_with_engine(kernel_engine.as_ref(), None, workflow)?;
     Ok(FileReadResultIterator::into_handle(actions, engine))
 }
 
@@ -417,7 +417,7 @@ fn commit_range_commits_impl(
 ) -> DeltaResult<Handle<SharedCommitActionsIterator>> {
     let kernel_engine = engine.engine();
     let commits = commit_range.commits_generator(start_snapshot, &actions)?;
-    let inner = iterate_result_generator_with_engine(kernel_engine.as_ref(), commits);
+    let inner = iterate_result_coroutine_with_engine(kernel_engine.as_ref(), commits);
     let boxed: CommitActionIter = Box::new(inner);
     let iter = FfiCommitActionsIterator {
         data: Mutex::new(boxed),

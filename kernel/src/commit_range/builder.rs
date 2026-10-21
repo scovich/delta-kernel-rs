@@ -1,8 +1,9 @@
 use url::Url;
 
 use crate::commit_range::CommitRange;
-use crate::coroutine::kernel::{static_workflow, Channel, StaticWorkflow};
-use crate::coroutine::run_workflow_with_engine;
+use crate::coroutine::kernel::{
+    run_workflow_with_engine, static_workflow, Channel, StaticWorkflow,
+};
 use crate::log_segment::{validate_catalog_managed_log_tail, LogSegment};
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::SnapshotRef;

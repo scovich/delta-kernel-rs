@@ -15,15 +15,15 @@ use crate::actions::{
 };
 use crate::cancellation::CancellationTokenRef;
 use crate::committer::CatalogCommit;
-use crate::coroutine::engine::EngineConnector;
 use crate::coroutine::generator::empty;
-use crate::coroutine::kernel::{workflow, Channel, DeltaResultGenerator};
+use crate::coroutine::kernel::engine::EngineConnector;
 #[cfg(test)]
-use crate::coroutine::run_workflow_with_engine;
-use crate::coroutine::{
-    iterate_prepared_result_generator_with_engine, run_workflow_with_storage, BoundGenerator as _,
-    ChannelExt as _, Generator, GeneratorExt as _,
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::{
+    iterate_prepared_result_coroutine_with_engine, run_workflow_with_storage, workflow, Channel,
+    ChannelExt as _, DeltaResultGenerator,
 };
+use crate::coroutine::{BoundGenerator as _, Generator, GeneratorExt as _};
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
 use crate::log_replay::ActionsBatch;
@@ -945,7 +945,7 @@ impl LogSegment {
             .await
         });
         let (actions, checkpoint_info) = connector
-            .iterate_prepared_result_generator_with_companion(
+            .iterate_prepared_result_coroutine_with_companion(
                 workflow,
                 ActionsWithCheckpointInfo::into_parts,
             )?;
@@ -1002,7 +1002,7 @@ impl LogSegment {
         engine: &dyn Engine,
         action_schema: SchemaRef,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        iterate_prepared_result_generator_with_engine!(engine, None, async move |channel| {
+        iterate_prepared_result_coroutine_with_engine!(engine, None, async move |channel| {
             self.read_actions_with_channel(channel, action_schema).await
         })
     }
@@ -1038,7 +1038,7 @@ impl LogSegment {
         schema: SchemaRef,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        iterate_prepared_result_generator_with_engine!(
+        iterate_prepared_result_coroutine_with_engine!(
             engine,
             cancellation_token.cloned(),
             async move |channel| { self.read_commit_actions_generator(channel, schema).await }
@@ -1337,7 +1337,7 @@ impl LogSegment {
             .await
         });
         let (actions, checkpoint_info) = connector
-            .iterate_prepared_result_generator_with_companion(
+            .iterate_prepared_result_coroutine_with_companion(
                 workflow,
                 ActionsWithCheckpointInfo::into_parts,
             )?;

@@ -12,8 +12,8 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 
-use crate::coroutine::engine::{EngineConnector, EngineResultGeneratorIterator};
 use crate::coroutine::generator::{map_async_witness, BoundGenerator as _, GeneratorExt as _};
+use crate::coroutine::kernel::engine::{EngineConnector, EngineResultCoroutineIterator};
 use crate::coroutine::kernel::{workflow, Channel, ChannelExt as _, DeltaResultGenerator};
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::scan::CHECKPOINT_READ_SCHEMA;
@@ -52,7 +52,7 @@ impl ParallelPhase {
         processor: P,
         leaf_files: Vec<FileMeta>,
         read_schema: SchemaRef,
-    ) -> DeltaResult<EngineResultGeneratorIterator<'static, P::Output>>
+    ) -> DeltaResult<EngineResultCoroutineIterator<'static, P::Output>>
     where
         P: ParallelLogReplayProcessor + Send + Sync + 'static,
         P::Output: Send + 'static,
@@ -61,7 +61,7 @@ impl ParallelPhase {
         let workflow = workflow!(async move |channel| {
             Self::try_new_with_channel(channel, processor, leaf_files, read_schema).await
         });
-        connector.iterate_prepared_result_generator(workflow)
+        connector.iterate_prepared_result_coroutine(workflow)
     }
 
     pub(crate) async fn try_new_with_channel<P>(

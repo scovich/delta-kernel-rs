@@ -16,10 +16,10 @@ use visitors::{MetadataVisitor, ProtocolVisitor};
 use self::deletion_vector::DeletionVectorDescriptor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::content_tree::resolve_amt_location;
+#[cfg(all(feature = "adaptive-metadata-in-dev", test))]
+use crate::coroutine::kernel::run_workflow_with_engine;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::coroutine::kernel::Channel;
-#[cfg(all(feature = "adaptive-metadata-in-dev", test))]
-use crate::coroutine::run_workflow_with_engine;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::create_row_with_channel;
 #[cfg(feature = "adaptive-metadata-in-dev")]

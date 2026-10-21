@@ -30,10 +30,11 @@ use delta_kernel::coroutine::kernel::request::{
     FileWriteMode, ForwardListing, ListingBounds, PredicateEvaluatorHandle, ReadJsonFiles,
     ReadParquetFiles, WriteJsonFile, WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
 };
-use delta_kernel::coroutine::kernel::{CoroutineStep, StaticCoroutine, StaticWorkflow};
+use delta_kernel::coroutine::kernel::{
+    CoroutineStep, PlanRequest, Request, StaticCoroutine, StaticWorkflow,
+};
 use delta_kernel::coroutine::{
-    drive_workflow_async, AsyncResult as _, Cursor, Page, PageRequest, PagedOperation, PlanRequest,
-    Request,
+    drive_workflow_async, AsyncResult as _, Cursor, Page, PageRequest, PagedOperation,
 };
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;

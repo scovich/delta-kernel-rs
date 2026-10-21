@@ -13,10 +13,11 @@ use super::log_replay::SCAN_ROW_SCHEMA;
 use super::ScanMetadata;
 use crate::actions::deletion_vector::{deletion_treemap_to_bools, DeletionVectorDescriptor};
 use crate::actions::visitors::visit_deletion_vector_at;
-use crate::coroutine::kernel::{static_workflow, Channel, StaticWorkflow};
-use crate::coroutine::{
-    run_workflow_with_engine, run_workflow_with_storage, AsyncOption as _, ChannelExt as _,
+use crate::coroutine::kernel::{
+    run_workflow_with_engine, run_workflow_with_storage, static_workflow, Channel, ChannelExt as _,
+    StaticWorkflow,
 };
+use crate::coroutine::AsyncOption as _;
 use crate::engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData};
 use crate::scan::get_transform_for_row;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};

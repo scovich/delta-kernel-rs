@@ -21,12 +21,10 @@ use url::Url;
 #[cfg(test)]
 use crate::cancellation::CancellationTokenRef;
 use crate::coroutine::kernel::request::{log_listing_bounds, ForwardListing};
-use crate::coroutine::kernel::{Channel, Request};
 #[cfg(test)]
-use crate::coroutine::run_workflow_with_storage;
-use crate::coroutine::{
-    BoundGenerator as _, ChannelExt as _, Generator, GeneratorExt as _, PageGenerator,
-};
+use crate::coroutine::kernel::run_workflow_with_storage;
+use crate::coroutine::kernel::{Channel, ChannelExt as _, Request};
+use crate::coroutine::{BoundGenerator as _, Generator, GeneratorExt as _, PageGenerator};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
 use crate::path::{

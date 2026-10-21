@@ -118,16 +118,17 @@ use crate::actions::{
     ADD_FIELD, CHECKPOINT_METADATA_NAME, DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD,
     REMOVE_FIELD, SET_TRANSACTION_FIELD, SIDECAR_FIELD,
 };
-use crate::coroutine::engine::EngineConnector;
 use crate::coroutine::generator::{
     map_async, AsyncIntoIterator as _, BoundGenerator, Generator as _, GeneratorExt as _,
     GeneratorStep,
 };
+use crate::coroutine::kernel::engine::EngineConnector;
 use crate::coroutine::kernel::request::{FileWriteMode, WriteParquetFile, WriteParquetFiles};
 use crate::coroutine::kernel::{
-    static_coroutine, workflow, Channel, DeltaResultGenerator, StaticCoroutine, Workflow,
+    run_workflow_with_engine, static_coroutine, workflow, Channel, ChannelExt as _,
+    DeltaResultGenerator, StaticCoroutine, Workflow,
 };
-use crate::coroutine::{run_workflow_with_engine, AsyncBool as _, ChannelExt as _};
+use crate::coroutine::AsyncBool as _;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ExpressionRef, Scalar, StructData};
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -481,7 +482,7 @@ impl CheckpointWriter {
         let workflow = workflow!(async move |channel| {
             self.checkpoint_data_actions_with_channel(channel).await
         });
-        let actions = connector.iterate_prepared_result_generator(workflow)?;
+        let actions = connector.iterate_prepared_result_coroutine(workflow)?;
         Ok(ActionReconciliationIterator::new(Box::new(actions)))
     }
 

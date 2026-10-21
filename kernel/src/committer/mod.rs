@@ -32,10 +32,9 @@ use derive_more::Constructor;
 pub use filesystem::FileSystemCommitter;
 pub use publish_types::{CatalogCommit, PublishMetadata};
 
-use crate::coroutine::engine::EngineConnector;
 use crate::coroutine::generator::BoundGenerator as _;
-use crate::coroutine::kernel::{static_coroutine, StaticCoroutine};
-use crate::coroutine::DeltaResultGenerator;
+use crate::coroutine::kernel::engine::EngineConnector;
+use crate::coroutine::kernel::{static_coroutine, DeltaResultGenerator, StaticCoroutine};
 use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, FilteredEngineData};
 
 /// An unpolled generator of commit actions.
@@ -77,7 +76,7 @@ impl Commit {
         DeltaResultIteratorStatic<FilteredEngineData>,
     )> {
         let (metadata, actions) = self.try_into_parts(is_catalog_committer)?;
-        let actions = EngineConnector::new(engine).iterate_generator(actions);
+        let actions = EngineConnector::new(engine).iterate_coroutine(actions);
         Ok((metadata, Box::new(actions)))
     }
 

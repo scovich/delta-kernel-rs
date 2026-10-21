@@ -15,8 +15,9 @@ use std::sync::Arc;
 use delta_kernel::actions::{Metadata, Protocol};
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::Committer;
-use delta_kernel::coroutine::kernel::Workflow;
-use delta_kernel::coroutine::{drive_with_engine, drive_with_engine_and_committer};
+use delta_kernel::coroutine::kernel::{
+    drive_with_engine, drive_with_engine_and_committer, Workflow,
+};
 use delta_kernel::history_manager::{
     first_version_after_workflow as kernel_first_version_after,
     get_earliest_commit_workflow as kernel_get_earliest_commit,

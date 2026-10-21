@@ -7,11 +7,11 @@ use itertools::Itertools;
 use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
-#[cfg(test)]
-use crate::coroutine::engine::EngineConnector;
-#[cfg(test)]
-use crate::coroutine::engine::EngineResultGeneratorIterator;
 use crate::coroutine::generator::{generator_fn, Generator, GeneratorExt as _};
+#[cfg(test)]
+use crate::coroutine::kernel::engine::EngineConnector;
+#[cfg(test)]
+use crate::coroutine::kernel::engine::EngineResultCoroutineIterator;
 #[cfg(test)]
 use crate::coroutine::kernel::{workflow, StaticCoroutine};
 use crate::coroutine::kernel::{
@@ -27,7 +27,7 @@ use crate::{DeltaResult, Error, FileMeta, RowVisitor};
 
 #[cfg(test)]
 type CheckpointManifestEngineIterator =
-    EngineResultGeneratorIterator<'static, ActionsBatch, DeltaResult<Vec<FileMeta>>>;
+    EngineResultCoroutineIterator<'static, ActionsBatch, DeltaResult<Vec<FileMeta>>>;
 
 /// Phase that processes single-part checkpoint. This also treats the checkpoint as a manifest file
 /// and extracts the sidecar actions during iteration.
@@ -68,7 +68,7 @@ impl CheckpointManifestReader {
         });
         let generator = connector.drive(workflow)?;
         let generator = StaticCoroutine::from_generator(generator);
-        let inner = connector.iterate_result_generator(generator);
+        let inner = connector.iterate_result_coroutine(generator);
         Ok(Self(inner, manifest_file))
     }
 

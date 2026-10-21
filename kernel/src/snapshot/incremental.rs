@@ -10,9 +10,9 @@ use tracing::{error, instrument};
 use super::{IncrementalReplay, Snapshot};
 #[cfg(test)]
 use crate::cancellation::CancellationTokenRef;
-use crate::coroutine::kernel::Channel;
 #[cfg(test)]
-use crate::coroutine::run_workflow_with_engine;
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::Channel;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::metrics::{

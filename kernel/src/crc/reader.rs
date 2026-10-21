@@ -5,10 +5,9 @@ use std::sync::Arc;
 use tracing::instrument;
 
 use super::Crc;
-use crate::coroutine::kernel::Channel;
 #[cfg(test)]
-use crate::coroutine::run_workflow_with_engine;
-use crate::coroutine::ChannelExt as _;
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::{Channel, ChannelExt as _};
 use crate::metrics::events::CRC_READ_COMPLETED_SPAN;
 use crate::path::{AsUrl as _, ParsedLogPath};
 #[cfg(test)]

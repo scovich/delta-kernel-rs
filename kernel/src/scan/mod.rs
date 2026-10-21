@@ -20,21 +20,19 @@ use crate::actions::{Add, ADD_FIELD, ADD_NAME, NULL_COUNT, REMOVE_FIELD, SIDECAR
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
-use crate::coroutine::engine::EngineConnector;
 use crate::coroutine::generator::{
     map_async_witness, AsyncIntoIterator as _, Generator, GeneratorExt as _,
 };
+use crate::coroutine::kernel::engine::EngineConnector;
 use crate::coroutine::kernel::request::ReadParquetFiles;
+#[cfg(feature = "declarative-plans")]
+use crate::coroutine::kernel::run_workflow_with_engine;
 use crate::coroutine::kernel::{
-    coroutine, static_workflow, workflow, Channel, Coroutine, DeltaResultGenerator, Request,
+    coroutine, iterate_prepared_result_coroutine_with_engine, run_workflow_with_storage,
+    static_workflow, workflow, Channel, ChannelExt as _, Coroutine, DeltaResultGenerator, Request,
     StaticWorkflow, Workflow,
 };
-#[cfg(feature = "declarative-plans")]
-use crate::coroutine::run_workflow_with_engine;
-use crate::coroutine::{
-    iterate_prepared_result_generator_with_engine, run_workflow_with_storage, ChannelExt as _,
-    PageGenerator,
-};
+use crate::coroutine::PageGenerator;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef};
 use crate::kernel_predicates::{
@@ -932,7 +930,7 @@ impl Scan {
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
         let connector =
             EngineConnector::new(engine).with_cancellation_token(self.cancellation_token.clone());
-        connector.iterate_prepared_result_generator(self.scan_metadata_workflow())
+        connector.iterate_prepared_result_coroutine(self.scan_metadata_workflow())
     }
 
     #[internal_api]
@@ -1011,7 +1009,7 @@ impl Scan {
         let connector =
             EngineConnector::new(engine).with_cancellation_token(self.cancellation_token.clone());
         let result =
-            connector.iterate_prepared_result_generator(self.scan_metadata_from_workflow(
+            connector.iterate_prepared_result_coroutine(self.scan_metadata_from_workflow(
                 existing_version,
                 existing_data.into_generator(),
                 existing_predicate,
@@ -1270,7 +1268,7 @@ impl Scan {
             self.replay_for_scan_metadata_with_channel(channel).await
         });
         let (actions, checkpoint_info) = connector
-            .iterate_prepared_result_generator_with_companion(
+            .iterate_prepared_result_coroutine_with_companion(
                 workflow,
                 ActionsWithCheckpointInfo::into_parts,
             )?;
@@ -1493,7 +1491,7 @@ impl Scan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
-        iterate_prepared_result_generator_with_engine!(
+        iterate_prepared_result_coroutine_with_engine!(
             engine.as_ref(),
             self.cancellation_token.clone(),
             async move |channel| { self.execute_with_channel(channel).await }

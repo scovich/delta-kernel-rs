@@ -23,8 +23,7 @@ use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::BackReference;
 use crate::actions::{LOG_ADD_SCHEMA, NUM_RECORDS, TIGHT_BOUNDS};
 use crate::coroutine::generator::{map_async_witness, AsyncIntoIterator as _, GeneratorExt as _};
-use crate::coroutine::kernel::{Channel, DeltaResultGenerator};
-use crate::coroutine::ChannelExt as _;
+use crate::coroutine::kernel::{Channel, ChannelExt as _, DeltaResultGenerator};
 use crate::engine_data::{
     FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData,
 };

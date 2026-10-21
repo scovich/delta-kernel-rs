@@ -7,10 +7,9 @@ use super::commit_types::CommitMetadata;
 use super::commit_types::CommitResponse;
 use super::publish_types::PublishMetadata;
 use super::{Commit, Committer};
-use crate::coroutine::engine::EngineConnector;
+use crate::coroutine::kernel::engine::EngineConnector;
 use crate::coroutine::kernel::request::FileWriteMode;
-use crate::coroutine::kernel::{static_workflow, Channel, StaticWorkflow};
-use crate::coroutine::ChannelExt as _;
+use crate::coroutine::kernel::{static_workflow, Channel, ChannelExt as _, StaticWorkflow};
 use crate::{DeltaResult, Engine, Error, FileMeta};
 
 /// The `FileSystemCommitter` is an internal implementation of the `Committer` trait which

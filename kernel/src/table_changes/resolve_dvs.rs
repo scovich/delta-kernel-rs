@@ -2,9 +2,9 @@ use url::Url;
 
 use super::scan_file::CdfScanFileType;
 use crate::actions::deletion_vector::{deletion_treemap_to_bools, selection_treemap_to_bools};
-use crate::coroutine::kernel::Channel;
 #[cfg(test)]
-use crate::coroutine::run_workflow_with_engine;
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::Channel;
 use crate::coroutine::AsyncOption as _;
 use crate::table_changes::scan_file::CdfScanFile;
 #[cfg(test)]

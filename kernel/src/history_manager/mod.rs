@@ -28,11 +28,10 @@ use search::{binary_search_by_key_with_bounds, Bound, SearchError};
 use tracing::{info, trace, warn};
 use url::Url;
 
-use crate::coroutine::kernel::{static_workflow, Channel, StaticWorkflow};
-use crate::coroutine::{
-    run_workflow_with_engine, AsyncOption as _, BoundGenerator as _, Generator as _,
-    GeneratorExt as _,
+use crate::coroutine::kernel::{
+    run_workflow_with_engine, static_workflow, Channel, StaticWorkflow,
 };
+use crate::coroutine::{AsyncOption as _, BoundGenerator as _, Generator as _, GeneratorExt as _};
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::{list_delta_log_generator, should_process_log_file};
 use crate::path::{LogPathFileType, ParsedLogPath};

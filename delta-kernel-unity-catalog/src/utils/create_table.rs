@@ -28,8 +28,9 @@
 use std::collections::{HashMap, HashSet};
 
 use delta_kernel::actions::Protocol;
-use delta_kernel::coroutine::kernel::{static_workflow, Channel, StaticWorkflow};
-use delta_kernel::coroutine::run_workflow_with_engine;
+use delta_kernel::coroutine::kernel::{
+    run_workflow_with_engine, static_workflow, Channel, StaticWorkflow,
+};
 use delta_kernel::{DeltaResult, Engine, Error, Snapshot, SnapshotRef};
 use unity_catalog_delta_client_api::{
     CreateTableRequest, Protocol as WireProtocol, StorageCredential,

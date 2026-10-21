@@ -7,9 +7,11 @@ use url::Url;
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::actions::{Metadata, Protocol, COMMIT_INFO_FIELD, METADATA_FIELD, PROTOCOL_FIELD};
 use crate::commit_range::with_version_context;
-use crate::coroutine::engine::EngineConnector;
-use crate::coroutine::kernel::{workflow, Channel, DeltaResultGenerator, Workflow};
-use crate::coroutine::{BoundGenerator as _, ChannelExt as _};
+use crate::coroutine::kernel::engine::EngineConnector;
+use crate::coroutine::kernel::{
+    workflow, Channel, ChannelExt as _, DeltaResultGenerator, Workflow,
+};
+use crate::coroutine::BoundGenerator as _;
 use crate::engine_data::RowVisitor as _;
 use crate::path::ParsedLogPath;
 use crate::schema::{lazy_schema_ref, SchemaRef};
@@ -227,7 +229,7 @@ impl CommitAction {
     /// translation is applied.
     pub fn get_actions(&self, engine: &dyn Engine) -> DeltaResult<FileDataReadResultIterator> {
         let connector = EngineConnector::new(engine).with_cancellation_token(None);
-        let actions = connector.iterate_prepared_result_generator(self.get_actions_workflow())?;
+        let actions = connector.iterate_prepared_result_coroutine(self.get_actions_workflow())?;
         Ok(Box::new(actions))
     }
 

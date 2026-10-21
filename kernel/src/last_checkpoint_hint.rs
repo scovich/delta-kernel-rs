@@ -14,10 +14,9 @@ use crate::actions::{
 };
 #[cfg(test)]
 use crate::cancellation::CancellationTokenRef;
-use crate::coroutine::kernel::Channel;
 #[cfg(test)]
-use crate::coroutine::run_workflow_with_storage;
-use crate::coroutine::ChannelExt as _;
+use crate::coroutine::kernel::run_workflow_with_storage;
+use crate::coroutine::kernel::{Channel, ChannelExt as _};
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
 #[cfg(test)]

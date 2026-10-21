@@ -17,11 +17,10 @@ use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
 use crate::coroutine::kernel::request::DirectoryListing;
-use crate::coroutine::kernel::{static_workflow, Channel, StaticWorkflow};
-use crate::coroutine::{
-    run_workflow_with_engine, BoundGenerator as _, ChannelExt as _, GeneratorExt as _,
-    PageGenerator,
+use crate::coroutine::kernel::{
+    run_workflow_with_engine, static_workflow, Channel, ChannelExt as _, StaticWorkflow,
 };
+use crate::coroutine::{BoundGenerator as _, GeneratorExt as _, PageGenerator};
 use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
 use crate::schema::variant_utils::schema_contains_variant_type;

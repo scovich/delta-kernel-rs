@@ -17,8 +17,7 @@ use crate::checkpoint::tests::{
 };
 use crate::checkpoint::CheckpointWriter;
 use crate::coroutine::kernel::request::WriteParquetFiles;
-use crate::coroutine::kernel::Channel;
-use crate::coroutine::{run_workflow_with_engine, ChannelExt as _};
+use crate::coroutine::kernel::{run_workflow_with_engine, Channel, ChannelExt as _};
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::sync::SyncEngine;
 use crate::object_store::memory::InMemory;

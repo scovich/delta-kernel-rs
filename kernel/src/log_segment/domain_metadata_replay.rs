@@ -13,10 +13,10 @@ use super::LogSegment;
 use crate::actions::visitors::DomainMetadataVisitor;
 use crate::actions::{DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA};
 #[cfg(test)]
-use crate::coroutine::iterate_prepared_result_generator_with_engine;
-use crate::coroutine::kernel::{Channel, DeltaResultGenerator};
+use crate::coroutine::kernel::iterate_prepared_result_coroutine_with_engine;
 #[cfg(test)]
-use crate::coroutine::run_workflow_with_engine;
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::{Channel, DeltaResultGenerator};
 use crate::coroutine::{BoundGenerator as _, Generator as _};
 use crate::crc::merge_domain_metadata;
 use crate::log_replay::ActionsBatch;
@@ -165,7 +165,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        iterate_prepared_result_generator_with_engine!(engine, None, async move |channel| {
+        iterate_prepared_result_coroutine_with_engine!(engine, None, async move |channel| {
             self.read_domain_metadata_batches_with_channel(channel)
                 .await
         })

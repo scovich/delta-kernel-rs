@@ -12,8 +12,7 @@ use roaring::RoaringTreemap;
 use serde::Deserialize;
 use url::Url;
 
-use crate::coroutine::kernel::Channel;
-use crate::coroutine::{run_workflow_with_storage, ChannelExt as _};
+use crate::coroutine::kernel::{run_workflow_with_storage, Channel, ChannelExt as _};
 use crate::schema::DataType;
 use crate::utils::require;
 use crate::{DeltaResult, Error, StorageHandler};

@@ -9,9 +9,9 @@ use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::SIDECAR_NAME;
-use crate::coroutine::engine::drive_with_plan_executor;
-use crate::coroutine::kernel::{workflow, Channel};
-use crate::coroutine::{BoundGenerator as _, ChannelExt as _};
+use crate::coroutine::kernel::engine::drive_with_plan_executor;
+use crate::coroutine::kernel::{workflow, Channel, ChannelExt as _};
+use crate::coroutine::BoundGenerator as _;
 use crate::engine_data::RowVisitor;
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::FileType;

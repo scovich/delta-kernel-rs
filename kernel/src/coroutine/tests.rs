@@ -15,13 +15,15 @@ use tracing::field::Empty;
 use tracing::info_span;
 use url::Url;
 
-use super::engine::{drive_with_engine, run_workflow_with_connector, EngineConnector};
 use super::generator::{
     empty, generator, map_async_witness, static_coroutine, AsyncIntoIterator as _,
     BoundGenerator as _, Generator as _, GeneratorExt as _, GeneratorStep,
 };
+use super::kernel::engine::{drive_with_engine, run_workflow_with_connector, EngineConnector};
 use super::kernel::request::{BackwardListing, ForwardListing, ListingBounds};
-use super::kernel::{generator_fn, workflow, Channel, CoroutineStep, StaticCoroutine};
+use super::kernel::{
+    generator_fn, workflow, Channel, ChannelExt as _, CoroutineStep, Request, StaticCoroutine,
+};
 use super::*;
 use crate::engine::sync::SyncEngine;
 use crate::metrics::MetricEvent;
@@ -969,7 +971,7 @@ fn engine_connector_pages_forward_listing() {
         Ok(())
     });
     let actual = connector
-        .iterate_generator(generator)
+        .iterate_coroutine(generator)
         .collect::<DeltaResult<Vec<_>>>()
         .unwrap();
 

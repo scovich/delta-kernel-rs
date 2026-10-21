@@ -1,6 +1,6 @@
 //! Drives kernel coroutines by serving requests through an [`Engine`].
 //!
-//! This adapter backs Engine-compatible entry points and generator iterators. It handles requests
+//! This adapter backs Engine-compatible entry points and coroutine iterators. It handles requests
 //! synchronously through Engine handlers; connector-native async execution uses its own driver.
 
 use std::any::Any;
@@ -11,20 +11,20 @@ use bytes::Bytes;
 use delta_kernel_derive::internal_api;
 use derive_more::Constructor;
 
-use super::kernel::request::{
+#[cfg(feature = "declarative-plans")]
+use super::request::PlanOperation;
+use super::request::{
     BackwardListing, BackwardListingResult, DirectoryListing, ExpressionEvaluatorHandle,
     ForwardListing, ListingBounds, PredicateEvaluatorHandle, ReadJsonFiles, ReadParquetFiles,
     WriteJsonFile, WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
 };
-use super::kernel::{
-    workflow, Coroutine, CoroutineStep, DeltaResultGenerator, StaticCoroutine, StaticWorkflow,
-    Workflow,
+use super::{
+    workflow, Coroutine, CoroutineStep, DeltaResultGenerator, PlanRequest, Request,
+    StaticCoroutine, StaticWorkflow, Workflow,
 };
-#[cfg(feature = "declarative-plans")]
-use super::PlanOperation;
-use super::{drive_workflow, Cursor, Page, PageRequest, PagedOperation, PlanRequest, Request};
 use crate::cancellation::{check_cancelled, CancellationTokenRef};
 use crate::committer::{Committer, FileSystemCommitter};
+use crate::coroutine::{drive_workflow, Cursor, Page, PageRequest, PagedOperation};
 use crate::engine_data::{EngineData, FilteredEngineData};
 #[cfg(feature = "declarative-plans")]
 use crate::plans::PlanExecutor;
@@ -99,35 +99,35 @@ struct PlanExecutorConnector<'a> {
     executor: &'a dyn PlanExecutor,
 }
 
-/// Iterator over yielded items that serves the generator's connector requests.
-pub(crate) struct EngineGeneratorIterator<
+/// Iterator over yielded items that serves the coroutine's connector requests.
+pub(crate) struct EngineCoroutineIterator<
     'a,
     Item: Send + 'static,
     O: Send + 'static = (),
     C = EngineConnector,
 > {
     connector: C,
-    state: GeneratorState<'a, Item, O>,
+    state: CoroutineState<'a, Item, O>,
 }
 
-/// Iterator over fallible yielded items that also serves generator requests.
-pub(crate) struct EngineResultGeneratorIterator<
+/// Iterator over fallible yielded items that also serves coroutine requests.
+pub(crate) struct EngineResultCoroutineIterator<
     'a,
     Item: Send + 'static,
     O: Send + 'static = (),
     C = EngineConnector,
 > {
-    inner: EngineGeneratorIterator<'a, DeltaResult<Item>, O, C>,
+    inner: EngineCoroutineIterator<'a, DeltaResult<Item>, O, C>,
 }
 
-enum GeneratorState<'a, Item: Send + 'static, O: Send + 'static> {
+enum CoroutineState<'a, Item: Send + 'static, O: Send + 'static> {
     Active(Coroutine<'a, Item, O>),
     Complete(O),
     Failed,
 }
 
 struct OutputTrackingIterator<'a, Item: Send + 'static, O: Send + 'static> {
-    inner: EngineGeneratorIterator<'a, Item, O>,
+    inner: EngineCoroutineIterator<'a, Item, O>,
     output: Arc<Mutex<Option<O>>>,
 }
 
@@ -137,8 +137,8 @@ impl<Item: Send + 'static, O: Send + 'static> Iterator for OutputTrackingIterato
     fn next(&mut self) -> Option<Self::Item> {
         let item = self.inner.next();
         if item.is_none() {
-            let state = std::mem::replace(&mut self.inner.state, GeneratorState::Failed);
-            if let GeneratorState::Complete(output) = state {
+            let state = std::mem::replace(&mut self.inner.state, CoroutineState::Failed);
+            if let CoroutineState::Complete(output) = state {
                 if let Ok(mut terminal) = self.output.lock() {
                     *terminal = Some(output);
                 }
@@ -148,14 +148,14 @@ impl<Item: Send + 'static, O: Send + 'static> Iterator for OutputTrackingIterato
     }
 }
 
-fn take_generator_output<O>(
+fn take_coroutine_output<O>(
     output: Arc<Mutex<Option<O>>>,
     incomplete_message: &'static str,
 ) -> DeltaResult<O> {
     Arc::into_inner(output)
-        .ok_or_else(|| Error::internal_error("generator output is still shared"))?
+        .ok_or_else(|| Error::internal_error("coroutine output is still shared"))?
         .into_inner()
-        .map_err(|_| Error::internal_error("generator output lock poisoned"))?
+        .map_err(|_| Error::internal_error("coroutine output lock poisoned"))?
         .ok_or_else(|| Error::internal_error(incomplete_message))
 }
 
@@ -306,32 +306,32 @@ impl EngineConnector {
         }))
     }
 
-    /// Prepare a fallible generator and return an iterator that drives it and its requests.
-    pub(crate) fn iterate_prepared_result_generator<'a, G, Item>(
+    /// Prepare a fallible result coroutine and return an iterator that drives it and its requests.
+    pub(crate) fn iterate_prepared_result_coroutine<'a, G, Item>(
         self,
         workflow: Workflow<'_, G>,
-    ) -> DeltaResult<EngineResultGeneratorIterator<'a, Item>>
+    ) -> DeltaResult<EngineResultCoroutineIterator<'a, Item>>
     where
         G: DeltaResultGenerator<Item> + 'a,
         Item: Send + 'static,
     {
-        let generator = Coroutine::from_generator(self.drive(workflow)?);
-        Ok(self.iterate_result_generator(generator))
+        let coroutine = Coroutine::from_generator(self.drive(workflow)?);
+        Ok(self.iterate_result_coroutine(coroutine))
     }
 
-    /// Prepare a fallible generator and return its iterator and eager companion value.
-    pub(crate) fn iterate_prepared_result_generator_with_companion<'a, R, G, Item, Companion>(
+    /// Prepare a fallible result coroutine and return its iterator and eager companion value.
+    pub(crate) fn iterate_prepared_result_coroutine_with_companion<'a, R, G, Item, Companion>(
         self,
         workflow: Workflow<'_, R>,
         into_parts: impl FnOnce(R) -> (G, Companion),
-    ) -> DeltaResult<(EngineResultGeneratorIterator<'a, Item>, Companion)>
+    ) -> DeltaResult<(EngineResultCoroutineIterator<'a, Item>, Companion)>
     where
         G: DeltaResultGenerator<Item> + 'a,
         Item: Send + 'static,
     {
-        let (generator, companion) = into_parts(self.drive(workflow)?);
-        let generator = Coroutine::from_generator(generator);
-        Ok((self.iterate_result_generator(generator), companion))
+        let (unbound, companion) = into_parts(self.drive(workflow)?);
+        let coroutine = Coroutine::from_generator(unbound);
+        Ok((self.iterate_result_coroutine(coroutine), companion))
     }
 
     /// Drive a workflow whose catalog requests are handled by `committer`.
@@ -355,24 +355,24 @@ impl EngineConnector {
         }))
     }
 
-    /// Return an iterator that drives `generator` and its connector requests.
-    pub(crate) fn iterate_generator<'a, Item: Send + 'static, O: Send + 'static>(
+    /// Return an iterator that drives `coroutine` and its connector requests.
+    pub(crate) fn iterate_coroutine<'a, Item: Send + 'static, O: Send + 'static>(
         self,
-        generator: impl Into<Coroutine<'a, Item, O>>,
-    ) -> EngineGeneratorIterator<'a, Item, O> {
-        EngineGeneratorIterator {
+        coroutine: impl Into<Coroutine<'a, Item, O>>,
+    ) -> EngineCoroutineIterator<'a, Item, O> {
+        EngineCoroutineIterator {
             connector: self,
-            state: GeneratorState::Active(generator.into()),
+            state: CoroutineState::Active(coroutine.into()),
         }
     }
 
-    /// Like [`iterate_generator`], but for generators that yield [`DeltaResult`] items.
-    pub(crate) fn iterate_result_generator<'a, Item: Send + 'static, O: Send + 'static>(
+    /// Like [`iterate_coroutine`], but for coroutines that yield [`DeltaResult`] items.
+    pub(crate) fn iterate_result_coroutine<'a, Item: Send + 'static, O: Send + 'static>(
         self,
-        generator: impl Into<Coroutine<'a, DeltaResult<Item>, O>>,
-    ) -> EngineResultGeneratorIterator<'a, Item, O> {
-        EngineResultGeneratorIterator {
-            inner: self.iterate_generator(generator),
+        coroutine: impl Into<Coroutine<'a, DeltaResult<Item>, O>>,
+    ) -> EngineResultCoroutineIterator<'a, Item, O> {
+        EngineResultCoroutineIterator {
+            inner: self.iterate_coroutine(coroutine),
         }
     }
 
@@ -479,14 +479,14 @@ impl EngineConnector {
 
     fn write_json_file(&self, operation: WriteJsonFile) -> DeltaResult<FileSize> {
         let WriteJsonFile { url, mode, input } = operation;
-        let mut iterator = EngineGeneratorIterator {
+        let mut iterator = EngineCoroutineIterator {
             connector: self,
-            state: GeneratorState::Active(input),
+            state: CoroutineState::Active(input),
         };
         let written_size =
             self.json
                 .write_json_file(&url, Box::new(&mut iterator), mode.overwrite())?;
-        if !matches!(iterator.state, GeneratorState::Complete(())) {
+        if !matches!(iterator.state, CoroutineState::Complete(())) {
             return Err(Error::internal_error(
                 "JSON handler completed before exhausting its input",
             ));
@@ -498,18 +498,18 @@ impl EngineConnector {
         let WriteParquetFile { url, input } = operation;
         let output = Arc::new(Mutex::new(None));
         let iterator = OutputTrackingIterator {
-            inner: self.clone().iterate_generator(input),
+            inner: self.clone().iterate_coroutine(input),
             output: Arc::clone(&output),
         };
         let mut iterator = iterator.peekable();
         if iterator.peek().is_none() {
             return Err(Error::generic(
-                "Cannot write parquet file with empty data generator",
+                "Cannot write parquet file with empty data coroutine",
             ));
         }
         self.parquet
             .write_parquet_file(url.clone(), Box::new(iterator))?;
-        take_generator_output(
+        take_coroutine_output(
             output,
             "Parquet handler completed before exhausting its input",
         )?;
@@ -523,13 +523,13 @@ impl EngineConnector {
         let WriteParquetFiles { write, input } = operation;
         let output = Arc::new(Mutex::new(None));
         let iterator = OutputTrackingIterator {
-            inner: self.clone().iterate_generator(input),
+            inner: self.clone().iterate_coroutine(input),
             output: Arc::clone(&output),
         };
         let locations = self
             .parquet
             .write_parquet_files(write, Box::new(iterator))?;
-        let output = take_generator_output(
+        let output = take_coroutine_output(
             output,
             "Parquet handler completed before exhausting its input",
         )?;
@@ -537,19 +537,19 @@ impl EngineConnector {
     }
 }
 
-/// Return an iterator that drives a fallible generator through `engine`.
+/// Return an iterator that drives a fallible result coroutine through `engine`.
 #[internal_api]
-pub(crate) fn iterate_result_generator_with_engine<'a, Item: Send + 'static, O: Send + 'static>(
+pub(crate) fn iterate_result_coroutine_with_engine<'a, Item: Send + 'static, O: Send + 'static>(
     engine: &dyn Engine,
-    generator: impl Into<Coroutine<'a, DeltaResult<Item>, O>>,
+    coroutine: impl Into<Coroutine<'a, DeltaResult<Item>, O>>,
 ) -> impl Iterator<Item = DeltaResult<Item>> + Send + 'a {
-    EngineConnector::new(engine).iterate_result_generator(generator)
+    EngineConnector::new(engine).iterate_result_coroutine(coroutine)
 }
 
-/// Prepare and iterate a fallible generator through one connector captured from `engine`.
+/// Prepare and iterate a fallible result coroutine through one connector captured from `engine`.
 #[doc(hidden)]
 #[internal_api]
-pub(crate) fn iterate_prepared_result_generator_with_engine<'a, G, Item>(
+pub(crate) fn iterate_prepared_result_coroutine_with_engine<'a, G, Item>(
     engine: &dyn Engine,
     cancellation_token: impl Into<Option<CancellationTokenRef>>,
     workflow: Workflow<'_, G>,
@@ -559,15 +559,15 @@ where
     Item: Send + 'static,
 {
     let connector = EngineConnector::new(engine).with_cancellation_token(cancellation_token);
-    connector.iterate_prepared_result_generator(workflow)
+    connector.iterate_prepared_result_coroutine(workflow)
 }
 
-/// Construct, prepare, and iterate a fallible generator through `engine`.
+/// Construct, prepare, and iterate a fallible result coroutine through `engine`.
 #[internal_api]
-macro_rules! iterate_prepared_result_generator_with_engine {
+macro_rules! iterate_prepared_result_coroutine_with_engine {
     ($engine:expr, $cancellation_token:expr, $body:expr) => {{
         let workflow = $crate::coroutine::kernel::workflow!($body);
-        $crate::coroutine::iterate_prepared_result_generator_with_engine(
+        $crate::coroutine::kernel::iterate_prepared_result_coroutine_with_engine(
             $engine,
             $cancellation_token,
             workflow,
@@ -582,14 +582,14 @@ macro_rules! iterate_prepared_result_generator_with_engine {
 #[internal_api]
 macro_rules! run_workflow_with_engine {
     ($engine:expr, $body:expr) => {
-        $crate::coroutine::drive_with_engine(
+        $crate::coroutine::kernel::drive_with_engine(
             $engine,
             None,
             $crate::coroutine::kernel::workflow!($body),
         )
     };
     ($engine:expr, $cancellation_token:expr, $body:expr) => {
-        $crate::coroutine::drive_with_engine(
+        $crate::coroutine::kernel::drive_with_engine(
             $engine,
             $cancellation_token,
             $crate::coroutine::kernel::workflow!($body),
@@ -601,7 +601,7 @@ macro_rules! run_workflow_with_engine {
 #[internal_api]
 macro_rules! run_workflow_with_storage {
     ($storage:expr, $cancellation_token:expr, $body:expr) => {
-        $crate::coroutine::drive_with_storage(
+        $crate::coroutine::kernel::drive_with_storage(
             $storage,
             $cancellation_token,
             $crate::coroutine::kernel::workflow!($body),
@@ -762,28 +762,28 @@ impl EnginePagination<PlanOperation> for PlanExecutorConnector<'_> {
     }
 }
 
-impl<Item: Send + 'static, O: Send + 'static, C> EngineGeneratorIterator<'_, Item, O, C> {
-    /// Return whether the generator completed and stored its terminal output.
+impl<Item: Send + 'static, O: Send + 'static, C> EngineCoroutineIterator<'_, Item, O, C> {
+    /// Return whether the coroutine completed and stored its terminal output.
     pub(crate) fn is_complete(&self) -> bool {
-        matches!(self.state, GeneratorState::Complete(_))
+        matches!(self.state, CoroutineState::Complete(_))
     }
 
     /// Return the terminal output after this iterator has been exhausted.
     pub(crate) fn into_output(self) -> DeltaResult<O> {
         match self.state {
-            GeneratorState::Complete(output) => Ok(output),
-            GeneratorState::Active(_) => Err(Error::internal_error(
-                "generator iterator must be exhausted before taking its output",
+            CoroutineState::Complete(output) => Ok(output),
+            CoroutineState::Active(_) => Err(Error::internal_error(
+                "coroutine iterator must be exhausted before taking its output",
             )),
-            GeneratorState::Failed => Err(Error::internal_error(
-                "generator iterator failed before producing its output",
+            CoroutineState::Failed => Err(Error::internal_error(
+                "coroutine iterator failed before producing its output",
             )),
         }
     }
 }
 
-impl<Item: Send + 'static, O: Send + 'static, C> EngineResultGeneratorIterator<'_, Item, O, C> {
-    /// Return whether the generator completed and stored its terminal output.
+impl<Item: Send + 'static, O: Send + 'static, C> EngineResultCoroutineIterator<'_, Item, O, C> {
+    /// Return whether the coroutine completed and stored its terminal output.
     pub(crate) fn is_complete(&self) -> bool {
         self.inner.is_complete()
     }
@@ -795,17 +795,17 @@ impl<Item: Send + 'static, O: Send + 'static, C> EngineResultGeneratorIterator<'
 }
 
 impl<C: Borrow<EngineConnector>, Item: Send + 'static, O: Send + 'static> Iterator
-    for EngineGeneratorIterator<'_, Item, O, C>
+    for EngineCoroutineIterator<'_, Item, O, C>
 {
     type Item = DeltaResult<Item>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        next_generator(self.connector.borrow(), &mut self.state)
+        next_coroutine(self.connector.borrow(), &mut self.state)
     }
 }
 
 impl<C: Borrow<EngineConnector>, Item: Send + 'static, O: Send + 'static> Iterator
-    for EngineResultGeneratorIterator<'_, Item, O, C>
+    for EngineResultCoroutineIterator<'_, Item, O, C>
 {
     type Item = DeltaResult<Item>;
 
@@ -814,32 +814,32 @@ impl<C: Borrow<EngineConnector>, Item: Send + 'static, O: Send + 'static> Iterat
     }
 }
 
-fn next_generator<Item: Send + 'static, O: Send + 'static>(
+fn next_coroutine<Item: Send + 'static, O: Send + 'static>(
     connector: &EngineConnector,
-    state: &mut GeneratorState<'_, Item, O>,
+    state: &mut CoroutineState<'_, Item, O>,
 ) -> Option<DeltaResult<Item>> {
-    let GeneratorState::Active(generator) = state else {
+    let CoroutineState::Active(coroutine) = state else {
         return None;
     };
     if let Err(err) = connector.check_cancelled() {
-        *state = GeneratorState::Failed;
+        *state = CoroutineState::Failed;
         return Some(Err(err));
     }
     loop {
-        match generator.try_advance() {
+        match coroutine.try_advance() {
             Ok(CoroutineStep::Done(output)) => {
-                *state = GeneratorState::Complete(output);
+                *state = CoroutineState::Complete(output);
                 return None;
             }
             Ok(CoroutineStep::Yield(item)) => return Some(Ok(item)),
             Ok(CoroutineStep::Request(request)) => {
                 if let Err(err) = connector.respond(request) {
-                    *state = GeneratorState::Failed;
+                    *state = CoroutineState::Failed;
                     return Some(Err(err));
                 }
             }
             Err(err) => {
-                *state = GeneratorState::Failed;
+                *state = CoroutineState::Failed;
                 return Some(Err(err));
             }
         }
@@ -956,7 +956,7 @@ mod tests {
         }
 
         #[test]
-        fn json_handler_cannot_succeed_without_exhausting_generator() {
+        fn json_handler_cannot_succeed_without_exhausting_coroutine() {
             let inner: Arc<dyn Engine> = Arc::new(SyncEngine::new());
             let engine =
                 DelegatingEngine::new(inner).with_json_handler(Arc::new(EarlyReturnJsonHandler));

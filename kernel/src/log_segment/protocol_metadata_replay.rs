@@ -17,10 +17,10 @@ use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
 #[cfg(feature = "declarative-plans")]
 use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
 #[cfg(test)]
-use crate::coroutine::iterate_prepared_result_generator_with_engine;
-use crate::coroutine::kernel::{BoundDeltaResultGenerator, Channel, DeltaResultGenerator};
+use crate::coroutine::kernel::iterate_prepared_result_coroutine_with_engine;
 #[cfg(feature = "declarative-plans")]
-use crate::coroutine::ChannelExt as _;
+use crate::coroutine::kernel::ChannelExt as _;
+use crate::coroutine::kernel::{BoundDeltaResultGenerator, Channel, DeltaResultGenerator};
 use crate::coroutine::{Generator as _, GeneratorExt as _};
 use crate::crc::Crc;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
@@ -248,7 +248,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<VersionedBatch>> + Send> {
-        iterate_prepared_result_generator_with_engine!(engine, None, async move |channel| {
+        iterate_prepared_result_coroutine_with_engine!(engine, None, async move |channel| {
             self.read_pm_batches_with_channel(channel).await
         })
     }

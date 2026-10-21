@@ -191,10 +191,9 @@ pub(crate) mod parallel;
 pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliationIteratorState};
 use cancellation::{check_cancelled, CancellableIterator};
 pub use cancellation::{CancellationToken, CancellationTokenRef, CancelledFuture};
-use coroutine::kernel::Channel;
 #[cfg(test)]
-use coroutine::run_workflow_with_engine;
-use coroutine::ChannelExt as _;
+use coroutine::kernel::run_workflow_with_engine;
+use coroutine::kernel::{Channel, ChannelExt as _};
 pub use delta_kernel_derive;
 pub use engine_data::{
     EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,

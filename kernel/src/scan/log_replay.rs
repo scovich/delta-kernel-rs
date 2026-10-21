@@ -11,15 +11,17 @@ use super::state_info::StateInfo;
 use super::{PhysicalPredicate, ScanMetadata, COMMIT_READ_SCHEMA};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 #[cfg(test)]
-use crate::coroutine::engine::EngineConnector;
-#[cfg(test)]
 use crate::coroutine::generator::AsyncIntoIterator as _;
 use crate::coroutine::generator::{map_async_witness, GeneratorExt as _};
+#[cfg(test)]
+use crate::coroutine::kernel::engine::EngineConnector;
 use crate::coroutine::kernel::request::ExpressionEvaluatorHandle;
 #[cfg(test)]
 use crate::coroutine::kernel::workflow;
-use crate::coroutine::kernel::{Channel, ChannelExt as _, DeltaResultGenerator};
-use crate::coroutine::{run_workflow_with_engine, DeltaFuture};
+use crate::coroutine::kernel::{
+    run_workflow_with_engine, Channel, ChannelExt as _, DeltaResultGenerator,
+};
+use crate::coroutine::DeltaFuture;
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
     col, column_expr_ref, column_name, null_lit, ColumnName, Expression, ExpressionRef,
@@ -1309,7 +1311,7 @@ pub(crate) fn scan_action_iter<'a>(
         )
         .await
     });
-    connector.iterate_prepared_result_generator_with_companion(workflow, std::convert::identity)
+    connector.iterate_prepared_result_coroutine_with_companion(workflow, std::convert::identity)
 }
 
 pub(super) async fn scan_action_iter_with_channel<'a>(

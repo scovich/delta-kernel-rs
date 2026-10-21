@@ -1,34 +1,72 @@
-//! Kernel coroutines and generators post [`Request`]s through a [`Channel`] and await connector
-//! replies.
+//! Kernel's connector request vocabulary and the coroutine types specialized to it.
 //!
-//! Workflows own their request channel. Generator bodies receive a parent channel plus a
-//! separate lane for yielded items.
+//! Kernel operations surface connector work as [`Request`]s. Each variant carries an operation
+//! payload from [`request`] and the [`Reply`] that completes it, either directly or nested in a
+//! [`PlanRequest`] or [`PageRequest`]. The aliases in this module fix the generic [`Workflow`] and
+//! [`Coroutine`] to this vocabulary; the [parent module] explains how to drive them.
+//!
+//! Some entry points return a workflow whose output is a [`DeltaResultGenerator`]. Pass that
+//! output to [`Coroutine::from_generator`] to drive its stream.
+//!
+//! [`Request`]: crate::coroutine::kernel::Request
+//! [`request`]: crate::coroutine::kernel::request
+//! [`PlanRequest`]: crate::coroutine::kernel::PlanRequest
+//! [`PageRequest`]: crate::coroutine::PageRequest
+//! [`Reply`]: crate::coroutine::Reply
+//! [`Workflow`]: crate::coroutine::Workflow
+//! [`Coroutine`]: crate::coroutine::Coroutine
+//! [parent module]: crate::coroutine
+//! [`DeltaResultGenerator`]: crate::coroutine::kernel::DeltaResultGenerator
+//! [`Coroutine::from_generator`]: crate::coroutine::Coroutine::from_generator
 use delta_kernel_derive::internal_api;
 
+#[internal_api]
+pub(crate) use self::channel::{
+    coroutine, static_coroutine, static_workflow, workflow, BoundDeltaResultGenerator, Channel,
+    ChannelExt, GeneratorBody,
+};
+pub(crate) use self::channel::{generator_fn, GeneratorChannel};
+#[doc(inline)]
+#[internal_api]
+pub(crate) use self::engine::{
+    drive_with_engine, drive_with_engine_and_committer, drive_with_storage,
+    iterate_prepared_result_coroutine_with_engine, iterate_result_coroutine_with_engine,
+    run_workflow_with_engine, run_workflow_with_storage,
+};
+pub use self::request::{PlanRequest, Request};
 use crate::coroutine::generator;
 use crate::DeltaResult;
 
-mod channel;
+#[cfg(feature = "internal-api")]
+pub mod channel;
+#[cfg(not(feature = "internal-api"))]
+#[allow(unreachable_pub)]
+pub(crate) mod channel;
+pub(crate) mod engine;
 pub mod request;
 
-#[doc(inline)]
-#[internal_api]
-pub(crate) use channel::ChannelExt;
-pub use request::{PlanRequest, Request};
+/// Kernel workflow that may borrow captured state.
+pub type Workflow<'a, O> = super::Workflow<'a, Request, O>;
 
-/// Borrowed capability used by kernel operations to post requests to a connector driver.
-///
-/// Workflow and coroutine bodies receive this channel as an ordinary async-function argument.
-/// Child generators use it for the lifetime of their [`GeneratorBody`].
-pub type Channel = super::Channel<Request>;
+/// Kernel workflow that owns all captured state.
+pub type StaticWorkflow<O> = super::StaticWorkflow<Request, O>;
 
-/// Unbound kernel generator equivalent to
-/// `Generator<Request, Item = DeltaResult<T>, Output = O>`.
+/// Request or completion from a kernel [`Workflow`].
+pub type WorkflowStep<O> = super::WorkflowStep<Request, O>;
+
+/// Kernel coroutine that may borrow captured state.
+pub type Coroutine<'a, Y, O = ()> = generator::Coroutine<'a, Request, Y, O>;
+
+/// Kernel coroutine that owns all captured state.
+pub type StaticCoroutine<Y, O = ()> = generator::StaticCoroutine<Request, Y, O>;
+
+/// Yield, request, or completion from a kernel [`Coroutine`].
+pub type CoroutineStep<Y, O = ()> = generator::CoroutineStep<Request, Y, O>;
+
+/// Unstarted Kernel result stream that yields `DeltaResult<T>` items and completes with `O`.
 ///
 /// Polling may fail before an item is yielded, each yielded item may independently be an error,
-/// and `O` is returned only after successful terminal completion. Use `impl
-/// DeltaResultGenerator<T>` for pipelines. At type-erasure sites use
-/// `Box<dyn Generator<Request, Item = DeltaResult<T>, Output = ()>>`.
+/// and `O` is returned only after successful terminal completion.
 pub trait DeltaResultGenerator<T, O = ()>:
     generator::Generator<Request, Item = DeltaResult<T>, Output = O>
 where
@@ -43,90 +81,4 @@ where
     T: Send,
     O: Send + 'static,
 {
-}
-
-/// Bound kernel generator equivalent to
-/// `BoundGenerator<Item = DeltaResult<T>, Output = O> + Unpin`.
-///
-/// Use `impl BoundDeltaResultGenerator<T>` after [`generator::Generator::bind`]. When json/parquet
-/// (or other) arms must share a type, erase with [`generator::BoundGenerator::into_boxed`] to
-/// [`generator::BoxedBoundGenerator`] with `Item = DeltaResult<T>`.
-pub trait BoundDeltaResultGenerator<T, O = ()>:
-    generator::BoundGenerator<Item = DeltaResult<T>, Output = O> + Unpin
-where
-    T: Send,
-    O: Send + 'static,
-{
-}
-
-impl<G, T, O> BoundDeltaResultGenerator<T, O> for G
-where
-    G: generator::BoundGenerator<Item = DeltaResult<T>, Output = O> + Unpin,
-    T: Send,
-    O: Send + 'static,
-{
-}
-
-/// Active streaming kernel operation using an existing request channel.
-///
-/// Connector requests surface through the driver that owns the channel. The `'a` lifetime
-/// covers that channel and any state captured by the operation.
-pub type GeneratorBody<'a, Y, O = ()> = generator::GeneratorBody<'a, Y, O>;
-
-/// Independently driven kernel generator that may borrow captured state.
-pub type Coroutine<'a, Y, O = ()> = generator::Coroutine<'a, Request, Y, O>;
-
-/// Kernel generator that owns all captured state and its request channel.
-pub type StaticCoroutine<Y, O = ()> = generator::StaticCoroutine<Request, Y, O>;
-
-/// Yield, request, or completion from a kernel [`StaticCoroutine`].
-///
-/// Yielded items are removed from the pending queue before this step returns. Requests carry their
-/// own replies.
-pub type CoroutineStep<Y, O = ()> = generator::CoroutineStep<Request, Y, O>;
-
-/// Independently driven kernel operation with an owned request channel.
-///
-/// Process each returned request and complete its reply.
-pub type Workflow<'a, O> = super::Workflow<'a, Request, O>;
-
-/// Kernel workflow that owns all captured state.
-pub type StaticWorkflow<O> = super::StaticWorkflow<Request, O>;
-
-/// Request or completion from a kernel [`Workflow`].
-pub type WorkflowStep<O> = super::WorkflowStep<Request, O>;
-
-pub(crate) type GeneratorChannel<'a, Y> = generator::GeneratorChannel<'a, Request, Y>;
-pub(crate) use generator::generator_fn;
-
-/// Creates an independently driven generator that may borrow captured state.
-#[internal_api]
-macro_rules! coroutine {
-    ($body:expr) => {
-        $crate::coroutine::generator::coroutine!($crate::coroutine::kernel::Request, $body)
-    };
-}
-
-/// Creates an unpolled [`StaticCoroutine`] from a static generator body.
-#[internal_api]
-macro_rules! static_coroutine {
-    ($body:expr) => {
-        $crate::coroutine::generator::static_coroutine!($crate::coroutine::kernel::Request, $body)
-    };
-}
-
-/// Creates a [`Workflow`] that may borrow captured state.
-#[internal_api]
-macro_rules! workflow {
-    ($body:expr) => {
-        $crate::coroutine::workflow!($crate::coroutine::kernel::Request, $body)
-    };
-}
-
-/// Creates an unpolled [`StaticWorkflow`] from a static workflow body.
-#[internal_api]
-macro_rules! static_workflow {
-    ($body:expr) => {
-        $crate::coroutine::static_workflow!($crate::coroutine::kernel::Request, $body)
-    };
 }
