@@ -134,7 +134,7 @@ impl SnapshotHint {
         parsed_paths
             .sort_unstable_by(|a, b| (a.version, &a.filename).cmp(&(b.version, &b.filename)));
         let parsed_paths = parsed_paths.into_iter().map(Ok);
-        let mut log_segment_files = LogSegmentFiles::build_log_segment_files(
+        let mut log_segment_files = LogSegmentFiles::build_log_segment_files_from_iter(
             parsed_paths,
             Vec::new(),
             0,

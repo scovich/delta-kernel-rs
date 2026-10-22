@@ -10,13 +10,13 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 use derive_more::Constructor;
 
-use super::request::ReadJsonFiles;
+use super::request::{ForwardListing, ReadJsonFiles};
 use super::{Coroutine, CoroutineStep, KernelResultGenerator, Request, Workflow};
 use crate::cancellation::{check_cancelled, CancellationTokenRef};
 use crate::coroutine::{drive_workflow, Cursor, Page, PageRequest, PagedOperation, Reply};
 use crate::{
-    Engine, EngineData, FileDataReadResultIterator, JsonHandler, KernelError, KernelResult,
-    StorageHandler,
+    Engine, EngineData, FileDataReadResultIterator, FileMeta, JsonHandler, KernelError,
+    KernelResult, KernelResultIterator, StorageHandler,
 };
 
 /// Maps a paged request onto synchronous Engine state stored in an opaque cursor.
@@ -125,6 +125,7 @@ impl EngineConnector {
 
     fn respond(&self, request: Request) -> KernelResult<()> {
         match request {
+            Request::ListForward(request) => respond_paged(&self.storage_connector(), request)?,
             Request::ReadSmallFile(..) => self.storage_connector().respond(request)?,
             Request::ReadJson(request) => respond_paged(self, request)?,
         }
@@ -288,6 +289,7 @@ struct StorageConnector<'a> {
 impl StorageConnector<'_> {
     fn respond(&self, request: Request) -> KernelResult<()> {
         match request {
+            Request::ListForward(request) => respond_paged(self, request),
             Request::ReadSmallFile(file, reply) => complete(
                 reply,
                 self.storage
@@ -320,6 +322,30 @@ impl CancellationLatch {
         } else {
             Ok(output)
         }
+    }
+}
+
+impl EnginePagination<ForwardListing> for StorageConnector<'_> {
+    type State = Box<dyn KernelResultIterator<FileMeta>>;
+
+    fn prepare(&self, ForwardListing(bounds): ForwardListing) -> KernelResult<Self::State> {
+        let listing = self
+            .storage
+            .list_from_with_cancellation(&bounds.low, self.cancellation_token.clone())?
+            .take_while(move |entry| bounds.contains(entry));
+        Ok(Box::new(listing))
+    }
+
+    fn next(&self, mut listing: Self::State) -> KernelResult<Page<ForwardListing>> {
+        let data = Vec::from_iter(listing.by_ref().take(ForwardListing::DEFAULT_PAGE_SIZE));
+        if data
+            .iter()
+            .any(|entry| matches!(entry, Err(KernelError::Cancelled)))
+        {
+            return Err(KernelError::Cancelled);
+        }
+        let next = (data.len() == ForwardListing::DEFAULT_PAGE_SIZE).then(|| Cursor::new(listing));
+        Ok(Page { data, next })
     }
 }
 

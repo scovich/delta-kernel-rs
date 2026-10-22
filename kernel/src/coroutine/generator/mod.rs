@@ -181,6 +181,23 @@ pub trait BoundGenerator: Send {
         })
     }
 
+    /// Counterpart of [`itertools::Itertools::try_collect`]: collects successful yielded items,
+    /// stopping at the first item or generator error.
+    fn try_collect<T, C>(mut self) -> impl KernelFuture<C>
+    where
+        Self: Sized + Unpin + BoundGenerator<Item = KernelResult<T>, Output = ()>,
+        T: Send + 'static,
+        C: Default + Extend<T> + Send,
+    {
+        async move {
+            let mut output = C::default();
+            while let Some(item) = self.next().await? {
+                output.extend([item?]);
+            }
+            Ok(output)
+        }
+    }
+
     /// Counterpart of [`Iterator::peekable`]: allows inspecting the next item without consuming it.
     fn peekable(self) -> Peekable<Self>
     where

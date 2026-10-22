@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
-use crate::metrics::events::{StorageReadCompleted, STORAGE_SPAN};
+use crate::metrics::events::{StorageListCompleted, StorageReadCompleted, STORAGE_SPAN};
 use crate::utils::PhantomType;
 use crate::{FileMeta, KernelResultIterator};
 
@@ -62,6 +62,11 @@ impl<I, T> Drop for MetricsIterator<I, T> {
 /// Emit a [`StorageReadCompleted`] metric for a read's elapsed time, file count, and byte count.
 pub fn emit_storage_read_completed(elapsed: Duration, num_files: u64, bytes_read: u64) {
     emit_storage_span(StorageReadCompleted::NAME, elapsed, num_files, bytes_read);
+}
+
+/// Emit a [`StorageListCompleted`] metric for a listing's elapsed time and file count.
+pub fn emit_storage_list_completed(elapsed: Duration, num_files: u64) {
+    emit_storage_span(StorageListCompleted::NAME, elapsed, num_files, 0);
 }
 
 /// Emit a one-shot `"storage"` span describing a completed operation. Use when the

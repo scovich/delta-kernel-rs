@@ -333,6 +333,7 @@ mod tests {
             &[
                 SNAPSHOT_COMPLETED_SPAN,
                 "log_segment.for_snapshot",
+                "log_segment.for_snapshot",
                 "log.list",
             ],
         );

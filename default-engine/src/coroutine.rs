@@ -22,19 +22,21 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use delta_kernel::coroutine::kernel::request::ReadJsonFiles;
+use delta_kernel::coroutine::kernel::request::{ForwardListing, ReadJsonFiles};
 use delta_kernel::coroutine::kernel::{Request, Workflow};
 use delta_kernel::coroutine::{
     drive_workflow_async, AsyncResult as _, Cursor, Page, PageRequest, PagedOperation,
 };
-use delta_kernel::metrics::{emit_json_read_completed, emit_storage_read_completed};
+use delta_kernel::metrics::{
+    emit_json_read_completed, emit_storage_list_completed, emit_storage_read_completed,
+};
 use delta_kernel::object_store::DynObjectStore;
-use delta_kernel::{EngineData, FileSlice, KernelError, KernelResult};
+use delta_kernel::{EngineData, FileMeta, FileSlice, KernelError, KernelResult};
 use futures::stream::BoxStream;
 use futures::{Stream, StreamExt as _};
 use tokio_util::sync::CancellationToken;
 
-use crate::filesystem::read_files_impl;
+use crate::filesystem::{list_from_impl, read_files_impl};
 use crate::json::read_json_files_impl;
 use crate::{DEFAULT_READ_BATCH_SIZE, DEFAULT_READ_BUFFER_SIZE};
 
@@ -137,6 +139,7 @@ impl AsyncEngineConnector {
 
     async fn respond_inner(&self, request: Request) -> KernelResult<()> {
         match request {
+            Request::ListForward(request) => respond_paged(self, request).await?,
             Request::ReadSmallFile(file, reply) => reply.send(self.read_small_file(file).await),
             Request::ReadJson(request) => respond_paged(self, request).await?,
         }
@@ -175,6 +178,24 @@ impl AsyncEngineConnector {
         };
         Ok(Page { data, next })
     }
+
+    async fn next_listing_page<Op>(
+        &self,
+        mut stream: ResultStream<FileMeta>,
+    ) -> KernelResult<Page<Op>>
+    where
+        Op: PagedOperation<Page = Vec<KernelResult<FileMeta>>>,
+    {
+        let mut data = Vec::with_capacity(ForwardListing::DEFAULT_PAGE_SIZE);
+        while data.len() < ForwardListing::DEFAULT_PAGE_SIZE {
+            let Some(entry) = stream.next().await else {
+                break;
+            };
+            data.push(entry);
+        }
+        let next = (data.len() == ForwardListing::DEFAULT_PAGE_SIZE).then(|| Cursor::new(stream));
+        Ok(Page { data, next })
+    }
 }
 
 const STORAGE_READAHEAD: usize = 10;
@@ -211,6 +232,25 @@ where
         }
     }
     Ok(())
+}
+
+impl AsyncPagination<ForwardListing> for AsyncEngineConnector {
+    type State = ResultStream<FileMeta>;
+
+    async fn prepare(&self, ForwardListing(bounds): ForwardListing) -> KernelResult<Self::State> {
+        let start = Instant::now();
+        let stream = list_from_impl(Arc::clone(&self.object_store), bounds.low.clone()).await?;
+        let observe = |_: &FileMeta| (1, 0);
+        let emit = |elapsed, num_files, _| emit_storage_list_completed(elapsed, num_files);
+        let stream = metered_stream(stream, start, observe, emit);
+        let in_bounds =
+            move |entry: &KernelResult<FileMeta>| std::future::ready(bounds.contains(entry));
+        Ok(Box::pin(stream.take_while(in_bounds)))
+    }
+
+    async fn next(&self, stream: Self::State) -> KernelResult<Page<ForwardListing>> {
+        self.next_listing_page(stream).await
+    }
 }
 
 impl AsyncPagination<ReadJsonFiles> for AsyncEngineConnector {
@@ -300,8 +340,10 @@ fn precounted_stream<T: Send + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::coroutine::generator::BoundGenerator as _;
+    use delta_kernel::coroutine::generator::{BoundGenerator as _, GeneratorExt as _};
+    use delta_kernel::coroutine::kernel::request::{ForwardListing, ListingBounds};
     use delta_kernel::coroutine::kernel::{static_workflow, ChannelExt as _, WorkflowStep};
+    use delta_kernel::coroutine::PageGenerator;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::ObjectStoreExt as _;
@@ -384,6 +426,44 @@ mod tests {
         let result = connector.run(workflow).await.unwrap();
 
         assert_eq!(result, (1, true));
+    }
+
+    #[tokio::test]
+    async fn lists_bounded_paths_through_native_async_storage() {
+        let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
+        for path in [
+            "00000000000000000000.json",
+            "00000000000000000001.json",
+            "_sidecars/part.parquet",
+        ] {
+            store
+                .put(&Path::from(path), Bytes::new().into())
+                .await
+                .unwrap();
+        }
+        let connector = AsyncEngineConnector::new(Arc::clone(&store));
+        let prefix = Url::parse("memory:///").unwrap();
+        let bounds = ListingBounds {
+            prefix: prefix.clone(),
+            low: prefix.join("00000000000000000000").unwrap(),
+            high: prefix.join("00000000000000000001").unwrap(),
+        };
+        let workflow = static_workflow!(async move |channel| {
+            let cursor = channel.prepare_paged(ForwardListing::new(bounds)).await?;
+            let mut files = channel.bind(PageGenerator::Next(cursor).flatten());
+            let mut locations = Vec::new();
+            while let Some(file) = files.next().await? {
+                locations.push(file?.location);
+            }
+            Ok(locations)
+        });
+
+        let locations = connector.run(workflow).await.unwrap();
+
+        assert_eq!(
+            locations,
+            [prefix.join("00000000000000000000.json").unwrap()]
+        );
     }
 
     #[tokio::test]

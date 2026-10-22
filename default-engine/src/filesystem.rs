@@ -44,7 +44,7 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
 /// returns the raw stream.
 ///
 /// [`MeteredStorageHandler`]: delta_kernel::metrics::MeteredStorageHandler
-async fn list_from_impl(
+pub(crate) async fn list_from_impl(
     store: Arc<DynObjectStore>,
     path: Url,
 ) -> KernelResult<BoxStream<'static, KernelResult<FileMeta>>> {
