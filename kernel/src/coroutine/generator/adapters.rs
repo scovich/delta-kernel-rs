@@ -72,6 +72,30 @@ where
     }
 }
 
+/// Filtering policy used by [`GeneratorExt::filter_ok`].
+pub struct FilterOk<P>(P);
+
+impl<P> FilterOk<P> {
+    pub(super) fn new(predicate: P) -> Self {
+        Self(predicate)
+    }
+}
+
+impl<P, T> Step<KernelResult<T>> for FilterOk<P>
+where
+    P: FnMut(&T) -> bool,
+{
+    type Out = KernelResult<T>;
+
+    fn step(&mut self, item: KernelResult<T>) -> Option<Self::Out> {
+        match item {
+            Ok(item) if (self.0)(&item) => Some(Ok(item)),
+            Ok(_) => None,
+            Err(err) => Some(Err(err)),
+        }
+    }
+}
+
 /// Generator returned by [`GeneratorExt::map`] and [`GeneratorExt::map_ok`].
 // This struct's manual `impl Unpin` is conditional on `G: Unpin` and valid because it does not use
 // structural field pinning.

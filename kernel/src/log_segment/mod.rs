@@ -23,7 +23,8 @@ use crate::coroutine::generator::GeneratorExt as _;
 #[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
 use crate::coroutine::kernel::run_workflow_with_engine;
 use crate::coroutine::kernel::{
-    iterate_prepared_result_coroutine_with_engine, Channel, ChannelExt as _, KernelResultGenerator,
+    iterate_prepared_result_coroutine_with_engine, run_workflow_with_storage, Channel,
+    ChannelExt as _, KernelResultGenerator,
 };
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
@@ -638,7 +639,6 @@ impl LogSegment {
         LogSegment::try_new(listed_files, log_root, end_version, None)
     }
 
-    #[allow(unused)]
     /// Constructs a [`LogSegment`] to be used for timestamp conversion. This [`LogSegment`] will
     /// consist only of contiguous commit files up to `end_version` (inclusive). If present,
     /// `limit` specifies the maximum length of the returned log segment. The log segment may be
@@ -647,8 +647,28 @@ impl LogSegment {
     /// listing.
     // This lists all files starting from `end-limit` if `limit` is defined. For large tables,
     // listing with a `limit` can be a significant speedup over listing _all_ the files in the log.
+    #[cfg(test)]
     pub(crate) fn for_timestamp_conversion(
         storage: &dyn StorageHandler,
+        log_root: Url,
+        end_version: Version,
+        limit: Option<NonZero<usize>>,
+        log_tail: Vec<ParsedLogPath>,
+    ) -> KernelResult<Self> {
+        // Timestamp conversion does not thread a cancellation token.
+        run_workflow_with_storage!(storage, None, |channel| {
+            Self::for_timestamp_conversion_with_channel(
+                channel,
+                log_root,
+                end_version,
+                limit,
+                log_tail,
+            )
+        })
+    }
+
+    pub(crate) async fn for_timestamp_conversion_with_channel(
+        channel: &Channel,
         log_root: Url,
         end_version: Version,
         limit: Option<NonZero<usize>>,
@@ -666,15 +686,14 @@ impl LogSegment {
 
         // this is a list of commits with possible gaps, we want to take the latest contiguous
         // chunk of commits
-        // Inherit any cancellation token bound to `storage`.
-        let mut listed_commits = LogSegmentFiles::list_commits(
-            storage,
+        let mut listed_commits = LogSegmentFiles::list_commits_with_channel(
+            channel,
             &log_root,
             log_tail,
             start_from,
             Some(end_version),
-            None,
-        )?;
+        )
+        .await?;
         if listed_commits.ascending_commit_files().is_empty() {
             return Err(KernelError::EmptyLog);
         }
