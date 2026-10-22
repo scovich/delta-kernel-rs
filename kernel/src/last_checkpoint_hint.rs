@@ -14,11 +14,16 @@ use crate::actions::CheckpointAction;
 use crate::actions::{
     CheckpointMetadata, DomainMetadata, Metadata, Protocol, SetTransaction, Sidecar,
 };
+#[cfg(test)]
 use crate::cancellation::CancellationTokenRef;
-use crate::coroutine::kernel::{run_workflow_with_storage, Channel, ChannelExt as _};
+#[cfg(test)]
+use crate::coroutine::kernel::run_workflow_with_storage;
+use crate::coroutine::kernel::{Channel, ChannelExt as _};
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
-use crate::{FileMeta, KernelError, KernelResult, StorageHandler, Version};
+#[cfg(test)]
+use crate::StorageHandler;
+use crate::{FileMeta, KernelError, KernelResult, Version};
 
 /// Name of the _last_checkpoint file that provides metadata about the last checkpoint
 /// created for the table. This file is used as a hint for the engine to quickly locate
@@ -440,6 +445,7 @@ impl LastCheckpointHint {
     /// are assumed to cause failure.
     // TODO(#1047): weird that we propagate FileNotFound as part of the iterator instead of top-
     // level result coming from storage.read_files
+    #[cfg(test)]
     pub(crate) fn try_read(
         storage: &dyn StorageHandler,
         log_root: &Url,

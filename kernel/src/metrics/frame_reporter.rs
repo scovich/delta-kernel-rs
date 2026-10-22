@@ -323,7 +323,7 @@ mod tests {
             &callstacks,
             &[
                 SNAPSHOT_COMPLETED_SPAN,
-                "log_segment.for_snapshot",
+                SNAPSHOT_COMPLETED_SPAN,
                 "log_segment.for_snapshot",
                 "last_checkpoint.read",
             ],
@@ -332,7 +332,7 @@ mod tests {
             &callstacks,
             &[
                 SNAPSHOT_COMPLETED_SPAN,
-                "log_segment.for_snapshot",
+                SNAPSHOT_COMPLETED_SPAN,
                 "log_segment.for_snapshot",
                 "log.list",
             ],

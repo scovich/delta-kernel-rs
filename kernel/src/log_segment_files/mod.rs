@@ -21,19 +21,22 @@ use itertools::Itertools;
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 
+#[cfg(test)]
 use crate::cancellation::CancellationTokenRef;
 use crate::coroutine::generator::AsyncIntoIterator as _;
 use crate::coroutine::kernel::request::{log_listing_bounds, ForwardListing};
-use crate::coroutine::kernel::{run_workflow_with_storage, Channel, ChannelExt as _, Request};
+#[cfg(test)]
+use crate::coroutine::kernel::run_workflow_with_storage;
+use crate::coroutine::kernel::{Channel, ChannelExt as _, Request};
 use crate::coroutine::{noop_context, BoundGenerator, Generator, GeneratorExt as _, PageGenerator};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
 use crate::path::{
     may_begin_listable_log_path, CheckpointInstance, LogPathFileType, ParsedLogPath,
 };
-use crate::{
-    FileMeta, KernelError, KernelResult, KernelResultIterator, StorageHandler, Version,
-};
+use crate::{FileMeta, KernelError, KernelResult, Version};
+#[cfg(test)]
+use crate::{KernelResultIterator, StorageHandler};
 
 #[cfg(test)]
 mod tests;
@@ -78,6 +81,7 @@ pub(crate) struct LogSegmentFiles {
 /// With a `cancellation_token`, [`StorageHandler::list_from_with_cancellation`] owns cancellation
 /// for the underlying listing. This pipeline preserves any cancellation error through its filters.
 #[internal_api]
+#[cfg(test)]
 pub(crate) fn list_delta_log_from_storage(
     storage: &dyn StorageHandler,
     log_root: &Url,
@@ -625,6 +629,7 @@ impl LogSegmentFiles {
     /// `log_tail` is a contiguous run of commits ending at the table's latest version. It takes
     /// precedence over the filesystem listing, and is required for catalog-managed tables, whose
     /// unbackfilled staged commits exist only here.
+    #[cfg(test)]
     pub(crate) fn list_commits(
         storage: &dyn StorageHandler,
         log_root: &Url,
@@ -705,6 +710,7 @@ impl LogSegmentFiles {
     // - SortedCommitFiles: Vec<ParsedLogPath>, is_ascending: bool, end_version: Version
     // - CheckpointParts: Vec<ParsedLogPath>, checkpoint_version: Version (guarantee all same
     //   version)
+    #[cfg(test)]
     pub(crate) fn list(
         storage: &dyn StorageHandler,
         log_root: &Url,
@@ -737,6 +743,7 @@ impl LogSegmentFiles {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) fn list_with_checkpoint_handling(
         storage: &dyn StorageHandler,
         log_root: &Url,
@@ -783,6 +790,7 @@ impl LogSegmentFiles {
     /// selected at a version. A hint that turns out to describe a different checkpoint than the one
     /// selected is logged and ignored, not an error. An AMT hint has no checkpoint file, so its
     /// listing is accepted without one as long as the hint's manifest commit is listed.
+    #[cfg(test)]
     pub(crate) fn list_with_checkpoint_hint(
         checkpoint_metadata: &LastCheckpointHint,
         storage: &dyn StorageHandler,
@@ -889,6 +897,7 @@ impl LogSegmentFiles {
     ///
     /// All files from windows 1-4 are combined with `log_tail` to produce a log segment
     /// rooted at the checkpoint at v8900 with all commits from v8901 to v12500.
+    #[cfg(test)]
     pub(crate) fn list_with_backward_checkpoint_scan(
         storage: &dyn StorageHandler,
         log_root: &Url,

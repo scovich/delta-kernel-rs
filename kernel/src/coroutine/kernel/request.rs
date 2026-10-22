@@ -10,7 +10,7 @@ use crate::coroutine::{PageRequest, PagedOperation, Reply};
 use crate::expressions::PredicateRef;
 use crate::path::may_begin_listable_log_path;
 use crate::schema::SchemaRef;
-use crate::{EngineData, FileMeta, FileSlice, KernelResult, Version};
+use crate::{EngineData, FileMeta, FileSlice, KernelResult, ParquetFooter, Version};
 
 /// Operations Kernel can request from a connector.
 #[derive(From)]
@@ -22,9 +22,14 @@ pub enum Request {
     /// Missing-object failures remain connector errors. `Ok(None)` means the connector returned no
     /// result. Extra objects from a single-file read are an error.
     ReadSmallFile(FileSlice, Reply<Option<Bytes>>),
+    /// Read one Parquet footer.
+    ReadParquetFooter(FileMeta, Reply<ParquetFooter>),
     /// Read JSON files as ordered [`EngineData`] batches. Each file may produce multiple batches,
     /// but batches may not span files.
     ReadJson(PageRequest<ReadJsonFiles>),
+    /// Read Parquet files as ordered [`EngineData`] batches. Each file may produce multiple
+    /// batches, but batches may not span files.
+    ReadParquet(PageRequest<ReadParquetFiles>),
 }
 
 /// URL bounds for a forward listing.
@@ -117,6 +122,36 @@ impl ReadJsonFiles {
 }
 
 impl PagedOperation for ReadJsonFiles {
+    type Page = Vec<KernelResult<Box<dyn EngineData>>>;
+}
+
+/// Paginated Parquet file read.
+pub struct ReadParquetFiles {
+    /// Files to read in order.
+    pub files: Vec<FileMeta>,
+    /// Exact physical schema required for every returned batch.
+    pub physical_schema: SchemaRef,
+    /// Optional conservative push-down. Connectors may ignore it; if applied, omit data only when
+    /// it cannot be true. Returned data need not satisfy it.
+    pub predicate: Option<PredicateRef>,
+}
+
+impl ReadParquetFiles {
+    /// Creates a Parquet read operation.
+    pub fn new(
+        files: impl Into<Vec<FileMeta>>,
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> Self {
+        Self {
+            files: files.into(),
+            physical_schema,
+            predicate,
+        }
+    }
+}
+
+impl PagedOperation for ReadParquetFiles {
     type Page = Vec<KernelResult<Box<dyn EngineData>>>;
 }
 

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tracing::{error, instrument};
 
 use super::{IncrementalReplay, PreparedSnapshot, Snapshot};
+use crate::coroutine::kernel::{run_workflow_with_storage, Channel};
 use crate::log_segment::{LogSegment, PmResolution};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::metrics::{
@@ -330,9 +331,28 @@ impl Snapshot {
         requested_version: Option<Version>,
         checkpoint_handling: CheckpointHandling,
     ) -> KernelResult<NewSegment> {
-        let log_root = existing_log_segment.log_root.clone();
         let storage = engine.storage_handler();
+        run_workflow_with_storage!(storage.as_ref(), None, |channel| {
+            Self::build_new_segment_with_channel(
+                channel,
+                existing_log_segment,
+                existing_snapshot_version,
+                log_tail,
+                requested_version,
+                checkpoint_handling,
+            )
+        })
+    }
 
+    async fn build_new_segment_with_channel(
+        channel: &Channel,
+        existing_log_segment: &LogSegment,
+        existing_snapshot_version: Version,
+        log_tail: Vec<ParsedLogPath>,
+        requested_version: Option<Version>,
+        checkpoint_handling: CheckpointHandling,
+    ) -> KernelResult<NewSegment> {
+        let log_root = existing_log_segment.log_root.clone();
         let listing_base_version = match checkpoint_handling {
             CheckpointHandling::Adopt => {
                 // Start listing just after the previous segment's checkpoint, if any.
@@ -350,15 +370,15 @@ impl Snapshot {
             // No version can follow Version::MAX.
             return Ok(NewSegment::Unchanged);
         };
-        let new_listed_files = LogSegmentFiles::list_with_checkpoint_handling(
-            storage.as_ref(),
+        let new_listed_files = LogSegmentFiles::list_with_checkpoint_handling_with_channel(
+            channel,
             &log_root,
             log_tail,
             Some(listing_start),
             requested_version,
             checkpoint_handling,
-            None,
-        )?;
+        )
+        .await?;
 
         // NB: we need to check both checkpoints and commits since we filter commits at and below
         // the checkpoint version. Example: if we have a checkpoint + commit at version 1, the log

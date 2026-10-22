@@ -268,7 +268,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
 }
 
 /// Internal async implementation of read_parquet_files
-async fn read_parquet_files_impl(
+pub(crate) async fn read_parquet_files_impl(
     store: Arc<DynObjectStore>,
     files: Vec<FileMeta>,
     physical_schema: SchemaRef,

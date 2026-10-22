@@ -22,13 +22,14 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use delta_kernel::coroutine::kernel::request::{ForwardListing, ReadJsonFiles};
+use delta_kernel::coroutine::kernel::request::{ForwardListing, ReadJsonFiles, ReadParquetFiles};
 use delta_kernel::coroutine::kernel::{Request, Workflow};
 use delta_kernel::coroutine::{
     drive_workflow_async, AsyncResult as _, Cursor, Page, PageRequest, PagedOperation,
 };
 use delta_kernel::metrics::{
-    emit_json_read_completed, emit_storage_list_completed, emit_storage_read_completed,
+    emit_json_read_completed, emit_parquet_read_completed, emit_storage_list_completed,
+    emit_storage_read_completed,
 };
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::{EngineData, FileMeta, FileSlice, KernelError, KernelResult};
@@ -38,6 +39,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::filesystem::{list_from_impl, read_files_impl};
 use crate::json::read_json_files_impl;
+use crate::parquet::{read_parquet_files_impl, read_parquet_footer_impl};
 use crate::{DEFAULT_READ_BATCH_SIZE, DEFAULT_READ_BUFFER_SIZE};
 
 /// Drives Kernel workflows one request at a time through the default engine's native async I/O.
@@ -91,13 +93,13 @@ impl AsyncEngineConnector {
         self
     }
 
-    /// Sets the maximum number of files read concurrently by JSON operations.
+    /// Sets the maximum number of files read concurrently by JSON and Parquet operations.
     pub fn with_buffer_size(mut self, buffer_size: NonZero<usize>) -> Self {
         self.buffer_size = buffer_size;
         self
     }
 
-    /// Sets the maximum number of rows in each JSON batch.
+    /// Sets the maximum number of rows in each JSON and Parquet batch.
     pub fn with_batch_size(mut self, batch_size: NonZero<usize>) -> Self {
         self.batch_size = batch_size;
         self
@@ -141,7 +143,11 @@ impl AsyncEngineConnector {
         match request {
             Request::ListForward(request) => respond_paged(self, request).await?,
             Request::ReadSmallFile(file, reply) => reply.send(self.read_small_file(file).await),
+            Request::ReadParquetFooter(file, reply) => {
+                reply.send(read_parquet_footer_impl(Arc::clone(&self.object_store), file).await)
+            }
             Request::ReadJson(request) => respond_paged(self, request).await?,
+            Request::ReadParquet(request) => respond_paged(self, request).await?,
         }
         Ok(())
     }
@@ -277,6 +283,30 @@ impl AsyncPagination<ReadJsonFiles> for AsyncEngineConnector {
     }
 }
 
+impl AsyncPagination<ReadParquetFiles> for AsyncEngineConnector {
+    type State = ResultStream<Box<dyn EngineData>>;
+
+    async fn prepare(&self, read: ReadParquetFiles) -> KernelResult<Self::State> {
+        let num_files = read.files.len() as u64;
+        let bytes_read = read.files.iter().map(|file| file.size).sum();
+        let stream = read_parquet_files_impl(
+            Arc::clone(&self.object_store),
+            read.files,
+            read.physical_schema,
+            read.predicate,
+            self.buffer_size.get(),
+            self.batch_size.get(),
+        )
+        .await?;
+        let emit = |_, num_files, bytes_read| emit_parquet_read_completed(num_files, bytes_read);
+        Ok(precounted_stream(stream, num_files, bytes_read, emit))
+    }
+
+    async fn next(&self, stream: Self::State) -> KernelResult<Page<ReadParquetFiles>> {
+        self.next_data(stream).await
+    }
+}
+
 struct MeteredStream<T> {
     inner: ResultStream<T>,
     start: Instant,
@@ -344,6 +374,7 @@ mod tests {
     use delta_kernel::coroutine::kernel::request::{ForwardListing, ListingBounds};
     use delta_kernel::coroutine::kernel::{static_workflow, ChannelExt as _, WorkflowStep};
     use delta_kernel::coroutine::PageGenerator;
+    use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::ObjectStoreExt as _;
@@ -426,6 +457,33 @@ mod tests {
         let result = connector.run(workflow).await.unwrap();
 
         assert_eq!(result, (1, true));
+    }
+
+    #[tokio::test]
+    async fn reads_parquet_through_native_async_storage() {
+        let path = std::fs::canonicalize(
+            "../kernel/tests/data/table-with-dv-small/\
+             part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet",
+        )
+        .unwrap();
+        let location = Url::from_file_path(&path).unwrap();
+        let file = FileMeta::new(location, 0, std::fs::metadata(path).unwrap().len());
+        let connector = AsyncEngineConnector::new(Arc::new(LocalFileSystem::new()));
+        let workflow = static_workflow!(async move |channel| {
+            let footer = channel.read_parquet_footer(&file).await?;
+            let mut batches = channel
+                .read_parquet_files([file], footer.schema, None)
+                .await?;
+            let mut rows = 0;
+            while let Some(batch) = batches.next().await? {
+                rows += batch?.len();
+            }
+            Ok(rows)
+        });
+
+        let rows = connector.run(workflow).await.unwrap();
+
+        assert_eq!(rows, 10);
     }
 
     #[tokio::test]

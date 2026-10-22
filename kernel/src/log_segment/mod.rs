@@ -17,14 +17,10 @@ use crate::actions::{
 use crate::actions::{CheckpointAction, LastManifestCommit, LOG_CHECKPOINT_SCHEMA};
 use crate::cancellation::CancellationTokenRef;
 use crate::committer::CatalogCommit;
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::coroutine::generator::BoundGenerator;
-use crate::coroutine::generator::GeneratorExt as _;
-#[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
-use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::generator::{BoundGenerator, Generator as _, GeneratorExt as _};
 use crate::coroutine::kernel::{
-    iterate_prepared_result_coroutine_with_engine, run_workflow_with_storage, Channel,
-    ChannelExt as _, KernelResultGenerator,
+    iterate_prepared_result_coroutine_with_engine, run_workflow_with_engine,
+    run_workflow_with_storage, Channel, ChannelExt as _, KernelResultGenerator,
 };
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
@@ -482,12 +478,6 @@ impl LogSegment {
     ///
     /// Reports metrics: `LogSegmentLoadSuccess` or `LogSegmentLoadFailure`.
     #[internal_api]
-    #[tracing::instrument(
-        name = "log_segment.for_snapshot",
-        skip_all,
-        fields(enable_call_frame),
-        err
-    )]
     pub(crate) fn for_snapshot(
         storage: &dyn StorageHandler,
         log_root: Url,
@@ -497,21 +487,48 @@ impl LogSegment {
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<Self> {
         let time_travel_version = time_travel_version.into();
+        run_workflow_with_storage!(storage, cancellation_token.cloned(), |channel| {
+            Self::for_snapshot_with_channel(
+                channel,
+                log_root,
+                log_tail,
+                time_travel_version,
+                metric_context,
+            )
+        })
+    }
+
+    /// Channel-driven counterpart to [`Self::for_snapshot`].
+    #[internal_api]
+    #[tracing::instrument(
+        name = "log_segment.for_snapshot",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
+    pub(crate) async fn for_snapshot_with_channel(
+        channel: &Channel,
+        log_root: Url,
+        log_tail: Vec<ParsedLogPath>,
+        time_travel_version: Option<Version>,
+        metric_context: SnapshotLoadMetricContext,
+    ) -> KernelResult<Self> {
         let start = std::time::Instant::now();
-        let build = || {
+        let build = async {
             let checkpoint_hint =
-                LastCheckpointHint::try_read(storage, &log_root, cancellation_token)?;
-            Self::for_snapshot_impl(
-                storage,
+                LastCheckpointHint::try_read_with_channel(channel, &log_root).await?;
+            Self::for_snapshot_impl_with_channel(
+                channel,
                 log_root,
                 log_tail,
                 checkpoint_hint,
                 time_travel_version,
-                cancellation_token,
             )
+            .await
         };
-        let log_segment =
-            build().inspect_err(|_| emit_log_segment_load_failure(&metric_context))?;
+        let log_segment = build
+            .await
+            .inspect_err(|_| emit_log_segment_load_failure(&metric_context))?;
 
         emit_log_segment_load(&metric_context, &log_segment, start.elapsed());
         Ok(log_segment)
@@ -529,6 +546,7 @@ impl LogSegment {
     }
 
     // factored out for testing
+    #[cfg(test)]
     pub(crate) fn for_snapshot_impl(
         storage: &dyn StorageHandler,
         log_root: Url,
@@ -536,6 +554,24 @@ impl LogSegment {
         checkpoint_hint: Option<LastCheckpointHint>,
         time_travel_version: Option<Version>,
         cancellation_token: Option<&CancellationTokenRef>,
+    ) -> KernelResult<Self> {
+        run_workflow_with_storage!(storage, cancellation_token.cloned(), |channel| {
+            Self::for_snapshot_impl_with_channel(
+                channel,
+                log_root,
+                log_tail,
+                checkpoint_hint,
+                time_travel_version,
+            )
+        })
+    }
+
+    pub(crate) async fn for_snapshot_impl_with_channel(
+        channel: &Channel,
+        log_root: Url,
+        log_tail: Vec<ParsedLogPath>,
+        checkpoint_hint: Option<LastCheckpointHint>,
+        time_travel_version: Option<Version>,
     ) -> KernelResult<Self> {
         // The end_version is the time_travel_version, if present
         // TODO: When max catalog version is implemented, we would use that as end_version if
@@ -561,25 +597,26 @@ impl LogSegment {
 
         let listed_files = match (usable_hint, end_version) {
             // Cases 1 and 2
-            (Some(cp), end_version) => LogSegmentFiles::list_with_checkpoint_hint(
-                cp,
-                storage,
-                &log_root,
-                log_tail,
-                end_version,
-                cancellation_token,
-            )?,
+            (Some(cp), end_version) => {
+                LogSegmentFiles::list_with_checkpoint_hint_with_channel(
+                    cp,
+                    channel,
+                    &log_root,
+                    log_tail,
+                    end_version,
+                )
+                .await?
+            }
             // Case 3
-            (None, Some(end)) => LogSegmentFiles::list_with_backward_checkpoint_scan(
-                storage,
-                &log_root,
-                log_tail,
-                end,
-                cancellation_token,
-            )?,
+            (None, Some(end)) => {
+                LogSegmentFiles::list_with_backward_checkpoint_scan_with_channel(
+                    channel, &log_root, log_tail, end,
+                )
+                .await?
+            }
             // Case 4
             (None, None) => {
-                LogSegmentFiles::list(storage, &log_root, log_tail, None, None, cancellation_token)?
+                LogSegmentFiles::list_with_channel(channel, &log_root, log_tail, None, None).await?
             }
         };
 
@@ -598,12 +635,34 @@ impl LogSegment {
         start_version: Version,
         end_version: impl Into<Option<Version>>,
     ) -> KernelResult<Self> {
-        Self::for_table_changes_with_log_tail(storage, log_root, start_version, end_version, vec![])
+        let end_version = end_version.into();
+        // Table changes does not thread a cancellation token.
+        run_workflow_with_storage!(storage, None, |channel| {
+            Self::for_table_changes_with_channel(channel, log_root, start_version, end_version)
+        })
+    }
+
+    /// Channel-driven counterpart to [`Self::for_table_changes`].
+    #[internal_api]
+    pub(crate) async fn for_table_changes_with_channel(
+        channel: &Channel,
+        log_root: Url,
+        start_version: Version,
+        end_version: impl Into<Option<Version>>,
+    ) -> KernelResult<Self> {
+        Self::for_table_changes_with_log_tail_with_channel(
+            channel,
+            log_root,
+            start_version,
+            end_version,
+            vec![],
+        )
+        .await
     }
 
     /// Constructs a table-changes log segment with a caller-provided authoritative commit tail.
-    pub(crate) fn for_table_changes_with_log_tail(
-        storage: &dyn StorageHandler,
+    pub(crate) async fn for_table_changes_with_log_tail_with_channel(
+        channel: &Channel,
         log_root: Url,
         start_version: Version,
         end_version: impl Into<Option<Version>>,
@@ -619,15 +678,14 @@ impl LogSegment {
         }
 
         // TODO: compactions?
-        // Inherit any cancellation token bound to `storage`.
-        let listed_files = LogSegmentFiles::list_commits(
-            storage,
+        let listed_files = LogSegmentFiles::list_commits_with_channel(
+            channel,
             &log_root,
             log_tail,
             Some(start_version),
             end_version,
-            None,
-        )?;
+        )
+        .await?;
         // - Here check that the start version is correct.
         // - [`LogSegment::try_new`] will verify that the `end_version` is correct if present.
         // - [`LogSegment::try_new`] also checks that there are no gaps between commits.
@@ -1186,6 +1244,15 @@ impl LogSegment {
         engine: &dyn Engine,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<(Option<SchemaRef>, Vec<FileMeta>)> {
+        run_workflow_with_engine!(engine, cancellation_token.cloned(), |channel| {
+            self.get_file_actions_schema_and_sidecars_with_channel(channel)
+        })
+    }
+
+    async fn get_file_actions_schema_and_sidecars_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<(Option<SchemaRef>, Vec<FileMeta>)> {
         // Hint schema from `_last_checkpoint` avoids footer reads when available.
         let hint_schema = self.checkpoint_hint_schema();
 
@@ -1198,35 +1265,36 @@ impl LogSegment {
         match &checkpoint.file_type {
             MultiPartCheckpoint { .. } => {
                 // Multi-part checkpoints are always V1 and never have sidecars.
-                let schema = Self::read_checkpoint_schema(
-                    engine,
+                let schema = Self::read_checkpoint_schema_with_channel(
+                    channel,
                     checkpoint,
                     hint_schema.as_ref(),
-                    cancellation_token,
-                )?;
+                );
+                let schema = schema.await?;
                 Ok((Some(schema), vec![]))
             }
             UuidCheckpoint if checkpoint.extension.as_str() == "json" => {
                 // JSON checkpoint is always V2. No checkpoint schema is available since JSON
                 // checkpoints don't have a parquet footer to read.
-                self.read_sidecar_schema_and_files(engine, checkpoint, None, cancellation_token)
+                self.read_sidecar_schema_and_files_with_channel(channel, checkpoint, None)
+                    .await
             }
             ClassicCheckpoint | UuidCheckpoint if checkpoint.extension.as_str() == "parquet" => {
                 // Parquet checkpoint (classic-named or UUID-named): either can be V1 or V2.
                 // Check for sidecar column to distinguish.
-                let checkpoint_schema = Self::read_checkpoint_schema(
-                    engine,
+                let checkpoint_schema = Self::read_checkpoint_schema_with_channel(
+                    channel,
                     checkpoint,
                     hint_schema.as_ref(),
-                    cancellation_token,
-                )?;
+                );
+                let checkpoint_schema = checkpoint_schema.await?;
                 if checkpoint_schema.field(SIDECAR_NAME).is_some() {
-                    self.read_sidecar_schema_and_files(
-                        engine,
+                    self.read_sidecar_schema_and_files_with_channel(
+                        channel,
                         checkpoint,
                         Some(&checkpoint_schema),
-                        cancellation_token,
                     )
+                    .await
                 } else {
                     Ok((Some(checkpoint_schema), vec![]))
                 }
@@ -1235,46 +1303,41 @@ impl LogSegment {
         }
     }
 
-    /// Reads a parquet footer schema, passing the cancellation token to the Engine. Engines may
-    /// additionally use it to interrupt a read already in flight.
-    fn read_footer_schema(
-        engine: &dyn Engine,
+    /// Reads a Parquet footer schema.
+    async fn read_footer_schema_with_channel(
+        channel: &Channel,
         file: &FileMeta,
-        cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<SchemaRef> {
-        Ok(engine
-            .parquet_handler()
-            .read_parquet_footer_with_cancellation(file, cancellation_token.cloned())?
-            .schema)
+        Ok(channel.read_parquet_footer(file).await?.schema)
     }
 
     /// Returns the checkpoint's parquet schema, using the hint from `_last_checkpoint` if
     /// available or reading the parquet footer otherwise.
-    fn read_checkpoint_schema(
-        engine: &dyn Engine,
+    async fn read_checkpoint_schema_with_channel(
+        channel: &Channel,
         checkpoint: &ParsedLogPath<FileMeta>,
         hint_schema: Option<&SchemaRef>,
-        cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<SchemaRef> {
         match hint_schema {
             Some(schema) => Ok(schema.clone()),
-            None => Self::read_footer_schema(engine, &checkpoint.location, cancellation_token),
+            None => Self::read_footer_schema_with_channel(channel, &checkpoint.location).await,
         }
     }
 
     /// Extracts sidecar file references and reads the file actions schema from the first
     /// sidecar's parquet footer. If no sidecars exist, falls back to `checkpoint_schema`
     /// since V2 checkpoints may store add actions directly in the main file.
-    fn read_sidecar_schema_and_files(
+    async fn read_sidecar_schema_and_files_with_channel(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         checkpoint: &ParsedLogPath<FileMeta>,
         checkpoint_schema: Option<&SchemaRef>,
-        cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<(Option<SchemaRef>, Vec<FileMeta>)> {
-        let sidecar_files = self.extract_sidecar_refs(engine, checkpoint, cancellation_token)?;
+        let sidecar_files = self
+            .extract_sidecar_refs_with_channel(channel, checkpoint)
+            .await?;
         let file_actions_schema = match sidecar_files.first() {
-            Some(first) => Some(Self::read_footer_schema(engine, first, cancellation_token)?),
+            Some(first) => Some(Self::read_footer_schema_with_channel(channel, first).await?),
             None => checkpoint_schema.cloned(),
         };
         Ok((file_actions_schema, sidecar_files))
@@ -1458,34 +1521,29 @@ impl LogSegment {
     }
 
     /// Extracts sidecar file references from a checkpoint file.
-    fn extract_sidecar_refs(
+    async fn extract_sidecar_refs_with_channel(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         checkpoint: &ParsedLogPath,
-        cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<Vec<FileMeta>> {
         // Read checkpoint with just the sidecar column
+        let files = std::slice::from_ref(&checkpoint.location).to_vec();
         let batches = match checkpoint.extension.as_str() {
-            "json" => engine.json_handler().read_json_files_with_cancellation(
-                std::slice::from_ref(&checkpoint.location),
-                Self::sidecar_read_schema(),
-                None,
-                cancellation_token.cloned(),
-            )?,
-            "parquet" => engine
-                .parquet_handler()
-                .read_parquet_files_with_cancellation(
-                    std::slice::from_ref(&checkpoint.location),
-                    Self::sidecar_read_schema(),
-                    None,
-                    cancellation_token.cloned(),
-                )?,
+            "json" => channel
+                .prepare_json_files(files, Self::sidecar_read_schema(), None)
+                .await?
+                .into_boxed(),
+            "parquet" => channel
+                .prepare_parquet_files(files, Self::sidecar_read_schema(), None)
+                .await?
+                .into_boxed(),
             _ => return Ok(vec![]),
         };
+        let mut batches = channel.bind(batches);
 
         // Extract sidecar file references
         let mut visitor = SidecarVisitor::default();
-        for batch_result in batches {
+        while let Some(batch_result) = batches.next().await? {
             let batch = batch_result?;
             visitor.visit_rows_of(batch.as_ref())?;
         }

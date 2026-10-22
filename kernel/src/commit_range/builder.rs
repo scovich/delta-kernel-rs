@@ -1,6 +1,8 @@
+use delta_kernel_derive::internal_api;
 use url::Url;
 
 use crate::commit_range::CommitRange;
+use crate::coroutine::kernel::{run_workflow_with_engine, workflow, Channel, Workflow};
 use crate::log_segment::{
     validate_catalog_managed_log_tail, validate_start_version_available, LogSegment,
 };
@@ -91,6 +93,17 @@ impl CommitRangeBuilder {
     /// versions exist, [`KernelError::EmptyLog`] if nothing is available in the requested range at
     /// all, and a generic error if the resolved version range is invalid (start > end).
     pub fn build(&self, engine: &dyn Engine) -> KernelResult<CommitRange> {
+        run_workflow_with_engine!(engine, |channel| self.build_with_channel(channel))
+    }
+
+    /// Returns a lazy workflow for [`Self::build`].
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
+    pub(crate) fn build_workflow(&self) -> Workflow<'_, CommitRange> {
+        workflow!(|channel| self.build_with_channel(channel))
+    }
+
+    async fn build_with_channel(&self, channel: &Channel) -> KernelResult<CommitRange> {
         let table_root = Self::parse_table_root(&self.table_root)?;
         let log_root = table_root.join("_delta_log/")?;
 
@@ -127,13 +140,14 @@ impl CommitRangeBuilder {
             }
             (commit_files, end_version)
         } else {
-            let log_segment = LogSegment::for_table_changes_with_log_tail(
-                engine.storage_handler().as_ref(),
+            let log_segment = LogSegment::for_table_changes_with_log_tail_with_channel(
+                channel,
                 log_root,
                 start_version,
                 configured_end_version,
                 log_tail,
-            )?;
+            )
+            .await?;
             let end_version = configured_end_version.unwrap_or(log_segment.end_version);
             let commit_files = log_segment
                 .listed
