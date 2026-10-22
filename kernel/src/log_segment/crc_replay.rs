@@ -27,8 +27,9 @@ use crate::actions::{
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{LastManifestCommit, LAST_MANIFEST_COMMIT_FIELD};
-use crate::coroutine::kernel::{run_workflow_with_engine, Channel};
-use crate::coroutine::AsyncOption as _;
+use crate::coroutine::generator::BoundGenerator as _;
+use crate::coroutine::kernel::{run_workflow_with_engine, Channel, ChannelExt as _};
+use crate::coroutine::{AsyncOption as _, KernelFuture};
 use crate::crc::{
     is_incremental_safe_operation, read_crc_file_or_none_with_channel, size_to_u64, Crc, CrcDelta,
     FileSizeHistogram, FileStatsDelta,
@@ -89,6 +90,17 @@ impl LogSegment {
         base: Option<&Arc<Crc>>,
         incremental_replay: IncrementalReplay,
     ) -> KernelResult<Option<(Arc<Crc>, ProtocolMetadataSource)>> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.try_build_crc_within_budget_with_channel(channel, base, incremental_replay)
+        })
+    }
+
+    pub(crate) async fn try_build_crc_within_budget_with_channel(
+        &self,
+        channel: &Channel,
+        base: Option<&Arc<Crc>>,
+        incremental_replay: IncrementalReplay,
+    ) -> KernelResult<Option<(Arc<Crc>, ProtocolMetadataSource)>> {
         let Some(base) = base else {
             return Ok(None);
         };
@@ -98,7 +110,7 @@ impl LogSegment {
         if !incremental_replay.should_advance(base.version, self.end_version)? {
             return Ok(None);
         }
-        let advanced = self.build_crc_from_base(engine, base)?;
+        let advanced = self.build_crc_from_base_with_channel(channel, base).await?;
         Ok(Some((
             Arc::new(advanced),
             ProtocolMetadataSource::CrcAdvancedByReplay,
@@ -163,15 +175,25 @@ impl LogSegment {
     /// Produce a fresh `Crc` at `self.end_version` by reverse-replaying the commits in
     /// `(base_crc.version, self.end_version]` and applying the resulting delta to
     /// `base_crc` via [`Crc::apply`].
+    pub(crate) fn build_crc_from_base(
+        &self,
+        engine: &dyn Engine,
+        base_crc: &Crc,
+    ) -> KernelResult<Crc> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.build_crc_from_base_with_channel(channel, base_crc)
+        })
+    }
+
     #[instrument(
         name = "log_seg.build_crc_from_base",
         skip_all,
         fields(enable_call_frame),
         err
     )]
-    pub(crate) fn build_crc_from_base(
+    pub(crate) async fn build_crc_from_base_with_channel(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         base_crc: &Crc,
     ) -> KernelResult<Crc> {
         let seed_histogram = base_crc
@@ -181,7 +203,9 @@ impl LogSegment {
                 FileSizeHistogram::create_empty_with_boundaries(h.sorted_bin_boundaries().to_vec())
             })
             .transpose()?;
-        let delta = self.build_crc_delta_from_base(engine, base_crc.version, seed_histogram)?;
+        let delta = self
+            .build_crc_delta_from_base_with_channel(channel, base_crc.version, seed_histogram)
+            .await?;
         Ok(base_crc.clone().apply(delta, self.end_version))
     }
 
@@ -234,6 +258,15 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<Crc>> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.build_crc_from_version_zero_with_channel(channel)
+        })
+    }
+
+    pub(crate) async fn build_crc_from_version_zero_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<Option<Crc>> {
         require!(
             self.checkpoint_version.is_none(),
             KernelError::internal_error(
@@ -246,11 +279,12 @@ impl LogSegment {
         // A log with no checkpoint must start at version 0; a higher first version means a table
         // truncated without a checkpoint.
         require!(first.version == 0, KernelError::MissingVersion(0));
-        let delta = self.replay_commits_into_crc_delta(
-            engine,
+        let delta = self.replay_commits_into_crc_delta_with_channel(
+            channel,
             self.listed.ascending_commit_files.iter(),
             Some(FileSizeHistogram::create_default()),
-        )?;
+        );
+        let delta = delta.await?;
         Ok(delta.into_complete_crc(self.end_version))
     }
 
@@ -263,6 +297,17 @@ impl LogSegment {
     pub(crate) fn build_crc_delta_from_base(
         &self,
         engine: &dyn Engine,
+        base_version: Version,
+        seed_histogram: Option<FileSizeHistogram>,
+    ) -> KernelResult<CrcDelta> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.build_crc_delta_from_base_with_channel(channel, base_version, seed_histogram)
+        })
+    }
+
+    pub(crate) async fn build_crc_delta_from_base_with_channel(
+        &self,
+        channel: &Channel,
         base_version: Version,
         seed_histogram: Option<FileSizeHistogram>,
     ) -> KernelResult<CrcDelta> {
@@ -293,33 +338,44 @@ impl LogSegment {
             ))
         );
 
-        self.replay_commits_into_crc_delta(engine, deltas.into_iter(), seed_histogram)
+        self.replay_commits_into_crc_delta_with_channel(channel, deltas.into_iter(), seed_histogram)
+            .await
     }
 
     /// Replay the given commits into a [`CrcDelta`]. The shared core of
     /// [`Self::build_crc_delta_from_base`] and [`Self::build_crc_from_version_zero`].
     /// `ascending_commits` are taken oldest-first; `seed_histogram` is an empty histogram with the
     /// downstream base's bin boundaries, or `None` to skip histogram tracking.
-    fn replay_commits_into_crc_delta<'a>(
-        &self,
-        engine: &dyn Engine,
+    fn replay_commits_into_crc_delta_with_channel<'a>(
+        &'a self,
+        channel: &'a Channel,
         mut ascending_commits: impl DoubleEndedIterator<Item = &'a ParsedLogPath>,
         seed_histogram: Option<FileSizeHistogram>,
-    ) -> KernelResult<CrcDelta> {
+    ) -> impl KernelFuture<CrcDelta> + 'a {
         // Replay newest-first: ICT capture reads from the newest commit only.
         let newest = ascending_commits.next_back();
+        let newest_version = newest.map(|commit| commit.version);
         let locations: Vec<FileMeta> = newest
             .into_iter()
             .chain(ascending_commits.rev())
             .map(|c| c.location.clone())
             .collect();
-        let mut acc = CrcReplayAccumulator::new(seed_histogram);
-        let batches =
-            engine
-                .json_handler()
-                .read_json_files(&locations, REPLAY_SCHEMA.clone(), None)?;
+        self.replay_commits_into_crc_delta_impl(channel, locations, newest_version, seed_histogram)
+    }
 
-        for batch_result in batches {
+    async fn replay_commits_into_crc_delta_impl(
+        &self,
+        channel: &Channel,
+        locations: Vec<FileMeta>,
+        newest: Option<Version>,
+        seed_histogram: Option<FileSizeHistogram>,
+    ) -> KernelResult<CrcDelta> {
+        let mut acc = CrcReplayAccumulator::new(seed_histogram);
+        let mut batches = channel
+            .read_json_files(locations, REPLAY_SCHEMA.clone(), None)
+            .await?;
+
+        while let Some(batch_result) = batches.next().await? {
             // Transient visitor borrows the shared accumulator for the duration of the
             // batch; same pattern as `ActionReconciliationVisitor`.
             let mut visitor = CommitCrcVisitor { acc: &mut acc };
@@ -331,9 +387,11 @@ impl LogSegment {
         acc.process_commit_file_end();
 
         let delta = acc.into_crc_delta();
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+        let _ = newest;
         #[cfg(feature = "adaptive-metadata-in-dev")]
         if let (Some(newest), Some(last_manifest_commit)) = (newest, &delta.last_manifest_commit) {
-            last_manifest_commit.ensure_at_or_before(newest.version)?;
+            last_manifest_commit.ensure_at_or_before(newest)?;
         }
         Ok(delta)
     }

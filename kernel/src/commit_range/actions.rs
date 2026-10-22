@@ -10,7 +10,7 @@ use crate::commit_range::with_version_context;
 use crate::coroutine::generator::BoundGenerator as _;
 use crate::coroutine::kernel::engine::EngineConnector;
 use crate::coroutine::kernel::{
-    run_workflow_with_engine, workflow, Channel, ChannelExt as _, KernelResultGenerator, Workflow,
+    workflow, Channel, ChannelExt as _, KernelResultGenerator, Workflow,
 };
 use crate::engine_data::RowVisitor as _;
 use crate::path::ParsedLogPath;
@@ -69,27 +69,6 @@ impl CommitAction {
     /// (`[protocol, metadata, commitInfo]`), overlays any `Protocol` / `Metadata` the commit
     /// carries onto the seed, validates that the kernel can read the resulting configuration,
     /// and resolves the commit timestamp.
-    pub(crate) fn try_new(
-        engine: &dyn Engine,
-        table_root: Url,
-        log_path: ParsedLogPath,
-        read_schema: SchemaRef,
-        seed_protocol: Option<Protocol>,
-        seed_metadata: Option<Metadata>,
-    ) -> KernelResult<Self> {
-        run_workflow_with_engine!(engine, async move |channel| {
-            Self::try_new_with_channel(
-                channel,
-                table_root,
-                log_path,
-                read_schema,
-                seed_protocol,
-                seed_metadata,
-            )
-            .await
-        })
-    }
-
     pub(crate) async fn try_new_with_channel(
         channel: &Channel,
         table_root: Url,

@@ -8,6 +8,8 @@ use std::task::{Context, Poll};
 use super::{
     BoundGenerator, BoxedBoundGenerator, ChannelBinding, Generator, GeneratorExt, GeneratorStep,
 };
+use crate::coroutine::Channel;
+use crate::utils::PhantomType;
 use crate::{KernelError, KernelResult};
 
 /// Extract a yielded item from the provided poll, propagating pending, failure, or completion.
@@ -135,6 +137,130 @@ where
             if let Some(item) = step.step(item) {
                 return Poll::Ready(Ok(GeneratorStep::Yield(item)));
             }
+        }
+    }
+}
+
+/// Witnesses one call to an asynchronous mapper.
+pub async fn map_async_witness<'a, P, F, I, U>(
+    mapper: &'a mut F,
+    (channel, item): (&'a Channel<P>, I),
+) -> U
+where
+    P: Send + 'static,
+    F: for<'b> AsyncFnMut(&'b Channel<P>, I) -> U,
+{
+    mapper(channel, item).await
+}
+
+/// Exposes one concrete asynchronous mapper call future for a channel lifetime.
+#[doc(hidden)]
+pub trait MapAsyncWitness<'a, P: 'static, F, I, U> {
+    /// Future returned by this witness invocation.
+    type Future: Future<Output = U> + Send + 'a;
+
+    /// Invokes the witness for `mapper` and its channel-bound item.
+    fn invoke(&self, mapper: &'a mut F, argument: (&'a Channel<P>, I)) -> Self::Future;
+}
+
+impl<'a, P, F: 'a, I, U, W, Fut> MapAsyncWitness<'a, P, F, I, U> for W
+where
+    P: 'static,
+    W: Fn(&'a mut F, (&'a Channel<P>, I)) -> Fut,
+    Fut: Future<Output = U> + Send + 'a,
+{
+    type Future = Fut;
+
+    fn invoke(&self, mapper: &'a mut F, argument: (&'a Channel<P>, I)) -> Self::Future {
+        self(mapper, argument)
+    }
+}
+
+/// Generator returned by [`GeneratorExt::map_async`].
+pub struct MapAsync<G, P, F, W, U> {
+    inner: G,
+    mapper: F,
+    witness: W,
+    _types: PhantomType<(P, U)>,
+}
+
+impl<G, P, F, W, U> MapAsync<G, P, F, W, U> {
+    pub(super) fn new(inner: G, mapper: F, witness: W) -> Self {
+        Self {
+            inner,
+            mapper,
+            witness,
+            _types: PhantomType::default(),
+        }
+    }
+}
+
+impl<G, P, F, W, U> GeneratorExt for MapAsync<G, P, F, W, U> {}
+
+impl<P, G, F, W, U> Generator<P> for MapAsync<G, P, F, W, U>
+where
+    P: Send + 'static,
+    G: Generator<P>,
+    F: for<'a> AsyncFnMut(&'a Channel<P>, G::Item) -> U + Send,
+    W: Send,
+    for<'a> W: MapAsyncWitness<'a, P, F, G::Item, U>,
+    U: Send + 'static,
+{
+    type Item = U;
+    type Output = G::Output;
+
+    fn bind_to<'a>(
+        self,
+        channel: ChannelBinding<'a, P>,
+    ) -> impl BoundGenerator<Item = U, Output = G::Output> + Unpin + 'a
+    where
+        Self: 'a,
+    {
+        let state = BoundMapAsync {
+            inner: self.inner.bind_to(channel.clone()),
+            channel,
+            mapper: self.mapper,
+            witness: self.witness,
+            _item_type: PhantomType::default(),
+        };
+        unfold(state, BoundMapAsync::<'a, P, _, _, _, U>::next)
+    }
+
+    fn bind_boxed<'a>(
+        self: Box<Self>,
+        channel: ChannelBinding<'a, P>,
+    ) -> BoxedBoundGenerator<'a, U, G::Output>
+    where
+        Self: 'a,
+    {
+        Box::new((*self).bind_to(channel))
+    }
+}
+
+struct BoundMapAsync<'a, P: 'static, G, F, W, U> {
+    inner: G,
+    channel: ChannelBinding<'a, P>,
+    mapper: F,
+    witness: W,
+    _item_type: PhantomType<U>,
+}
+
+impl<'channel, P, G, F, W, U> BoundMapAsync<'channel, P, G, F, W, U>
+where
+    P: Send + 'static,
+    G: BoundGenerator + Unpin,
+    F: for<'a> AsyncFnMut(&'a Channel<P>, G::Item) -> U + Send,
+    W: for<'a> MapAsyncWitness<'a, P, F, G::Item, U> + Send,
+    U: Send + 'static,
+{
+    async fn next(mut self) -> KernelResult<ControlFlow<G::Output, (Self, U)>> {
+        match poll_fn(|context| Pin::new(&mut self.inner).poll_step(context)).await? {
+            GeneratorStep::Yield(item) => {
+                let argument = (&*self.channel, item);
+                let item = self.witness.invoke(&mut self.mapper, argument).await;
+                Ok(ControlFlow::Continue((self, item)))
+            }
+            GeneratorStep::Done(output) => Ok(ControlFlow::Break(output)),
         }
     }
 }

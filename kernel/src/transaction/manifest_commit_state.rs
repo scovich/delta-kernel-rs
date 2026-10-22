@@ -3,6 +3,9 @@
 use delta_kernel_derive::internal_api;
 
 use super::leaf_writer::{LeafNodeWriter, LeafNodeWriterResult};
+#[cfg(test)]
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::Channel;
 use crate::error::KernelError;
 use crate::schema::SchemaRef;
 use crate::snapshot::SnapshotRef;
@@ -33,8 +36,20 @@ impl ManifestCommitState {
     ///
     /// Returns an error if `table_config` does not support the `adaptiveMetadata-preview` feature,
     /// or if delta log commits exist after the last manifest commit (not yet supported).
+    #[cfg(test)]
     pub(super) fn try_new(
         engine: &dyn Engine,
+        read_snapshot: SnapshotRef,
+        version_to_write: Version,
+        table_config: &TableConfiguration,
+    ) -> KernelResult<Self> {
+        run_workflow_with_engine!(engine, |channel| {
+            Self::try_new_with_channel(channel, read_snapshot, version_to_write, table_config)
+        })
+    }
+
+    pub(super) async fn try_new_with_channel(
+        channel: &Channel,
         read_snapshot: SnapshotRef,
         version_to_write: Version,
         table_config: &TableConfiguration,
@@ -48,7 +63,8 @@ impl ManifestCommitState {
         // TODO(#2866): tighten this check (checkpoints that spill to sidecars, log compaction, and
         // the precise "since the last manifest commit" semantics) once the manifest-commit write
         // path lands.
-        if let Some(checkpoint) = read_snapshot.latest_checkpoint_action(engine)? {
+        let checkpoint = read_snapshot.latest_checkpoint_action_with_channel(channel);
+        if let Some(checkpoint) = checkpoint.await? {
             let snapshot_version = version_as_i64(read_snapshot.version())?;
             require!(
                 checkpoint.version() >= snapshot_version,

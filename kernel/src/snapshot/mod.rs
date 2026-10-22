@@ -313,13 +313,24 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<Arc<CheckpointAction>>> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.latest_checkpoint_action_with_channel(channel)
+        })
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) async fn latest_checkpoint_action_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<Option<Arc<CheckpointAction>>> {
         if let Some(cached) = self.checkpoint_action.get() {
             return Ok(cached.clone());
         }
-        let found = match self.last_manifest_commit(engine)? {
+        let found = match self.last_manifest_commit_with_channel(channel).await? {
             Some(pointer) => Some(Arc::new(
                 self.log_segment
-                    .read_last_checkpoint_action_from_pointer(engine, &pointer)?,
+                    .read_last_checkpoint_action_from_pointer_with_channel(channel, &pointer)
+                    .await?,
             )),
             None => None,
         };

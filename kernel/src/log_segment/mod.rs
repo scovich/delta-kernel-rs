@@ -17,7 +17,11 @@ use crate::actions::{
 use crate::actions::{CheckpointAction, LastManifestCommit, LOG_CHECKPOINT_SCHEMA};
 use crate::cancellation::CancellationTokenRef;
 use crate::committer::CatalogCommit;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::coroutine::generator::BoundGenerator;
 use crate::coroutine::generator::GeneratorExt as _;
+#[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
+use crate::coroutine::kernel::run_workflow_with_engine;
 use crate::coroutine::kernel::{
     iterate_prepared_result_coroutine_with_engine, Channel, ChannelExt as _, KernelResultGenerator,
 };
@@ -929,10 +933,21 @@ impl LogSegment {
     /// # Errors
     /// Returns an error if the commit cannot be read, or if this segment does not list the commit,
     /// the commit carries no checkpoint action, or that action disagrees with `pointer`.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
     pub(crate) fn read_last_checkpoint_action_from_pointer(
         &self,
         engine: &dyn Engine,
+        pointer: &LastManifestCommit,
+    ) -> KernelResult<CheckpointAction> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.read_last_checkpoint_action_from_pointer_with_channel(channel, pointer)
+        })
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) async fn read_last_checkpoint_action_from_pointer_with_channel(
+        &self,
+        channel: &Channel,
         pointer: &LastManifestCommit,
     ) -> KernelResult<CheckpointAction> {
         let inconsistent = |detail: String| {
@@ -946,11 +961,12 @@ impl LogSegment {
             inconsistent("this log segment does not list that commit".to_string())
         })?;
         let files = std::slice::from_ref(&commit.location);
-        let batches =
-            engine
-                .json_handler()
-                .read_json_files(files, LOG_CHECKPOINT_SCHEMA.clone(), None)?;
-        let action = first_checkpoint_action(batches)?
+        let files = files.to_vec();
+        let batches = channel
+            .read_json_files(files, LOG_CHECKPOINT_SCHEMA.clone(), None)
+            .await?;
+        let action = first_checkpoint_action(batches)
+            .await?
             .ok_or_else(|| inconsistent("that commit carries no checkpoint action".to_string()))?;
         require!(
             action.content_root_version() == pointer.content_root_version,
@@ -1755,10 +1771,10 @@ impl LogSegment {
 
 /// The first checkpoint action in `batches`, or `None` when no batch carries one.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-fn first_checkpoint_action(
-    batches: impl KernelResultIterator<Box<dyn EngineData>>,
+async fn first_checkpoint_action(
+    mut batches: impl BoundGenerator<Item = KernelResult<Box<dyn EngineData>>, Output = ()> + Unpin,
 ) -> KernelResult<Option<CheckpointAction>> {
-    for batch in batches {
+    while let Some(batch) = batches.next().await? {
         if let Some(action) = CheckpointAction::try_new_from_data(batch?.as_ref())? {
             return Ok(Some(action));
         }
