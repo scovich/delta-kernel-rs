@@ -64,14 +64,14 @@ use crate::{Engine, FileMeta, KernelError, KernelResult, KernelResultIterator};
 /// ```
 /// cbindgen:ignore
 #[internal_api]
-pub(crate) struct SequentialPhase {
+pub(crate) struct SequentialPhase<C, M> {
     // The processor that will be used to process the action batches
     processor: ScanLogReplayProcessor,
     // Commit action batches, exhausted before the checkpoint manifest
-    commit_phase: Option<Box<dyn KernelResultIterator<ActionsBatch>>>,
+    commit_phase: Option<C>,
     // The checkpoint manifest reader that will be used to read the checkpoint manifest files.
     // If the checkpoint is single-part, this will be Some(CheckpointManifestReader).
-    checkpoint_manifest_phase: Option<CheckpointManifestReader>,
+    checkpoint_manifest_phase: Option<M>,
     // Whether the iterator has been fully exhausted
     is_finished: bool,
     // Checkpoint parts for potential parallel phase processing
@@ -91,7 +91,7 @@ pub(crate) enum AfterSequential {
     },
 }
 
-impl SequentialPhase {
+impl SequentialPhase<Box<dyn KernelResultIterator<ActionsBatch>>, CheckpointManifestReader> {
     /// Create a new sequential phase log replay.
     ///
     /// # Parameters
@@ -181,12 +181,8 @@ impl SequentialPhase {
             })
         }
     }
-}
 
-impl Iterator for SequentialPhase {
-    type Item = KernelResult<ScanMetadata>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+    fn next_action(&mut self) -> Option<KernelResult<ActionsBatch>> {
         let next = self
             .commit_phase
             .as_mut()
@@ -201,7 +197,22 @@ impl Iterator for SequentialPhase {
             return None;
         };
 
-        Some(result.and_then(|batch| self.processor.process_actions_batch_sequential(batch)))
+        Some(result)
+    }
+
+    fn advance(&mut self) -> Option<KernelResult<ScanMetadata>> {
+        let batch = self.next_action()?;
+        Some(batch.and_then(|batch| self.processor.process_actions_batch_sequential(batch)))
+    }
+}
+
+impl Iterator
+    for SequentialPhase<Box<dyn KernelResultIterator<ActionsBatch>>, CheckpointManifestReader>
+{
+    type Item = KernelResult<ScanMetadata>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.advance()
     }
 }
 
