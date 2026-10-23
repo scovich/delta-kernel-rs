@@ -191,6 +191,9 @@ pub(crate) mod parallel;
 pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliationIteratorState};
 use cancellation::{check_cancelled, CancellableIterator};
 pub use cancellation::{CancellationToken, CancellationTokenRef, CancelledFuture};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use coroutine::kernel::Channel;
+use coroutine::kernel::{run_workflow_with_engine, ChannelExt as _};
 pub use delta_kernel_derive;
 pub use engine_data::{
     EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
@@ -549,9 +552,17 @@ pub(crate) fn create_row(
     value: impl Into<Scalar>,
 ) -> KernelResult<Box<dyn EngineData>> {
     let value = value.into();
-    engine
-        .evaluation_handler()
-        .create_many(schema, vec![vec![value]])
+    run_workflow_with_engine!(engine, |channel| channel.create_row(schema, value))
+}
+
+/// Creates one row through `channel`.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) async fn create_row_with_channel(
+    channel: &Channel,
+    schema: SchemaRef,
+    value: impl Into<Scalar>,
+) -> KernelResult<Box<dyn EngineData>> {
+    channel.create_row(schema, value).await
 }
 
 /// Provides file system related functionalities to Delta Kernel.

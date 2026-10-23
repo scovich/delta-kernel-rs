@@ -7,20 +7,25 @@
 //! its channel.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use delta_kernel_derive::internal_api;
 use url::Url;
 
-use super::request::{ReadJsonFiles, ReadParquetFiles};
+use super::request::{
+    CreateEngineData, CreateExpressionEvaluator, CreatePredicateEvaluator, EvaluateExpression,
+    EvaluatePredicate, ExpressionEvaluatorHandle, PredicateEvaluatorHandle, ReadJsonFiles,
+    ReadParquetFiles,
+};
 use super::Request;
 use crate::coroutine::generator::{self, BoundGenerator, Flatten, Generator, GeneratorExt as _};
 use crate::coroutine::{
     ChannelExchange, Cursor, KernelFuture, Page, PageGenerator, PageRequest, PagedOperation,
 };
-use crate::expressions::PredicateRef;
-use crate::schema::SchemaRef;
-use crate::{EngineData, FileIndex, FileMeta, KernelResult, ParquetFooter};
+use crate::expressions::{ExpressionRef, PredicateRef};
+use crate::schema::{DataType, SchemaRef};
+use crate::{EngineData, FileIndex, FileMeta, KernelResult, ParquetFooter, Scalar};
 
 /// Kernel's [`crate::coroutine::Channel`] specialized to [`Request`].
 ///
@@ -103,6 +108,68 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
         let operation = ReadParquetFiles::new(files, physical_schema, predicate);
         let cursor = self.prepare_paged(operation).await?;
         Ok(PageGenerator::Next(cursor).flatten())
+    }
+
+    /// Materializes one row containing a single scalar value via [`Request::CreateEngineData`].
+    fn create_row(
+        &self,
+        schema: SchemaRef,
+        value: impl Into<Scalar>,
+    ) -> impl KernelFuture<Box<dyn EngineData>> {
+        self.create_many(schema, vec![vec![value.into()]])
+    }
+
+    /// Materializes owned scalar rows as one engine-data batch via [`Request::CreateEngineData`].
+    fn create_many(
+        &self,
+        schema: SchemaRef,
+        rows: Vec<Vec<Scalar>>,
+    ) -> impl KernelFuture<Box<dyn EngineData>> {
+        self.exchange(
+            CreateEngineData::new(schema, rows),
+            Request::CreateEngineData,
+        )
+    }
+
+    /// Prepares `expression` for repeated evaluation.
+    fn create_expression_evaluator(
+        &self,
+        input_schema: SchemaRef,
+        expression: ExpressionRef,
+        output_type: DataType,
+    ) -> impl KernelFuture<ExpressionEvaluatorHandle> {
+        let evaluator = CreateExpressionEvaluator::new(input_schema, expression, output_type);
+        self.exchange(evaluator, Request::CreateExpressionEvaluator)
+    }
+
+    /// Prepares `predicate` for repeated evaluation.
+    fn create_predicate_evaluator(
+        &self,
+        input_schema: SchemaRef,
+        predicate: PredicateRef,
+    ) -> impl KernelFuture<PredicateEvaluatorHandle> {
+        let evaluator = CreatePredicateEvaluator::new(input_schema, predicate);
+        self.exchange(evaluator, Request::CreatePredicateEvaluator)
+    }
+
+    /// Evaluates a prepared expression against `input`.
+    fn evaluate_expression(
+        &self,
+        evaluator: &ExpressionEvaluatorHandle,
+        input: Box<dyn EngineData>,
+    ) -> impl KernelFuture<Box<dyn EngineData>> {
+        let evaluation = EvaluateExpression::new(Arc::clone(evaluator), input);
+        self.exchange(evaluation, Request::EvaluateExpression)
+    }
+
+    /// Evaluates a prepared predicate against `input`.
+    fn evaluate_predicate(
+        &self,
+        evaluator: &PredicateEvaluatorHandle,
+        input: Box<dyn EngineData>,
+    ) -> impl KernelFuture<Box<dyn EngineData>> {
+        let evaluation = EvaluatePredicate::new(Arc::clone(evaluator), input);
+        self.exchange(evaluation, Request::EvaluatePredicate)
     }
 
     /// Initialize `operation` via [`PageRequest::Prepare`] without fetching its first page.

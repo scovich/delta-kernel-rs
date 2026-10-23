@@ -22,17 +22,24 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use delta_kernel::coroutine::kernel::request::{ForwardListing, ReadJsonFiles, ReadParquetFiles};
+use delta_kernel::coroutine::kernel::request::{
+    ExpressionEvaluatorHandle, ForwardListing, PredicateEvaluatorHandle, ReadJsonFiles,
+    ReadParquetFiles,
+};
 use delta_kernel::coroutine::kernel::{Request, Workflow};
 use delta_kernel::coroutine::{
     drive_workflow_async, AsyncResult as _, Cursor, Page, PageRequest, PagedOperation,
 };
+use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
 use delta_kernel::metrics::{
     emit_json_read_completed, emit_parquet_read_completed, emit_storage_list_completed,
     emit_storage_read_completed,
 };
 use delta_kernel::object_store::DynObjectStore;
-use delta_kernel::{EngineData, FileMeta, FileSlice, KernelError, KernelResult};
+use delta_kernel::{
+    EngineData, EvaluationHandler, ExpressionEvaluator, FileMeta, FileSlice, KernelError,
+    KernelResult, PredicateEvaluator,
+};
 use futures::stream::BoxStream;
 use futures::{Stream, StreamExt as _};
 use tokio_util::sync::CancellationToken;
@@ -148,6 +155,31 @@ impl AsyncEngineConnector {
             }
             Request::ReadJson(request) => respond_paged(self, request).await?,
             Request::ReadParquet(request) => respond_paged(self, request).await?,
+            Request::CreateEngineData(operation, reply) => {
+                reply.send(ArrowEvaluationHandler.create_many(operation.schema, operation.rows))
+            }
+            Request::CreateExpressionEvaluator(operation, reply) => reply.send(
+                ArrowEvaluationHandler
+                    .new_expression_evaluator(
+                        operation.input_schema,
+                        operation.expression,
+                        operation.output_type,
+                    )
+                    .map(|evaluator| Arc::new(evaluator) as _),
+            ),
+            Request::CreatePredicateEvaluator(operation, reply) => reply.send(
+                ArrowEvaluationHandler
+                    .new_predicate_evaluator(operation.input_schema, operation.predicate)
+                    .map(|evaluator| Arc::new(evaluator) as _),
+            ),
+            Request::EvaluateExpression(operation, reply) => reply.send(
+                expression_evaluator(&operation.evaluator)
+                    .and_then(|evaluator| evaluator.evaluate(operation.input.as_ref())),
+            ),
+            Request::EvaluatePredicate(operation, reply) => reply.send(
+                predicate_evaluator(&operation.evaluator)
+                    .and_then(|evaluator| evaluator.evaluate(operation.input.as_ref())),
+            ),
         }
         Ok(())
     }
@@ -307,6 +339,22 @@ impl AsyncPagination<ReadParquetFiles> for AsyncEngineConnector {
     }
 }
 
+fn expression_evaluator(
+    handle: &ExpressionEvaluatorHandle,
+) -> KernelResult<&Arc<dyn ExpressionEvaluator>> {
+    handle.downcast_ref().ok_or_else(|| {
+        KernelError::internal_error("invalid async engine expression evaluator handle")
+    })
+}
+
+fn predicate_evaluator(
+    handle: &PredicateEvaluatorHandle,
+) -> KernelResult<&Arc<dyn PredicateEvaluator>> {
+    handle.downcast_ref().ok_or_else(|| {
+        KernelError::internal_error("invalid async engine predicate evaluator handle")
+    })
+}
+
 struct MeteredStream<T> {
     inner: ResultStream<T>,
     start: Instant,
@@ -374,11 +422,12 @@ mod tests {
     use delta_kernel::coroutine::kernel::request::{ForwardListing, ListingBounds};
     use delta_kernel::coroutine::kernel::{static_workflow, ChannelExt as _, WorkflowStep};
     use delta_kernel::coroutine::PageGenerator;
+    use delta_kernel::expressions::{col, lit};
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::ObjectStoreExt as _;
-    use delta_kernel::schema::schema_ref;
+    use delta_kernel::schema::{schema_ref, DataType};
     use delta_kernel::FileMeta;
     use url::Url;
 
@@ -457,6 +506,46 @@ mod tests {
         let result = connector.run(workflow).await.unwrap();
 
         assert_eq!(result, (1, true));
+    }
+
+    #[tokio::test]
+    async fn creates_engine_data_through_native_async_connector() {
+        let connector = AsyncEngineConnector::new(Arc::new(InMemory::new()));
+        let workflow = static_workflow!(|channel| {
+            channel.create_row(schema_ref! { nullable "value": LONG }, 1_i64)
+        });
+
+        let data = connector.run(workflow).await.unwrap();
+
+        assert_eq!(data.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn evaluates_through_native_async_connector() {
+        let connector = AsyncEngineConnector::new(Arc::new(InMemory::new()));
+        let workflow = static_workflow!(async move |channel| {
+            let input_schema = schema_ref! { nullable "value": LONG };
+            let input = channel.create_row(input_schema.clone(), 1_i64).await?;
+            let expression = channel
+                .create_expression_evaluator(
+                    input_schema,
+                    Arc::new(col!("value") + lit(1_i64)),
+                    DataType::LONG,
+                )
+                .await?;
+            let output = channel.evaluate_expression(&expression, input).await?;
+            let predicate = channel
+                .create_predicate_evaluator(
+                    schema_ref! { nullable "output": LONG },
+                    Arc::new(col!("output").gt(lit(1_i64))),
+                )
+                .await?;
+            channel.evaluate_predicate(&predicate, output).await
+        });
+
+        let data = connector.run(workflow).await.unwrap();
+
+        assert_eq!(data.len(), 1);
     }
 
     #[tokio::test]

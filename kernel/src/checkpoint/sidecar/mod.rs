@@ -4,6 +4,7 @@ use itertools::Itertools;
 
 use crate::action_reconciliation::ActionReconciliationIterator;
 use crate::actions::{ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
+use crate::coroutine::kernel::{run_workflow_with_engine, Channel, ChannelExt as _};
 use crate::engine_data::filter_by_predicate;
 use crate::expressions::{
     col, null_lit, Expression, ExpressionStructPatchBuilder, Predicate, Scalar, StructData,
@@ -33,6 +34,17 @@ const SIDECAR_SCHEMA_TAGS: &str = "tags";
 /// - `sidecar_metas`: Pairs of (sidecar filename, FileMeta) for each sidecar file.
 pub(super) fn create_sidecar_action_batch(
     engine: &dyn Engine,
+    checkpoint_data_schema: &SchemaRef,
+    sidecar_metas: &[(String, FileMeta)],
+) -> KernelResult<Option<Box<dyn EngineData>>> {
+    run_workflow_with_engine!(engine, |channel| {
+        create_sidecar_action_batch_with_channel(channel, checkpoint_data_schema, sidecar_metas)
+    })
+}
+
+/// Channel-driven counterpart to [`create_sidecar_action_batch`].
+pub(super) async fn create_sidecar_action_batch_with_channel(
+    channel: &Channel,
     checkpoint_data_schema: &SchemaRef,
     sidecar_metas: &[(String, FileMeta)],
 ) -> KernelResult<Option<Box<dyn EngineData>>> {
@@ -94,9 +106,9 @@ pub(super) fn create_sidecar_action_batch(
         })
         .try_collect()?;
 
-    let batch = engine
-        .evaluation_handler()
-        .create_many(checkpoint_data_schema.clone(), rows)?;
+    let batch = channel
+        .create_many(checkpoint_data_schema.clone(), rows)
+        .await?;
     Ok(Some(batch))
 }
 

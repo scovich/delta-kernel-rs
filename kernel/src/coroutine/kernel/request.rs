@@ -2,15 +2,18 @@
 //!
 //! Variants are added in lockstep with connector support and the Kernel operations that issue them.
 
+use std::any::Any;
+use std::sync::Arc;
+
 use bytes::Bytes;
-use derive_more::From;
+use derive_more::{Constructor, From};
 use url::Url;
 
 use crate::coroutine::{PageRequest, PagedOperation, Reply};
-use crate::expressions::PredicateRef;
+use crate::expressions::{ExpressionRef, PredicateRef};
 use crate::path::may_begin_listable_log_path;
-use crate::schema::SchemaRef;
-use crate::{EngineData, FileMeta, FileSlice, KernelResult, ParquetFooter, Version};
+use crate::schema::{DataType, SchemaRef};
+use crate::{EngineData, FileMeta, FileSlice, KernelResult, ParquetFooter, Scalar, Version};
 
 /// Operations Kernel can request from a connector.
 #[derive(From)]
@@ -30,6 +33,16 @@ pub enum Request {
     /// Read Parquet files as ordered [`EngineData`] batches. Each file may produce multiple
     /// batches, but batches may not span files.
     ReadParquet(PageRequest<ReadParquetFiles>),
+    /// Materialize scalar rows as one [`EngineData`] batch.
+    CreateEngineData(CreateEngineData, Reply<Box<dyn EngineData>>),
+    /// Prepare an expression evaluator for repeated use.
+    CreateExpressionEvaluator(CreateExpressionEvaluator, Reply<ExpressionEvaluatorHandle>),
+    /// Prepare a predicate evaluator for repeated use.
+    CreatePredicateEvaluator(CreatePredicateEvaluator, Reply<PredicateEvaluatorHandle>),
+    /// Evaluate a prepared expression against one [`EngineData`] batch.
+    EvaluateExpression(EvaluateExpression, Reply<Box<dyn EngineData>>),
+    /// Evaluate a prepared predicate against one [`EngineData`] batch.
+    EvaluatePredicate(EvaluatePredicate, Reply<Box<dyn EngineData>>),
 }
 
 /// URL bounds for a forward listing.
@@ -153,6 +166,52 @@ impl ReadParquetFiles {
 
 impl PagedOperation for ReadParquetFiles {
     type Page = Vec<KernelResult<Box<dyn EngineData>>>;
+}
+
+// === Evaluation ===
+
+/// Values to materialize as one [`EngineData`] batch.
+#[derive(Constructor)]
+pub struct CreateEngineData {
+    /// Schema describing each row.
+    pub schema: SchemaRef,
+    /// Owned rows with one scalar per top-level schema field.
+    pub rows: Vec<Vec<Scalar>>,
+}
+
+/// Type-erased, shared connector state for a prepared expression evaluator.
+pub type ExpressionEvaluatorHandle = Arc<dyn Any + Send + Sync>;
+
+/// Type-erased, shared connector state for a prepared predicate evaluator.
+pub type PredicateEvaluatorHandle = Arc<dyn Any + Send + Sync>;
+
+/// Parameters for preparing an expression evaluator.
+#[derive(Constructor)]
+pub struct CreateExpressionEvaluator {
+    pub input_schema: SchemaRef,
+    pub expression: ExpressionRef,
+    pub output_type: DataType,
+}
+
+/// Parameters for preparing a predicate evaluator.
+#[derive(Constructor)]
+pub struct CreatePredicateEvaluator {
+    pub input_schema: SchemaRef,
+    pub predicate: PredicateRef,
+}
+
+/// A prepared expression evaluator and input batch to evaluate.
+#[derive(Constructor)]
+pub struct EvaluateExpression {
+    pub evaluator: ExpressionEvaluatorHandle,
+    pub input: Box<dyn EngineData>,
+}
+
+/// A prepared predicate evaluator and input batch to evaluate.
+#[derive(Constructor)]
+pub struct EvaluatePredicate {
+    pub evaluator: PredicateEvaluatorHandle,
+    pub input: Box<dyn EngineData>,
 }
 
 #[cfg(test)]
