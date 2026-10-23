@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::visitors::SetTransactionMap;
 use crate::actions::{CheckpointAction, ContentRoot, DomainMetadata, SetTransaction};
+use crate::coroutine::kernel::{run_workflow_with_engine, Channel};
 use crate::crc::{merge_domain_metadata, DomainMetadataState, SetTransactionState};
 use crate::error::KernelError;
 use crate::log_segment::DomainMetadataMap;
@@ -45,8 +46,28 @@ impl RootManifestFile {
         dm_changes: &[DomainMetadata],
         set_transactions: &[SetTransaction],
     ) -> KernelResult<CheckpointAction> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.compute_checkpoint_action_with_channel(
+                channel,
+                commit_version,
+                table_config,
+                dm_changes,
+                set_transactions,
+            )
+        })
+    }
+
+    /// Builds the self-contained checkpoint action through `channel`.
+    pub(super) async fn compute_checkpoint_action_with_channel(
+        &self,
+        channel: &Channel,
+        commit_version: Version,
+        table_config: &TableConfiguration,
+        dm_changes: &[DomainMetadata],
+        set_transactions: &[SetTransaction],
+    ) -> KernelResult<CheckpointAction> {
         let (mut domain_metadata, mut transactions, existing_checkpoint) =
-            self.scan_non_content_metadata(engine)?;
+            self.scan_non_content_metadata_with_channel(channel).await?;
 
         // Domains can be tombstoned, so merging applies removals. The transactions map is keyed by
         // app id, so extend overwrites with the newest entry per app.
@@ -97,9 +118,23 @@ impl RootManifestFile {
 
     /// Returns the read snapshot's active domain metadata, set transactions, and latest checkpoint
     /// action.
+    #[cfg(test)]
     fn scan_non_content_metadata(
         &self,
         engine: &dyn Engine,
+    ) -> KernelResult<(
+        DomainMetadataMap,
+        SetTransactionMap,
+        Option<Arc<CheckpointAction>>,
+    )> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.scan_non_content_metadata_with_channel(channel)
+        })
+    }
+
+    async fn scan_non_content_metadata_with_channel(
+        &self,
+        channel: &Channel,
     ) -> KernelResult<(
         DomainMetadataMap,
         SetTransactionMap,
@@ -116,7 +151,9 @@ impl RootManifestFile {
             Some(SetTransactionState::Complete(_))
         );
 
-        let checkpoint_action = snapshot.latest_checkpoint_action(engine)?;
+        let checkpoint_action = snapshot
+            .latest_checkpoint_action_with_channel(channel)
+            .await?;
 
         // Reject a checkpoint that spilled txns/domain metadata to sidecars, since sidecars aren't
         // read yet and that state would be lost.
@@ -144,7 +181,11 @@ impl RootManifestFile {
                 );
                 domain_metadata
             }
-            _ => snapshot.get_domain_metadatas_internal(engine, None)?,
+            _ => {
+                snapshot
+                    .get_domain_metadatas_internal_with_channel(channel, None)
+                    .await?
+            }
         };
         let transactions = match &checkpoint_action {
             Some(checkpoint) if !transactions_complete_in_crc => checkpoint
@@ -153,7 +194,7 @@ impl RootManifestFile {
                 .cloned()
                 .map(|txn| (txn.app_id.clone(), txn))
                 .collect(),
-            _ => snapshot.get_app_id_versions(engine)?,
+            _ => snapshot.get_app_id_versions_with_channel(channel).await?,
         };
 
         Ok((domain_metadata, transactions, checkpoint_action))

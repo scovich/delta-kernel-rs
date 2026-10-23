@@ -1,12 +1,12 @@
-use delta_kernel::snapshot::Snapshot;
+use delta_kernel::snapshot::SnapshotRef;
 use delta_kernel::KernelResult;
 
 use crate::error::{ExternResult, IntoExternResult};
 use crate::expressions::kernel_visitor::NullTypeTag;
 use crate::handle::Handle;
 use crate::{
-    kernel_string_slice, AllocateStringFn, ExternEngine, KernelStringSlice, NullableCvoid,
-    OptionalValue, SharedExternEngine, SharedSnapshot, TryFromStringSlice,
+    drive_kernel, kernel_string_slice, AllocateStringFn, ExternEngine, KernelStringSlice,
+    NullableCvoid, OptionalValue, SharedExternEngine, SharedSnapshot, TryFromStringSlice,
 };
 
 /// The row-tracking high-water mark before any fresh row IDs have been assigned.
@@ -28,7 +28,7 @@ pub unsafe extern "C" fn get_domain_metadata(
     engine: Handle<SharedExternEngine>,
     allocate_fn: AllocateStringFn,
 ) -> ExternResult<NullableCvoid> {
-    let snapshot = unsafe { snapshot.as_ref() };
+    let snapshot: SnapshotRef = unsafe { snapshot.clone_as_arc() };
     let engine = unsafe { engine.as_ref() };
     let domain = unsafe { String::try_from_slice(&domain) };
 
@@ -36,13 +36,13 @@ pub unsafe extern "C" fn get_domain_metadata(
 }
 
 fn get_domain_metadata_impl(
-    snapshot: &Snapshot,
+    snapshot: SnapshotRef,
     domain: KernelResult<String>,
     extern_engine: &dyn ExternEngine,
     allocate_fn: AllocateStringFn,
 ) -> KernelResult<NullableCvoid> {
-    Ok(snapshot
-        .get_domain_metadata(&domain?, extern_engine.engine().as_ref())?
+    let workflow = snapshot.get_domain_metadata_workflow(domain?);
+    Ok(drive_kernel(extern_engine, workflow)?
         .and_then(|config| allocate_fn(kernel_string_slice!(config))))
 }
 
@@ -62,9 +62,9 @@ pub unsafe extern "C" fn snapshot_row_tracking_high_water_mark(
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<OptionalValue<i64>> {
     let engine_ref = unsafe { engine.as_ref() };
-    let snapshot = unsafe { snapshot.as_ref() };
-    snapshot
-        .get_row_tracking_high_water_mark(engine_ref.engine().as_ref())
+    let snapshot: SnapshotRef = unsafe { snapshot.clone_as_arc() };
+    let workflow = snapshot.get_row_tracking_high_water_mark_workflow();
+    drive_kernel(engine_ref, workflow)
         .map(OptionalValue::from)
         .into_extern_result(&engine_ref)
 }
@@ -120,19 +120,20 @@ pub unsafe extern "C" fn visit_clustering_columns(
     engine_context: NullableCvoid,
     visitor: ClusteringColumnVisitor,
 ) -> ExternResult<OptionalValue<usize>> {
-    let snapshot = unsafe { snapshot.as_ref() };
+    let snapshot: SnapshotRef = unsafe { snapshot.clone_as_arc() };
     let engine = unsafe { engine.as_ref() };
     visit_clustering_columns_impl(snapshot, engine, engine_context, visitor)
         .into_extern_result(&engine)
 }
 
 fn visit_clustering_columns_impl(
-    snapshot: &Snapshot,
+    snapshot: SnapshotRef,
     extern_engine: &dyn ExternEngine,
     engine_context: NullableCvoid,
     visitor: ClusteringColumnVisitor,
 ) -> KernelResult<OptionalValue<usize>> {
-    let Some(infos) = snapshot.get_clustering_column_infos(extern_engine.engine().as_ref())? else {
+    let workflow = snapshot.get_clustering_column_infos_workflow();
+    let Some(infos) = drive_kernel(extern_engine, workflow)? else {
         return Ok(OptionalValue::None);
     };
     for info in &infos {
@@ -168,7 +169,7 @@ pub unsafe extern "C" fn visit_domain_metadata(
         configuration: KernelStringSlice,
     ),
 ) -> ExternResult<bool> {
-    let snapshot = unsafe { snapshot.as_ref() };
+    let snapshot: SnapshotRef = unsafe { snapshot.clone_as_arc() };
     let engine = unsafe { engine.as_ref() };
 
     visit_domain_metadata_impl(snapshot, engine, engine_context, visitor)
@@ -176,7 +177,7 @@ pub unsafe extern "C" fn visit_domain_metadata(
 }
 
 fn visit_domain_metadata_impl(
-    snapshot: &Snapshot,
+    snapshot: SnapshotRef,
     extern_engine: &dyn ExternEngine,
     engine_context: NullableCvoid,
     visitor: extern "C" fn(
@@ -185,7 +186,8 @@ fn visit_domain_metadata_impl(
         value: KernelStringSlice,
     ),
 ) -> KernelResult<bool> {
-    let res = snapshot.get_all_domain_metadata(extern_engine.engine().as_ref())?;
+    let workflow = snapshot.get_all_domain_metadata_workflow();
+    let res = drive_kernel(extern_engine, workflow)?;
     res.iter().for_each(|metadata| {
         let domain = &metadata.domain();
         let configuration = &metadata.configuration();

@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use delta_kernel::actions::{Metadata, Protocol};
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
+use delta_kernel::coroutine::kernel::{drive_with_engine, Workflow};
 use delta_kernel::history_manager::{
     first_version_after as kernel_first_version_after,
     get_earliest_commit as kernel_get_earliest_commit,
@@ -748,6 +749,14 @@ pub unsafe extern "C" fn free_engine_data(engine_data: Handle<ExclusiveEngineDat
 pub trait ExternEngine: Send + Sync {
     fn engine(&self) -> Arc<dyn Engine>;
     fn error_allocator(&self) -> &dyn AllocateError;
+}
+
+/// Drives a Kernel workflow through the engine exposed by `extern_engine`.
+pub(crate) fn drive_kernel<O: Send + 'static>(
+    extern_engine: &dyn ExternEngine,
+    workflow: Workflow<'_, O>,
+) -> KernelResult<O> {
+    drive_with_engine(extern_engine.engine().as_ref(), None, workflow)
 }
 
 #[handle_descriptor(target=dyn ExternEngine, mutable=false)]
