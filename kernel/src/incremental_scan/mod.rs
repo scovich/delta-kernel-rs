@@ -6,6 +6,12 @@ use std::sync::{Arc, LazyLock};
 
 use url::Url;
 
+use crate::coroutine::kernel::engine::{EngineConnector, EngineResultCoroutineIterator};
+use crate::coroutine::kernel::{
+    static_coroutine, static_workflow, Channel, ChannelExt as _, KernelResultGenerator,
+    StaticCoroutine, StaticWorkflow,
+};
+use crate::coroutine::BoundGenerator;
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor};
 use crate::expressions::{column_name, ColumnName};
 use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
@@ -16,10 +22,7 @@ use crate::schema::{ColumnNamesAndTypes, DataType};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
 use crate::utils::require;
-use crate::{
-    Engine, EngineData, FileDataReadResultIterator, FileMeta, KernelError, KernelResult,
-    PredicateRef, Version,
-};
+use crate::{Engine, EngineData, FileMeta, KernelError, KernelResult, PredicateRef, Version};
 
 /// Builder for an incremental scan over `(base_version, target_version]`. Construct via
 /// [`crate::Snapshot::incremental_scan_builder`] and drive with
@@ -85,6 +88,23 @@ impl IncrementalScanBuilder {
     /// - `Err` if the target snapshot's protocol contains an unsupported reader feature.
     /// - `Err` if the engine fails to open the commit stream.
     pub fn build(self, engine: &dyn Engine) -> KernelResult<Option<IncrementalScanStream>> {
+        let connector = EngineConnector::new(engine);
+        let stream = connector.drive(self.build_workflow())?;
+        Ok(stream.map(|stream| IncrementalScanStream {
+            inner: connector.iterate_result_coroutine(stream),
+            errored: false,
+        }))
+    }
+
+    /// Returns a lazy workflow with the same error contract as [`Self::build`].
+    pub fn build_workflow(self) -> StaticWorkflow<Option<IncrementalScanCoroutine>> {
+        static_workflow!(|channel| self.build_with_channel(channel))
+    }
+
+    async fn build_with_channel(
+        self,
+        channel: &Channel,
+    ) -> KernelResult<Option<IncrementalScanCoroutine>> {
         // TODO(#2493): the version validation, the snapshot-commit-list extraction and
         // clipping below, and the "snapshot covers the range" check should all be replaced
         // by a single `CommitRangeBuilder::from_snapshot(...).build(engine)` call once
@@ -100,7 +120,7 @@ impl IncrementalScanBuilder {
         // Resolve the predicate into an Add-side skipping strategy up front so `build` can
         // fail fast on a malformed predicate (e.g. references to unknown columns), rather
         // than surfacing the error lazily from the stream.
-        let add_skipping = self.resolve_add_skipping(engine)?;
+        let add_skipping = self.resolve_add_skipping_with_channel(channel).await?;
         // `base_version < target_version` above guarantees `base_version < u64::MAX`, but use
         // `checked_add` to make the dependency explicit and panic-free.
         let start_version = self.base_version.checked_add(1).ok_or_else(|| {
@@ -145,12 +165,9 @@ impl IncrementalScanBuilder {
             .map(|c| c.location.clone())
             .collect();
 
-        let actions = engine.json_handler().read_json_files(
-            &commit_locations,
-            COMMIT_READ_SCHEMA.clone(),
-            None,
-        )?;
-
+        let actions = channel
+            .prepare_json_files(commit_locations, COMMIT_READ_SCHEMA.clone(), None)
+            .await?;
         let state = IncrementalScanState {
             base_version: self.base_version,
             target_version,
@@ -165,7 +182,7 @@ impl IncrementalScanBuilder {
                 .table_configuration()
                 .dv_normalization_root(),
         };
-        Ok(Some(IncrementalScanStream(state)))
+        Ok(Some(incremental_scan_generator(state)))
     }
 
     /// Lowers `self.predicate` into the per-batch skipping strategy applied to live Adds.
@@ -175,7 +192,10 @@ impl IncrementalScanBuilder {
     /// constructed. [`AddSkipping::SkipAll`] when the predicate statically excludes every file
     /// ([`PhysicalPredicate::StaticSkipAll`]); the stream still reports Removes but yields no
     /// live Adds. [`AddSkipping::Filter`] carries the reusable [`DataSkippingFilter`].
-    fn resolve_add_skipping(&self, engine: &dyn Engine) -> KernelResult<AddSkipping> {
+    async fn resolve_add_skipping_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<AddSkipping> {
         let Some(predicate) = self.predicate.as_ref() else {
             return Ok(AddSkipping::KeepAll);
         };
@@ -191,12 +211,13 @@ impl IncrementalScanBuilder {
                 // parse stats from `add.stats` JSON and partition values from
                 // `add.partitionValues`, then skip against the shared `DataSkippingFilter`.
                 // `None` (predicate ineligible for skipping) degrades to keep-all.
-                let filter = DataSkippingFilter::for_raw_action_batch(
-                    engine,
+                let filter = DataSkippingFilter::for_raw_action_batch_with_channel(
+                    channel,
                     physical_predicate,
                     table_configuration,
                     COMMIT_READ_SCHEMA.clone(),
-                );
+                )
+                .await;
                 Ok(filter.map_or(AddSkipping::KeepAll, |f| AddSkipping::Filter(Arc::new(f))))
             }
         }
@@ -231,7 +252,10 @@ enum AddSkipping {
 ///
 /// [`into_summary`]: Self::into_summary
 /// [`into_listing`]: Self::into_listing
-pub struct IncrementalScanStream(IncrementalScanState<FileDataReadResultIterator>);
+pub struct IncrementalScanStream {
+    inner: IncrementalScanEngineIterator,
+    errored: bool,
+}
 
 struct IncrementalScanState<A> {
     base_version: Version,
@@ -246,36 +270,47 @@ struct IncrementalScanState<A> {
     dv_normalization_root: Option<Url>,
 }
 
-impl Iterator for IncrementalScanState<FileDataReadResultIterator> {
-    type Item = KernelResult<FilteredEngineData>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+impl<G> IncrementalScanState<G>
+where
+    G: BoundGenerator<Item = KernelResult<Box<dyn EngineData>>, Output = ()> + Unpin,
+{
+    async fn advance(
+        &mut self,
+        channel: &Channel,
+    ) -> KernelResult<Option<KernelResult<FilteredEngineData>>> {
         if self.errored {
-            return None;
+            return Ok(None);
         }
-        loop {
-            match self.actions.next()? {
+        let result = loop {
+            let Some(result) = self.actions.next().await? else {
+                break None;
+            };
+            match result {
                 Err(e) => {
                     self.errored = true;
-                    return Some(Err(e));
+                    break Some(Err(e));
                 }
-                Ok(batch) => match process_batch(
+                Ok(batch) => match process_batch_with_channel(
+                    channel,
                     batch,
                     &self.add_skipping,
                     &mut self.seen_file_keys,
                     &mut self.live_adds,
                     &mut self.removes,
                     self.dv_normalization_root.clone(),
-                ) {
-                    Ok(Some(filtered)) => return Some(Ok(filtered)),
+                )
+                .await
+                {
+                    Ok(Some(filtered)) => break Some(Ok(filtered)),
                     Ok(None) => continue,
                     Err(e) => {
                         self.errored = true;
-                        return Some(Err(e));
+                        break Some(Err(e));
                     }
                 },
             }
-        }
+        };
+        Ok(result)
     }
 }
 
@@ -295,11 +330,61 @@ impl<A> IncrementalScanState<A> {
     }
 }
 
+impl<A: KernelResultGenerator<Box<dyn EngineData>>> IncrementalScanState<A> {
+    fn bind_actions<'a>(
+        self,
+        channel: &'a Channel,
+    ) -> IncrementalScanState<
+        impl BoundGenerator<Item = KernelResult<Box<dyn EngineData>>, Output = ()> + Unpin + 'a,
+    >
+    where
+        A: 'a,
+    {
+        IncrementalScanState {
+            base_version: self.base_version,
+            target_version: self.target_version,
+            actions: self.actions.bind(channel),
+            add_skipping: self.add_skipping,
+            seen_file_keys: self.seen_file_keys,
+            live_adds: self.live_adds,
+            removes: self.removes,
+            errored: self.errored,
+            dv_normalization_root: self.dv_normalization_root,
+        }
+    }
+}
+
+fn incremental_scan_generator<G>(state: IncrementalScanState<G>) -> IncrementalScanCoroutine
+where
+    G: KernelResultGenerator<Box<dyn EngineData>> + 'static,
+{
+    static_coroutine!(async move |channel| {
+        let mut state = state.bind_actions(&channel);
+        while let Some(item) = state.advance(&channel).await? {
+            channel.yield_item(item).await?;
+        }
+        Ok(state.into_summary())
+    })
+}
+
+/// Connector-driven incremental scan over `(base_version, target_version]`.
+pub type IncrementalScanCoroutine =
+    StaticCoroutine<KernelResult<FilteredEngineData>, KernelResult<IncrementalScanSummary>>;
+type IncrementalScanEngineIterator = EngineResultCoroutineIterator<
+    'static,
+    FilteredEngineData,
+    KernelResult<IncrementalScanSummary>,
+>;
+
 impl Iterator for IncrementalScanStream {
     type Item = KernelResult<FilteredEngineData>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.0.next()
+        let item = self.inner.next();
+        if matches!(item, Some(Err(_))) {
+            self.errored = true;
+        }
+        item
     }
 }
 
@@ -326,7 +411,7 @@ impl IncrementalScanStream {
         for item in self.by_ref() {
             item?;
         }
-        self.0.into_summary()
+        self.inner.into_output()?
     }
 
     /// Eager helper: collect every live Add batch into a [`Vec`], then call
@@ -475,12 +560,8 @@ impl IncrementalScanStream {
 impl std::fmt::Debug for IncrementalScanStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IncrementalScanStream")
-            .field("base_version", &self.0.base_version)
-            .field("target_version", &self.0.target_version)
-            .field("live_adds", &self.0.live_adds.len())
-            .field("removes", &self.0.removes.len())
-            .field("errored", &self.0.errored)
-            .finish()
+            .field("errored", &self.errored)
+            .finish_non_exhaustive()
     }
 }
 
@@ -587,7 +668,8 @@ impl std::fmt::Debug for IncrementalListingAgainstBase {
 /// still advances dedup state (its `(path, dv_unique_id)` key is recorded as seen) so an
 /// older duplicate of the same file cannot leak through, matching newest-wins semantics.
 /// Removes are never skipped.
-fn process_batch(
+async fn process_batch_with_channel(
+    channel: &Channel,
     batch: Box<dyn EngineData>,
     add_skipping: &AddSkipping,
     seen_file_keys: &mut HashSet<FileActionKey>,
@@ -605,7 +687,7 @@ fn process_batch(
     let keep_add: Vec<bool> = match add_skipping {
         AddSkipping::KeepAll => vec![true; row_count],
         AddSkipping::SkipAll => vec![false; row_count],
-        AddSkipping::Filter(filter) => filter.apply(batch.as_ref())?,
+        AddSkipping::Filter(filter) => filter.apply_with_channel(channel, batch.as_ref()).await?,
     };
 
     let deduplicator = FileActionDeduplicator::new(

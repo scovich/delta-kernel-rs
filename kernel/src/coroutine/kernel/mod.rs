@@ -56,6 +56,9 @@ pub type Coroutine<'a, Y, O = ()> = super::Coroutine<'a, Request, Y, O>;
 /// Kernel coroutine that owns all captured state.
 pub type StaticCoroutine<Y, O = ()> = super::StaticCoroutine<Request, Y, O>;
 
+/// Instrumented Kernel coroutine that owns all captured state.
+pub type StaticInstrumentedCoroutine<Y, O = ()> = super::StaticInstrumentedCoroutine<Request, Y, O>;
+
 /// Yield, request, or completion from a Kernel [`Coroutine`].
 pub type CoroutineStep<Y, O = ()> = super::CoroutineStep<Request, Y, O>;
 

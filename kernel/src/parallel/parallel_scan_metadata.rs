@@ -2,21 +2,24 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
-use tracing::{info_span, Span};
+use tracing::{info_span, Instrument as _, Span};
 
-use crate::log_reader::checkpoint_manifest::CheckpointManifestReader;
+use crate::coroutine::generator::{generator_fn, AsyncIntoIterator as _};
+use crate::coroutine::kernel::engine::{EngineConnector, EngineResultCoroutineIterator};
+use crate::coroutine::kernel::{
+    run_workflow_with_engine, static_workflow, workflow, Channel, KernelResultGenerator,
+    StaticCoroutine, StaticInstrumentedCoroutine, StaticWorkflow, Workflow,
+};
+use crate::coroutine::KernelFuture;
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
 use crate::parallel::parallel_phase::ParallelPhase;
-use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
+use crate::parallel::sequential_phase::AfterSequential;
 use crate::scan::log_replay::{ScanLogReplayProcessor, SerializableScanState};
 use crate::scan::ScanMetadata;
 use crate::schema::SchemaRef;
-use crate::{Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator};
-
-type EngineSequentialPhase =
-    SequentialPhase<Box<dyn KernelResultIterator<ActionsBatch>>, CheckpointManifestReader>;
+use crate::{Engine, EngineData, FileMeta, KernelError, KernelResult};
 
 /// Result of sequential scan metadata processing.
 ///
@@ -31,31 +34,76 @@ pub enum AfterSequentialScanMetadata {
     },
 }
 
-/// Sequential scan metadata iterator.
+type RawSequentialScanCoroutine =
+    StaticCoroutine<KernelResult<ScanMetadata>, KernelResult<AfterSequential>>;
+type SequentialScanEngineIterator =
+    EngineResultCoroutineIterator<'static, ScanMetadata, KernelResult<AfterSequential>>;
+
+/// Connector-driven first phase of distributed scan metadata replay.
 ///
-/// This phase processes commits and single-part checkpoint manifests sequentially.
-/// After exhaustion, call `finish()` to get the result which indicates whether
-/// a distributed phase is needed.
+/// Its terminal output either completes replay or returns the state and checkpoint files needed for
+/// parallel processing.
+/// cbindgen:ignore
+pub type SequentialScanMetadata = StaticInstrumentedCoroutine<
+    KernelResult<ScanMetadata>,
+    KernelResult<AfterSequentialScanMetadata>,
+>;
+
+/// Creates the span shared by sequential connector and Engine drivers.
+pub(crate) fn sequential_scan_span() -> Span {
+    // TODO: Associate a unique scan ID with this span to correlate sequential and parallel phases.
+    info_span!("sequential_scan_metadata")
+}
+
+/// Wraps sequential replay for connector-driven execution and terminal metrics reporting.
+pub(crate) fn sequential_scan_metadata(
+    sequential: impl KernelResultGenerator<ScanMetadata, KernelResult<AfterSequential>> + 'static,
+    correlation_id: Option<Arc<str>>,
+    span: Span,
+) -> SequentialScanMetadata {
+    let completion = SequentialScanCompletion::new(correlation_id);
+    let generator = generator_fn!(async move |channel| {
+        let after = channel.yield_from(sequential.bind(&channel)).await?;
+        Ok(after.map(|after| completion.finish(after)))
+    });
+    let coroutine = StaticCoroutine::from_generator(generator);
+    SequentialScanMetadata::new(coroutine, span)
+}
+
+/// Engine-driven compatibility iterator for sequential scan metadata.
+///
+/// Exhaust the iterator before calling [`Self::finish`] to recover any parallel work.
 pub struct SequentialScanMetadataIterator {
-    pub(crate) sequential: EngineSequentialPhase,
+    inner: SequentialScanEngineIterator,
     completion: SequentialScanCompletion,
     span: Span,
 }
 
 impl SequentialScanMetadataIterator {
-    pub(crate) fn new(sequential: EngineSequentialPhase, correlation_id: Option<Arc<str>>) -> Self {
+    pub(crate) fn new(
+        connector: EngineConnector,
+        sequential: impl KernelResultGenerator<ScanMetadata, KernelResult<AfterSequential>> + 'static,
+        correlation_id: Option<Arc<str>>,
+        span: Span,
+    ) -> Self {
+        let raw: RawSequentialScanCoroutine = StaticCoroutine::from_generator(sequential);
         Self {
-            sequential,
+            inner: connector.iterate_result_coroutine(raw),
             completion: SequentialScanCompletion::new(correlation_id),
-            // TODO: Associate a unique scan ID with this span to correlate sequential and parallel
-            // phases
-            span: info_span!("sequential_scan_metadata"),
+            span,
         }
     }
 
+    /// Finishes the sequential phase, failing if the iterator has not been exhausted.
     pub fn finish(self) -> KernelResult<AfterSequentialScanMetadata> {
         let _guard = self.span.enter();
-        Ok(self.completion.finish(self.sequential.finish()?))
+        if !self.inner.is_complete() {
+            return Err(KernelError::generic(
+                "Must exhaust iterator before calling finish()",
+            ));
+        }
+        let after = self.inner.into_output()??;
+        Ok(self.completion.finish(after))
     }
 }
 
@@ -64,7 +112,7 @@ impl Iterator for SequentialScanMetadataIterator {
 
     fn next(&mut self) -> Option<Self::Item> {
         let _guard = self.span.enter();
-        self.sequential.next()
+        self.inner.next()
     }
 }
 
@@ -149,9 +197,11 @@ impl ParallelLogReplayProcessor for Arc<ParallelState> {
 
     fn process_actions_batch_parallel(
         &self,
+        channel: &Channel,
         actions_batch: ActionsBatch,
-    ) -> KernelResult<Self::Output> {
-        self.inner.process_actions_batch_parallel(actions_batch)
+    ) -> impl KernelFuture<Self::Output> {
+        self.inner
+            .process_actions_batch_parallel(channel, actions_batch)
     }
 }
 
@@ -198,6 +248,40 @@ impl ParallelState {
         self.inner.checkpoint_info().checkpoint_read_schema.clone()
     }
 
+    /// Returns a workflow that processes `leaf_files` using this shared replay state.
+    pub fn scan_metadata_workflow(
+        self: Arc<Self>,
+        leaf_files: Vec<FileMeta>,
+    ) -> StaticWorkflow<ParallelScanMetadata> {
+        static_workflow!(|channel| self.scan_metadata_with_channel(channel, leaf_files))
+    }
+
+    /// Processes pre-read action batches using this shared replay state.
+    pub fn scan_metadata_from_iter(
+        self: Arc<Self>,
+        iter: impl IntoIterator<Item = KernelResult<Box<dyn EngineData>>, IntoIter: Send + 'static>,
+    ) -> ParallelScanMetadata {
+        let span = parallel_scan_span();
+        span.in_scope(|| {
+            let generator =
+                ParallelPhase::process_batches(Arc::clone(&self), iter.into_generator());
+            parallel_scan_metadata(generator, span.clone())
+        })
+    }
+
+    async fn scan_metadata_with_channel(
+        self: Arc<Self>,
+        channel: &Channel,
+        leaf_files: Vec<FileMeta>,
+    ) -> KernelResult<ParallelScanMetadata> {
+        let span = parallel_scan_span();
+        let read_schema = self.file_read_schema();
+        let generator = ParallelPhase::try_new_with_channel(channel, self, leaf_files, read_schema)
+            .instrument(span.clone())
+            .await?;
+        Ok(span.in_scope(|| parallel_scan_metadata(generator, span.clone())))
+    }
+
     /// Serialize the processor state for distributed processing.
     ///
     /// Returns a `SerializableScanState` containing all information needed to
@@ -222,7 +306,17 @@ impl ParallelState {
         engine: &dyn Engine,
         state: SerializableScanState,
     ) -> KernelResult<Self> {
-        let inner = ScanLogReplayProcessor::from_serializable_state(engine, state)?;
+        run_workflow_with_engine!(engine, |channel| {
+            Self::from_serializable_state_with_channel(channel, state)
+        })
+    }
+
+    pub(crate) async fn from_serializable_state_with_channel(
+        channel: &Channel,
+        state: SerializableScanState,
+    ) -> KernelResult<Self> {
+        let inner =
+            ScanLogReplayProcessor::from_serializable_state_with_channel(channel, state).await?;
         Ok(Self {
             inner,
             // Neither operation_id nor correlation_id survive the serialization boundary today; a
@@ -259,49 +353,63 @@ impl ParallelState {
     /// - `bytes`: The serialized bytes from a previous `into_bytes()` call
     #[allow(unused)]
     pub fn from_bytes(engine: &dyn Engine, bytes: &[u8]) -> KernelResult<Self> {
+        run_workflow_with_engine!(engine, |channel| {
+            Self::from_bytes_with_channel(channel, bytes)
+        })
+    }
+
+    /// Returns a workflow that reconstructs a ParallelState from bytes produced by
+    /// [`Self::into_bytes`].
+    pub fn from_bytes_workflow(bytes: &[u8]) -> Workflow<'_, Self> {
+        workflow!(|channel| Self::from_bytes_with_channel(channel, bytes))
+    }
+
+    async fn from_bytes_with_channel(channel: &Channel, bytes: &[u8]) -> KernelResult<Self> {
         let state: SerializableScanState =
             serde_json::from_slice(bytes).map_err(KernelError::MalformedJson)?;
-        Self::from_serializable_state(engine, state)
+        Self::from_serializable_state_with_channel(channel, state).await
     }
 }
 
-/// Parallel scan metadata iterator.
+type ParallelScanEngineIterator = EngineResultCoroutineIterator<'static, ScanMetadata>;
+
+/// Connector-driven processing of one partition of checkpoint files or pre-read batches.
+/// cbindgen:ignore
+pub type ParallelScanMetadata = StaticInstrumentedCoroutine<KernelResult<ScanMetadata>>;
+
+fn parallel_scan_span() -> Span {
+    // TODO: Associate the same scan ID from sequential phase to correlate phases.
+    info_span!("parallel_scan_metadata")
+}
+
+fn parallel_scan_metadata(
+    generator: impl KernelResultGenerator<ScanMetadata> + 'static,
+    span: Span,
+) -> ParallelScanMetadata {
+    let coroutine = StaticCoroutine::from_generator(generator);
+    ParallelScanMetadata::new(coroutine, span)
+}
+
+/// Engine-driven compatibility iterator for one partition of parallel scan metadata.
 pub struct ParallelScanMetadataIterator {
-    pub(crate) inner: Box<dyn KernelResultIterator<ScanMetadata>>,
+    inner: ParallelScanEngineIterator,
     span: Span,
 }
 
 impl ParallelScanMetadataIterator {
+    /// Creates an Engine-driven iterator over `leaf_files` using shared `state`.
     pub fn try_new(
         engine: Arc<dyn Engine>,
         state: Arc<ParallelState>,
         leaf_files: Vec<FileMeta>,
     ) -> KernelResult<Self> {
-        let read_schema = state.file_read_schema();
+        let connector = EngineConnector::new(engine.as_ref());
+        let stream = connector.drive(state.scan_metadata_workflow(leaf_files))?;
+        let (coroutine, span) = stream.into_parts();
         Ok(Self {
-            inner: Box::new(ParallelPhase::try_new(
-                engine,
-                state,
-                leaf_files,
-                read_schema,
-            )?),
-            // TODO: Associate the same scan ID from sequential phase to correlate phases
-            span: info_span!("parallel_scan_metadata"),
+            inner: connector.iterate_result_coroutine(coroutine),
+            span,
         })
-    }
-
-    pub fn new_from_iter(
-        state: Arc<ParallelState>,
-        iter: impl IntoIterator<Item = KernelResult<Box<dyn EngineData>>, IntoIter: Send + 'static>,
-    ) -> Self {
-        Self {
-            inner: Box::new(ParallelPhase::process_batches(
-                state.clone(),
-                iter.into_iter(),
-            )),
-            // TODO: Associate the same scan ID from sequential phase to correlate phases
-            span: info_span!("parallel_scan_metadata"),
-        }
     }
 }
 

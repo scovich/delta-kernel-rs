@@ -7,11 +7,11 @@ use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, Instrument as _};
 use url::Url;
 
 use self::data_skipping::as_checkpoint_skipping_predicate;
-use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
+use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter_with_channel};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
@@ -19,10 +19,13 @@ use crate::actions::{Add, ADD_FIELD, ADD_NAME, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
+use crate::coroutine::generator::{
+    map_async, AsyncIntoIterator as _, Generator, GeneratorExt as _,
+};
 use crate::coroutine::kernel::engine::EngineConnector;
 use crate::coroutine::kernel::{
-    run_workflow_with_storage, static_workflow, workflow, Channel, KernelResultGenerator,
-    StaticWorkflow,
+    run_workflow_with_storage, static_workflow, workflow, Channel, ChannelExt as _,
+    KernelResultGenerator, Request, StaticWorkflow, Workflow,
 };
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef};
@@ -34,7 +37,8 @@ use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegme
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
-use crate::parallel::sequential_phase::SequentialPhase;
+use crate::parallel::parallel_scan_metadata::{sequential_scan_metadata, sequential_scan_span};
+use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::plan::Plan;
 use crate::scan::log_replay::{
@@ -50,7 +54,7 @@ use crate::schema::{
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
-use crate::utils::{require, FoldWithOption as _, IteratorExt};
+use crate::utils::{require, FoldWithOption as _};
 use crate::{
     Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator, SnapshotRef,
     Version,
@@ -109,8 +113,8 @@ static PARALLEL_CHECKPOINT_READ_SCHEMA_NO_JSON_STATS: LazyLock<SchemaRef> = Lazy
 });
 #[allow(unused)]
 pub use crate::parallel::parallel_scan_metadata::{
-    AfterSequentialScanMetadata, ParallelScanMetadataIterator, ParallelState,
-    SequentialScanMetadataIterator,
+    AfterSequentialScanMetadata, ParallelScanMetadata, ParallelScanMetadataIterator, ParallelState,
+    SequentialScanMetadata, SequentialScanMetadataIterator,
 };
 
 /// Configures structured-stats output and JSON synthesis in scan metadata.
@@ -907,6 +911,9 @@ pub struct Scan {
     cancellation_token: Option<CancellationTokenRef>,
 }
 
+type ScanMetadataGenerator<'a> =
+    Box<dyn Generator<Request, Item = KernelResult<ScanMetadata>, Output = ()> + 'a>;
+
 /// Builds the consumer-visible stats schemas without predicate-only fields.
 fn build_stats_output_schemas(
     table_configuration: &TableConfiguration,
@@ -1069,8 +1076,26 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<impl KernelResultIterator<ScanMetadata>> {
-        let actions_with_checkpoint_info = self.replay_for_scan_metadata(engine)?;
-        self.scan_metadata_inner(engine, actions_with_checkpoint_info)
+        let connector =
+            EngineConnector::new(engine).with_cancellation_token(self.cancellation_token.clone());
+        connector.iterate_prepared_result_coroutine(self.scan_metadata_workflow())
+    }
+
+    #[internal_api]
+    pub(crate) fn scan_metadata_workflow(
+        &self,
+    ) -> Workflow<'_, impl KernelResultGenerator<ScanMetadata> + 'static> {
+        workflow!(|channel| self.scan_metadata_with_channel(channel))
+    }
+
+    async fn scan_metadata_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<impl KernelResultGenerator<ScanMetadata> + 'static> {
+        let actions_with_checkpoint_info =
+            self.replay_for_scan_metadata_with_channel(channel).await?;
+        self.scan_metadata_inner_with_channel(channel, actions_with_checkpoint_info)
+            .await
     }
 
     /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of
@@ -1129,8 +1154,41 @@ impl Scan {
         engine: &dyn Engine,
         existing_version: Version,
         existing_data: impl IntoIterator<Item = Box<dyn EngineData>, IntoIter: Send + 'static>,
-        _existing_predicate: Option<PredicateRef>,
+        existing_predicate: Option<PredicateRef>,
     ) -> KernelResult<Box<dyn KernelResultIterator<ScanMetadata>>> {
+        self.validate_scan_metadata_from_options()?;
+        let existing_data = existing_data.into_iter();
+        // Cached metadata bypasses engine handlers, so kernel must poll cancellation while
+        // consuming it.
+        let existing_data =
+            CancellableIterator::new(existing_data.map(Ok), self.cancellation_token.clone());
+        let connector =
+            EngineConnector::new(engine).with_cancellation_token(self.cancellation_token.clone());
+        let result =
+            connector.iterate_prepared_result_coroutine(self.scan_metadata_from_workflow(
+                existing_version,
+                existing_data.into_generator(),
+                existing_predicate,
+            ))?;
+        Ok(Box::new(result))
+    }
+
+    #[internal_api]
+    pub(crate) fn scan_metadata_from_workflow(
+        &self,
+        existing_version: Version,
+        existing_data: impl KernelResultGenerator<Box<dyn EngineData>> + 'static,
+        existing_predicate: Option<PredicateRef>,
+    ) -> Workflow<'_, ScanMetadataGenerator<'static>> {
+        workflow!(|channel| self.scan_metadata_from_with_channel(
+            channel,
+            existing_version,
+            existing_data,
+            existing_predicate
+        ))
+    }
+
+    fn validate_scan_metadata_from_options(&self) -> KernelResult<()> {
         // TODO(#3609): scan_metadata_from does not reuse existing partitionValues_parsed
         // from compatible checkpoints. Support reusing those values and enable connector-supplied
         // timezone support.
@@ -1144,13 +1202,18 @@ impl Scan {
                  tables with TIMESTAMP partition columns; use scan_metadata instead"
             )
         );
-        // TODO(#966): validate that the current predicate is compatible with the hint predicate.
-        let existing_data = existing_data.into_iter();
-        // Cached metadata bypasses engine handlers, so kernel must poll cancellation while
-        // consuming it.
-        let existing_data =
-            CancellableIterator::new(existing_data.map(Ok), self.cancellation_token.clone());
+        Ok(())
+    }
 
+    async fn scan_metadata_from_with_channel(
+        &self,
+        channel: &Channel,
+        existing_version: Version,
+        existing_data: impl KernelResultGenerator<Box<dyn EngineData>> + 'static,
+        _existing_predicate: Option<PredicateRef>,
+    ) -> KernelResult<ScanMetadataGenerator<'static>> {
+        self.validate_scan_metadata_from_options()?;
+        // TODO(#966): validate that the current predicate is compatible with the hint predicate.
         if existing_version > self.snapshot.version() {
             return Err(KernelError::Generic(format!(
                 "existing_version {} is greater than current version {}",
@@ -1164,14 +1227,16 @@ impl Scan {
         // we treat it as if it originated from a checkpoint.
         // TODO(#3263): Existing data may contain `stats_parsed` and `partitionValues_parsed`;
         // provide its full schema to the evaluator.
-        let transform = engine.evaluation_handler().new_expression_evaluator(
-            scan_row_schema(),
-            get_scan_metadata_transform_expr(),
-            restored_add_schema().clone().into(),
-        )?;
-        let apply_transform = move |data: KernelResult<Box<dyn EngineData>>| {
+        let transform = channel
+            .create_expression_evaluator(
+                scan_row_schema(),
+                get_scan_metadata_transform_expr(),
+                restored_add_schema().clone().into(),
+            )
+            .await?;
+        let apply_transform = async move |channel: &Channel, data| {
             let data = data?;
-            let data = transform.evaluate(data.as_ref())?;
+            let data = channel.evaluate_expression(&transform, data).await?;
             Ok(ActionsBatch::new(data, false))
         };
 
@@ -1182,7 +1247,7 @@ impl Scan {
         // Since we're only processing existing data (no checkpoint), we use the base schema
         // and no stats_parsed optimization.
         if existing_version == self.snapshot.version() {
-            let actions = existing_data.map(apply_transform);
+            let actions = map_async!(existing_data, apply_transform);
             let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
                 actions,
                 checkpoint_info: CheckpointReadInfo {
@@ -1192,7 +1257,8 @@ impl Scan {
                 },
             };
             return Ok(Box::new(
-                self.scan_metadata_inner(engine, actions_with_checkpoint_info)?,
+                self.scan_metadata_inner_with_channel(channel, actions_with_checkpoint_info)
+                    .await?,
             ));
         }
 
@@ -1202,7 +1268,7 @@ impl Scan {
         // TODO: we may be able to apply heuristics or other logic to try and fetch missing deltas
         // from the log.
         if matches!(log_segment.checkpoint_version, Some(v) if v > existing_version) {
-            return Ok(Box::new(self.scan_metadata(engine)?));
+            return Ok(Box::new(self.scan_metadata_with_channel(channel).await?));
         }
 
         // create a new log segment containing only the commits added after the version hint.
@@ -1224,18 +1290,18 @@ impl Scan {
         // checkpoint schema returned by the function for consistency.
         let (checkpoint_schema, meta_predicate, physical_stats_read_schema) =
             self.checkpoint_read_options();
-        let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
-            engine,
+        let result = new_log_segment.read_actions_with_projected_checkpoint_actions_with_channel(
+            channel,
             COMMIT_READ_SCHEMA.clone(),
             checkpoint_schema,
             meta_predicate,
             physical_stats_read_schema,
             None,
-            self.cancellation_token.as_ref(),
-        )?;
+        );
+        let result = result.await?;
         // Only the cached suffix needs a kernel-side check. The engine owns cancellation for the
         // newly read action prefix.
-        let existing_actions = existing_data.map(apply_transform);
+        let existing_actions = map_async!(existing_data, apply_transform);
         let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
             actions: result.actions.chain(existing_actions),
             checkpoint_info: CheckpointReadInfo {
@@ -1245,44 +1311,45 @@ impl Scan {
             },
         };
 
-        Ok(Box::new(self.scan_metadata_inner(
-            engine,
-            actions_with_checkpoint_info,
-        )?))
+        Ok(Box::new(
+            self.scan_metadata_inner_with_channel(channel, actions_with_checkpoint_info)
+                .await?,
+        ))
     }
 
-    fn scan_metadata_inner(
+    async fn scan_metadata_inner_with_channel<'a>(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         actions_with_checkpoint_info: ActionsWithCheckpointInfo<
-            impl KernelResultIterator<ActionsBatch>,
+            impl KernelResultGenerator<ActionsBatch> + 'a,
         >,
-    ) -> KernelResult<impl KernelResultIterator<ScanMetadata>> {
+    ) -> KernelResult<impl KernelResultGenerator<ScanMetadata> + 'a> {
         let start = Instant::now();
         let operation_id = MetricId::new();
         let is_catalog_managed = self.snapshot.table_configuration().is_catalog_managed();
         let correlation_id = self.correlation_id.clone();
 
-        let (iter, metrics) = match self.state_info.physical_predicate {
+        let (it, m) = match self.state_info.physical_predicate {
             PhysicalPredicate::StaticSkipAll => {
                 info!("Predicate statically evaluated to false; skipping all files");
                 (None, Arc::new(ScanMetrics::default()))
             }
             _ => {
-                let (it, m) = scan_action_iter(
-                    engine,
+                let (it, m) = scan_action_iter_with_channel(
+                    channel,
                     actions_with_checkpoint_info.actions,
                     self.state_info.clone(),
                     actions_with_checkpoint_info.checkpoint_info,
                     self.stats_options(),
                     self.partition_values_options(),
-                )?;
+                )
+                .await?;
                 (Some(it), m)
             }
         };
 
         let on_complete = move || {
-            let event = metrics.to_event(
+            let event = m.to_event(
                 operation_id,
                 is_catalog_managed,
                 correlation_id,
@@ -1292,7 +1359,8 @@ impl Scan {
             info!(%event);
             emit_scan_metadata_completed(&event);
         };
-        Ok(iter.into_iter().flatten().on_complete(on_complete))
+        let it = it.into_generator().flatten_async();
+        Ok(it.on_complete(on_complete))
     }
 
     #[cfg(feature = "declarative-plans")]
@@ -1349,6 +1417,7 @@ impl Scan {
     }
 
     // Factored out to facilitate testing
+    #[cfg(test)]
     fn replay_for_scan_metadata(
         &self,
         engine: &dyn Engine,
@@ -1516,6 +1585,43 @@ impl Scan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> KernelResult<SequentialScanMetadataIterator> {
+        let connector = EngineConnector::new(engine.as_ref());
+        let span = sequential_scan_span();
+        let workflow =
+            span.in_scope(|| workflow!(|channel| self.parallel_scan_metadata_generator(channel)));
+        let sequential = connector.drive(workflow)?;
+        Ok(SequentialScanMetadataIterator::new(
+            connector,
+            sequential,
+            self.correlation_id.clone(),
+            span,
+        ))
+    }
+
+    #[internal_api]
+    pub(crate) fn parallel_scan_metadata_workflow(&self) -> Workflow<'_, SequentialScanMetadata> {
+        workflow!(async move |channel| {
+            let span = sequential_scan_span();
+            let body_span = span.clone();
+            async move {
+                let sequential = self.parallel_scan_metadata_generator(channel).await?;
+                Ok(sequential_scan_metadata(
+                    sequential,
+                    self.correlation_id.clone(),
+                    body_span,
+                ))
+            }
+            .instrument(span)
+            .await
+        })
+    }
+
+    async fn parallel_scan_metadata_generator(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<
+        impl KernelResultGenerator<ScanMetadata, KernelResult<AfterSequential>> + 'static,
+    > {
         // The scan token is not carried across distributed phases.
         if self.cancellation_token.is_some() {
             return Err(KernelError::unsupported(
@@ -1547,24 +1653,23 @@ impl Scan {
             has_partition_values_parsed: false,
             checkpoint_read_schema: checkpoint_read_schema.clone(),
         };
-        let processor = ScanLogReplayProcessor::new(
-            engine.as_ref(),
+        let processor = ScanLogReplayProcessor::new_with_channel(
+            channel,
             self.state_info.clone(),
             checkpoint_info,
             self.stats_options(),
             self.partition_values_options(),
-        )?;
-        let sequential = SequentialPhase::try_new(
+        )
+        .await?;
+        let sequential = SequentialPhase::try_new_with_channel(
+            channel,
             processor,
             self.snapshot.log_segment(),
-            engine.clone(),
             checkpoint_read_schema,
-        )?;
+        )
+        .await?;
 
-        Ok(SequentialScanMetadataIterator::new(
-            sequential,
-            self.correlation_id.clone(),
-        ))
+        Ok(sequential)
     }
 
     /// Perform an "all in one" scan. This will use the provided `engine` to read and process all

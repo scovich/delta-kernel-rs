@@ -1,31 +1,41 @@
 //! Parallel phase of log replay - processes checkpoint leaf files (sidecars or multi-part parts).
 //!
 //! This phase runs after [`SequentialPhase`] completes and is designed for parallel execution.
-//! Partition the leaf files across executors and create one `ParallelPhase` per partition.
+//! Partition the leaf files across executors and use `ParallelPhase` to create one generator per
+//! partition.
 //!
 //! [`SequentialPhase`]: super::sequential_phase::SequentialPhase
 #![allow(unused)]
 
+#[cfg(test)]
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 
+use crate::coroutine::generator::{map_async, GeneratorExt as _};
+#[cfg(test)]
+use crate::coroutine::kernel::engine::{EngineConnector, EngineResultCoroutineIterator};
+#[cfg(test)]
+use crate::coroutine::kernel::workflow;
+use crate::coroutine::kernel::{Channel, ChannelExt as _, KernelResultGenerator};
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::scan::CHECKPOINT_READ_SCHEMA;
 use crate::schema::SchemaRef;
-use crate::{Engine, EngineData, FileMeta, KernelResult, KernelResultIterator};
+#[cfg(test)]
+use crate::Engine;
+use crate::{EngineData, FileMeta, KernelResult};
 
-/// Creates iterators that process checkpoint leaf files in parallel using a shared processor.
+/// Creates generators that process checkpoint leaf files in parallel using a shared processor.
 ///
-/// Checkpoint leaf files may be partitioned across multiple executors. Each executor creates an
-/// iterator with a subset of files, but all iterators share the same processor to coordinate
+/// Checkpoint leaf files may be partitioned across multiple executors. Each executor creates a
+/// generator with a subset of files, but all generators share the same processor to coordinate
 /// deduplication.
 ///
 /// # Example workflow
 /// - Partition leaf files across N executors
-/// - Create one iterator per executor with its file subset
-/// - Each iterator processes its files independently while sharing deduplication state
+/// - Create one generator per executor with its file subset
+/// - Each generator processes its files independently while sharing deduplication state
 /// cbindgen:ignore
 #[internal_api]
 pub(crate) struct ParallelPhase;
@@ -38,21 +48,40 @@ impl ParallelPhase {
     /// - `processor`: Shared processor (wrap in `Arc` for distribution across executors)
     /// - `leaf_files`: Checkpoint leaf files (sidecars or multi-part checkpoint parts)
     /// - `read_schema`: Schema to use for reading checkpoint files
-    #[internal_api]
-    #[allow(unused)]
+    #[cfg(test)]
     pub(crate) fn try_new<P>(
         engine: Arc<dyn Engine>,
         processor: P,
         leaf_files: Vec<FileMeta>,
         read_schema: SchemaRef,
-    ) -> KernelResult<impl KernelResultIterator<P::Output>>
+    ) -> KernelResult<EngineResultCoroutineIterator<'static, P::Output>>
     where
-        P: ParallelLogReplayProcessor + Send,
+        P: ParallelLogReplayProcessor + Send + Sync + 'static,
+        P::Output: Send + 'static,
     {
-        let batches =
-            engine
-                .parquet_handler()
-                .read_parquet_files(&leaf_files, read_schema, None)?;
+        let connector = EngineConnector::new(engine.as_ref());
+        let workflow = workflow!(|channel| Self::try_new_with_channel(
+            channel,
+            processor,
+            leaf_files,
+            read_schema
+        ));
+        connector.iterate_prepared_result_coroutine(workflow)
+    }
+
+    pub(crate) async fn try_new_with_channel<P>(
+        channel: &Channel,
+        processor: P,
+        leaf_files: Vec<FileMeta>,
+        read_schema: SchemaRef,
+    ) -> KernelResult<impl KernelResultGenerator<P::Output> + 'static>
+    where
+        P: ParallelLogReplayProcessor + Send + Sync + 'static,
+        P::Output: Send + 'static,
+    {
+        let batches = channel
+            .prepare_parquet_files(leaf_files, read_schema, None)
+            .await?;
         Ok(Self::process_batches(processor, batches))
     }
 
@@ -62,14 +91,17 @@ impl ParallelPhase {
     /// finer-grained parallelism. Shared processors coordinate deduplication across partitions.
     pub(crate) fn process_batches<P>(
         processor: P,
-        batches: impl KernelResultIterator<Box<dyn EngineData>>,
-    ) -> impl KernelResultIterator<P::Output>
+        batches: impl KernelResultGenerator<Box<dyn EngineData>> + 'static,
+    ) -> impl KernelResultGenerator<P::Output> + 'static
     where
-        P: ParallelLogReplayProcessor + Send,
+        P: ParallelLogReplayProcessor + Send + Sync + 'static,
+        P::Output: Send + 'static,
     {
-        batches.map(move |batch| {
+        map_async!(batches, async move |channel, batch| {
             let batch = ActionsBatch::new(batch?, false);
-            processor.process_actions_batch_parallel(batch)
+            processor
+                .process_actions_batch_parallel(channel, batch)
+                .await
         })
     }
 

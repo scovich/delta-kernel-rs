@@ -7,6 +7,8 @@ use tracing::{debug, error};
 
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
+use crate::coroutine::kernel::request::{ExpressionEvaluatorHandle, PredicateEvaluatorHandle};
+use crate::coroutine::kernel::{Channel, ChannelExt as _};
 use crate::expressions::{
     col, column_name, column_pred, lit, BinaryPredicateOp, ColumnName, Expression as Expr,
     ExpressionRef, JunctionPredicateOp, MapToStructOptions, OpaquePredicateOpRef,
@@ -21,10 +23,7 @@ use crate::scan::metrics::ScanMetrics;
 use crate::schema::{lazy_schema_ref, schema_ref, DataType, PrimitiveType, SchemaRef};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
-use crate::{
-    Engine, EngineData, ExpressionEvaluator, KernelError, KernelResult, PredicateEvaluator,
-    RowVisitor as _,
-};
+use crate::{EngineData, KernelError, KernelResult, RowVisitor as _};
 
 pub(crate) mod stats_schema;
 #[cfg(test)]
@@ -96,9 +95,9 @@ pub(crate) struct DataSkippingFilter {
     ///   batch (where `add.*` fields are flattened to top-level columns).
     /// - Table changes path: `Expression::parse_json(col!("add.stats"), schema)` parses JSON from
     ///   a raw action batch (where stats are nested under `add.stats`).
-    stats_evaluator: Arc<dyn ExpressionEvaluator>,
-    skipping_evaluator: Arc<dyn PredicateEvaluator>,
-    filter_evaluator: Arc<dyn PredicateEvaluator>,
+    stats_evaluator: ExpressionEvaluatorHandle,
+    skipping_evaluator: PredicateEvaluatorHandle,
+    filter_evaluator: PredicateEvaluatorHandle,
     /// Metrics to record data skipping statistics.
     metrics: Option<Arc<ScanMetrics>>,
 }
@@ -111,7 +110,7 @@ impl DataSkippingFilter {
     /// but using an `Option` lets the engine easily avoid the overhead of applying trivial filters.
     ///
     /// # Parameters
-    /// - `engine`: Engine for creating evaluators
+    /// - `channel`: Connector channel for creating evaluators
     /// - `predicate`: Optional predicate for data skipping
     /// - `stats_schema`: The data stats schema (numRecords, nullCount, minValues, maxValues). Pass
     ///   `None` if no data stats are available.
@@ -128,15 +127,16 @@ impl DataSkippingFilter {
     ///   non-file rows (e.g. `path IS NOT NULL` against a transformed batch, or `add.path IS NOT
     ///   NULL` against a raw action batch). Used to guard partition predicates and opaque-predicate
     ///   rewrites so non-Add rows are never filtered out.
-    /// - `input_schema`: Schema of the batch that will be passed to [`apply()`](Self::apply)
+    /// - `input_schema`: Schema of the batch that will be passed to
+    ///   [`apply_with_channel`](Self::apply_with_channel)
     /// - `stats_columns`: Physical leaf paths whose stats are in `stats_schema`. References to
     ///   other data columns fold to NULL (keeping the file). Must line up with `stats_schema` --
     ///   otherwise the rewritten predicate references columns the unified schema doesn't have and
     ///   evaluator construction fails.
     /// - `metrics`: Optional metrics to record data skipping statistics.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        engine: &dyn Engine,
+    pub(crate) async fn new_with_channel(
+        channel: &Channel,
         predicate: Option<PredicateRef>,
         stats_schema: Option<&SchemaRef>,
         stats_expr: ExpressionRef,
@@ -167,13 +167,13 @@ impl DataSkippingFilter {
                 is_add_expr,
             )?;
 
-        let stats_evaluator = engine
-            .evaluation_handler()
-            .new_expression_evaluator(
+        let stats_evaluator = channel
+            .create_expression_evaluator(
                 input_schema,
                 unified_expr,
                 unified_schema.as_ref().clone().into(),
             )
+            .await
             .inspect_err(|e| error!("Failed to create stats evaluator: {e}"))
             .ok()?;
 
@@ -190,9 +190,8 @@ impl DataSkippingFilter {
         //
         // 3. The selection evaluator does DISTINCT(col(predicate), 'false') to produce true (=
         //    keep) when the predicate is true/null and false (= skip) when the predicate is false.
-        let skipping_evaluator = engine
-            .evaluation_handler()
-            .new_predicate_evaluator(
+        let skipping_evaluator = channel
+            .create_predicate_evaluator(
                 unified_schema.clone(),
                 Arc::new(as_sql_data_skipping_predicate_with_stats_columns(
                     &predicate,
@@ -200,14 +199,15 @@ impl DataSkippingFilter {
                     stats_columns,
                 )?),
             )
+            .await
             .inspect_err(|e| error!("Failed to create skipping evaluator: {e}"))
             .ok()?;
 
         // The filter evaluator operates on the skipping evaluator's output, which is a single
         // boolean column named "output" (not the unified stats schema).
-        let filter_evaluator = engine
-            .evaluation_handler()
-            .new_predicate_evaluator(FILTER_SCHEMA.clone(), FILTER_PRED.clone())
+        let filter_evaluator = channel
+            .create_predicate_evaluator(FILTER_SCHEMA.clone(), FILTER_PRED.clone())
+            .await
             .inspect_err(|e| error!("Failed to create filter evaluator: {e}"))
             .ok()?;
 
@@ -238,13 +238,14 @@ impl DataSkippingFilter {
     /// change-data-feed path rely on this so tombstones survive a non-matching predicate.
     ///
     /// # Parameters
-    /// - `engine`: Engine for creating evaluators.
+    /// - `channel`: Connector channel for creating evaluators.
     /// - `physical_predicate`: The predicate, already lowered to physical column names.
     /// - `table_configuration`: Source of the stats schema, partition schema, and stats-column
     ///   gate.
-    /// - `input_schema`: Schema of the raw action batches passed to [`apply()`](Self::apply).
-    pub(crate) fn for_raw_action_batch(
-        engine: &dyn Engine,
+    /// - `input_schema`: Schema of the raw action batches passed to
+    ///   [`apply_with_channel`](Self::apply_with_channel).
+    pub(crate) async fn for_raw_action_batch_with_channel(
+        channel: &Channel,
         physical_predicate: PredicateRef,
         table_configuration: &TableConfiguration,
         input_schema: SchemaRef,
@@ -278,8 +279,8 @@ impl DataSkippingFilter {
             MapToStructOptions::default(),
         ));
         let is_add_expr = Arc::new(Pred::is_not_null(col!("add.path")).into());
-        Self::new(
-            engine,
+        Self::new_with_channel(
+            channel,
             Some(physical_predicate),
             Some(&physical_stats_read_schema),
             stats_expr,
@@ -290,6 +291,7 @@ impl DataSkippingFilter {
             &physical_stats_columns,
             None,
         )
+        .await
     }
 
     /// Builds the unified schema and extraction expression from separate data stats and partition
@@ -366,11 +368,17 @@ impl DataSkippingFilter {
 
     /// Apply the DataSkippingFilter to an EngineData batch. Returns a selection vector
     /// which can be applied to the batch to find rows that passed data skipping.
-    pub(crate) fn apply(&self, batch: &dyn EngineData) -> KernelResult<Vec<bool>> {
+    pub(crate) async fn apply_with_channel(
+        &self,
+        channel: &Channel,
+        batch: &dyn EngineData,
+    ) -> KernelResult<Vec<bool>> {
         let start_time = Instant::now();
         let batch_len = batch.len();
 
-        let file_stats = self.stats_evaluator.evaluate(batch)?;
+        let file_stats = channel
+            .evaluate_expression(&self.stats_evaluator, batch.clone_data())
+            .await?;
         require!(
             file_stats.len() == batch_len,
             KernelError::internal_error(format!(
@@ -380,7 +388,9 @@ impl DataSkippingFilter {
             ))
         );
 
-        let skipping_predicate = self.skipping_evaluator.evaluate(&*file_stats)?;
+        let skipping_predicate = channel
+            .evaluate_predicate(&self.skipping_evaluator, file_stats)
+            .await?;
         require!(
             skipping_predicate.len() == batch_len,
             KernelError::internal_error(format!(
@@ -390,9 +400,9 @@ impl DataSkippingFilter {
             ))
         );
 
-        let selection_vector = self
-            .filter_evaluator
-            .evaluate(skipping_predicate.as_ref())?;
+        let selection_vector = channel
+            .evaluate_predicate(&self.filter_evaluator, skipping_predicate)
+            .await?;
         debug_assert_eq!(selection_vector.len(), batch_len);
         require!(
             selection_vector.len() == batch_len,

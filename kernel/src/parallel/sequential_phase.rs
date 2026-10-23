@@ -9,11 +9,14 @@
 //! the checkpoint parts for parallel processing.
 #![allow(unused)]
 
-use std::sync::Arc;
+use std::future::poll_fn;
+use std::pin::Pin;
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 
+use crate::coroutine::generator::{generator_fn, BoundGenerator, GeneratorStep};
+use crate::coroutine::kernel::{Channel, ChannelExt as _, KernelResultGenerator};
 use crate::log_reader::checkpoint_manifest::CheckpointManifestReader;
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
@@ -21,58 +24,21 @@ use crate::scan::log_replay::ScanLogReplayProcessor;
 use crate::scan::{ScanMetadata, COMMIT_READ_SCHEMA};
 use crate::schema::SchemaRef;
 use crate::utils::require;
-use crate::{Engine, FileMeta, KernelError, KernelResult, KernelResultIterator};
+use crate::{FileMeta, KernelError, KernelResult};
 
-/// Sequential log replay processor for parallel execution.
-///
-/// This iterator processes log replay sequentially:
-/// 1. Commit files (JSON)
-/// 2. Manifest (single-part checkpoint, if present)
-///
-/// After exhaustion, call `finish()` to extract:
-/// - The processor (for serialization and distribution)
-/// - Files (sidecars or multi-part checkpoint parts) for parallel processing
-///
-/// # Example
-///
-/// ```ignore
-/// let mut sequential =
-///     SequentialPhase::try_new(processor, log_segment, engine, checkpoint_read_schema)?;
-///
-/// // Iterate over sequential batches
-/// for batch in sequential.by_ref() {
-///     let metadata = batch?;
-///     // Process metadata
-/// }
-///
-/// // Extract processor and files for distribution (if needed)
-/// match sequential.finish()? {
-///     AfterSequential::Parallel { processor, files } => {
-///         // Parallel phase needed - distribute files for parallel processing.
-///         // If crossing the network boundary, the processor must be serialized.
-///         let serialized = processor.serialize()?;
-///         let partitions = partition_files(files, num_workers);
-///         for (worker, partition) in partitions {
-///             worker.send(serialized.clone(), partition)?;
-///         }
-///     }
-///     AfterSequential::Done(processor) => {
-///         // No parallel phase needed - all processing complete sequentially
-///         println!("Log replay complete");
-///     }
-/// }
-/// ```
+/// State carried while commits and an optional checkpoint manifest replay sequentially.
 /// cbindgen:ignore
 #[internal_api]
-pub(crate) struct SequentialPhase<C, M> {
+pub(crate) struct SequentialPhase<C = (), M = ()> {
     // The processor that will be used to process the action batches
     processor: ScanLogReplayProcessor,
     // Commit action batches, exhausted before the checkpoint manifest
     commit_phase: Option<C>,
-    // The checkpoint manifest reader that will be used to read the checkpoint manifest files.
-    // If the checkpoint is single-part, this will be Some(CheckpointManifestReader).
+    // The checkpoint manifest generator for a single-part checkpoint
     checkpoint_manifest_phase: Option<M>,
-    // Whether the iterator has been fully exhausted
+    // Terminal sidecar output, populated when checkpoint_manifest_phase completes
+    checkpoint_manifest_output: Option<KernelResult<Vec<FileMeta>>>,
+    // Whether the sequential state has been fully exhausted
     is_finished: bool,
     // Checkpoint parts for potential parallel phase processing
     checkpoint_parts: Vec<FileMeta>,
@@ -91,34 +57,32 @@ pub(crate) enum AfterSequential {
     },
 }
 
-impl SequentialPhase<Box<dyn KernelResultIterator<ActionsBatch>>, CheckpointManifestReader> {
-    /// Create a new sequential phase log replay.
-    ///
-    /// # Parameters
-    /// - `processor`: The log replay processor
-    /// - `log_segment`: The log segment to process
-    /// - `engine`: Engine for reading files
-    /// - `checkpoint_read_schema`: Schema for checkpoint manifests and leaf files
-    #[internal_api]
-    pub(crate) fn try_new(
+impl SequentialPhase {
+    /// Prepares sequential replay whose terminal output carries any parallel work.
+    pub(crate) async fn try_new_with_channel(
+        channel: &Channel,
         processor: ScanLogReplayProcessor,
         log_segment: &LogSegment,
-        engine: Arc<dyn Engine>,
         checkpoint_read_schema: SchemaRef,
-    ) -> KernelResult<Self> {
-        let commit_phase: Option<Box<dyn KernelResultIterator<ActionsBatch>>> = Some(Box::new(
-            log_segment.read_commit_actions(engine.as_ref(), COMMIT_READ_SCHEMA.clone(), None)?,
-        ));
+    ) -> KernelResult<
+        impl KernelResultGenerator<ScanMetadata, KernelResult<AfterSequential>> + 'static,
+    > {
+        let commit_phase = log_segment
+            .read_commit_actions_generator(channel, COMMIT_READ_SCHEMA.clone())
+            .await?;
 
         // Concurrently start reading the checkpoint manifest. Only create a checkpoint manifest
         // reader if the checkpoint is single-part.
         let checkpoint_manifest_phase = match log_segment.listed.checkpoint_parts.as_slice() {
-            [single_part] => Some(CheckpointManifestReader::try_new(
-                engine,
-                single_part,
-                log_segment.log_root.clone(),
-                checkpoint_read_schema,
-            )?),
+            [single_part] => Some(
+                CheckpointManifestReader::try_new_generator(
+                    channel,
+                    single_part,
+                    log_segment.log_root.clone(),
+                    checkpoint_read_schema,
+                )
+                .await?,
+            ),
             _ => None,
         };
 
@@ -129,35 +93,34 @@ impl SequentialPhase<Box<dyn KernelResultIterator<ActionsBatch>>, CheckpointMani
             .map(|path| path.location.clone())
             .collect_vec();
 
-        Ok(Self {
+        let state = SequentialPhase {
             processor,
-            commit_phase,
+            commit_phase: Some(commit_phase),
             checkpoint_manifest_phase,
+            checkpoint_manifest_output: None,
             is_finished: false,
             checkpoint_parts,
-        })
+        };
+        Ok(generator_fn!(async move |channel| {
+            let mut state = state.bind(&channel);
+            while let Some(item) = state.advance(&channel).await? {
+                channel.yield_item(item).await?;
+            }
+            Ok(state.finish())
+        }))
     }
+}
 
-    /// Complete sequential phase and extract processor + files for distribution.
-    ///
-    /// Must be called after the iterator is exhausted.
-    ///
-    /// # Returns
-    /// - `Done`: All processing done sequentially - no parallel phase needed
-    /// - `Parallel`: Parallel phase needed. The resulting files may be processed in parallel.
-    ///
-    /// # Errors
-    /// Returns an error if called before iterator exhaustion.
-    #[internal_api]
-    pub(crate) fn finish(self) -> KernelResult<AfterSequential> {
+impl<C, M> SequentialPhase<C, M> {
+    fn finish(self) -> KernelResult<AfterSequential> {
         if !self.is_finished {
             return Err(KernelError::generic(
                 "Must exhaust iterator before calling finish()",
             ));
         }
 
-        let parallel_files = match self.checkpoint_manifest_phase {
-            Some(manifest_reader) => manifest_reader.extract_sidecars()?,
+        let parallel_files = match self.checkpoint_manifest_output {
+            Some(sidecars) => sidecars?,
             None => {
                 let parts = self.checkpoint_parts;
                 require!(
@@ -181,38 +144,83 @@ impl SequentialPhase<Box<dyn KernelResultIterator<ActionsBatch>>, CheckpointMani
             })
         }
     }
+    async fn next_action(&mut self) -> KernelResult<Option<KernelResult<ActionsBatch>>>
+    where
+        C: BoundGenerator<Item = KernelResult<ActionsBatch>, Output = ()> + Unpin,
+        M: BoundGenerator<Item = KernelResult<ActionsBatch>, Output = KernelResult<Vec<FileMeta>>>
+            + Unpin,
+    {
+        if let Some(commit_phase) = self.commit_phase.as_mut() {
+            match poll_fn(|context| Pin::new(&mut *commit_phase).poll_step(context)).await? {
+                GeneratorStep::Yield(result) => return Ok(Some(result)),
+                GeneratorStep::Done(()) => self.commit_phase = None,
+            }
+        }
 
-    fn next_action(&mut self) -> Option<KernelResult<ActionsBatch>> {
-        let next = self
-            .commit_phase
-            .as_mut()
-            .and_then(|commit_phase| commit_phase.next())
-            .or_else(|| {
-                self.commit_phase = None;
-                self.checkpoint_manifest_phase.as_mut()?.next()
-            });
+        if let Some(checkpoint_manifest_phase) = self.checkpoint_manifest_phase.as_mut() {
+            match poll_fn(|context| Pin::new(&mut *checkpoint_manifest_phase).poll_step(context))
+                .await?
+            {
+                GeneratorStep::Yield(result) => return Ok(Some(result)),
+                GeneratorStep::Done(output) => {
+                    self.checkpoint_manifest_phase = None;
+                    self.checkpoint_manifest_output = Some(output);
+                }
+            }
+        }
 
-        let Some(result) = next else {
-            self.is_finished = true;
-            return None;
-        };
-
-        Some(result)
+        self.is_finished = true;
+        Ok(None)
     }
 
-    fn advance(&mut self) -> Option<KernelResult<ScanMetadata>> {
-        let batch = self.next_action()?;
-        Some(batch.and_then(|batch| self.processor.process_actions_batch_sequential(batch)))
+    fn bind<'a>(
+        self,
+        channel: &'a Channel,
+    ) -> SequentialPhase<
+        impl BoundGenerator<Item = KernelResult<ActionsBatch>, Output = ()> + Unpin + 'a,
+        impl BoundGenerator<Item = KernelResult<ActionsBatch>, Output = KernelResult<Vec<FileMeta>>>
+            + Unpin
+            + 'a,
+    >
+    where
+        C: KernelResultGenerator<ActionsBatch> + 'a,
+        M: KernelResultGenerator<ActionsBatch, KernelResult<Vec<FileMeta>>> + 'a,
+    {
+        SequentialPhase {
+            processor: self.processor,
+            commit_phase: self.commit_phase.map(|phase| channel.bind(phase)),
+            checkpoint_manifest_phase: self
+                .checkpoint_manifest_phase
+                .map(|phase| channel.bind(phase)),
+            checkpoint_manifest_output: self.checkpoint_manifest_output,
+            is_finished: self.is_finished,
+            checkpoint_parts: self.checkpoint_parts,
+        }
     }
 }
 
-impl Iterator
-    for SequentialPhase<Box<dyn KernelResultIterator<ActionsBatch>>, CheckpointManifestReader>
+impl<C, M> SequentialPhase<C, M>
+where
+    C: BoundGenerator<Item = KernelResult<ActionsBatch>, Output = ()> + Unpin,
+    M: BoundGenerator<Item = KernelResult<ActionsBatch>, Output = KernelResult<Vec<FileMeta>>>
+        + Unpin,
 {
-    type Item = KernelResult<ScanMetadata>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.advance()
+    async fn advance(
+        &mut self,
+        channel: &Channel,
+    ) -> KernelResult<Option<KernelResult<ScanMetadata>>> {
+        let Some(batch) = self.next_action().await? else {
+            return Ok(None);
+        };
+        let metadata = match batch {
+            Ok(batch) => {
+                self.processor
+                    .process_actions_batch_sequential_with_channel(channel, batch)
+                    .await
+            }
+            Err(err) => Err(err),
+        };
+        Ok(Some(metadata))
     }
 }
 

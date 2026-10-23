@@ -314,6 +314,65 @@ fn flatten_yields_collection_elements_then_exhausts() {
 }
 
 #[test]
+fn flatten_async_preserves_output_and_runs_completion_callback() {
+    let completed = Arc::new(AtomicBool::new(false));
+    let callback_completed = Arc::clone(&completed);
+    let outer = generator_fn!(async move |channel| -> KernelResult<i32> {
+        channel.yield_item(vec![1, 2].into_generator()).await?;
+        channel.yield_item(vec![3].into_generator()).await?;
+        Ok(42)
+    });
+    let items = outer
+        .flatten_async()
+        .on_complete(move || callback_completed.store(true, Ordering::Relaxed));
+    let mut generator: StaticCoroutine<i32, i32> =
+        static_coroutine!(Request, async move |channel| {
+            channel.yield_from(items.bind(&channel)).await
+        });
+
+    for expected in [1, 2, 3] {
+        let CoroutineStep::Yield(item) = generator.try_advance().unwrap() else {
+            panic!("expected item");
+        };
+        assert_eq!(item, expected);
+        assert!(!completed.load(Ordering::Relaxed));
+    }
+    let CoroutineStep::Done(output) = generator.try_advance().unwrap() else {
+        panic!("expected completion");
+    };
+    assert_eq!(output, 42);
+    assert!(completed.load(Ordering::Relaxed));
+}
+
+#[test]
+fn flatten_ok_preserves_outer_errors_between_inner_generators() {
+    let first = vec![1, 2].into_generator();
+    let second = vec![3].into_generator();
+    let outer = [
+        Ok(first),
+        Err(KernelError::generic("outer failed")),
+        Ok(second),
+    ]
+    .into_generator();
+    let mut workflow = workflow!(async move |channel| {
+        let mut items = outer.flatten_ok::<_, i32>().bind(channel);
+        let mut output = Vec::new();
+        while let Some(item) = items.next().await? {
+            output.push(item);
+        }
+        Ok(output)
+    });
+
+    let WorkflowStep::Done(output) = workflow.try_advance().unwrap() else {
+        panic!("expected completion");
+    };
+    assert_eq!(output[0].as_ref().unwrap(), &1);
+    assert_eq!(output[1].as_ref().unwrap(), &2);
+    assert_eq!(output[3].as_ref().unwrap(), &3);
+    assert_result_error_with_message(output.into_iter().nth(2).unwrap(), "outer failed");
+}
+
+#[test]
 fn parent_intercepts_child_items_while_child_io_reaches_connector() {
     async fn parent(channel: &Channel) -> KernelResult<Vec<Bytes>> {
         let first = Url::parse("memory:///first")?;
@@ -491,9 +550,12 @@ fn engine_result_iterator_drives_generator_requests() {
     let mut iter = EngineConnector::new(&SyncEngine::new())
         .iterate_result_coroutine(Coroutine::from_generator(items));
 
+    assert!(!iter.is_complete());
     assert_eq!(iter.next().unwrap().unwrap(), 4);
     assert!(iter.next().unwrap().is_err());
     assert!(iter.next().is_none());
+    assert!(iter.is_complete());
+    iter.into_output().unwrap();
 }
 
 struct NumberPages;

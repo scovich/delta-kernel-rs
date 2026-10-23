@@ -33,7 +33,8 @@ use tracing::{error, Instrument as _, Span};
 
 pub use self::adapters::{
     empty, map_async_witness, unfold, AsyncIntoIterator, Chain, Enumerate, FilterMap, FilterOk,
-    Flatten, Iter, Map, MapAsync, MapAsyncWitness, MapOk, Peekable, Unfold,
+    Flatten, FlattenBy, FlattenIdent, FlattenResult, Iter, Map, MapAsync, MapAsyncWitness, MapOk,
+    OnComplete, Peekable, Unfold,
 };
 pub(crate) use self::adapters::{unfold_mut_with, unfold_mut_witness};
 use super::witness::invoke_witness;
@@ -65,6 +66,14 @@ pub trait GeneratorExt {
         FilterMap::new(self, Map::new(map))
     }
 
+    /// Invokes `on_complete` after successful generator completion.
+    fn on_complete<F>(self, on_complete: F) -> OnComplete<Self, F>
+    where
+        Self: Sized,
+    {
+        OnComplete::new(self, on_complete)
+    }
+
     /// Counterpart of [`itertools::Itertools::map_ok`]: transforms each successful yielded item.
     fn map_ok<F>(self, map: F) -> FilterMap<Self, MapOk<F>>
     where
@@ -93,6 +102,22 @@ pub trait GeneratorExt {
         W: for<'a> MapAsyncWitness<'a, P, F, Self::Item, U>,
     {
         MapAsync::new(self, mapper, witness)
+    }
+
+    /// Flattens inner generators, preserving this generator's completion value.
+    fn flatten_async<I, T>(self) -> FlattenBy<Self, FlattenIdent<I, T>>
+    where
+        Self: Sized,
+    {
+        FlattenBy::new(self)
+    }
+
+    /// Counterpart of `itertools::Itertools::flatten_ok`: flattens successful inner generators.
+    fn flatten_ok<I, T>(self) -> FlattenBy<Self, FlattenResult<I, T>>
+    where
+        Self: Sized,
+    {
+        FlattenBy::new(self)
     }
 
     /// Counterpart of [`Iterator::chain`]: yields every item of `self`, then every item of `other`.

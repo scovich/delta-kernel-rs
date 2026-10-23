@@ -99,6 +99,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use delta_kernel_derive::{internal_api, pub_macro};
+use tracing::{Instrument as _, Span};
 
 pub(crate) use self::async_ext::AsyncOption;
 #[doc(inline)]
@@ -198,6 +199,37 @@ pub struct Coroutine<'a, P: Send + 'static, Y: Send + 'a, O: Send + 'static = ()
 
 /// Independently driven coroutine that owns all captured state.
 pub type StaticCoroutine<P, Y, O = ()> = Coroutine<'static, P, Y, O>;
+
+/// Coroutine that enters one tracing span whenever it is advanced.
+pub struct InstrumentedCoroutine<'a, P: Send + 'static, Y: Send, O: Send + 'static = ()> {
+    inner: Coroutine<'a, P, Y, O>,
+    span: Span,
+}
+
+/// Instrumented coroutine that owns all captured state.
+pub type StaticInstrumentedCoroutine<P, Y, O = ()> = InstrumentedCoroutine<'static, P, Y, O>;
+
+impl<'a, P: Send + 'static, Y: Send + 'a, O: Send + 'static> InstrumentedCoroutine<'a, P, Y, O> {
+    /// Wraps `inner` so each advance occurs inside `span`.
+    pub fn new(inner: Coroutine<'a, P, Y, O>, span: Span) -> Self {
+        Self { inner, span }
+    }
+
+    /// Tries to advance to the next yielded item, request, or completion without waiting.
+    pub fn try_advance(&mut self) -> KernelResult<CoroutineStep<P, Y, O>> {
+        let _guard = self.span.enter();
+        self.inner.try_advance()
+    }
+
+    /// Advances asynchronously to the next yielded item, request, or completion.
+    pub async fn advance(&mut self) -> KernelResult<CoroutineStep<P, Y, O>> {
+        self.inner.advance().instrument(self.span.clone()).await
+    }
+
+    pub(crate) fn into_parts(self) -> (Coroutine<'a, P, Y, O>, Span) {
+        (self.inner, self.span)
+    }
+}
 
 impl<'a, P: Send + 'static, Y: Send + 'a, O: Send + 'static> Coroutine<'a, P, Y, O> {
     /// Construct a coroutine around an unpolled generator body.

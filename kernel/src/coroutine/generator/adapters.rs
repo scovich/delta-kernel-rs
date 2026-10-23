@@ -3,7 +3,7 @@
 use std::future::{poll_fn, Future};
 use std::ops::{AsyncFnMut, ControlFlow};
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 
 use super::{
     BoundGenerator, BoxedBoundGenerator, ChannelBinding, Generator, GeneratorExt, GeneratorStep,
@@ -289,6 +289,106 @@ where
     }
 }
 
+/// Invokes a callback when the inner generator completes successfully.
+///
+/// Dropping the bound generator before completion does not invoke the callback.
+pub struct OnComplete<G, F> {
+    inner: G,
+    on_complete: F,
+}
+
+impl<G, F> OnComplete<G, F> {
+    pub(super) fn new(inner: G, on_complete: F) -> Self {
+        Self { inner, on_complete }
+    }
+}
+
+struct BoundOnComplete<G, F: FnOnce()> {
+    inner: G,
+    on_complete: Option<F>,
+}
+
+impl<G: Unpin, F: FnOnce()> Unpin for BoundOnComplete<G, F> {}
+
+impl<G, F> GeneratorExt for OnComplete<G, F> {}
+
+impl<P, G, F> Generator<P> for OnComplete<G, F>
+where
+    P: Send + 'static,
+    G: Generator<P>,
+    F: FnOnce() + Send,
+{
+    type Item = G::Item;
+    type Output = G::Output;
+
+    fn bind_to<'a>(
+        self,
+        channel: ChannelBinding<'a, P>,
+    ) -> impl BoundGenerator<Item = G::Item, Output = G::Output> + Unpin + 'a
+    where
+        Self: 'a,
+        G::Item: 'a,
+    {
+        BoundOnComplete {
+            inner: self.inner.bind_to(channel),
+            on_complete: Some(self.on_complete),
+        }
+    }
+
+    fn bind_boxed<'a>(
+        self: Box<Self>,
+        channel: ChannelBinding<'a, P>,
+    ) -> BoxedBoundGenerator<'a, G::Item, G::Output>
+    where
+        Self: 'a,
+        G::Item: 'a,
+    {
+        Box::new((*self).bind_to(channel))
+    }
+}
+
+impl<G, F> BoundGenerator for BoundOnComplete<G, F>
+where
+    G: BoundGenerator + Unpin,
+    F: FnOnce() + Send,
+{
+    type Item = G::Item;
+    type Output = G::Output;
+
+    fn poll_step(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<KernelResult<GeneratorStep<G::Item, G::Output>>> {
+        let this = self.get_mut();
+        let result = ready!(Pin::new(&mut this.inner).poll_step(context));
+        let Some(on_complete) = this.on_complete.take() else {
+            return Poll::Ready(Err(KernelError::internal_error(
+                "on-complete generator advanced after completion",
+            )));
+        };
+        // Drop the callback on error, invoke it on completion, or retain it across yields.
+        if let Ok(step) = &result {
+            match step {
+                GeneratorStep::Done(_) => on_complete(),
+                GeneratorStep::Yield(_) => {
+                    this.on_complete = Some(on_complete);
+                }
+            }
+        }
+        Poll::Ready(result)
+    }
+}
+
+impl<G, F: FnOnce()> Drop for BoundOnComplete<G, F> {
+    fn drop(&mut self) {
+        if self.on_complete.is_some() {
+            tracing::debug!(
+                "OnComplete generator dropped before completion; completion callback not called"
+            );
+        }
+    }
+}
+
 /// Generator returned by [`BoundGenerator::enumerate`].
 // This struct's manual `impl Unpin` is conditional on `G: Unpin` and valid because it does not use
 // structural field pinning.
@@ -321,6 +421,169 @@ where
         let index = this.next;
         this.next += 1;
         Poll::Ready(Ok(GeneratorStep::Yield((index, item))))
+    }
+}
+
+/// Chooses whether flattening enters an inner generator or yields an outer item directly.
+pub enum FlattenAction<Inner, Yield> {
+    Enter(Inner),
+    Yield(Yield),
+}
+
+/// Classifies outer items and wraps items yielded by inner generators.
+pub trait FlattenPolicy {
+    type OuterItem: Send;
+    type Inner: Send;
+    type InnerItem: Send;
+    type Yield: Send;
+
+    fn classify(item: Self::OuterItem) -> FlattenAction<Self::Inner, Self::Yield>;
+    fn wrap_yield(item: Self::InnerItem) -> Self::Yield;
+}
+
+/// Treats every outer item as an inner generator and yields its items unchanged.
+pub struct FlattenIdent<I, T>(PhantomType<(I, T)>);
+
+impl<I: Send, T: Send> FlattenPolicy for FlattenIdent<I, T> {
+    type OuterItem = I;
+    type Inner = I;
+    type InnerItem = T;
+    type Yield = T;
+
+    fn classify(item: I) -> FlattenAction<I, T> {
+        FlattenAction::Enter(item)
+    }
+
+    fn wrap_yield(item: T) -> T {
+        item
+    }
+}
+
+/// Flattens successful inner generators while preserving outer errors as yielded items.
+pub struct FlattenResult<I, T>(PhantomType<(I, T)>);
+
+impl<I: Send, T: Send> FlattenPolicy for FlattenResult<I, T> {
+    type OuterItem = KernelResult<I>;
+    type Inner = I;
+    type InnerItem = T;
+    type Yield = KernelResult<T>;
+
+    fn classify(item: KernelResult<I>) -> FlattenAction<I, KernelResult<T>> {
+        match item {
+            Ok(inner) => FlattenAction::Enter(inner),
+            Err(err) => FlattenAction::Yield(Err(err)),
+        }
+    }
+
+    fn wrap_yield(item: T) -> KernelResult<T> {
+        Ok(item)
+    }
+}
+
+/// Flattens generator-valued items while preserving the outer generator's completion value.
+pub struct FlattenBy<G, Policy> {
+    outer: G,
+    _policy: PhantomType<Policy>,
+}
+
+impl<G, Policy> FlattenBy<G, Policy> {
+    pub(super) fn new(outer: G) -> Self {
+        Self {
+            outer,
+            _policy: PhantomType::default(),
+        }
+    }
+}
+
+impl<G, Policy> GeneratorExt for FlattenBy<G, Policy> {}
+
+impl<P, G, Policy> Generator<P> for FlattenBy<G, Policy>
+where
+    P: Send + 'static,
+    G: Generator<P, Item = Policy::OuterItem>,
+    Policy: FlattenPolicy,
+    Policy::Inner: Generator<P, Item = Policy::InnerItem, Output = ()>,
+{
+    type Item = Policy::Yield;
+    type Output = G::Output;
+
+    fn bind_to<'a>(
+        self,
+        channel: ChannelBinding<'a, P>,
+    ) -> impl BoundGenerator<Item = Policy::Yield, Output = G::Output> + Unpin + 'a
+    where
+        Self: 'a,
+        Policy::Yield: 'a,
+    {
+        BoundFlatten::<'_, P, _, Policy, _, _> {
+            outer: self.outer.bind_to(channel.clone()),
+            channel,
+            bind_inner: |inner: Policy::Inner, channel| inner.bind_to(channel),
+            inner: None,
+            _policy: PhantomType::default(),
+        }
+    }
+
+    fn bind_boxed<'a>(
+        self: Box<Self>,
+        channel: ChannelBinding<'a, P>,
+    ) -> BoxedBoundGenerator<'a, Policy::Yield, G::Output>
+    where
+        Self: 'a,
+        Policy::Yield: 'a,
+    {
+        Box::new((*self).bind_to(channel))
+    }
+}
+
+struct BoundFlatten<'a, P: 'static, G, Policy, F, B> {
+    outer: G,
+    channel: ChannelBinding<'a, P>,
+    bind_inner: F,
+    inner: Option<B>,
+    _policy: PhantomType<Policy>,
+}
+
+impl<P, G: Unpin, Policy, F, B: Unpin> Unpin for BoundFlatten<'_, P, G, Policy, F, B> {}
+
+impl<'a, P, G, Policy, F, B> BoundGenerator for BoundFlatten<'a, P, G, Policy, F, B>
+where
+    P: Send + 'static,
+    G: BoundGenerator<Item = Policy::OuterItem> + Unpin,
+    Policy: FlattenPolicy,
+    Policy::OuterItem: Send + 'a,
+    Policy::Inner: Send + 'a,
+    F: FnMut(Policy::Inner, ChannelBinding<'a, P>) -> B + Send,
+    B: BoundGenerator<Item = Policy::InnerItem, Output = ()> + Unpin,
+{
+    type Item = Policy::Yield;
+    type Output = G::Output;
+
+    fn poll_step(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<KernelResult<GeneratorStep<Policy::Yield, G::Output>>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(inner) = &mut this.inner {
+                match std::task::ready!(Pin::new(inner).poll_step(context)) {
+                    Ok(GeneratorStep::Yield(item)) => {
+                        return Poll::Ready(Ok(GeneratorStep::Yield(Policy::wrap_yield(item))));
+                    }
+                    Ok(GeneratorStep::Done(())) => this.inner = None,
+                    Err(err) => return Poll::Ready(Err(err)),
+                }
+            }
+
+            match Policy::classify(ready_yield!(Pin::new(&mut this.outer).poll_step(context))) {
+                FlattenAction::Enter(inner) => {
+                    this.inner = Some((this.bind_inner)(inner, this.channel.clone()));
+                }
+                FlattenAction::Yield(item) => {
+                    return Poll::Ready(Ok(GeneratorStep::Yield(item)));
+                }
+            }
+        }
     }
 }
 

@@ -3,7 +3,6 @@ use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -12,6 +11,18 @@ use super::metrics::ScanMetrics;
 use super::state_info::{ResolvedPhysicalStatsSchemas, StateInfo};
 use super::{PhysicalPredicate, ScanMetadata, COMMIT_READ_SCHEMA};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
+#[cfg(test)]
+use crate::coroutine::generator::AsyncIntoIterator as _;
+use crate::coroutine::generator::{map_async, GeneratorExt as _};
+#[cfg(test)]
+use crate::coroutine::kernel::engine::EngineConnector;
+use crate::coroutine::kernel::request::ExpressionEvaluatorHandle;
+#[cfg(test)]
+use crate::coroutine::kernel::workflow;
+use crate::coroutine::kernel::{
+    run_workflow_with_engine, Channel, ChannelExt as _, KernelResultGenerator,
+};
+use crate::coroutine::KernelFuture;
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
     col, column_expr_ref, column_name, null_lit, ColumnName, Expression, ExpressionRef,
@@ -33,7 +44,9 @@ use crate::schema::{
 use crate::struct_patch::{project_struct_preserving_nulls, ProjectionStructPatchBuilder};
 use crate::table_features::ColumnMappingMode;
 use crate::utils::{require, FoldWithOption as _};
-use crate::{Engine, ExpressionEvaluator, KernelError, KernelResult, KernelResultIterator};
+#[cfg(test)]
+use crate::KernelResultIterator;
+use crate::{Engine, KernelError, KernelResult};
 
 /// Read-time stats toggles consumed by [`ScanLogReplayProcessor`].
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -160,24 +173,24 @@ pub struct SerializableScanState {
 ///   those derived from projection or filters) are preserved and passed through to the engine,
 ///   which applies them as part of its scan execution logic.
 ///
-/// [`ScanLogReplayProcessor::process_actions_batch_sequential`] applies these steps to each batch
-/// of log actions and produces a [`ScanMetadata`] result. This result includes the transformed
-/// batch, a selection vector indicating which rows are valid, and any row-level transformation
-/// expressions that need to be applied to the selected rows.
+/// [`ScanLogReplayProcessor::process_actions_batch_sequential_with_channel`] applies these steps
+/// to each batch of log actions and produces a [`ScanMetadata`] result. This result includes the
+/// transformed batch, a selection vector indicating which rows are valid, and any row-level
+/// transformation expressions that need to be applied to the selected rows.
 #[allow(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)]
 pub struct ScanLogReplayProcessor {
     data_skipping_filter: Option<DataSkippingFilter>,
     /// StructPatch for log batches (commit files) - uses ParseJson for stats and MapToStruct
     /// for partition values
-    commit_transform: Arc<dyn ExpressionEvaluator>,
+    commit_transform: ExpressionEvaluatorHandle,
     /// StructPatch for checkpoint batches - reads pre-parsed stats_parsed and
     /// partitionValues_parsed directly when available, otherwise parses from raw columns
-    checkpoint_transform: Arc<dyn ExpressionEvaluator>,
+    checkpoint_transform: ExpressionEvaluatorHandle,
     /// Final metadata projection built when log replay starts.
     ///
     /// Batch processing applies it after data skipping and deduplication, so predicate-only fields
     /// remain available internally but are absent from returned `ScanMetadata`.
-    stats_output_projection: Option<Arc<dyn ExpressionEvaluator>>,
+    stats_output_projection: Option<ExpressionEvaluatorHandle>,
     state_info: Arc<StateInfo>,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
@@ -215,6 +228,7 @@ impl ScanLogReplayProcessor {
     const REMOVE_DV_START_INDEX: usize = 9; // Start position of remove deletion vector columns
 
     /// Create a new [`ScanLogReplayProcessor`] instance
+    #[cfg(test)]
     pub(crate) fn new(
         engine: &dyn Engine,
         state_info: Arc<StateInfo>,
@@ -222,15 +236,34 @@ impl ScanLogReplayProcessor {
         stats_options: ScanStatsOptions,
         partition_values_options: ScanPartitionValuesOptions,
     ) -> KernelResult<Self> {
+        run_workflow_with_engine!(engine, |channel| {
+            Self::new_with_channel(
+                channel,
+                state_info,
+                checkpoint_info,
+                stats_options,
+                partition_values_options,
+            )
+        })
+    }
+
+    pub(crate) async fn new_with_channel(
+        channel: &Channel,
+        state_info: Arc<StateInfo>,
+        checkpoint_info: CheckpointReadInfo,
+        stats_options: ScanStatsOptions,
+        partition_values_options: ScanPartitionValuesOptions,
+    ) -> KernelResult<Self> {
         let dedup_capacity = state_info.dedup_capacity_hint();
-        Self::new_with_seen_files(
-            engine,
+        Self::new_with_seen_files_with_channel(
+            channel,
             state_info,
             checkpoint_info,
             HashSet::with_capacity(dedup_capacity),
             stats_options,
             partition_values_options,
         )
+        .await
     }
 
     /// Create new [`ScanLogReplayProcessor`] with pre-populated seen_file_keys.
@@ -246,8 +279,29 @@ impl ScanLogReplayProcessor {
     /// - `stats_options`: Read-time stats options (see [`ScanStatsOptions`])
     /// - `partition_values_options`: Read-time partition value options (see
     ///   [`ScanPartitionValuesOptions`])
+    #[cfg(test)]
     pub(crate) fn new_with_seen_files(
         engine: &dyn Engine,
+        state_info: Arc<StateInfo>,
+        checkpoint_info: CheckpointReadInfo,
+        seen_file_keys: HashSet<FileActionKey>,
+        stats_options: ScanStatsOptions,
+        partition_values_options: ScanPartitionValuesOptions,
+    ) -> KernelResult<Self> {
+        run_workflow_with_engine!(engine, |channel| {
+            Self::new_with_seen_files_with_channel(
+                channel,
+                state_info,
+                checkpoint_info,
+                seen_file_keys,
+                stats_options,
+                partition_values_options,
+            )
+        })
+    }
+
+    pub(crate) async fn new_with_seen_files_with_channel(
+        channel: &Channel,
         state_info: Arc<StateInfo>,
         checkpoint_info: CheckpointReadInfo,
         seen_file_keys: HashSet<FileActionKey>,
@@ -298,11 +352,12 @@ impl ScanLogReplayProcessor {
             stats_schema_for_transform.clone(),
             partition_schema_for_transform.clone(),
         )?;
-        let stats_output_projection = build_stats_output_projection(
-            engine,
+        let stats_output_projection = build_stats_output_projection_with_channel(
+            channel,
             output_schema.clone(),
             state_info.physical_stats_output_schema().map(AsRef::as_ref),
-        )?;
+        )
+        .await?;
 
         // Create data skipping filter that reads stats_parsed and partitionValues_parsed
         // from the transformed batch. This avoids double JSON parsing -- the transform parses
@@ -314,8 +369,8 @@ impl ScanLogReplayProcessor {
         let data_skipping_filter = if skip_stats {
             None
         } else {
-            DataSkippingFilter::new(
-                engine,
+            DataSkippingFilter::new_with_channel(
+                channel,
                 physical_predicate.as_ref().map(|(p, _)| p.clone()),
                 stats_schema_for_transform.as_ref(),
                 column_expr_ref!("stats_parsed"),
@@ -328,36 +383,41 @@ impl ScanLogReplayProcessor {
                 &state_info.eligible_physical_stats_columns,
                 Some(metrics.clone()),
             )
+            .await
         };
 
         // Commit transform: parse JSON for stats, MapToStruct for partition values
-        let commit_transform = engine.evaluation_handler().new_expression_evaluator(
-            COMMIT_READ_SCHEMA.clone(),
-            get_add_transform_expr(
-                stats_schema_for_transform.clone(),
-                false, /* has_stats_parsed */
-                skip_stats,
-                synthesize_json,
-                partition_schema_for_transform.clone(),
-                false, /* has_partition_values_parsed */
-                timestamp_timezone_name,
-            ),
-            output_schema.clone().into(),
-        )?;
+        let commit_transform = channel
+            .create_expression_evaluator(
+                COMMIT_READ_SCHEMA.clone(),
+                get_add_transform_expr(
+                    stats_schema_for_transform.clone(),
+                    false, /* has_stats_parsed */
+                    skip_stats,
+                    synthesize_json,
+                    partition_schema_for_transform.clone(),
+                    false, /* has_partition_values_parsed */
+                    timestamp_timezone_name,
+                ),
+                output_schema.clone().into(),
+            )
+            .await?;
         // Checkpoint transform: read pre-parsed columns directly when available
-        let checkpoint_transform = engine.evaluation_handler().new_expression_evaluator(
-            checkpoint_read_schema,
-            get_add_transform_expr(
-                stats_schema_for_transform,
-                has_stats_parsed,
-                skip_stats,
-                synthesize_json,
-                partition_schema_for_transform,
-                has_partition_values_parsed,
-                timestamp_timezone_name,
-            ),
-            output_schema.into(),
-        )?;
+        let checkpoint_transform = channel
+            .create_expression_evaluator(
+                checkpoint_read_schema,
+                get_add_transform_expr(
+                    stats_schema_for_transform,
+                    has_stats_parsed,
+                    skip_stats,
+                    synthesize_json,
+                    partition_schema_for_transform,
+                    has_partition_values_parsed,
+                    timestamp_timezone_name,
+                ),
+                output_schema.into(),
+            )
+            .await?;
 
         Ok(Self {
             data_skipping_filter,
@@ -471,6 +531,15 @@ impl ScanLogReplayProcessor {
         engine: &dyn Engine,
         state: SerializableScanState,
     ) -> KernelResult<Self> {
+        run_workflow_with_engine!(engine, |channel| {
+            Self::from_serializable_state_with_channel(channel, state)
+        })
+    }
+
+    pub(crate) async fn from_serializable_state_with_channel(
+        channel: &Channel,
+        state: SerializableScanState,
+    ) -> KernelResult<Self> {
         // Deserialize internal state from json
         let internal_state: InternalScanState = serde_json::from_slice(&state.internal_state_blob)
             .map_err(KernelError::MalformedJson)?;
@@ -506,18 +575,20 @@ impl ScanLogReplayProcessor {
             dv_normalization_root: internal_state.dv_normalization_root,
         });
 
-        Self::new_with_seen_files(
-            engine,
+        Self::new_with_seen_files_with_channel(
+            channel,
             state_info,
             state.checkpoint_info,
             state.seen_file_keys,
             internal_state.stats_options,
             internal_state.partition_values_options,
         )
+        .await
     }
 
-    fn transform_and_data_skip(
+    async fn transform_and_data_skip_with_channel(
         &self,
+        channel: &Channel,
         actions: &dyn EngineData,
         is_log_batch: bool,
     ) -> KernelResult<(Box<dyn EngineData>, Vec<bool>)> {
@@ -527,7 +598,9 @@ impl ScanLogReplayProcessor {
             &self.checkpoint_transform
         };
         let start = std::time::Instant::now();
-        let transformed = transform.evaluate(actions);
+        let transformed = channel
+            .evaluate_expression(transform, actions.clone_data())
+            .await;
         self.metrics
             .add_action_transform_time_ns(start.elapsed().as_nanos() as u64);
         let transformed = transformed?;
@@ -540,7 +613,9 @@ impl ScanLogReplayProcessor {
             ))
         );
 
-        let selection_vector = self.build_selection_vector(transformed.as_ref())?;
+        let selection_vector = self
+            .build_selection_vector_with_channel(channel, transformed.as_ref())
+            .await?;
         require!(
             selection_vector.len() == actions.len(),
             KernelError::internal_error(format!(
@@ -552,18 +627,24 @@ impl ScanLogReplayProcessor {
         Ok((transformed, selection_vector))
     }
 
-    fn project_stats_output(
+    async fn project_stats_output_with_channel(
         &self,
+        channel: &Channel,
         transformed_actions: Box<dyn EngineData>,
     ) -> KernelResult<Box<dyn EngineData>> {
         match &self.stats_output_projection {
-            Some(projection) => projection.evaluate(transformed_actions.as_ref()),
+            Some(projection) => {
+                channel
+                    .evaluate_expression(projection, transformed_actions)
+                    .await
+            }
             None => Ok(transformed_actions),
         }
     }
 
-    fn retry_transform_and_data_skip(
+    async fn retry_transform_and_data_skip_with_channel(
         &self,
+        channel: &Channel,
         actions: Box<dyn EngineData>,
         is_log_batch: bool,
         dedup_selection: Vec<bool>,
@@ -582,8 +663,9 @@ impl ScanLogReplayProcessor {
             .filter_map(|(selected, size)| (*selected).then_some(size))
             .collect();
         let actions = actions.apply_selection_vector(dedup_selection)?;
-        let (transformed_actions, final_selection) =
-            self.transform_and_data_skip(actions.as_ref(), is_log_batch)?;
+        let (transformed_actions, final_selection) = self
+            .transform_and_data_skip_with_channel(channel, actions.as_ref(), is_log_batch)
+            .await?;
         Ok(RetryTransformAndDataSkipOutput {
             transformed_actions,
             final_selection,
@@ -878,14 +960,14 @@ fn scan_row_schema_with_parsed_columns(
 
 /// Builds the final `stats_parsed` projection for log replay.
 ///
-/// [`ScanLogReplayProcessor::new_with_seen_files`] calls this after its commit and checkpoint
-/// transforms have established the internal metadata schema. It returns no evaluator when that
-/// schema already matches the consumer-facing schema.
-fn build_stats_output_projection(
-    engine: &dyn Engine,
+/// [`ScanLogReplayProcessor::new_with_seen_files_with_channel`] calls this after its commit and
+/// checkpoint transforms have established the internal metadata schema. It returns no evaluator
+/// when that schema already matches the consumer-facing schema.
+async fn build_stats_output_projection_with_channel(
+    channel: &Channel,
     input_schema: SchemaRef,
     output_stats_schema: Option<&StructType>,
-) -> KernelResult<Option<Arc<dyn ExpressionEvaluator>>> {
+) -> KernelResult<Option<ExpressionEvaluatorHandle>> {
     let input_stats_schema =
         input_schema
             .field(STATS_PARSED_NAME)
@@ -907,11 +989,11 @@ fn build_stats_output_projection(
         None => projection.drop_if_exists(STATS_PARSED_NAME),
     };
     let (output_schema, expression) = projection.build()?;
-    Ok(Some(engine.evaluation_handler().new_expression_evaluator(
-        input_schema,
-        expression,
-        output_schema.into(),
-    )?))
+    Ok(Some(
+        channel
+            .create_expression_evaluator(input_schema, expression, output_schema.into())
+            .await?,
+    ))
 }
 
 /// Build the add transform expression with optional stats and partition value parsing.
@@ -1045,25 +1127,28 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
 
     fn process_actions_batch_parallel(
         &self,
+        channel: &Channel,
         actions_batch: ActionsBatch,
-    ) -> KernelResult<Self::Output> {
-        self.process_actions_batch_parallel(actions_batch)
+    ) -> impl KernelFuture<Self::Output> {
+        self.process_actions_batch_parallel(channel, actions_batch)
     }
 }
 
 impl ScanLogReplayProcessor {
     // WARNING: This function performs all the same operations as
-    // [`ScanLogReplayProcessor::process_actions_batch_sequential`]! Any changes performed to this
-    // function probably also need to be applied to the other copy. The copy exists because
-    // parallel processing requires `&self`, while sequential processing requires `&mut self`.
+    // [`ScanLogReplayProcessor::process_actions_batch_sequential_with_channel`]! Any changes
+    // performed to this function probably also need to be applied to the other copy. The copy
+    // exists because parallel processing requires `&self`, while sequential processing requires
+    // `&mut self`.
     #[tracing::instrument(
         name = "scan_log_replay.process_actions_batch_parallel",
         skip_all,
         fields(enable_call_frame),
         err
     )]
-    fn process_actions_batch_parallel(
+    async fn process_actions_batch_parallel(
         &self,
+        channel: &Channel,
         actions_batch: ActionsBatch,
     ) -> KernelResult<ScanMetadata> {
         let ActionsBatch {
@@ -1083,17 +1168,19 @@ impl ScanLogReplayProcessor {
         // This step transforms all Adds, including those superseded by Removes (dead Adds).
         // The transform for a dead Add may fail because it may have a different partition column
         // type. In that case, we get a ParseError and retry after deduplication.
-        let (pre_dedup_transform_result, pre_dedup_selection) =
-            match self.transform_and_data_skip(actions.as_ref(), is_log_batch) {
-                Ok((transformed_actions, pre_dedup_selection)) => {
-                    (Ok(transformed_actions), pre_dedup_selection)
-                }
-                Err(err @ KernelError::ParseError(_, _)) => {
-                    should_retry_transform_and_data_skip = true;
-                    (Err(err), vec![true; actions.len()])
-                }
-                Err(err) => return Err(err),
-            };
+        let (pre_dedup_transform_result, pre_dedup_selection) = match self
+            .transform_and_data_skip_with_channel(channel, actions.as_ref(), is_log_batch)
+            .await
+        {
+            Ok((transformed_actions, pre_dedup_selection)) => {
+                (Ok(transformed_actions), pre_dedup_selection)
+            }
+            Err(err @ KernelError::ParseError(_, _)) => {
+                should_retry_transform_and_data_skip = true;
+                (Err(err), vec![true; actions.len()])
+            }
+            Err(err) => return Err(err),
+        };
 
         // Step 2: Run deduplication visitor on RAW batch (needs add.path, remove.path, etc.)
         let deduplicator = CheckpointDeduplicator::try_new(
@@ -1127,13 +1214,15 @@ impl ScanLogReplayProcessor {
         } = if should_retry_transform_and_data_skip {
             // If step 1 failed with a parse error, filter out the dead Adds and retry after
             // deduplication.
-            self.retry_transform_and_data_skip(
+            self.retry_transform_and_data_skip_with_channel(
+                channel,
                 actions,
                 is_log_batch,
                 dedup_selection,
                 row_transform_exprs,
                 active_add_file_sizes,
-            )?
+            )
+            .await?
         } else {
             RetryTransformAndDataSkipOutput {
                 transformed_actions: pre_dedup_transform_result?,
@@ -1143,12 +1232,25 @@ impl ScanLogReplayProcessor {
             }
         };
         self.record_selected_add_files(&final_selection, &active_add_file_sizes)?;
-        let transformed_actions = self.project_stats_output(transformed_actions)?;
+        let transformed_actions = self
+            .project_stats_output_with_channel(channel, transformed_actions)
+            .await?;
         let scan_metadata =
             ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)?;
         self.metrics
             .update_peak_hash_set_size(self.seen_file_keys.len());
         Ok(scan_metadata)
+    }
+
+    #[cfg(test)]
+    fn process_actions_batch_sequential(
+        &mut self,
+        engine: &dyn Engine,
+        actions_batch: ActionsBatch,
+    ) -> KernelResult<ScanMetadata> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.process_actions_batch_sequential_with_channel(channel, actions_batch)
+        })
     }
 
     // WARNING: This function performs all the same operations as
@@ -1162,8 +1264,9 @@ impl ScanLogReplayProcessor {
         fields(enable_call_frame),
         err
     )]
-    pub(crate) fn process_actions_batch_sequential(
+    pub(crate) async fn process_actions_batch_sequential_with_channel(
         &mut self,
+        channel: &Channel,
         actions_batch: ActionsBatch,
     ) -> KernelResult<ScanMetadata> {
         let ActionsBatch {
@@ -1186,17 +1289,19 @@ impl ScanLogReplayProcessor {
         // with ISNULL guards that keep rows with missing stats. For partition values, the
         // predicate is wrapped with OR(NOT is_add, pred) via guard_for_removes, so non-Add
         // rows always pass the partition filter regardless of null partition values.
-        let (pre_dedup_transform_result, pre_dedup_selection) =
-            match self.transform_and_data_skip(actions.as_ref(), is_log_batch) {
-                Ok((transformed_actions, pre_dedup_selection)) => {
-                    (Ok(transformed_actions), pre_dedup_selection)
-                }
-                Err(err @ KernelError::ParseError(_, _)) => {
-                    should_retry_transform_and_data_skip = true;
-                    (Err(err), vec![true; actions.len()])
-                }
-                Err(err) => return Err(err),
-            };
+        let (pre_dedup_transform_result, pre_dedup_selection) = match self
+            .transform_and_data_skip_with_channel(channel, actions.as_ref(), is_log_batch)
+            .await
+        {
+            Ok((transformed_actions, pre_dedup_selection)) => {
+                (Ok(transformed_actions), pre_dedup_selection)
+            }
+            Err(err @ KernelError::ParseError(_, _)) => {
+                should_retry_transform_and_data_skip = true;
+                (Err(err), vec![true; actions.len()])
+            }
+            Err(err) => return Err(err),
+        };
 
         // Step 2: Run deduplication visitor on RAW batch (needs add.path, remove.path, etc.)
         let deduplicator = FileActionDeduplicator::new(
@@ -1233,13 +1338,15 @@ impl ScanLogReplayProcessor {
         } = if should_retry_transform_and_data_skip {
             // If step 1 failed with a parse error, filter out the dead Adds and retry after
             // deduplication.
-            self.retry_transform_and_data_skip(
+            self.retry_transform_and_data_skip_with_channel(
+                channel,
                 actions,
                 is_log_batch,
                 dedup_selection,
                 row_transform_exprs,
                 active_add_file_sizes,
-            )?
+            )
+            .await?
         } else {
             RetryTransformAndDataSkipOutput {
                 transformed_actions: pre_dedup_transform_result?,
@@ -1249,7 +1356,9 @@ impl ScanLogReplayProcessor {
             }
         };
         self.record_selected_add_files(&final_selection, &active_add_file_sizes)?;
-        let transformed_actions = self.project_stats_output(transformed_actions)?;
+        let transformed_actions = self
+            .project_stats_output_with_channel(channel, transformed_actions)
+            .await?;
         let scan_metadata =
             ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)?;
         self.metrics
@@ -1257,9 +1366,13 @@ impl ScanLogReplayProcessor {
         Ok(scan_metadata)
     }
 
-    fn build_selection_vector(&self, batch: &dyn EngineData) -> KernelResult<Vec<bool>> {
+    async fn build_selection_vector_with_channel(
+        &self,
+        channel: &Channel,
+        batch: &dyn EngineData,
+    ) -> KernelResult<Vec<bool>> {
         match &self.data_skipping_filter {
-            Some(filter) => filter.apply(batch),
+            Some(filter) => filter.apply_with_channel(channel, batch).await,
             None => Ok(vec![true; batch.len()]),
         }
     }
@@ -1280,25 +1393,56 @@ impl ScanLogReplayProcessor {
 ///
 /// Note: The iterator of [`ActionsBatch`]s ('action_iter' parameter) must be sorted by the order of
 /// the actions in the log from most recent to least recent.
-pub(crate) fn scan_action_iter(
+#[cfg(test)]
+pub(crate) fn scan_action_iter<'a>(
     engine: &dyn Engine,
-    action_iter: impl KernelResultIterator<ActionsBatch>,
+    action_iter: impl KernelResultIterator<ActionsBatch> + 'a,
     state_info: Arc<StateInfo>,
     checkpoint_info: CheckpointReadInfo,
     stats_options: ScanStatsOptions,
     partition_values_options: ScanPartitionValuesOptions,
-) -> KernelResult<(impl KernelResultIterator<ScanMetadata>, Arc<ScanMetrics>)> {
-    let mut processor = ScanLogReplayProcessor::new(
-        engine,
+) -> KernelResult<(
+    impl KernelResultIterator<ScanMetadata> + 'a,
+    Arc<ScanMetrics>,
+)> {
+    let connector = EngineConnector::new(engine);
+    let workflow = workflow!(|channel| scan_action_iter_with_channel(
+        channel,
+        action_iter.into_generator(),
+        state_info,
+        checkpoint_info,
+        stats_options,
+        partition_values_options
+    ));
+    connector.iterate_prepared_result_coroutine_with_companion(workflow, std::convert::identity)
+}
+
+pub(super) async fn scan_action_iter_with_channel<'a>(
+    channel: &Channel,
+    action_iter: impl KernelResultGenerator<ActionsBatch> + 'a,
+    state_info: Arc<StateInfo>,
+    checkpoint_info: CheckpointReadInfo,
+    stats_options: ScanStatsOptions,
+    partition_values_options: ScanPartitionValuesOptions,
+) -> KernelResult<(
+    impl KernelResultGenerator<ScanMetadata> + 'a,
+    Arc<ScanMetrics>,
+)> {
+    let mut processor = ScanLogReplayProcessor::new_with_channel(
+        channel,
         state_info,
         checkpoint_info,
         stats_options,
         partition_values_options,
-    )?;
+    )
+    .await?;
     let metrics = processor.metrics.clone();
-    let action_iter = action_iter
-        .map(move |batch| processor.process_actions_batch_sequential(batch?))
-        .filter_ok(HasSelectionVector::has_selected_rows);
+    let action_iter = map_async!(action_iter, async move |channel, batch| {
+        processor
+            .process_actions_batch_sequential_with_channel(channel, batch?)
+            .await
+    })
+    .filter_ok(HasSelectionVector::has_selected_rows);
     Ok((action_iter, metrics))
 }
 
@@ -1494,15 +1638,23 @@ mod tests {
         .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let delay = Duration::from_millis(5);
-        processor.commit_transform = Arc::new(RetryOnceEvaluator {
-            inner: processor.commit_transform.clone(),
+        let inner = processor
+            .commit_transform
+            .downcast_ref::<Arc<dyn ExpressionEvaluator>>()
+            .unwrap()
+            .clone();
+        let evaluator: Arc<dyn ExpressionEvaluator> = Arc::new(RetryOnceEvaluator {
+            inner,
             calls: calls.clone(),
             delay,
         });
+        processor.commit_transform = Arc::new(evaluator);
 
         // Process one batch; the injected parse error must trigger one successful retry.
         let batch = ActionsBatch::new(add_batch_simple(COMMIT_READ_SCHEMA.clone()), true);
-        processor.process_actions_batch_sequential(batch).unwrap();
+        processor
+            .process_actions_batch_sequential(&engine, batch)
+            .unwrap();
 
         // Confirm both attempts ran and their deterministic delays were accumulated in the event.
         assert_eq!(calls.load(Ordering::Relaxed), 2);
@@ -1934,8 +2086,8 @@ mod tests {
             )])),
             COMMIT_READ_SCHEMA.clone(),
         )?;
-        let metadata =
-            deserialized.process_actions_batch_sequential(ActionsBatch::new(actions, true))?;
+        let metadata = deserialized
+            .process_actions_batch_sequential(&engine, ActionsBatch::new(actions, true))?;
 
         let (data, selection) = metadata.scan_files.into_parts();
         assert_eq!(selection, vec![true]);

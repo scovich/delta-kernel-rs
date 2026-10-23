@@ -21,6 +21,8 @@ use derive_more::Constructor;
 use tracing::{debug, warn};
 use url::Url;
 
+use crate::coroutine::kernel::Channel;
+use crate::coroutine::KernelFuture;
 use crate::engine_data::GetData;
 use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
 use crate::{EngineData, KernelResult};
@@ -247,8 +249,9 @@ pub(crate) trait ParallelLogReplayProcessor {
     type Output;
     fn process_actions_batch_parallel(
         &self,
+        channel: &Channel,
         actions_batch: ActionsBatch,
-    ) -> KernelResult<Self::Output>;
+    ) -> impl KernelFuture<Self::Output>;
 }
 
 impl<T> ParallelLogReplayProcessor for Arc<T>
@@ -259,9 +262,10 @@ where
 
     fn process_actions_batch_parallel(
         &self,
+        channel: &Channel,
         actions_batch: ActionsBatch,
-    ) -> KernelResult<Self::Output> {
-        T::process_actions_batch_parallel(self, actions_batch)
+    ) -> impl KernelFuture<Self::Output> {
+        T::process_actions_batch_parallel(self, channel, actions_batch)
     }
 }
 
