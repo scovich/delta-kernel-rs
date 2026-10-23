@@ -104,7 +104,8 @@ static PARALLEL_CHECKPOINT_READ_SCHEMA_NO_JSON_STATS: LazyLock<SchemaRef> = Lazy
 });
 #[allow(unused)]
 pub use crate::parallel::parallel_scan_metadata::{
-    AfterSequentialScanMetadata, ParallelScanMetadata, ParallelState, SequentialScanMetadata,
+    AfterSequentialScanMetadata, ParallelScanMetadataIterator, ParallelState,
+    SequentialScanMetadataIterator,
 };
 
 /// Configures structured-stats output and JSON synthesis in scan metadata.
@@ -1425,7 +1426,7 @@ impl Scan {
 
     /// Start a parallel scan metadata processing for the table.
     ///
-    /// This method returns a [`SequentialScanMetadata`] iterator that processes commits and
+    /// This method returns a [`SequentialScanMetadataIterator`] that processes commits and
     /// checkpoint manifests sequentially. After exhausting this iterator, call `finish()`
     /// to determine if a distributed phase is needed.
     ///
@@ -1444,7 +1445,7 @@ impl Scan {
     /// ```no_run
     /// # use std::sync::Arc;
     /// # use delta_kernel::{Engine, KernelResult};
-    /// # use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
+    /// # use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadataIterator};
     /// # use delta_kernel::Snapshot;
     /// # use url::Url;
     /// # use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
@@ -1475,7 +1476,7 @@ impl Scan {
     ///         // Distribute files for parallel processing (e.g., one file per worker)
     ///         let state = Arc::new(*state);
     ///         for file in files {
-    ///             let parallel = ParallelScanMetadata::try_new(
+    ///             let parallel = ParallelScanMetadataIterator::try_new(
     ///                 engine.clone(),
     ///                 state.clone(),
     ///                 vec![file],
@@ -1492,7 +1493,7 @@ impl Scan {
     pub fn parallel_scan_metadata(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> KernelResult<SequentialScanMetadata> {
+    ) -> KernelResult<SequentialScanMetadataIterator> {
         // The scan token is not carried across distributed phases.
         if self.cancellation_token.is_some() {
             return Err(KernelError::unsupported(
@@ -1538,7 +1539,7 @@ impl Scan {
             checkpoint_read_schema,
         )?;
 
-        Ok(SequentialScanMetadata::new(
+        Ok(SequentialScanMetadataIterator::new(
             sequential,
             self.correlation_id.clone(),
         ))

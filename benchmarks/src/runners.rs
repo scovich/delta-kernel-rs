@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use delta_kernel::expressions::PredicateRef;
 use delta_kernel::object_store::local::LocalFileSystem;
-use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata, StatsOptions};
+use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadataIterator, StatsOptions};
 use delta_kernel::{Engine, Snapshot};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngine;
@@ -319,9 +319,12 @@ impl ReadMetadataRunner {
                                 return;
                             }
 
-                            let parallel =
-                                ParallelScanMetadata::try_new(engine, state, partition_files)
-                                    .expect("Failed to create ParallelScanMetadata");
+                            let parallel = ParallelScanMetadataIterator::try_new(
+                                engine,
+                                state,
+                                partition_files,
+                            )
+                            .expect("Failed to create ParallelScanMetadataIterator");
                             for result in parallel {
                                 black_box(result.expect("Parallel scan error"));
                             }

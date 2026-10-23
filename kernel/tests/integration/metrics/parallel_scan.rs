@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::metrics::TableType;
-use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
+use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadataIterator};
 use delta_kernel::{Engine, KernelResult, Snapshot};
 use rstest::rstest;
 use test_utils::{
@@ -60,8 +60,11 @@ async fn test_parallel_scan_metadata_events_carry_table_type(
     if let AfterSequentialScanMetadata::Parallel { state, files } = sequential.finish()? {
         let state = Arc::new(*state);
         for file in files {
-            let parallel =
-                ParallelScanMetadata::try_new(engine_dyn.clone(), state.clone(), vec![file])?;
+            let parallel = ParallelScanMetadataIterator::try_new(
+                engine_dyn.clone(),
+                state.clone(),
+                vec![file],
+            )?;
             for result in parallel {
                 result?;
             }

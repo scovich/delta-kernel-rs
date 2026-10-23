@@ -12,7 +12,7 @@ use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
 use crate::scan::log_replay::{ScanLogReplayProcessor, SerializableScanState};
 use crate::scan::ScanMetadata;
 use crate::schema::SchemaRef;
-use crate::{Engine, EngineData, FileMeta, KernelError, KernelResult};
+use crate::{Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator};
 
 /// Result of sequential scan metadata processing.
 ///
@@ -27,12 +27,12 @@ pub enum AfterSequentialScanMetadata {
     },
 }
 
-/// Sequential scan metadata processing.
+/// Sequential scan metadata iterator.
 ///
 /// This phase processes commits and single-part checkpoint manifests sequentially.
 /// After exhaustion, call `finish()` to get the result which indicates whether
 /// a distributed phase is needed.
-pub struct SequentialScanMetadata {
+pub struct SequentialScanMetadataIterator {
     pub(crate) sequential: SequentialPhase,
     operation_id: MetricId,
     /// Opaque, caller-supplied correlation id propagated to both phases' metric events.
@@ -41,7 +41,7 @@ pub struct SequentialScanMetadata {
     span: Span,
 }
 
-impl SequentialScanMetadata {
+impl SequentialScanMetadataIterator {
     pub(crate) fn new(sequential: SequentialPhase, correlation_id: Option<Arc<str>>) -> Self {
         let operation_id = MetricId::new();
         Self {
@@ -100,7 +100,7 @@ impl SequentialScanMetadata {
     }
 }
 
-impl Iterator for SequentialScanMetadata {
+impl Iterator for SequentialScanMetadataIterator {
     type Item = KernelResult<ScanMetadata>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -246,12 +246,13 @@ impl ParallelState {
     }
 }
 
-pub struct ParallelScanMetadata {
-    pub(crate) processor: ParallelPhase<Arc<ParallelState>>,
+/// Parallel scan metadata iterator.
+pub struct ParallelScanMetadataIterator {
+    pub(crate) inner: Box<dyn KernelResultIterator<ScanMetadata>>,
     span: Span,
 }
 
-impl ParallelScanMetadata {
+impl ParallelScanMetadataIterator {
     pub fn try_new(
         engine: Arc<dyn Engine>,
         state: Arc<ParallelState>,
@@ -259,7 +260,12 @@ impl ParallelScanMetadata {
     ) -> KernelResult<Self> {
         let read_schema = state.file_read_schema();
         Ok(Self {
-            processor: ParallelPhase::try_new(engine, state, leaf_files, read_schema)?,
+            inner: Box::new(ParallelPhase::try_new(
+                engine,
+                state,
+                leaf_files,
+                read_schema,
+            )?),
             // TODO: Associate the same scan ID from sequential phase to correlate phases
             span: info_span!("parallel_scan_metadata"),
         })
@@ -270,19 +276,22 @@ impl ParallelScanMetadata {
         iter: impl IntoIterator<Item = KernelResult<Box<dyn EngineData>>, IntoIter: Send + 'static>,
     ) -> Self {
         Self {
-            processor: ParallelPhase::new_from_iter(state.clone(), iter),
+            inner: Box::new(ParallelPhase::process_batches(
+                state.clone(),
+                iter.into_iter(),
+            )),
             // TODO: Associate the same scan ID from sequential phase to correlate phases
             span: info_span!("parallel_scan_metadata"),
         }
     }
 }
 
-impl Iterator for ParallelScanMetadata {
+impl Iterator for ParallelScanMetadataIterator {
     type Item = KernelResult<ScanMetadata>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let _guard = self.span.enter();
-        self.processor.next()
+        self.inner.next()
     }
 }
 
