@@ -15,8 +15,12 @@ use crate::{Engine, FileMeta, KernelError, KernelResult, KernelResultIterator, R
 /// Phase that processes single-part checkpoint. This also treats the checkpoint as a manifest file
 /// and extracts the sidecar actions during iteration.
 #[allow(unused)]
-pub(crate) struct CheckpointManifestReader {
-    actions: Box<dyn KernelResultIterator<ActionsBatch>>,
+pub(crate) struct CheckpointManifestReader(
+    CheckpointManifestState<Box<dyn KernelResultIterator<ActionsBatch>>>,
+);
+
+struct CheckpointManifestState<A> {
+    actions: A,
     sidecar_visitor: SidecarVisitor,
     log_root: Url,
     is_complete: bool,
@@ -61,19 +65,25 @@ impl CheckpointManifestReader {
         };
 
         let actions = Box::new(actions.map_ok(|batch_res| ActionsBatch::new(batch_res, false)));
-        Ok(Self {
+        Ok(Self(CheckpointManifestState {
             actions,
             sidecar_visitor: SidecarVisitor::default(),
             log_root,
             is_complete: false,
             manifest_file: manifest.location.clone(),
-        })
+        }))
     }
 
     /// Extract the sidecars from the manifest file if there were any.
     /// NOTE: The iterator must be completely exhausted before calling this
     #[allow(unused)]
     pub(crate) fn extract_sidecars(self) -> KernelResult<Vec<FileMeta>> {
+        self.0.extract_sidecars()
+    }
+}
+
+impl<A> CheckpointManifestState<A> {
+    fn extract_sidecars(self) -> KernelResult<Vec<FileMeta>> {
         require!(
             self.is_complete,
             KernelError::generic(format!(
@@ -93,7 +103,7 @@ impl CheckpointManifestReader {
     }
 }
 
-impl Iterator for CheckpointManifestReader {
+impl<A: Iterator<Item = KernelResult<ActionsBatch>>> Iterator for CheckpointManifestState<A> {
     type Item = KernelResult<ActionsBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -106,6 +116,14 @@ impl Iterator for CheckpointManifestReader {
             self.sidecar_visitor.visit_rows_of(batch.actions())?;
             Ok(batch)
         }))
+    }
+}
+
+impl Iterator for CheckpointManifestReader {
+    type Item = KernelResult<ActionsBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
     }
 }
 

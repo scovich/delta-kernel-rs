@@ -151,7 +151,7 @@ impl IncrementalScanBuilder {
             None,
         )?;
 
-        Ok(Some(IncrementalScanStream {
+        let state = IncrementalScanState {
             base_version: self.base_version,
             target_version,
             actions,
@@ -164,7 +164,8 @@ impl IncrementalScanBuilder {
                 .target_snapshot
                 .table_configuration()
                 .dv_normalization_root(),
-        }))
+        };
+        Ok(Some(IncrementalScanStream(state)))
     }
 
     /// Lowers `self.predicate` into the per-batch skipping strategy applied to live Adds.
@@ -230,10 +231,12 @@ enum AddSkipping {
 ///
 /// [`into_summary`]: Self::into_summary
 /// [`into_listing`]: Self::into_listing
-pub struct IncrementalScanStream {
+pub struct IncrementalScanStream(IncrementalScanState<FileDataReadResultIterator>);
+
+struct IncrementalScanState<A> {
     base_version: Version,
     target_version: Version,
-    actions: FileDataReadResultIterator,
+    actions: A,
     add_skipping: AddSkipping,
     seen_file_keys: HashSet<FileActionKey>,
     live_adds: HashSet<FileActionKey>,
@@ -243,7 +246,7 @@ pub struct IncrementalScanStream {
     dv_normalization_root: Option<Url>,
 }
 
-impl Iterator for IncrementalScanStream {
+impl Iterator for IncrementalScanState<FileDataReadResultIterator> {
     type Item = KernelResult<FilteredEngineData>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -276,6 +279,30 @@ impl Iterator for IncrementalScanStream {
     }
 }
 
+impl<A> IncrementalScanState<A> {
+    fn into_summary(self) -> KernelResult<IncrementalScanSummary> {
+        if self.errored {
+            return Err(KernelError::generic(
+                "IncrementalScanStream: cannot finish a stream that previously errored",
+            ));
+        }
+        Ok(IncrementalScanSummary {
+            base_version: self.base_version,
+            target_version: self.target_version,
+            live_adds: self.live_adds,
+            removes: self.removes,
+        })
+    }
+}
+
+impl Iterator for IncrementalScanStream {
+    type Item = KernelResult<FilteredEngineData>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
+    }
+}
+
 impl IncrementalScanStream {
     /// Drain any unread batches, then return the live file-key sets without applying
     /// cross-snapshot dedup. Consumers can intersect these against whatever base
@@ -294,22 +321,12 @@ impl IncrementalScanStream {
     ///   prior `next()` returned `Err`. Rebuild to retry the latter; the former indicates table
     ///   corruption.
     pub fn into_summary(mut self) -> KernelResult<IncrementalScanSummary> {
-        if self.errored {
-            return Err(KernelError::generic(
-                "IncrementalScanStream: cannot finish a stream that previously errored",
-            ));
-        }
         // Drain anything the consumer didn't pull. `self.next()` propagates errors via
         // `Some(Err(_))` and sets `errored`; the `?` below surfaces them.
         for item in self.by_ref() {
             item?;
         }
-        Ok(IncrementalScanSummary {
-            base_version: self.base_version,
-            target_version: self.target_version,
-            live_adds: self.live_adds,
-            removes: self.removes,
-        })
+        self.0.into_summary()
     }
 
     /// Eager helper: collect every live Add batch into a [`Vec`], then call
@@ -458,11 +475,11 @@ impl IncrementalScanStream {
 impl std::fmt::Debug for IncrementalScanStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IncrementalScanStream")
-            .field("base_version", &self.base_version)
-            .field("target_version", &self.target_version)
-            .field("live_adds", &self.live_adds.len())
-            .field("removes", &self.removes.len())
-            .field("errored", &self.errored)
+            .field("base_version", &self.0.base_version)
+            .field("target_version", &self.0.target_version)
+            .field("live_adds", &self.0.live_adds.len())
+            .field("removes", &self.0.removes.len())
+            .field("errored", &self.0.errored)
             .finish()
     }
 }

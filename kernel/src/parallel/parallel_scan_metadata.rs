@@ -4,6 +4,7 @@ use std::time::Instant;
 use delta_kernel_derive::internal_api;
 use tracing::{info_span, Span};
 
+use crate::log_reader::checkpoint_manifest::CheckpointManifestReader;
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
@@ -13,6 +14,9 @@ use crate::scan::log_replay::{ScanLogReplayProcessor, SerializableScanState};
 use crate::scan::ScanMetadata;
 use crate::schema::SchemaRef;
 use crate::{Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator};
+
+type EngineSequentialPhase =
+    SequentialPhase<Box<dyn KernelResultIterator<ActionsBatch>>, CheckpointManifestReader>;
 
 /// Result of sequential scan metadata processing.
 ///
@@ -33,22 +37,16 @@ pub enum AfterSequentialScanMetadata {
 /// After exhaustion, call `finish()` to get the result which indicates whether
 /// a distributed phase is needed.
 pub struct SequentialScanMetadataIterator {
-    pub(crate) sequential: SequentialPhase,
-    operation_id: MetricId,
-    /// Opaque, caller-supplied correlation id propagated to both phases' metric events.
-    correlation_id: Option<Arc<str>>,
-    start: Instant,
+    pub(crate) sequential: EngineSequentialPhase,
+    completion: SequentialScanCompletion,
     span: Span,
 }
 
 impl SequentialScanMetadataIterator {
-    pub(crate) fn new(sequential: SequentialPhase, correlation_id: Option<Arc<str>>) -> Self {
-        let operation_id = MetricId::new();
+    pub(crate) fn new(sequential: EngineSequentialPhase, correlation_id: Option<Arc<str>>) -> Self {
         Self {
             sequential,
-            operation_id,
-            correlation_id,
-            start: Instant::now(),
+            completion: SequentialScanCompletion::new(correlation_id),
             // TODO: Associate a unique scan ID with this span to correlate sequential and parallel
             // phases
             span: info_span!("sequential_scan_metadata"),
@@ -57,7 +55,37 @@ impl SequentialScanMetadataIterator {
 
     pub fn finish(self) -> KernelResult<AfterSequentialScanMetadata> {
         let _guard = self.span.enter();
-        match self.sequential.finish()? {
+        Ok(self.completion.finish(self.sequential.finish()?))
+    }
+}
+
+impl Iterator for SequentialScanMetadataIterator {
+    type Item = KernelResult<ScanMetadata>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let _guard = self.span.enter();
+        self.sequential.next()
+    }
+}
+
+struct SequentialScanCompletion {
+    operation_id: MetricId,
+    /// Opaque, caller-supplied correlation id propagated to both phases' metric events.
+    correlation_id: Option<Arc<str>>,
+    start: Instant,
+}
+
+impl SequentialScanCompletion {
+    fn new(correlation_id: Option<Arc<str>>) -> Self {
+        Self {
+            operation_id: MetricId::new(),
+            correlation_id,
+            start: Instant::now(),
+        }
+    }
+
+    fn finish(self, after: AfterSequential) -> AfterSequentialScanMetadata {
+        match after {
             AfterSequential::Done(processor) => {
                 let event = processor.get_metrics().to_event(
                     self.operation_id,
@@ -70,7 +98,7 @@ impl SequentialScanMetadataIterator {
                     .get_metrics()
                     .log("Sequential scan metadata completed");
                 emit_scan_metadata_completed(&event);
-                Ok(AfterSequentialScanMetadata::Done)
+                AfterSequentialScanMetadata::Done
             }
             AfterSequential::Parallel { processor, files } => {
                 let event = processor.get_metrics().to_event(
@@ -86,7 +114,7 @@ impl SequentialScanMetadataIterator {
                 emit_scan_metadata_completed(&event);
                 processor.get_metrics().reset_counters();
 
-                Ok(AfterSequentialScanMetadata::Parallel {
+                AfterSequentialScanMetadata::Parallel {
                     state: Box::new(ParallelState {
                         inner: processor,
                         operation_id: self.operation_id,
@@ -94,18 +122,9 @@ impl SequentialScanMetadataIterator {
                         parallel_start: Instant::now(),
                     }),
                     files,
-                })
+                }
             }
         }
-    }
-}
-
-impl Iterator for SequentialScanMetadataIterator {
-    type Item = KernelResult<ScanMetadata>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let _guard = self.span.enter();
-        self.sequential.next()
     }
 }
 
