@@ -20,7 +20,7 @@ use delta_kernel::expressions::{
 };
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::object_store::local::LocalFileSystem;
-use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
+use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadataIterator};
 use delta_kernel::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
 };
@@ -775,8 +775,11 @@ async fn test_predicate_on_file_sub_field_skips_files_in_other_scans(
             };
             let state = Arc::from(state);
             for file in files {
-                let parallel =
-                    ParallelScanMetadata::try_new(engine.clone(), Arc::clone(&state), vec![file])?;
+                let parallel = ParallelScanMetadataIterator::try_new(
+                    engine.clone(),
+                    Arc::clone(&state),
+                    vec![file],
+                )?;
                 for scan_metadata in parallel {
                     kept = scan_metadata?.visit_scan_files(kept, count)?;
                 }
