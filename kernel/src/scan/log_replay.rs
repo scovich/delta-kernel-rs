@@ -330,36 +330,39 @@ impl ScanLogReplayProcessor {
             )
         };
 
+        // Commit transform: parse JSON for stats, MapToStruct for partition values
+        let commit_transform = engine.evaluation_handler().new_expression_evaluator(
+            COMMIT_READ_SCHEMA.clone(),
+            get_add_transform_expr(
+                stats_schema_for_transform.clone(),
+                false, /* has_stats_parsed */
+                skip_stats,
+                synthesize_json,
+                partition_schema_for_transform.clone(),
+                false, /* has_partition_values_parsed */
+                timestamp_timezone_name,
+            ),
+            output_schema.clone().into(),
+        )?;
+        // Checkpoint transform: read pre-parsed columns directly when available
+        let checkpoint_transform = engine.evaluation_handler().new_expression_evaluator(
+            checkpoint_read_schema,
+            get_add_transform_expr(
+                stats_schema_for_transform,
+                has_stats_parsed,
+                skip_stats,
+                synthesize_json,
+                partition_schema_for_transform,
+                has_partition_values_parsed,
+                timestamp_timezone_name,
+            ),
+            output_schema.into(),
+        )?;
+
         Ok(Self {
             data_skipping_filter,
-            // Commit transform: parse JSON for stats, MapToStruct for partition values
-            commit_transform: engine.evaluation_handler().new_expression_evaluator(
-                COMMIT_READ_SCHEMA.clone(),
-                get_add_transform_expr(
-                    stats_schema_for_transform.clone(),
-                    false, /* has_stats_parsed */
-                    skip_stats,
-                    synthesize_json,
-                    partition_schema_for_transform.clone(),
-                    false, /* has_partition_values_parsed */
-                    timestamp_timezone_name,
-                ),
-                output_schema.clone().into(),
-            )?,
-            // Checkpoint transform: read pre-parsed columns directly when available
-            checkpoint_transform: engine.evaluation_handler().new_expression_evaluator(
-                checkpoint_read_schema,
-                get_add_transform_expr(
-                    stats_schema_for_transform,
-                    has_stats_parsed,
-                    skip_stats,
-                    synthesize_json,
-                    partition_schema_for_transform,
-                    has_partition_values_parsed,
-                    timestamp_timezone_name,
-                ),
-                output_schema.into(),
-            )?,
+            commit_transform,
+            checkpoint_transform,
             stats_output_projection,
             seen_file_keys,
             state_info,
@@ -1040,6 +1043,15 @@ pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
 impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
     type Output = ScanMetadata;
 
+    fn process_actions_batch_parallel(
+        &self,
+        actions_batch: ActionsBatch,
+    ) -> KernelResult<Self::Output> {
+        self.process_actions_batch_parallel(actions_batch)
+    }
+}
+
+impl ScanLogReplayProcessor {
     // WARNING: This function performs all the same operations as
     // [`ScanLogReplayProcessor::process_actions_batch_sequential`]! Any changes performed to this
     // function probably also need to be applied to the other copy. The copy exists because
@@ -1053,7 +1065,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
     fn process_actions_batch_parallel(
         &self,
         actions_batch: ActionsBatch,
-    ) -> KernelResult<Self::Output> {
+    ) -> KernelResult<ScanMetadata> {
         let ActionsBatch {
             actions,
             is_log_batch,
@@ -1138,9 +1150,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             .update_peak_hash_set_size(self.seen_file_keys.len());
         Ok(scan_metadata)
     }
-}
 
-impl ScanLogReplayProcessor {
     // WARNING: This function performs all the same operations as
     // [`<ScanLogReplayProcessor as ParallelLogReplayProcessor>::process_actions_batch_parallel`]!
     // Any changes performed to this function probably also need to be applied to the other copy.
