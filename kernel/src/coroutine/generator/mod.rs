@@ -32,8 +32,8 @@ use delta_kernel_derive::internal_api;
 use tracing::{error, Instrument as _, Span};
 
 pub use self::adapters::{
-    empty, map_async_witness, unfold, AsyncIntoIterator, Enumerate, FilterMap, FilterOk, Flatten,
-    Iter, Map, MapAsync, MapAsyncWitness, MapOk, Peekable, Unfold,
+    empty, map_async_witness, unfold, AsyncIntoIterator, Chain, Enumerate, FilterMap, FilterOk,
+    Flatten, Iter, Map, MapAsync, MapAsyncWitness, MapOk, Peekable, Unfold,
 };
 pub(crate) use self::adapters::{unfold_mut_with, unfold_mut_witness};
 use super::witness::invoke_witness;
@@ -93,6 +93,14 @@ pub trait GeneratorExt {
         W: for<'a> MapAsyncWitness<'a, P, F, Self::Item, U>,
     {
         MapAsync::new(self, mapper, witness)
+    }
+
+    /// Counterpart of [`Iterator::chain`]: yields every item of `self`, then every item of `other`.
+    fn chain<B>(self, other: B) -> Chain<Self, B>
+    where
+        Self: Sized,
+    {
+        Chain::new(self, other)
     }
 
     /// Counterpart of [`Iterator::flatten`]: yields the elements of each collection-valued item.

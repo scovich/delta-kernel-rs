@@ -324,6 +324,84 @@ where
     }
 }
 
+/// Generator returned by [`GeneratorExt::chain`].
+pub struct Chain<A, B> {
+    first: Option<A>,
+    second: B,
+}
+
+impl<A, B> Chain<A, B> {
+    pub(super) fn new(first: A, second: B) -> Self {
+        Self {
+            first: Some(first),
+            second,
+        }
+    }
+}
+
+impl<A, B> GeneratorExt for Chain<A, B> {}
+
+impl<P, A, B> Generator<P> for Chain<A, B>
+where
+    P: Send + 'static,
+    A: Generator<P, Output = ()>,
+    B: Generator<P, Item = A::Item>,
+{
+    type Item = A::Item;
+    type Output = B::Output;
+
+    fn bind_to<'a>(
+        self,
+        channel: ChannelBinding<'a, P>,
+    ) -> impl BoundGenerator<Item = A::Item, Output = B::Output> + Unpin + 'a
+    where
+        Self: 'a,
+        A::Item: 'a,
+    {
+        Chain {
+            first: self.first.map(|first| first.bind_to(channel.clone())),
+            second: self.second.bind_to(channel),
+        }
+    }
+
+    fn bind_boxed<'a>(
+        self: Box<Self>,
+        channel: ChannelBinding<'a, P>,
+    ) -> BoxedBoundGenerator<'a, A::Item, B::Output>
+    where
+        Self: 'a,
+        A::Item: 'a,
+    {
+        Box::new((*self).bind_to(channel))
+    }
+}
+
+impl<A, B> BoundGenerator for Chain<A, B>
+where
+    A: BoundGenerator<Output = ()> + Unpin,
+    B: BoundGenerator<Item = A::Item> + Unpin,
+{
+    type Item = A::Item;
+    type Output = B::Output;
+
+    fn poll_step(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<KernelResult<GeneratorStep<A::Item, B::Output>>> {
+        let this = self.get_mut();
+        if let Some(first) = &mut this.first {
+            match std::task::ready!(Pin::new(first).poll_step(context)) {
+                Ok(GeneratorStep::Done(())) => this.first = None,
+                Ok(GeneratorStep::Yield(item)) => {
+                    return Poll::Ready(Ok(GeneratorStep::Yield(item)));
+                }
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+        }
+        Pin::new(&mut this.second).poll_step(context)
+    }
+}
+
 /// Generator returned by [`GeneratorExt::flatten`].
 // This struct's manual `impl Unpin` is conditional on `G: Unpin` and valid because it does not use
 // structural field pinning.

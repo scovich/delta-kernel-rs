@@ -11,6 +11,9 @@ use tracing::instrument;
 use super::LogSegment;
 use crate::actions::visitors::DomainMetadataVisitor;
 use crate::actions::{DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA};
+use crate::coroutine::kernel::{
+    iterate_prepared_result_coroutine_with_engine, Channel, KernelResultGenerator,
+};
 use crate::crc::merge_domain_metadata;
 use crate::log_replay::ActionsBatch;
 use crate::{Engine, KernelResult, KernelResultIterator, RowVisitor as _, Version};
@@ -124,7 +127,17 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<impl KernelResultIterator<ActionsBatch>> {
-        self.read_actions(engine, LOG_DOMAIN_METADATA_SCHEMA.clone())
+        iterate_prepared_result_coroutine_with_engine!(engine, None, |channel| {
+            self.read_domain_metadata_batches_generator(channel)
+        })
+    }
+
+    async fn read_domain_metadata_batches_generator(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<impl KernelResultGenerator<ActionsBatch> + 'static> {
+        self.read_actions_generator(channel, LOG_DOMAIN_METADATA_SCHEMA.clone())
+            .await
     }
 }
 

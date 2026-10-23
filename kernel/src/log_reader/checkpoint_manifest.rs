@@ -6,18 +6,24 @@ use itertools::Itertools;
 use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
+use crate::coroutine::generator::{
+    generator_fn, BoundGenerator, Generator as _, GeneratorExt as _,
+};
+use crate::coroutine::kernel::engine::{EngineConnector, EngineResultCoroutineIterator};
+use crate::coroutine::kernel::{workflow, Channel, ChannelExt as _, KernelResultGenerator};
 use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
 use crate::schema::SchemaRef;
 use crate::utils::require;
-use crate::{Engine, FileMeta, KernelError, KernelResult, KernelResultIterator, RowVisitor};
+use crate::{Engine, FileMeta, KernelError, KernelResult, RowVisitor};
+
+type CheckpointManifestEngineIterator =
+    EngineResultCoroutineIterator<'static, ActionsBatch, KernelResult<Vec<FileMeta>>>;
 
 /// Phase that processes single-part checkpoint. This also treats the checkpoint as a manifest file
 /// and extracts the sidecar actions during iteration.
 #[allow(unused)]
-pub(crate) struct CheckpointManifestReader(
-    CheckpointManifestState<Box<dyn KernelResultIterator<ActionsBatch>>>,
-);
+pub(crate) struct CheckpointManifestReader(CheckpointManifestEngineIterator, FileMeta);
 
 struct CheckpointManifestState<A> {
     actions: A,
@@ -46,17 +52,32 @@ impl CheckpointManifestReader {
         log_root: Url,
         read_schema: SchemaRef,
     ) -> KernelResult<Self> {
+        let manifest_file = manifest.location.clone();
+        let workflow =
+            workflow!(|channel| Self::try_new_generator(channel, manifest, log_root, read_schema));
+        let inner =
+            EngineConnector::new(engine.as_ref()).iterate_prepared_result_coroutine(workflow)?;
+        Ok(Self(inner, manifest_file))
+    }
+
+    /// Prepares manifest actions and returns discovered sidecars when the stream completes.
+    pub(crate) async fn try_new_generator(
+        channel: &Channel,
+        manifest: &ParsedLogPath,
+        log_root: Url,
+        read_schema: SchemaRef,
+    ) -> KernelResult<impl KernelResultGenerator<ActionsBatch, KernelResult<Vec<FileMeta>>> + 'static>
+    {
+        let files = [manifest.location.clone()];
         let actions = match manifest.extension.as_str() {
-            "json" => engine.json_handler().read_json_files(
-                std::slice::from_ref(&manifest.location),
-                read_schema.clone(),
-                None,
-            )?,
-            "parquet" => engine.parquet_handler().read_parquet_files(
-                std::slice::from_ref(&manifest.location),
-                read_schema,
-                None,
-            )?,
+            "json" => channel
+                .prepare_json_files(files, read_schema.clone(), None)
+                .await?
+                .into_boxed(),
+            "parquet" => channel
+                .prepare_parquet_files(files, read_schema, None)
+                .await?
+                .into_boxed(),
             extension => {
                 return Err(KernelError::generic(format!(
                     "Unsupported checkpoint extension: {extension}",
@@ -64,13 +85,20 @@ impl CheckpointManifestReader {
             }
         };
 
-        let actions = Box::new(actions.map_ok(|batch_res| ActionsBatch::new(batch_res, false)));
-        Ok(Self(CheckpointManifestState {
+        let actions = actions.map_ok(|batch_res| ActionsBatch::new(batch_res, false));
+        let state = CheckpointManifestState {
             actions,
             sidecar_visitor: SidecarVisitor::default(),
             log_root,
             is_complete: false,
             manifest_file: manifest.location.clone(),
+        };
+        Ok(generator_fn!(async move |channel| {
+            let mut state = state.bind_actions(&channel);
+            while let Some(item) = state.next().await? {
+                channel.yield_item(item).await?;
+            }
+            Ok(state.extract_sidecars())
         }))
     }
 
@@ -78,7 +106,15 @@ impl CheckpointManifestReader {
     /// NOTE: The iterator must be completely exhausted before calling this
     #[allow(unused)]
     pub(crate) fn extract_sidecars(self) -> KernelResult<Vec<FileMeta>> {
-        self.0.extract_sidecars()
+        let Self(inner, manifest_file) = self;
+        require!(
+            inner.is_complete(),
+            KernelError::generic(format!(
+                "Cannot extract sidecars from in-progress ManifestReader for file: {}",
+                manifest_file.location
+            ))
+        );
+        inner.into_output()?
     }
 }
 
@@ -103,19 +139,40 @@ impl<A> CheckpointManifestState<A> {
     }
 }
 
-impl<A: Iterator<Item = KernelResult<ActionsBatch>>> Iterator for CheckpointManifestState<A> {
-    type Item = KernelResult<ActionsBatch>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let Some(result) = self.actions.next() else {
+impl<G> CheckpointManifestState<G>
+where
+    G: BoundGenerator<Item = KernelResult<ActionsBatch>, Output = ()> + Unpin,
+{
+    async fn next(&mut self) -> KernelResult<Option<KernelResult<ActionsBatch>>> {
+        let Some(result) = self.actions.next().await? else {
             self.is_complete = true;
-            return None;
+            return Ok(None);
         };
 
-        Some(result.and_then(|batch| {
+        Ok(Some(result.and_then(|batch| {
             self.sidecar_visitor.visit_rows_of(batch.actions())?;
             Ok(batch)
-        }))
+        })))
+    }
+}
+
+impl<A: KernelResultGenerator<ActionsBatch>> CheckpointManifestState<A> {
+    fn bind_actions<'a>(
+        self,
+        channel: &'a Channel,
+    ) -> CheckpointManifestState<
+        impl BoundGenerator<Item = KernelResult<ActionsBatch>, Output = ()> + Unpin + 'a,
+    >
+    where
+        A: 'a,
+    {
+        CheckpointManifestState {
+            actions: self.actions.bind(channel),
+            sidecar_visitor: self.sidecar_visitor,
+            log_root: self.log_root,
+            is_complete: self.is_complete,
+            manifest_file: self.manifest_file,
+        }
     }
 }
 

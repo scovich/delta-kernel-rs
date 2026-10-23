@@ -19,8 +19,10 @@ use crate::actions::{Add, ADD_FIELD, ADD_NAME, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
+use crate::coroutine::kernel::engine::EngineConnector;
 use crate::coroutine::kernel::{
-    run_workflow_with_storage, static_workflow, Channel, StaticWorkflow,
+    run_workflow_with_storage, static_workflow, workflow, Channel, KernelResultGenerator,
+    StaticWorkflow,
 };
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef};
@@ -1351,14 +1353,31 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch>>> {
+        let connector =
+            EngineConnector::new(engine).with_cancellation_token(self.cancellation_token.clone());
+        let workflow = workflow!(|channel| self.replay_for_scan_metadata_with_channel(channel));
+        let (actions, checkpoint_info) = connector
+            .iterate_prepared_result_coroutine_with_companion(workflow, |result| {
+                (result.actions, result.checkpoint_info)
+            })?;
+        Ok(ActionsWithCheckpointInfo {
+            actions,
+            checkpoint_info,
+        })
+    }
+
+    async fn replay_for_scan_metadata_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultGenerator<ActionsBatch>>> {
         let (checkpoint_schema, meta_predicate, physical_stats_read_schema) =
             self.checkpoint_read_options();
         // Checkpoints already represent reconciled state, so scans project only Add actions. This
         // derives `add.path IS NOT NULL` and allows readers to skip non-Add row groups.
         self.snapshot
             .log_segment()
-            .read_actions_with_projected_checkpoint_actions(
-                engine,
+            .read_actions_with_projected_checkpoint_actions_with_channel(
+                channel,
                 COMMIT_READ_SCHEMA.clone(),
                 checkpoint_schema,
                 meta_predicate,
@@ -1367,8 +1386,8 @@ impl Scan {
                     .physical_partition_schema
                     .as_ref()
                     .map(|s| s.as_ref()),
-                self.cancellation_token.as_ref(),
             )
+            .await
     }
 
     /// Builds a predicate for row group skipping in checkpoint and sidecar parquet files.

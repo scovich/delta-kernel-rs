@@ -17,10 +17,13 @@ use crate::actions::{
 use crate::actions::{CheckpointAction, LastManifestCommit, LOG_CHECKPOINT_SCHEMA};
 use crate::cancellation::CancellationTokenRef;
 use crate::committer::CatalogCommit;
-use crate::coroutine::generator::{BoundGenerator, Generator as _, GeneratorExt as _};
+use crate::coroutine::generator::{self, BoundGenerator, Generator as _, GeneratorExt as _};
+use crate::coroutine::kernel::engine::EngineConnector;
+#[cfg(test)]
+use crate::coroutine::kernel::run_workflow_with_engine;
 use crate::coroutine::kernel::{
-    iterate_prepared_result_coroutine_with_engine, run_workflow_with_engine,
-    run_workflow_with_storage, Channel, ChannelExt as _, KernelResultGenerator,
+    iterate_prepared_result_coroutine_with_engine, run_workflow_with_storage, workflow, Channel,
+    ChannelExt as _, KernelResultGenerator,
 };
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
@@ -117,8 +120,8 @@ impl CheckpointReadInfo {
 ///
 /// This struct provides named access to the return values instead of tuple indexing.
 #[internal_api]
-pub(crate) struct ActionsWithCheckpointInfo<A: KernelResultIterator<ActionsBatch>> {
-    /// Iterator over action batches read from the log segment.
+pub(crate) struct ActionsWithCheckpointInfo<A> {
+    /// Source of action batches read from the log segment.
     pub actions: A,
     /// Metadata about checkpoint reading, including the schema used.
     #[allow(unused)]
@@ -957,6 +960,40 @@ impl LogSegment {
         partition_schema: Option<&StructType>,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch>>> {
+        let connector =
+            EngineConnector::new(engine).with_cancellation_token(cancellation_token.cloned());
+        let workflow = workflow!(|channel| {
+            self.read_actions_with_projected_checkpoint_actions_with_channel(
+                channel,
+                commit_read_schema,
+                checkpoint_read_schema,
+                meta_predicate,
+                stats_schema,
+                partition_schema,
+            )
+        });
+        let (actions, checkpoint_info) = connector
+            .iterate_prepared_result_coroutine_with_companion(workflow, |result| {
+                (result.actions, result.checkpoint_info)
+            })?;
+        Ok(ActionsWithCheckpointInfo {
+            actions,
+            checkpoint_info,
+        })
+    }
+
+    /// Generates projected commit and checkpoint actions with eagerly prepared checkpoint info.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn read_actions_with_projected_checkpoint_actions_with_channel(
+        &self,
+        channel: &Channel,
+        commit_read_schema: SchemaRef,
+        checkpoint_read_schema: SchemaRef,
+        meta_predicate: Option<PredicateRef>,
+        stats_schema: Option<&StructType>,
+        partition_schema: Option<&StructType>,
+    ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultGenerator<ActionsBatch> + 'static>>
+    {
         // Combine the action-presence predicate with the caller's skipping predicate so readers
         // can omit checkpoint data that cannot contain a relevant action.
         let projection_predicate = checkpoint_action_projection_predicate(&checkpoint_read_schema);
@@ -965,17 +1002,18 @@ impl LogSegment {
 
         // `replay` expects commit files to be sorted in descending order, so the return value here
         // is correct
-        let commit_stream =
-            self.read_commit_actions(engine, commit_read_schema, cancellation_token)?;
+        let commit_stream = self
+            .read_commit_actions_generator(channel, commit_read_schema)
+            .await?;
 
-        let checkpoint_result = self.create_checkpoint_stream(
-            engine,
+        let checkpoint_result = self.create_checkpoint_stream_with_channel(
+            channel,
             checkpoint_read_schema,
             checkpoint_predicate,
             stats_schema,
             partition_schema,
-            cancellation_token,
-        )?;
+        );
+        let checkpoint_result = checkpoint_result.await?;
 
         Ok(ActionsWithCheckpointInfo {
             actions: commit_stream.chain(checkpoint_result.actions),
@@ -992,15 +1030,27 @@ impl LogSegment {
         engine: &dyn Engine,
         action_schema: SchemaRef,
     ) -> KernelResult<impl KernelResultIterator<ActionsBatch>> {
-        let result = self.read_actions_with_projected_checkpoint_actions(
-            engine,
-            action_schema.clone(),
-            action_schema,
-            None,
-            None,
-            None,
-            None,
-        )?;
+        iterate_prepared_result_coroutine_with_engine!(engine, None, |channel| {
+            self.read_actions_generator(channel, action_schema)
+        })
+    }
+
+    /// Generates this segment's action batches using one schema for checkpoints and commits.
+    pub(crate) async fn read_actions_generator(
+        &self,
+        channel: &Channel,
+        action_schema: SchemaRef,
+    ) -> KernelResult<impl KernelResultGenerator<ActionsBatch> + 'static> {
+        let result = self
+            .read_actions_with_projected_checkpoint_actions_with_channel(
+                channel,
+                action_schema.clone(),
+                action_schema,
+                None,
+                None,
+                None,
+            )
+            .await?;
         Ok(result.actions)
     }
 
@@ -1239,6 +1289,7 @@ impl LogSegment {
     ///   footer, then check for sidecar column to distinguish
     ///   - Has sidecar column (V2): extract sidecars, read first sidecar's schema
     ///   - No sidecar column (V1): use checkpoint schema directly
+    #[cfg(test)]
     fn get_file_actions_schema_and_sidecars(
         &self,
         engine: &dyn Engine,
@@ -1360,10 +1411,40 @@ impl LogSegment {
         partition_schema: Option<&StructType>,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch>>> {
+        let connector =
+            EngineConnector::new(engine).with_cancellation_token(cancellation_token.cloned());
+        let workflow = workflow!(|channel| {
+            self.create_checkpoint_stream_with_channel(
+                channel,
+                action_schema,
+                meta_predicate,
+                stats_schema,
+                partition_schema,
+            )
+        });
+        let (actions, checkpoint_info) = connector
+            .iterate_prepared_result_coroutine_with_companion(workflow, |result| {
+                (result.actions, result.checkpoint_info)
+            })?;
+        Ok(ActionsWithCheckpointInfo {
+            actions,
+            checkpoint_info,
+        })
+    }
+
+    async fn create_checkpoint_stream_with_channel(
+        &self,
+        channel: &Channel,
+        action_schema: SchemaRef,
+        meta_predicate: Option<PredicateRef>,
+        stats_schema: Option<&StructType>,
+        partition_schema: Option<&StructType>,
+    ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultGenerator<ActionsBatch>>> {
         let need_file_actions = schema_contains_file_actions(&action_schema);
 
         let (file_actions_schema, sidecar_files) = if need_file_actions {
-            self.get_file_actions_schema_and_sidecars(engine, cancellation_token)?
+            self.get_file_actions_schema_and_sidecars_with_channel(channel)
+                .await?
         } else {
             (None, vec![])
         };
@@ -1458,22 +1539,22 @@ impl LogSegment {
         // where it *could* have been useful, but for now, we're keeping them separate.
         // If similar patterns start appearing elsewhere, we should reconsider that decision.
         let actions = match self.listed.checkpoint_parts.first() {
-            Some(parsed_log_path) if parsed_log_path.extension == "json" => {
-                engine.json_handler().read_json_files_with_cancellation(
-                    &checkpoint_file_meta,
+            Some(parsed_log_path) if parsed_log_path.extension == "json" => channel
+                .prepare_json_files(
+                    checkpoint_file_meta,
                     augmented_checkpoint_read_schema.clone(),
                     meta_predicate.clone(),
-                    cancellation_token.cloned(),
-                )?
-            }
-            Some(parsed_log_path) if parsed_log_path.extension == "parquet" => engine
-                .parquet_handler()
-                .read_parquet_files_with_cancellation(
-                    &checkpoint_file_meta,
+                )
+                .await?
+                .into_boxed(),
+            Some(parsed_log_path) if parsed_log_path.extension == "parquet" => channel
+                .prepare_parquet_files(
+                    checkpoint_file_meta,
                     augmented_checkpoint_read_schema.clone(),
                     meta_predicate.clone(),
-                    cancellation_token.cloned(),
-                )?,
+                )
+                .await?
+                .into_boxed(),
             Some(parsed_log_path) => {
                 return Err(KernelError::invalid_checkpoint(format!(
                     "Unsupported checkpoint file type: {}",
@@ -1481,8 +1562,8 @@ impl LogSegment {
                 )));
             }
             // This is the case when there are no checkpoints in the log segment
-            // so we return an empty iterator
-            None => Box::new(std::iter::empty()),
+            // so we return an empty generator
+            None => generator::empty().into_boxed(),
         };
 
         // Read sidecars with the same schema as checkpoint (including stats_parsed if available).
@@ -1490,16 +1571,16 @@ impl LogSegment {
         // Both checkpoint and sidecar parquet files share the same `add.stats_parsed.*` column
         // layout, so we reuse the same predicate for row group skipping.
         let sidecar_batches = if !sidecar_files.is_empty() {
-            engine
-                .parquet_handler()
-                .read_parquet_files_with_cancellation(
-                    &sidecar_files,
+            channel
+                .prepare_parquet_files(
+                    sidecar_files,
                     augmented_checkpoint_read_schema.clone(),
                     meta_predicate,
-                    cancellation_token.cloned(),
-                )?
+                )
+                .await?
+                .into_boxed()
         } else {
-            Box::new(std::iter::empty())
+            generator::empty().into_boxed()
         };
 
         // Chain checkpoint batches with sidecar batches.
