@@ -2,8 +2,14 @@ use url::Url;
 
 use super::scan_file::CdfScanFileType;
 use crate::actions::deletion_vector::{deletion_treemap_to_bools, selection_treemap_to_bools};
+#[cfg(test)]
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::Channel;
+use crate::coroutine::AsyncOption as _;
 use crate::table_changes::scan_file::CdfScanFile;
-use crate::{Engine, KernelError, KernelResult};
+#[cfg(test)]
+use crate::Engine;
+use crate::{KernelError, KernelResult};
 
 /// A [`CdfScanFile`] with its associated `selection_vector`. The `scan_type` is resolved to
 /// match the `_change_type` that its rows will have in the change data feed.
@@ -33,16 +39,32 @@ pub(crate) struct ResolvedCdfScanFile {
 /// 2. The second case handles all other add, remove, and cdc [`CdfScanFile`]s. These will simply
 ///    read the deletion vector (if present), and each is converted into a [`ResolvedCdfScanFile`].
 ///    No changes are made to the `scan_type`.
+#[cfg(test)]
 pub(crate) fn resolve_scan_file_dv(
     engine: &dyn Engine,
     table_root: &Url,
     scan_file: CdfScanFile,
 ) -> KernelResult<impl Iterator<Item = ResolvedCdfScanFile>> {
-    let add_dv = scan_file.dv_info.get_treemap(engine, table_root)?;
+    run_workflow_with_engine!(engine, |channel| {
+        resolve_scan_file_dv_with_channel(channel, table_root, scan_file)
+    })
+}
+
+/// Resolves the deletion vectors for `scan_file` through `channel`.
+pub(crate) async fn resolve_scan_file_dv_with_channel(
+    channel: &Channel,
+    table_root: &Url,
+    scan_file: CdfScanFile,
+) -> KernelResult<impl Iterator<Item = ResolvedCdfScanFile>> {
+    let add_dv = scan_file
+        .dv_info
+        .get_treemap_with_channel(channel, table_root)
+        .await?;
     let rm_dv = scan_file
         .remove_dv
         .as_ref()
-        .map(|rm_dv| rm_dv.get_treemap(engine, table_root))
+        .map_async(|rm_dv| rm_dv.get_treemap_with_channel(channel, table_root))
+        .await
         .transpose()?;
     let (add_dv, rm_dv) = match (add_dv, rm_dv, &scan_file.scan_type) {
         (_, Some(_), CdfScanFileType::Remove) => {

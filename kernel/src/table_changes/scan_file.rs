@@ -7,17 +7,18 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use delta_kernel_derive::internal_api;
-use itertools::Itertools;
 
 use super::log_replay::TableChangesScanMetadata;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::visitors::visit_deletion_vector_at;
+use crate::coroutine::generator::{AsyncIntoIterator as _, GeneratorExt as _};
+use crate::coroutine::kernel::KernelResultGenerator;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{col, lit, Expression};
 use crate::scan::state::DvInfo;
 use crate::schema::{lazy_schema_ref, ColumnName, ColumnNamesAndTypes, DataType, SchemaRef};
 use crate::utils::require;
-use crate::{KernelError, KernelResult, KernelResultIterator, RowVisitor};
+use crate::{KernelError, KernelResult, RowVisitor};
 
 // The type of action associated with a [`CdfScanFile`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,19 +195,18 @@ impl TableChangesScanFile {
     }
 }
 
-/// Transforms an iterator of [`TableChangesScanMetadata`] into an iterator of
-/// [`CdfScanFile`] by visiting the engine data.
+/// Transforms a generator of [`TableChangesScanMetadata`] into one of [`CdfScanFile`].
 pub(crate) fn scan_metadata_to_scan_file(
-    scan_metadata: impl KernelResultIterator<TableChangesScanMetadata>,
-) -> impl KernelResultIterator<CdfScanFile> {
+    scan_metadata: impl KernelResultGenerator<TableChangesScanMetadata>,
+) -> impl KernelResultGenerator<CdfScanFile> {
     scan_metadata
         .map(|scan_metadata| -> KernelResult<_> {
             let scan_metadata = scan_metadata?;
             let callback: CdfScanCallback<Vec<CdfScanFile>> =
                 |context, scan_file| context.push(scan_file);
-            Ok(visit_cdf_scan_files(&scan_metadata, vec![], callback)?.into_iter())
-        }) // Iterator-Result-Iterator
-        .flatten_ok() // Iterator-Result
+            Ok(visit_cdf_scan_files(&scan_metadata, vec![], callback)?.into_generator())
+        }) // Generator-Result-Generator
+        .flatten_ok() // Generator-Result
 }
 
 /// Request that the kernel call a callback on each valid file that needs to be read for the
@@ -489,6 +489,11 @@ mod tests {
     use super::{scan_metadata_to_scan_file, CdfScanFile, CdfScanFileType, TableChangesFileAction};
     use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
     use crate::actions::{Add, Cdc, Remove};
+    use crate::coroutine::generator::{
+        AsyncIntoIterator as _, BoundGenerator as _, Generator as _,
+    };
+    use crate::coroutine::kernel::workflow;
+    use crate::coroutine::WorkflowStep;
     use crate::engine::sync::SyncEngine;
     use crate::log_segment::LogSegment;
     use crate::scan::state::DvInfo;
@@ -504,7 +509,7 @@ mod tests {
         assert_result_error_with_message, Action, LocalMockTable, MockProtocolBuilder,
         MockTableConfigurationBuilder,
     };
-    use crate::Engine as _;
+    use crate::{Engine as _, KernelResult};
 
     fn row_tracking_add(
         path: &str,
@@ -541,7 +546,7 @@ mod tests {
         }
     }
 
-    fn row_tracking_scan_files(
+    async fn row_tracking_scan_files(
         engine: Arc<SyncEngine>,
         mock_table: &LocalMockTable,
     ) -> Vec<CdfScanFile> {
@@ -567,9 +572,14 @@ mod tests {
             CdfMode::RowTracking,
         )
         .unwrap();
-        scan_metadata_to_scan_file(scan_metadata)
-            .try_collect()
-            .unwrap()
+        let generator = scan_metadata_to_scan_file(scan_metadata.into_generator());
+        let mut workflow = workflow!(async move |channel| -> KernelResult<Vec<CdfScanFile>> {
+            generator.bind(channel).try_collect().await
+        });
+        let WorkflowStep::Done(scan_files) = workflow.try_advance().unwrap() else {
+            panic!("scan-file generator unexpectedly requested connector work");
+        };
+        scan_files
     }
 
     #[tokio::test]
@@ -674,9 +684,13 @@ mod tests {
             None,
         )
         .unwrap();
-        let scan_files: Vec<_> = scan_metadata_to_scan_file(scan_metadata)
-            .try_collect()
-            .unwrap();
+        let generator = scan_metadata_to_scan_file(scan_metadata.into_generator());
+        let mut workflow = workflow!(async move |channel| -> KernelResult<Vec<CdfScanFile>> {
+            generator.bind(channel).try_collect().await
+        });
+        let WorkflowStep::Done(scan_files) = workflow.try_advance().unwrap() else {
+            panic!("scan-file generator unexpectedly requested connector work");
+        };
 
         // Generate the expected [`CdfScanFile`]
         let timestamps = log_segment
@@ -780,7 +794,7 @@ mod tests {
         mock_table.commit([Action::Add(add_insert)]).await;
         mock_table.commit([Action::Add(add_no_data_change)]).await;
 
-        let scan_files = row_tracking_scan_files(engine, &mock_table);
+        let scan_files = row_tracking_scan_files(engine, &mock_table).await;
 
         // The cdc action in commit 1 is ignored: only add/remove-derived files appear. The
         // metadata-only add (`data_change == false`) in commit 3 is also excluded.

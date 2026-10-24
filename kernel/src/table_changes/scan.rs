@@ -2,15 +2,22 @@
 
 use std::sync::Arc;
 
-use itertools::Itertools;
 use url::Url;
 
-use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
+use super::log_replay::{table_changes_action_iter_with_channel, TableChangesScanMetadata};
 use super::physical_to_logical::{get_cdf_transform_expr, scan_file_physical_schema};
-use super::resolve_dvs::{resolve_scan_file_dv, ResolvedCdfScanFile};
+use super::resolve_dvs::{resolve_scan_file_dv_with_channel, ResolvedCdfScanFile};
 use super::scan_file::scan_metadata_to_scan_file;
 use super::{CdfMode, TableChanges};
 use crate::actions::deletion_vector::split_vector;
+use crate::coroutine::generator::{
+    empty, map_async, map_async_witness, AsyncIntoIterator as _, GeneratorExt as _,
+};
+use crate::coroutine::kernel::engine::EngineConnector;
+use crate::coroutine::kernel::{
+    coroutine, workflow, Channel, ChannelExt as _, Coroutine, KernelResultGenerator, Request,
+};
+use crate::coroutine::{AsyncOption as _, Generator};
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
 use crate::scan::state_info::StateInfo;
 use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions};
@@ -19,6 +26,9 @@ use crate::utils::FoldWithOption as _;
 use crate::{
     Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator, PredicateRef,
 };
+
+type TableChangesScanMetadataGenerator<'a> =
+    Box<dyn Generator<Request, Item = KernelResult<TableChangesScanMetadata>, Output = ()> + 'a>;
 
 /// The result of building a [`TableChanges`] scan over a table. This can be used to get the change
 /// data feed from the table.
@@ -160,10 +170,10 @@ impl TableChangesScan {
     /// deletion vectors present in the commit. The engine data in each scan metadata is guaranteed
     /// to belong to the same commit. Several [`TableChangesScanMetadata`] may belong to the same
     /// commit.
-    fn scan_metadata(
+    async fn scan_metadata_with_channel(
         &self,
-        engine: Arc<dyn Engine>,
-    ) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata>> {
+        channel: &Channel,
+    ) -> KernelResult<TableChangesScanMetadataGenerator<'static>> {
         let commits = self
             .table_changes
             .log_segment
@@ -172,19 +182,20 @@ impl TableChangesScan {
             .clone();
         // NOTE: This is a cheap arc clone
         let physical_predicate = match self.state_info.physical_predicate.clone() {
-            PhysicalPredicate::StaticSkipAll => return Ok(None.into_iter().flatten()),
+            PhysicalPredicate::StaticSkipAll => return Ok(empty().into_boxed()),
             PhysicalPredicate::Some(predicate, schema) => Some((predicate, schema)),
             PhysicalPredicate::None => None,
         };
         let schema = self.table_changes.end_snapshot.schema();
-        let it = table_changes_action_iter(
-            engine,
+        let it = table_changes_action_iter_with_channel(
+            channel,
             &self.table_changes.start_table_config,
-            commits,
+            commits.into_iter(),
             schema,
             physical_predicate,
-        )?;
-        Ok(Some(it).into_iter().flatten())
+        )
+        .await?;
+        Ok(it.into_boxed())
     }
 
     /// Get a shared reference to the logical [`Schema`] of the table changes scan.
@@ -221,46 +232,68 @@ impl TableChangesScan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>>> {
-        let scan_metadata = self.scan_metadata(engine.clone())?;
+        let connector = EngineConnector::new(engine.as_ref());
+        let workflow = workflow!(|channel| self.execute_with_channel(channel));
+        connector.iterate_prepared_result_coroutine(workflow)
+    }
+
+    /// Returns a connector-driven coroutine over change data feed batches.
+    pub fn execute_generator(&self) -> Coroutine<'_, KernelResult<Box<dyn EngineData>>> {
+        coroutine!(async move |channel| {
+            let batches = self.execute_with_channel(&channel).await?;
+            channel.yield_from(batches.bind(&channel)).await
+        })
+    }
+
+    async fn execute_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<impl KernelResultGenerator<Box<dyn EngineData>> + 'static> {
+        let scan_metadata = self.scan_metadata_with_channel(channel).await?;
         let scan_files = scan_metadata_to_scan_file(scan_metadata);
 
         let table_root = self.table_changes.table_root().clone();
         let state_info = self.state_info.clone();
-        let dv_engine_ref = engine.clone();
 
         let table_root_copy = self.table_changes.table_root().clone();
         let physical_predicate = self.physical_predicate().clone();
 
         let result = scan_files
-            .map(move |scan_file| {
-                resolve_scan_file_dv(dv_engine_ref.as_ref(), &table_root, scan_file?)
-            }) // Iterator-Result-Iterator
-            .flatten_ok() // Iterator-Result
-            .map(move |resolved_scan_file| -> KernelResult<_> {
-                read_scan_file(
-                    engine.as_ref(),
-                    resolved_scan_file?,
-                    &table_root_copy,
-                    state_info.as_ref(),
-                    physical_predicate.clone(),
-                )
-            }) // Iterator-Result-Iterator-Result
-            .flatten_ok() // Iterator-Result-Result
-            .map(|x| x?); // Iterator-Result
+            .map_async(map_async_witness, async move |channel, scan_file| {
+                let resolved =
+                    resolve_scan_file_dv_with_channel(channel, &table_root, scan_file?).await?;
+                Ok(resolved.into_generator())
+            }) // Generator-Result-Generator
+            .flatten_ok() // Generator-Result
+            .map_async(
+                map_async_witness,
+                async move |channel, resolved_scan_file| {
+                    read_scan_file_with_channel(
+                        channel,
+                        resolved_scan_file?,
+                        &table_root_copy,
+                        state_info.as_ref(),
+                        physical_predicate.clone(),
+                    )
+                    .await
+                },
+            ) // Generator-Result-Generator-Result
+            .flatten_ok() // Generator-Result-Result
+            .map(|x| x?); // Generator-Result
 
         Ok(result)
     }
 }
 
 /// Reads the data at the `resolved_scan_file` and transforms the data from physical to logical.
-/// The result is a fallible iterator of [`Box<dyn EngineData>`] containing the logical data.
-fn read_scan_file(
-    engine: &dyn Engine,
+/// The result is a fallible generator of [`Box<dyn EngineData>`] containing the logical data.
+async fn read_scan_file_with_channel(
+    channel: &Channel,
     resolved_scan_file: ResolvedCdfScanFile,
     table_root: &Url,
     state_info: &StateInfo,
     _physical_predicate: Option<PredicateRef>,
-) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>>> {
+) -> KernelResult<impl KernelResultGenerator<Box<dyn EngineData>> + 'static> {
     let ResolvedCdfScanFile {
         scan_file,
         mut selection_vector,
@@ -272,13 +305,14 @@ fn read_scan_file(
 
     // Only create an evaluator if transformation is needed
     let phys_to_logical_eval = transform_expr
-        .map(|expr| {
-            engine.evaluation_handler().new_expression_evaluator(
+        .map_async(|expr| {
+            channel.create_expression_evaluator(
                 physical_schema.clone(),
                 expr,
                 state_info.logical_schema.clone().into(),
             )
         })
+        .await
         .transpose()?;
     // Determine if the scan file was derived from a deletion vector pair
     let is_dv_resolved_pair = scan_file.remove_dv.is_some();
@@ -295,16 +329,15 @@ fn read_scan_file(
         location,
     };
     // TODO(#860): we disable predicate pushdown until we support row indexes.
-    let read_result_iter =
-        engine
-            .parquet_handler()
-            .read_parquet_files(&[file], physical_schema, None)?;
+    let read_result_iter = channel
+        .prepare_parquet_files([file], physical_schema, None)
+        .await?;
 
-    let result = read_result_iter.map(move |batch| -> KernelResult<_> {
+    let result = map_async!(read_result_iter, async move |channel, batch| {
         let batch = batch?;
         // Transform the physical data into the correct logical form, or pass through unchanged.
         let logical = if let Some(ref eval) = phys_to_logical_eval {
-            eval.evaluate(batch.as_ref())
+            channel.evaluate_expression(eval, batch).await
         } else {
             // No transformation needed - pass through the batch as-is
             Ok(batch)

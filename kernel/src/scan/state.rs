@@ -65,16 +65,6 @@ impl DvInfo {
         self.deletion_vector.is_some()
     }
 
-    pub(crate) fn get_treemap(
-        &self,
-        engine: &dyn Engine,
-        table_root: &url::Url,
-    ) -> KernelResult<Option<RoaringTreemap>> {
-        run_workflow_with_engine!(engine, |channel| {
-            self.get_treemap_with_channel(channel, table_root)
-        })
-    }
-
     pub(crate) async fn get_treemap_with_channel(
         &self,
         channel: &Channel,

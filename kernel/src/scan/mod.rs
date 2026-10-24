@@ -6,6 +6,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
+#[cfg(test)]
 use itertools::Itertools;
 use tracing::{debug, info, warn, Instrument as _};
 use url::Url;
@@ -20,13 +21,15 @@ use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
 use crate::coroutine::generator::{
-    map_async, AsyncIntoIterator as _, Generator, GeneratorExt as _,
+    map_async, map_async_witness, AsyncIntoIterator as _, Generator, GeneratorExt as _,
 };
 use crate::coroutine::kernel::engine::EngineConnector;
+use crate::coroutine::kernel::request::ReadParquetFiles;
 use crate::coroutine::kernel::{
-    run_workflow_with_storage, static_workflow, workflow, Channel, ChannelExt as _,
-    KernelResultGenerator, Request, StaticWorkflow, Workflow,
+    coroutine, run_workflow_with_storage, static_workflow, workflow, Channel, ChannelExt as _,
+    Coroutine, KernelResultGenerator, Request, StaticWorkflow, Workflow,
 };
+use crate::coroutine::PageGenerator;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef};
 use crate::kernel_predicates::{
@@ -1687,6 +1690,24 @@ impl Scan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>>> {
+        let connector = EngineConnector::new(engine.as_ref())
+            .with_cancellation_token(self.cancellation_token.clone());
+        let workflow = workflow!(|channel| self.execute_with_channel(channel));
+        connector.iterate_prepared_result_coroutine(workflow)
+    }
+
+    /// Returns a connector-driven coroutine over logical table-data batches.
+    pub fn execute_generator(&self) -> Coroutine<'_, KernelResult<Box<dyn EngineData>>> {
+        coroutine!(async move |channel| {
+            let batches = self.execute_with_channel(&channel).await?;
+            channel.yield_from(batches.bind(&channel)).await
+        })
+    }
+
+    async fn execute_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<impl KernelResultGenerator<Box<dyn EngineData>> + 'static> {
         if self.state_info.skip_row_transforms {
             return Err(KernelError::unsupported(
                 "Scan::execute is not supported when row transforms are disabled by \
@@ -1706,25 +1727,29 @@ impl Scan {
 
         let table_root = self.snapshot.table_root().clone();
 
-        let scan_metadata_iter = self.scan_metadata(engine.as_ref())?;
+        let scan_metadata_iter = self.scan_metadata_with_channel(channel).await?;
         let scan_files_iter = scan_metadata_iter
             .map(|res| {
-                let scan_metadata = res?;
+                let scan_metadata: ScanMetadata = res?;
                 let scan_files = vec![];
-                scan_metadata.visit_scan_files(scan_files, scan_metadata_callback)
+                let scan_files =
+                    scan_metadata.visit_scan_files(scan_files, scan_metadata_callback)?;
+                Ok(scan_files.into_generator())
             })
-            // Iterator<Result<Vec<ScanFile>>> to Iterator<Result<ScanFile>>
+            // Generator<Result<Generator<ScanFile>>> to Generator<Result<ScanFile>>
             .flatten_ok();
 
         let physical_schema = self.physical_schema().clone();
         let logical_schema = self.logical_schema().clone();
-        let result = scan_files_iter
-            .map(move |scan_file| -> KernelResult<_> {
+        let result = scan_files_iter.map_async(
+            map_async_witness,
+            async move |channel, scan_file| {
                 let scan_file = scan_file?;
                 let file_path = table_root.join(&scan_file.path)?;
                 let mut selection_vector = scan_file
                     .dv_info
-                    .get_selection_vector(engine.as_ref(), &table_root)?;
+                    .get_selection_vector_with_channel(channel, &table_root)
+                    .await?;
                 let meta = FileMeta {
                     last_modified: scan_file.modification_time,
                     size: scan_file.size.try_into().map_err(|_| {
@@ -1739,19 +1764,19 @@ impl Scan {
                 // https://github.com/delta-io/delta-kernel-rs/issues/434 for more details.
                 //
                 // TODO(#860): we disable predicate pushdown until we support row indexes.
-                let read_result_iter = engine.parquet_handler().read_parquet_files(
-                    &[meta],
-                    physical_schema.clone(),
-                    None,
-                )?;
-
-                let mut read_result_iter = read_result_iter.peekable();
+                let operation = ReadParquetFiles::new([meta], physical_schema.clone(), None);
+                let cursor = channel.prepare_paged(operation).await?;
+                let mut page = channel.next_page(cursor).await?;
 
                 // Only flag an empty iterator as a connector bug when stats are present and report
                 // a positive row count. When stats are absent we cannot distinguish a legitimate
                 // 0-row file from a buggy connector, so we conservatively allow it.
                 let expect_data = scan_file.stats.as_ref().is_some_and(|s| s.num_records > 0);
-                if expect_data && read_result_iter.peek().is_none() {
+                while expect_data && page.data.is_empty() {
+                    if let Some(cursor) = page.next {
+                        page = channel.next_page(cursor).await?;
+                        continue;
+                    }
                     return Err(KernelError::internal_error(format!(
                         "ParquetHandler returned no data for file '{}'. This is likely a connector \
                          bug -- the handler's read_parquet_files must return at least one batch for \
@@ -1760,19 +1785,22 @@ impl Scan {
                     )));
                 }
 
-                let engine = engine.clone(); // Arc clone
+                let remainder = page.next.map_or(PageGenerator::Done, PageGenerator::Next);
+                let read_result_iter = page.data.into_generator().chain(remainder.flatten());
+
                 let physical_schema_inner = physical_schema.clone();
                 let logical_schema_inner = logical_schema.clone();
-                Ok(read_result_iter.map(move |read_result| -> KernelResult<_> {
+                Ok(map_async!(read_result_iter, async move |channel, read_result| {
                     let read_result = read_result?;
                     // transform the physical data into the correct logical form
-                    let logical = state::transform_to_logical(
-                        engine.as_ref(),
+                    let logical = state::transform_to_logical_with_channel(
+                        channel,
                         read_result,
                         &physical_schema_inner,
                         &logical_schema_inner,
                         scan_file.transform.clone(), // Arc clone
                     );
+                    let logical = logical.await;
                     let len = logical.as_ref().map_or(0, |res| res.len());
                     // need to split the dv_mask. what's left in dv_mask covers this result, and rest
                     // will cover the following results. we `take()` out of `selection_vector` to avoid
@@ -1786,11 +1814,10 @@ impl Scan {
                     selection_vector = rest;
                     result
                 }))
-            })
-            // Iterator<Result<Iterator<Result<Box<dyn EngineData>>>>> to Iterator<Result<Result<Box<dyn EngineData>>>>
-            .flatten_ok()
-            // Iterator<Result<Result<Box<dyn EngineData>>>> to Iterator<Result<Box<dyn EngineData>>>
-            .map(|x| x?);
+            }); // Generator-Result-Generator-Result
+        let result = result
+            .flatten_ok() // Generator-Result-Result
+            .map(|x| x?); // Generator-Result
         Ok(result)
     }
 }
