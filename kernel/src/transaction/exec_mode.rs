@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 #[cfg(doc)]
 use super::Transaction;
 use crate::engine_data::FilteredEngineData;
@@ -30,10 +32,10 @@ pub(crate) trait StagedDataChanges {
 /// This is the default mode of [`Transaction`].
 #[derive(Default)]
 pub struct Imperative {
-    pub(super) add_files_metadata: Vec<Box<dyn EngineData>>,
-    pub(super) remove_files_metadata: Vec<FilteredEngineData>,
+    pub(super) add_files_metadata: Vec<Arc<dyn EngineData>>,
+    pub(super) remove_files_metadata: Vec<Arc<FilteredEngineData>>,
     // Matched scan files with new DV descriptors and rewritten statistics appended.
-    pub(super) dv_matched_files: Vec<FilteredEngineData>,
+    pub(super) dv_matched_files: Vec<Arc<FilteredEngineData>>,
     // Number of selected files within dv_matched_files (after selection vector is applied)
     pub(super) num_dv_updates: usize,
 }

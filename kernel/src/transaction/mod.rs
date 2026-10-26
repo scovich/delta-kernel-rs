@@ -287,7 +287,7 @@ pub struct Transaction<STATE = UpdateTable, MODE: ExecutionMode = Imperative> {
     operation_parameters: Option<HashMap<String, Option<String>>>,
     operation_metrics: Option<HashMap<String, Option<String>>>,
     engine_info: String,
-    engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
+    engine_commit_info: Option<(Arc<dyn EngineData>, SchemaRef)>,
     staged_data_changes: MODE,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
     // key/payload. HashSet requires Borrow<&str> with matching Eq, Ord, and Hash. Plus,
@@ -526,7 +526,7 @@ impl<STATE> Transaction<STATE, Imperative> {
         engine_commit_info: Box<dyn EngineData>,
         commit_info_schema: SchemaRef,
     ) -> Self {
-        self.engine_commit_info = Some((engine_commit_info, commit_info_schema));
+        self.engine_commit_info = Some((engine_commit_info.into(), commit_info_schema));
         self
     }
 }
@@ -764,7 +764,7 @@ impl<STATE> Transaction<STATE, Imperative> {
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
         self.staged_data_changes
             .add_files_metadata
-            .push(add_metadata);
+            .push(add_metadata.into());
     }
 }
 
@@ -1524,7 +1524,7 @@ impl<STATE> Transaction<STATE, Imperative> {
             .remove_files_metadata
             .iter()
             .chain(&self.staged_data_changes.dv_matched_files)
-            .any(HasSelectionVector::has_selected_rows);
+            .any(|batch| batch.has_selected_rows());
         require!(
             !removes_data,
             KernelError::invalid_transaction_state(
@@ -1729,7 +1729,10 @@ impl<STATE> Transaction<STATE, Imperative> {
     /// Only add files are validated(remove files do not carry statistics).
     ///
     /// [`requires_stats_num_records`]: crate::table_configuration::TableConfiguration::requires_stats_num_records
-    fn validate_add_files_stats(&self, add_files: &[Box<dyn EngineData>]) -> KernelResult<()> {
+    fn validate_add_files_stats(
+        &self,
+        add_files: &[impl AsRef<dyn EngineData>],
+    ) -> KernelResult<()> {
         if add_files.is_empty() {
             return Ok(());
         }
@@ -1895,7 +1898,7 @@ impl<STATE> Transaction<STATE, Imperative> {
     fn generate_remove_actions<'a>(
         &'a self,
         engine: &dyn Engine,
-        remove_files_metadata: impl Iterator<Item = &'a FilteredEngineData> + Send + 'a,
+        remove_files_metadata: impl Iterator<Item = &'a Arc<FilteredEngineData>> + Send + 'a,
         has_dv_update_columns: bool,
     ) -> KernelResult<impl KernelResultIterator<FilteredEngineData> + 'a> {
         // Create-table transactions should not have any remove actions.
@@ -2375,7 +2378,8 @@ mod tests {
         let expected_metrics = HashMap::from([("numFiles".into(), Some("3".into()))]);
         let expected_domains = vec![DomainMetadata::new("app.domain".into(), "{}".into())];
         let expected_commit_info_schema = schema_ref! { nullable "tag": STRING };
-        let commit_info = string_array_to_engine_data(StringArray::from(vec!["connector-tag"]));
+        let commit_info: Arc<dyn EngineData> =
+            string_array_to_engine_data(StringArray::from(vec!["connector-tag"])).into();
         let expected_commit_info = std::ptr::from_ref(commit_info.as_ref());
         let expected_commit_timestamp = 5678;
 
@@ -3437,11 +3441,12 @@ mod tests {
     fn test_update_deletion_vectors_iter_error_does_not_mutate_transaction() -> KernelResult<()> {
         let (engine, snapshot) = setup_dv_enabled_table();
         let mut txn = create_dv_transaction(snapshot.clone(), &engine)?;
-        txn.staged_data_changes
-            .dv_matched_files
-            .push(FilteredEngineData::with_all_rows_selected(
-                string_array_to_engine_data(StringArray::from(vec!["sentinel"])),
-            ));
+        txn.staged_data_changes.dv_matched_files.push(
+            FilteredEngineData::with_all_rows_selected(string_array_to_engine_data(
+                StringArray::from(vec!["sentinel"]),
+            ))
+            .into(),
+        );
         let staged_len_before = txn.staged_data_changes.dv_matched_files.len();
         let scan = snapshot.scan_builder().build()?;
         let scan_metadata = scan
@@ -3622,7 +3627,7 @@ mod tests {
         match removal {
             DataRemoval::RemoveFile => txn.remove_files(data),
             DataRemoval::DeletionVectorUpdate => {
-                txn.staged_data_changes.dv_matched_files.push(data)
+                txn.staged_data_changes.dv_matched_files.push(data.into())
             }
         }
     }
@@ -3872,7 +3877,9 @@ mod tests {
         let dv_data = FilteredEngineData::with_all_rows_selected(string_array_to_engine_data(
             StringArray::from(vec!["dv"]),
         ));
-        txn.staged_data_changes.dv_matched_files.push(dv_data);
+        txn.staged_data_changes
+            .dv_matched_files
+            .push(dv_data.into());
         let result = txn.validate_blind_append_semantics();
         assert!(matches!(
             result,

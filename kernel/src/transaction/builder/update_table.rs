@@ -965,7 +965,10 @@ mod tests {
                 match action {
                     StagedFileAction::Remove => transaction.remove_files(data),
                     StagedFileAction::DeletionVectorUpdate => {
-                        transaction.staged_data_changes.dv_matched_files.push(data);
+                        transaction
+                            .staged_data_changes
+                            .dv_matched_files
+                            .push(data.into());
                         transaction.staged_data_changes.num_dv_updates = selection_vector
                             .iter()
                             .filter(|&&selected| selected)
@@ -1048,7 +1051,7 @@ mod tests {
         transaction
             .staged_data_changes
             .add_files_metadata
-            .push(Box::new(ArrowEngineData::new(RecordBatch::try_from_iter(
+            .push(Arc::new(ArrowEngineData::new(RecordBatch::try_from_iter(
                 [("value", values)],
             )?)));
         assert_eq!(transaction.data_change, data_change);

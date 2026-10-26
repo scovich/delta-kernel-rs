@@ -260,7 +260,7 @@ impl Transaction<UpdateTable, Imperative> {
     pub fn remove_files(&mut self, remove_metadata: FilteredEngineData) {
         self.staged_data_changes
             .remove_files_metadata
-            .push(remove_metadata);
+            .push(remove_metadata.into());
     }
 
     // -------------------------------------------------------------------------
@@ -413,7 +413,7 @@ impl Transaction<UpdateTable, Imperative> {
 
         self.staged_data_changes
             .dv_matched_files
-            .extend(matched_files);
+            .extend(matched_files.into_iter().map(Arc::new));
         self.staged_data_changes.num_dv_updates += matched_dv_files;
         Ok(())
     }
@@ -570,7 +570,7 @@ impl<STATE> Transaction<STATE, Imperative> {
     fn generate_adds_for_dv_update<'a>(
         &'a self,
         engine: &'a dyn Engine,
-        file_metadata_batch: impl Iterator<Item = &'a FilteredEngineData> + Send + 'a,
+        file_metadata_batch: impl Iterator<Item = &'a Arc<FilteredEngineData>> + Send + 'a,
     ) -> KernelResult<impl KernelResultIterator<FilteredEngineData> + 'a> {
         let evaluation_handler = engine.evaluation_handler();
         // Struct patch to replace the deletionVector field with the new DV/stats from

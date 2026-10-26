@@ -139,7 +139,7 @@ impl<T: TransactionType> TransactionBuilder<T> {
         commit_info: Box<dyn EngineData>,
         commit_info_schema: SchemaRef,
     ) -> Self {
-        self.common_state.engine_commit_info = Some((commit_info, commit_info_schema));
+        self.common_state.engine_commit_info = Some((commit_info.into(), commit_info_schema));
         self
     }
 }
