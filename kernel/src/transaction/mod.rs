@@ -116,8 +116,7 @@ use update_table::{intermediate_dv_schema, new_dv_column_schema};
 pub use write_state::{BoundWriteContextBuilder, RowTrackingMetadataColumns, WriteState};
 
 /// Type alias for an iterator of [`EngineData`] results.
-pub(crate) type EngineDataResultIterator<'a> =
-    Box<dyn KernelResultIterator<Box<dyn EngineData>> + 'a>;
+pub(crate) type EngineDataResultIterator = Box<dyn KernelResultIterator<Box<dyn EngineData>>>;
 
 /// The static instance referenced by [`add_files_schema`] that doesn't contain the dataChange
 /// column.
@@ -380,15 +379,15 @@ fn build_add_action_projection(
 
 /// Transforms add file metadata into commit-ready add actions by converting stats to JSON and
 /// setting the `dataChange` field.
-fn build_add_actions<'a, I, T>(
+fn build_add_actions<I, T>(
     engine: &dyn Engine,
     add_files_metadata: I,
     input_schema: SchemaRef,
     data_change: bool,
-) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>> + 'a>
+) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>>>
 where
-    I: KernelResultIterator<T> + 'a,
-    T: Deref<Target = dyn EngineData> + Send + 'a,
+    I: KernelResultIterator<T> + 'static,
+    T: Deref<Target = dyn EngineData> + Send + 'static,
 {
     let evaluation_handler = engine.evaluation_handler();
     let (output_schema, adds_expr) = build_add_action_projection(&input_schema, data_change)?;
@@ -439,7 +438,10 @@ impl<STATE> Transaction<STATE, Imperative> {
         ),
         err
     )]
-    pub fn commit(self, engine: &dyn Engine) -> KernelResult<CommitResult<STATE>> {
+    pub fn commit(self, engine: &dyn Engine) -> KernelResult<CommitResult<STATE>>
+    where
+        STATE: 'static,
+    {
         let commit_start = Instant::now();
 
         // === Pre-commit validation ===
@@ -781,8 +783,8 @@ struct NonfileCommitActions {
 }
 
 /// The encoded commit actions, plus the state the post-commit CRC and snapshot are built from.
-struct CommitBatches<'a> {
-    actions: Box<dyn KernelResultIterator<FilteredEngineData> + 'a>,
+struct CommitBatches {
+    actions: Box<dyn KernelResultIterator<FilteredEngineData>>,
     dm_changes: Vec<DomainMetadata>,
     /// The `checkpoint` action this commit writes, if any (adaptiveMetadata).
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1565,15 +1567,18 @@ impl<STATE> Transaction<STATE, Imperative> {
     /// Encodes actions (both non-file and file) into a committable iterator of EngineData,
     /// retaining per-action errors in the commit iterator. Returns the action iterator with the
     /// domain changes and checkpoint action used by the post-commit CRC and snapshot logic.
-    fn assemble_commit_batches<'a>(
-        &'a self,
-        engine: &'a dyn Engine,
+    fn assemble_commit_batches(
+        &self,
+        engine: &dyn Engine,
         commit_version: Version,
         kernel_commit_info: CommitInfo,
         protocol: Option<&Protocol>,
         metadata: Option<&Metadata>,
         set_transactions: Vec<SetTransaction>,
-    ) -> KernelResult<CommitBatches<'a>> {
+    ) -> KernelResult<CommitBatches>
+    where
+        STATE: 'static,
+    {
         let set_transaction_actions = (!set_transactions.is_empty()).then(|| {
             let rows = set_transactions.into_iter().map(|txn| vec![txn.into()]);
             engine
@@ -1602,9 +1607,14 @@ impl<STATE> Transaction<STATE, Imperative> {
 
         let dv_update_actions = self.generate_dv_update_actions(engine)?;
 
+        let remove_files_metadata = self
+            .staged_data_changes
+            .remove_files_metadata
+            .clone()
+            .into_iter();
         let remove_actions = self.generate_remove_actions(
             engine,
-            self.staged_data_changes.remove_files_metadata.iter(),
+            remove_files_metadata,
             false, /* has_dv_update_columns */
         )?;
 
@@ -1769,14 +1779,11 @@ impl<STATE> Transaction<STATE, Imperative> {
 
     /// Generates add actions and row tracking domain metadata for a commit.
     #[instrument(name = "txn.gen_adds", skip_all, err)]
-    fn generate_adds<'a>(
-        &'a self,
+    fn generate_adds(
+        &self,
         engine: &dyn Engine,
         commit_version: u64,
-    ) -> KernelResult<(
-        EngineDataResultIterator<'a>,
-        Option<RowTrackingDomainMetadata>,
-    )> {
+    ) -> KernelResult<(EngineDataResultIterator, Option<RowTrackingDomainMetadata>)> {
         // Note: this does not require delta.enableRowTracking=true. "supported" is sufficient
         // for writers to assign row IDs.
         let assign_fresh_row_tracking_metadata = self
@@ -1798,12 +1805,10 @@ impl<STATE> Transaction<STATE, Imperative> {
         if assign_fresh_row_tracking_metadata {
             self.generate_adds_with_row_tracking(engine, commit_version)
         } else {
+            let add_files_metadata = self.staged_data_changes.add_files_metadata.clone();
             let add_actions = build_add_actions(
                 engine,
-                self.staged_data_changes
-                    .add_files_metadata
-                    .iter()
-                    .map(|a| Ok(a.deref())),
+                add_files_metadata.into_iter().map(Ok),
                 self.add_files_schema().clone(),
                 self.data_change,
             )?;
@@ -1818,14 +1823,11 @@ impl<STATE> Transaction<STATE, Imperative> {
     /// non-overlapping `baseRowId` ranges in a second pass. The initial high water mark is read
     /// from the snapshot for existing tables, or defaults to -1 for create-table (no prior log
     /// to read from).
-    fn generate_adds_with_row_tracking<'a>(
-        &'a self,
+    fn generate_adds_with_row_tracking(
+        &self,
         engine: &dyn Engine,
         commit_version: i64,
-    ) -> KernelResult<(
-        EngineDataResultIterator<'a>,
-        Option<RowTrackingDomainMetadata>,
-    )> {
+    ) -> KernelResult<(EngineDataResultIterator, Option<RowTrackingDomainMetadata>)> {
         let row_id_high_water_mark = if self.is_create_table() {
             None
         } else {
@@ -1836,11 +1838,13 @@ impl<STATE> Transaction<STATE, Imperative> {
         // Assign base row IDs starting from the current high water mark.
         let mut row_tracking_visitor = RowTrackingVisitor::new(row_id_high_water_mark);
         let extended_add_files =
+            // Own Arc clones so commit actions do not borrow retryable transaction state.
             self.staged_data_changes
                 .add_files_metadata
-                .iter()
+                .clone()
+                .into_iter()
                 .map(move |add_files_batch| {
-                    row_tracking_visitor.visit_rows_of(add_files_batch.deref())?;
+                    row_tracking_visitor.visit_rows_of(add_files_batch.as_ref())?;
                     let base_row_ids = row_tracking_visitor.take_base_row_ids();
                     let commit_versions = vec![commit_version; base_row_ids.len()];
                     let base_row_ids_array =
@@ -1895,12 +1899,12 @@ impl<STATE> Transaction<STATE, Imperative> {
     /// [`remove_files`]: Transaction::remove_files
     /// [`update_deletion_vectors`]: Transaction::update_deletion_vectors
     #[instrument(name = "txn.gen_removes", skip_all, err)]
-    fn generate_remove_actions<'a>(
-        &'a self,
+    fn generate_remove_actions(
+        &self,
         engine: &dyn Engine,
-        remove_files_metadata: impl Iterator<Item = &'a Arc<FilteredEngineData>> + Send + 'a,
+        remove_files_metadata: impl Iterator<Item = Arc<FilteredEngineData>> + Send + 'static,
         has_dv_update_columns: bool,
-    ) -> KernelResult<impl KernelResultIterator<FilteredEngineData> + 'a> {
+    ) -> KernelResult<impl KernelResultIterator<FilteredEngineData>> {
         // Create-table transactions should not have any remove actions.
         // Only error if there are actually files queued for removal.
         if self.is_create_table() && !self.staged_data_changes.remove_files_metadata.is_empty() {
