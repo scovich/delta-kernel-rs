@@ -1537,7 +1537,14 @@ impl Snapshot {
         self: Arc<Self>,
         engine: &dyn Engine,
     ) -> KernelResult<CheckpointWriter> {
-        CheckpointWriter::try_new(self, engine)
+        run_workflow_with_engine!(engine, |channel| {
+            CheckpointWriter::try_new_with_channel(channel, self)
+        })
+    }
+
+    /// Returns a lazy workflow that creates a checkpoint writer for this snapshot.
+    pub fn create_checkpoint_writer_workflow(self: Arc<Self>) -> StaticWorkflow<CheckpointWriter> {
+        static_workflow!(|channel| CheckpointWriter::try_new_with_channel(channel, self))
     }
 
     /// Creates a [`LogCompactionWriter`] for generating a log compaction file.

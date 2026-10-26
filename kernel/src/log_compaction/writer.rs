@@ -1,12 +1,19 @@
 // TODO(#2337): remove dead_code allows when log compaction is re-enabled
 #![allow(dead_code, unused_imports)]
 
-use itertools::Itertools;
 use url::Url;
 
 use super::COMPACTION_ACTIONS_SCHEMA;
-use crate::action_reconciliation::log_replay::ActionReconciliationProcessor;
-use crate::action_reconciliation::{ActionReconciliationIterator, RetentionCalculator};
+use crate::action_reconciliation::log_replay::{
+    ActionReconciliationBatch, ActionReconciliationProcessor, ActionReconciliationState,
+};
+use crate::action_reconciliation::{
+    ActionReconciliationIterator, ActionReconciliationIteratorState, RetentionCalculator,
+};
+use crate::coroutine::generator::GeneratorExt as _;
+use crate::coroutine::kernel::engine::EngineConnector;
+use crate::coroutine::kernel::{workflow, Channel, Coroutine, KernelResultGenerator, Workflow};
+use crate::engine_data::FilteredEngineData;
 use crate::log_replay::HasSelectionVector;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
@@ -100,6 +107,34 @@ impl LogCompactionWriter {
         &mut self,
         engine: &dyn Engine,
     ) -> KernelResult<ActionReconciliationIterator> {
+        let connector = EngineConnector::new(engine);
+        let workflow = workflow!(|channel| self.compaction_data_actions_with_channel(channel));
+        let actions = connector.drive(workflow)?;
+        let (data, state) = ActionReconciliationState::with_shared_state(actions);
+        let data = connector.iterate_result_coroutine(Coroutine::from_generator(data));
+        Ok(ActionReconciliationIterator::new(Box::new(data), state))
+    }
+
+    /// Returns a lazy workflow that prepares a generator over reconciled compaction batches.
+    ///
+    /// The generator returns the reconciliation counters after successful completion.
+    pub fn compaction_data_workflow(
+        &mut self,
+    ) -> Workflow<
+        '_,
+        impl KernelResultGenerator<FilteredEngineData, ActionReconciliationIteratorState> + 'static,
+    > {
+        workflow!(async move |channel| {
+            let actions = self.compaction_data_actions_with_channel(channel).await?;
+            Ok(ActionReconciliationState::new(actions, Default::default())
+                .into_generator(std::convert::identity))
+        })
+    }
+
+    async fn compaction_data_actions_with_channel(
+        &mut self,
+        channel: &Channel,
+    ) -> KernelResult<impl KernelResultGenerator<ActionReconciliationBatch> + 'static> {
         // Validate that the requested version range is within the snapshot's range
         let snapshot_end_version = self.snapshot.version();
         if self.end_version > snapshot_end_version {
@@ -111,16 +146,18 @@ impl LogCompactionWriter {
 
         // Create a log segment specifically for the compaction range
         // This ensures we only process commits in [start_version, end_version]
-        let compaction_log_segment = LogSegment::for_table_changes(
-            engine.storage_handler().as_ref(),
+        let compaction_log_segment = LogSegment::for_table_changes_with_channel(
+            channel,
             self.snapshot.log_segment().log_root.clone(),
             self.start_version,
             Some(self.end_version),
-        )?;
+        )
+        .await?;
 
         // Read actions from the version-filtered log segment
-        let actions_iter =
-            compaction_log_segment.read_actions(engine, COMPACTION_ACTIONS_SCHEMA.clone())?;
+        let actions_iter = compaction_log_segment
+            .read_actions_generator(channel, COMPACTION_ACTIONS_SCHEMA.clone())
+            .await?;
 
         let min_file_retention_timestamp_millis = self.deleted_file_retention_timestamp()?;
 
@@ -132,13 +169,12 @@ impl LogCompactionWriter {
             self.snapshot.table_configuration().dv_normalization_root(),
         );
 
-        // Process actions using the same iterator pattern as checkpoints
+        // Process actions using the same stream pattern as checkpoints
         // The processor handles reverse chronological processing internally
         let result_iter = actions_iter
             .map(move |batch| processor.process_actions_batch(batch?))
             .filter_ok(HasSelectionVector::has_selected_rows);
 
-        // Wrap the iterator to track action counts lazily
-        Ok(ActionReconciliationIterator::new(Box::new(result_iter)))
+        Ok(result_iter)
     }
 }

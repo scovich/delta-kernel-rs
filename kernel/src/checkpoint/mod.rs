@@ -104,12 +104,11 @@
 //! [`Snapshot::create_checkpoint_writer`]: crate::Snapshot::create_checkpoint_writer
 use std::sync::{Arc, LazyLock, Mutex};
 
-use itertools::Itertools;
 use tracing::info;
 use url::Url;
 
 use crate::action_reconciliation::log_replay::{
-    ActionReconciliationBatch, ActionReconciliationProcessor,
+    ActionReconciliationBatch, ActionReconciliationProcessor, ActionReconciliationState,
 };
 use crate::action_reconciliation::{
     ActionReconciliationIterator, ActionReconciliationIteratorState, RetentionCalculator,
@@ -119,7 +118,13 @@ use crate::actions::{
     DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD, SET_TRANSACTION_FIELD,
     SIDECAR_FIELD,
 };
-use crate::coroutine::kernel::{run_workflow_with_engine, Channel, ChannelExt as _};
+use crate::coroutine::generator::{map_async, AsyncIntoIterator as _, GeneratorExt as _};
+use crate::coroutine::kernel::engine::EngineConnector;
+use crate::coroutine::kernel::{
+    run_workflow_with_engine, workflow, Channel, ChannelExt as _, Coroutine, KernelResultGenerator,
+    Workflow,
+};
+use crate::coroutine::AsyncBool as _;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ExpressionRef, Scalar};
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -375,7 +380,10 @@ impl RetentionCalculator for CheckpointWriter {
 
 impl CheckpointWriter {
     /// Creates a new [`CheckpointWriter`] for the given snapshot.
-    pub(crate) fn try_new(snapshot: SnapshotRef, engine: &dyn Engine) -> KernelResult<Self> {
+    pub(crate) async fn try_new_with_channel(
+        channel: &Channel,
+        snapshot: SnapshotRef,
+    ) -> KernelResult<Self> {
         snapshot
             .table_configuration()
             .ensure_read_write_supported()?;
@@ -386,7 +394,8 @@ impl CheckpointWriter {
         // create gaps in the version history, thereby breaking old readers.
         snapshot.log_segment().validate_published()?;
 
-        let schema_context = Self::checkpoint_schema_context(&snapshot, engine)?;
+        let schema_context =
+            Self::checkpoint_schema_context_with_channel(&snapshot, channel).await?;
         let read_schema = build_checkpoint_read_schema(
             &schema_context.checkpoint_base_schema,
             &schema_context.stats_schema,
@@ -464,11 +473,40 @@ impl CheckpointWriter {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<ActionReconciliationIterator> {
+        let connector = EngineConnector::new(engine);
+        let workflow = workflow!(|channel| self.checkpoint_data_actions_with_channel(channel));
+        let actions = connector.drive(workflow)?;
+        let (data, state) = ActionReconciliationState::with_shared_state(actions);
+        let data = connector.iterate_result_coroutine(Coroutine::from_generator(data));
+        Ok(ActionReconciliationIterator::new(Box::new(data), state))
+    }
+
+    /// Returns a lazy workflow that prepares a generator over checkpoint batches.
+    ///
+    /// The generator returns the reconciliation counters after successful completion.
+    pub fn checkpoint_data_workflow(
+        &self,
+    ) -> Workflow<
+        '_,
+        impl KernelResultGenerator<FilteredEngineData, ActionReconciliationIteratorState> + 'static,
+    > {
+        workflow!(async move |channel| {
+            let actions = self.checkpoint_data_actions_with_channel(channel).await?;
+            Ok(ActionReconciliationState::new(actions, Default::default())
+                .into_generator(std::convert::identity))
+        })
+    }
+
+    async fn checkpoint_data_actions_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<impl KernelResultGenerator<ActionReconciliationBatch> + 'static> {
         // Read actions from log segment
         let actions = self
             .snapshot
             .log_segment()
-            .read_actions(engine, self.read_schema.clone())?;
+            .read_actions_generator(channel, self.read_schema.clone())
+            .await?;
 
         // Process actions through reconciliation
         let mut processor = ActionReconciliationProcessor::new(
@@ -482,17 +520,18 @@ impl CheckpointWriter {
 
         // Create the expression evaluator for the checkpoint transform.
         // The transform is applied to reconciled action batches only (not checkpoint metadata).
-        let evaluator = engine.evaluation_handler().new_expression_evaluator(
+        let evaluator = channel.create_expression_evaluator(
             self.read_schema.clone(),
             self.transform_expr.clone(),
             self.output_schema.clone().into(),
-        )?;
+        );
+        let evaluator = evaluator.await?;
 
         // Apply stats transform to each reconciled batch
-        let transformed = checkpoint_data.map(move |batch_result| {
+        let transformed = map_async!(checkpoint_data, async move |channel, batch_result| {
             let batch = batch_result?;
             let (data, sv) = batch.filtered_data.into_parts();
-            let transformed = evaluator.evaluate(data.as_ref())?;
+            let transformed = channel.evaluate_expression(&evaluator, data).await?;
             Ok(ActionReconciliationBatch {
                 filtered_data: FilteredEngineData::try_new(transformed, sv)?,
                 actions_count: batch.actions_count,
@@ -505,11 +544,12 @@ impl CheckpointWriter {
         // bypassing the stats transform (it has no add actions to transform).
         let checkpoint_metadata = self
             .is_v2
-            .then(|| self.create_checkpoint_metadata_batch(engine, &self.output_schema));
+            .then_async(|| {
+                self.create_checkpoint_metadata_batch_with_channel(channel, &self.output_schema)
+            })
+            .await;
 
-        Ok(ActionReconciliationIterator::new(Box::new(
-            transformed.chain(checkpoint_metadata),
-        )))
+        Ok(transformed.chain(checkpoint_metadata.into_generator()))
     }
 
     /// Finalizes checkpoint creation by saving metadata about the checkpoint.
@@ -691,6 +731,7 @@ impl CheckpointWriter {
     /// An [`ActionReconciliationBatch`] including the single-row [`EngineData`] batch along with
     /// an accompanying selection vector with a single `true` value, indicating the action in
     /// the batch should be included in the checkpoint.
+    #[cfg(test)]
     fn create_checkpoint_metadata_batch(
         &self,
         engine: &dyn Engine,
@@ -736,10 +777,10 @@ impl CheckpointWriter {
         })
     }
 
-    /// Helper for computing the checkpoint schema context from the snapshot and engine.
-    fn checkpoint_schema_context(
+    /// Helper for computing the checkpoint schema context from the snapshot and channel.
+    async fn checkpoint_schema_context_with_channel(
         snapshot: &SnapshotRef,
-        engine: &dyn Engine,
+        channel: &Channel,
     ) -> KernelResult<CheckpointSchemaContext> {
         let tc = snapshot.table_configuration();
         let config = StatsTransformConfig::from_table_properties(snapshot.table_properties());
@@ -753,7 +794,9 @@ impl CheckpointWriter {
         };
 
         // Get clustering columns so they are always included in stats per the Delta protocol.
-        let physical_clustering_columns = snapshot.get_physical_clustering_columns(engine)?;
+        let physical_clustering_columns = snapshot
+            .get_physical_clustering_columns_with_channel(channel)
+            .await?;
 
         // Get stats schema from table configuration.
         // This already excludes partition columns and applies column mapping.

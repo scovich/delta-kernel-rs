@@ -8,6 +8,27 @@ use std::future::Future;
 
 use delta_kernel_derive::internal_api;
 
+/// Async counterpart of [`bool`] combinators.
+pub(crate) trait AsyncBool {
+    /// Async counterpart of [`bool::then`].
+    async fn then_async<T, Fut>(self, f: impl FnOnce() -> Fut) -> Option<T>
+    where
+        Fut: Future<Output = T>;
+}
+
+impl AsyncBool for bool {
+    async fn then_async<T, Fut>(self, f: impl FnOnce() -> Fut) -> Option<T>
+    where
+        Fut: Future<Output = T>,
+    {
+        if self {
+            Some(f().await)
+        } else {
+            None
+        }
+    }
+}
+
 /// Async counterparts of [`Option`] combinators.
 pub(crate) trait AsyncOption<T> {
     /// Async counterpart of [`Option::map`].
@@ -58,7 +79,16 @@ impl<T, E> AsyncResult<T, E> for Result<T, E> {
 
 #[cfg(test)]
 mod tests {
-    use super::AsyncResult as _;
+    use super::{AsyncBool as _, AsyncResult as _};
+
+    #[tokio::test]
+    async fn then_async_matches_bool_then() {
+        assert_eq!(true.then_async(|| async { 7 }).await, Some(7));
+        let value: Option<i32> = false
+            .then_async(|| async { panic!("false branch was evaluated") })
+            .await;
+        assert_eq!(value, None);
+    }
 
     #[tokio::test]
     async fn and_then_async_matches_result_and_then() {

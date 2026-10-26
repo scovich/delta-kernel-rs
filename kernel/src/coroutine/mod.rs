@@ -101,10 +101,10 @@ use std::task::{Context, Poll, Waker};
 use delta_kernel_derive::{internal_api, pub_macro};
 use tracing::{Instrument as _, Span};
 
-pub(crate) use self::async_ext::AsyncOption;
 #[doc(inline)]
 #[internal_api]
 pub(crate) use self::async_ext::AsyncResult;
+pub(crate) use self::async_ext::{AsyncBool, AsyncOption};
 use crate::{KernelError, KernelResult};
 
 /// Independently driven operation that may request connector work before producing a final output.
