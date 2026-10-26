@@ -14,6 +14,7 @@ use crate::content_tree::{
     FIRST_ROW_ID, LOCATION, PARTITION_SPEC_ID, RECORD_COUNT, SEQUENCE_NUMBER, TRACKING,
     TRACKING_SNAPSHOT_ID, TRACKING_STATUS,
 };
+use crate::coroutine::kernel::{run_workflow_with_engine, Channel, ChannelExt as _};
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{lit, ColumnName, Expression};
 use crate::scan::log_replay::{
@@ -107,6 +108,22 @@ pub(crate) fn convert_append_metadata_to_root_entry_batch(
     snapshot_id: i64,
     partition_columns: &[String],
 ) -> KernelResult<Box<dyn EngineData>> {
+    run_workflow_with_engine!(engine, |channel| {
+        convert_append_metadata_to_root_entry_batch_with_channel(
+            channel,
+            write_metadata,
+            snapshot_id,
+            partition_columns,
+        )
+    })
+}
+
+async fn convert_append_metadata_to_root_entry_batch_with_channel(
+    channel: &Channel,
+    write_metadata: &dyn EngineData,
+    snapshot_id: i64,
+    partition_columns: &[String],
+) -> KernelResult<Box<dyn EngineData>> {
     // TODO(#2866): This method doesn't allow for caching standard checks and expressions.
     // we should have some sort of struct wrapper to avoid reconstruction.
 
@@ -141,12 +158,16 @@ pub(crate) fn convert_append_metadata_to_root_entry_batch(
     };
 
     let expr = build_content_tree_entry_expression(&output_schema, &projections)?;
-    let evaluator = engine.evaluation_handler().new_expression_evaluator(
-        write_metadata_input_schema()?,
-        Arc::new(expr),
-        DataType::from(output_schema),
-    )?;
-    evaluator.evaluate(write_metadata)
+    let evaluator = channel
+        .create_expression_evaluator(
+            write_metadata_input_schema()?,
+            Arc::new(expr),
+            DataType::from(output_schema),
+        )
+        .await?;
+    channel
+        .evaluate_expression(&evaluator, write_metadata.clone_data())
+        .await
 }
 
 // === Helpers ===
