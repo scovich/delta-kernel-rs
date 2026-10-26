@@ -88,7 +88,10 @@ pub unsafe extern "C" fn committed_transaction_publish(
         .ok_or_else(|| {
             delta_kernel::KernelError::generic("Cannot publish without a post-commit snapshot")
         })
-        .and_then(|snapshot| snapshot.publish(engine.engine().as_ref(), txn.committer.as_ref()))
+        .and_then(|snapshot| {
+            let workflow = snapshot.publish_workflow();
+            crate::drive_kernel_with_catalog_committer(engine, workflow, txn.committer.as_ref())
+        })
         .map(Into::into)
         .into_extern_result(&engine)
 }

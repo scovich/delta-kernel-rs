@@ -183,6 +183,12 @@ impl AsyncEngineConnector {
             Request::Commit(_, reply) => reply.send(Err(KernelError::internal_error(
                 "commit request requires a committer-aware driver",
             ))),
+            Request::RequireCatalogCommitter(reply) => reply.send(Err(KernelError::unsupported(
+                "Default async connector does not handle catalog commits",
+            ))),
+            Request::Publish(_, reply) => reply.send(Err(KernelError::unsupported(
+                "Default async connector does not publish catalog commits",
+            ))),
         }
         Ok(())
     }

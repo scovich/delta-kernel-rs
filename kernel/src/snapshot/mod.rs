@@ -23,8 +23,10 @@ use crate::checkpoint::{
 };
 use crate::clustering::{parse_clustering_columns, ClusteringColumnInfo, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
+use crate::coroutine::kernel::engine::EngineConnector;
 use crate::coroutine::kernel::{
-    run_workflow_with_engine, static_workflow, Channel, StaticWorkflow,
+    run_workflow_with_engine, static_workflow, workflow, Channel, ChannelExt as _, StaticWorkflow,
+    Workflow,
 };
 use crate::crc::{
     try_write_crc_file, Crc, CrcDelta, DomainMetadataState, FileSizeHistogram, FileStats,
@@ -1908,11 +1910,24 @@ impl Snapshot {
     /// # See Also
     ///
     /// - [`Committer::publish`]
-    #[instrument(parent = &self.span, name = "snap.publish", skip_all, err)]
     pub fn publish(
         self: &SnapshotRef,
         engine: &dyn Engine,
         committer: &dyn Committer,
+    ) -> KernelResult<SnapshotRef> {
+        let connector = EngineConnector::new(engine);
+        connector.drive_with_catalog_committer(self.publish_workflow(), engine, committer)
+    }
+
+    /// Returns a lazy workflow that publishes this snapshot's catalog commits.
+    pub fn publish_workflow<'a>(self: &'a SnapshotRef) -> Workflow<'a, SnapshotRef> {
+        workflow!(|channel| self.publish_with_channel(channel))
+    }
+
+    #[instrument(parent = &self.span, name = "snap.publish", skip_all, err)]
+    async fn publish_with_channel(
+        self: &SnapshotRef,
+        channel: &Channel,
     ) -> KernelResult<SnapshotRef> {
         let unpublished_catalog_commits = self.log_segment().get_unpublished_catalog_commits()?;
 
@@ -1937,17 +1952,12 @@ impl Snapshot {
             )
         );
 
-        require!(
-            committer.is_catalog_committer(),
-            KernelError::generic(
-                "There are catalog commits that need publishing, but the committer is not a catalog committer.",
-            )
-        );
+        channel.require_catalog_committer().await?;
 
         let publish_metadata =
             PublishMetadata::try_new(self.version(), unpublished_catalog_commits)?;
 
-        committer.publish(engine, publish_metadata)?;
+        channel.publish(publish_metadata).await?;
 
         Ok(Arc::new(Snapshot::new_with_crc(
             self.log_segment().new_as_published()?,

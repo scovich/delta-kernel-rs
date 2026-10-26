@@ -19,7 +19,7 @@ use super::request::{
     ReadParquetFiles,
 };
 use super::Request;
-use crate::committer::{Commit, CommitResponse};
+use crate::committer::{Commit, CommitResponse, PublishMetadata};
 use crate::coroutine::generator::{self, BoundGenerator, Flatten, Generator, GeneratorExt as _};
 use crate::coroutine::{
     ChannelExchange, Cursor, KernelFuture, Page, PageGenerator, PageRequest, PagedOperation,
@@ -176,6 +176,16 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
     /// Delegates a prepared transaction to the connector's committer.
     fn commit(&self, commit: Commit) -> impl KernelFuture<CommitResponse> {
         self.exchange(Box::new(commit), Request::Commit)
+    }
+
+    /// Verifies that the connector selected a catalog committer.
+    fn require_catalog_committer(&self) -> impl KernelFuture<()> {
+        self.exchange((), |(), reply| Request::RequireCatalogCommitter(reply))
+    }
+
+    /// Publishes catalog commits through the connector's committer.
+    fn publish(&self, metadata: PublishMetadata) -> impl KernelFuture<()> {
+        self.exchange(metadata, Request::Publish)
     }
 
     /// Initialize `operation` via [`PageRequest::Prepare`] without fetching its first page.

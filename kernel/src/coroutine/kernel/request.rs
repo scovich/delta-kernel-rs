@@ -9,7 +9,7 @@ use bytes::Bytes;
 use derive_more::{Constructor, From};
 use url::Url;
 
-use crate::committer::{Commit, CommitResponse};
+use crate::committer::{Commit, CommitResponse, PublishMetadata};
 use crate::coroutine::{PageRequest, PagedOperation, Reply};
 use crate::expressions::{ExpressionRef, PredicateRef};
 use crate::path::may_begin_listable_log_path;
@@ -46,6 +46,10 @@ pub enum Request {
     EvaluatePredicate(EvaluatePredicate, Reply<Box<dyn EngineData>>),
     /// Commit one prepared transaction through a connector-selected committer.
     Commit(Box<Commit>, Reply<CommitResponse>),
+    /// Verifies that the connector selected a catalog committer.
+    RequireCatalogCommitter(Reply<()>),
+    /// Publish catalog commits through a connector-selected committer.
+    Publish(PublishMetadata, Reply<()>),
 }
 
 /// URL bounds for a forward listing.

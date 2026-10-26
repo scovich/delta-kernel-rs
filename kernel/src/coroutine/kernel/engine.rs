@@ -111,6 +111,37 @@ impl EngineConnector {
         cancellation.finish(output)
     }
 
+    /// Drives a workflow using `committer` for catalog publish requests.
+    pub(crate) fn drive_with_catalog_committer<O>(
+        &self,
+        workflow: Workflow<'_, O>,
+        engine: &dyn Engine,
+        committer: &dyn Committer,
+    ) -> KernelResult<O> {
+        let mut cancellation = CancellationLatch::default();
+        let output = drive_workflow!(workflow, |request| {
+            let result = match request {
+                Request::RequireCatalogCommitter(reply) => {
+                    let result = if committer.is_catalog_committer() {
+                        Ok(())
+                    } else {
+                        Err(KernelError::generic(
+                            "There are catalog commits that need publishing, but the committer is \
+                             not a catalog committer.",
+                        ))
+                    };
+                    complete(reply, result)
+                }
+                Request::Publish(metadata, reply) => {
+                    complete(reply, committer.publish(engine, metadata))
+                }
+                request => self.respond(request),
+            };
+            cancellation.record(result)?
+        });
+        cancellation.finish(output)
+    }
+
     /// Prepare a fallible result coroutine and return an iterator that drives it and its requests.
     pub(crate) fn iterate_prepared_result_coroutine<'a, G, Item, O>(
         self,
@@ -221,9 +252,9 @@ impl EngineConnector {
                         .and_then(|evaluator| evaluator.evaluate(operation.input.as_ref()))
                 }),
             )?,
-            Request::Commit(..) => {
+            Request::Commit(..) | Request::RequireCatalogCommitter(..) | Request::Publish(..) => {
                 return Err(KernelError::internal_error(
-                    "commit request requires a committer-aware driver",
+                    "committer request requires a committer-aware driver",
                 ));
             }
         }
@@ -428,6 +459,12 @@ impl StorageConnector<'_> {
             )),
             Request::Commit(..) => Err(KernelError::internal_error(
                 "commit request requires an Engine connector with a committer",
+            )),
+            Request::RequireCatalogCommitter(..) => Err(KernelError::internal_error(
+                "catalog committer validation requires an Engine connector with a committer",
+            )),
+            Request::Publish(..) => Err(KernelError::internal_error(
+                "publish request requires an Engine connector with a catalog committer",
             )),
         }
     }
