@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::num::NonZero;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -25,7 +27,9 @@ use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::schema::{SchemaRef, StructType};
 use crate::utils::FoldWithOption as _;
 #[cfg(test)]
-use crate::{EngineData, FileDataReadResultIterator, FileSize, ParquetHandler};
+use crate::{
+    EngineData, FileDataReadResultIterator, FileSize, ParquetHandler, ParquetMultiFileWrite,
+};
 use crate::{FileMeta, KernelResult, KernelResultIterator, ParquetFooter, PredicateRef};
 
 #[cfg(test)]
@@ -123,6 +127,39 @@ impl ParquetHandler for SyncParquetHandler {
         Ok(size_in_bytes)
     }
 
+    fn write_parquet_files(
+        &self,
+        write: ParquetMultiFileWrite,
+        data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
+    ) -> KernelResult<Vec<(Url, FileSize)>> {
+        let mut files = Vec::new();
+        let mut rows = 0usize;
+        let mut batches = Vec::new();
+        let preferred_rows_per_file = write
+            .preferred_rows_per_file
+            .map(NonZero::get)
+            .unwrap_or(usize::MAX);
+        let write_batches = |batches: Vec<Box<dyn EngineData>>| -> KernelResult<(Url, FileSize)> {
+            let location = write.new_file_url()?;
+            let data = Box::new(batches.into_iter().map(Ok));
+            let size = self.write_parquet_file(location.clone(), data)?;
+            Ok((location, size))
+        };
+        for batch in data {
+            let batch = batch?;
+            rows = rows.saturating_add(batch.len());
+            batches.push(batch);
+            if rows >= preferred_rows_per_file {
+                files.push(write_batches(std::mem::take(&mut batches))?);
+                rows = 0;
+            }
+        }
+        if !batches.is_empty() {
+            files.push(write_batches(batches)?);
+        }
+        Ok(files)
+    }
+
     fn read_parquet_footer(&self, file: &FileMeta) -> KernelResult<ParquetFooter> {
         parquet_footer(self.store.as_ref(), file)
     }
@@ -142,6 +179,7 @@ pub(super) fn parquet_footer(
 #[cfg(test)]
 mod tests {
     use std::fs::File;
+    use std::num::NonZero;
     use std::sync::Arc;
 
     use tempfile::tempdir;
@@ -150,7 +188,7 @@ mod tests {
     use super::*;
     use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
     use crate::engine::arrow_conversion::TryIntoKernel as _;
-    use crate::EngineData;
+    use crate::{EngineData, ParquetMultiFileWrite};
 
     fn test_data_iter() -> Box<dyn KernelResultIterator<Box<dyn EngineData>>> {
         let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
@@ -229,6 +267,43 @@ mod tests {
         assert_eq!(name_col.value(2), "c");
 
         assert!(result.next().is_none());
+    }
+
+    #[test]
+    fn test_sync_write_parquet_files_honors_row_hint() {
+        let handler = SyncParquetHandler::new(None);
+        let temp_dir = tempdir().unwrap();
+        let directory = Url::from_directory_path(temp_dir.path()).unwrap();
+        let write = ParquetMultiFileWrite::new(directory, "part-", ".parquet", NonZero::new(2));
+        let batch = || {
+            Box::new(ArrowEngineData::new(
+                RecordBatch::try_from_iter(vec![(
+                    "id",
+                    Arc::new(Int64Array::from(vec![1])) as Arc<dyn Array>,
+                )])
+                .unwrap(),
+            )) as Box<dyn EngineData>
+        };
+        let data = Box::new([Ok(batch()), Ok(batch()), Ok(batch())].into_iter());
+
+        let files = handler.write_parquet_files(write.clone(), data).unwrap();
+
+        assert_eq!(files.len(), 2);
+        for (file, size) in files {
+            let name = file.path_segments().unwrap().next_back().unwrap();
+            assert!(name.starts_with("part-") && name.ends_with(".parquet"));
+            assert_eq!(
+                size,
+                std::fs::metadata(file.to_file_path().unwrap())
+                    .unwrap()
+                    .len()
+            );
+        }
+
+        let empty = handler
+            .write_parquet_files(write, Box::new(std::iter::empty()))
+            .unwrap();
+        assert!(empty.is_empty());
     }
 
     #[test]

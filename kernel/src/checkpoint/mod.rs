@@ -102,7 +102,8 @@
 //! [`LastCheckpointHint`]: crate::last_checkpoint_hint::LastCheckpointHint
 //! [`Snapshot::checkpoint`]: crate::Snapshot::checkpoint
 //! [`Snapshot::create_checkpoint_writer`]: crate::Snapshot::create_checkpoint_writer
-use std::sync::{Arc, LazyLock, Mutex};
+use std::num::NonZero;
+use std::sync::{Arc, LazyLock};
 
 use tracing::info;
 use url::Url;
@@ -137,7 +138,6 @@ use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{
     version_as_i64, Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator,
-    Version,
 };
 
 #[cfg(feature = "declarative-plans")]
@@ -151,7 +151,7 @@ pub(crate) use checkpoint_shape::{CheckpointShape, CheckpointType};
 use checkpoint_transform::{
     build_checkpoint_read_schema, build_checkpoint_transform, StatsTransformConfig,
 };
-use sidecar::{create_sidecar_action_batch, SidecarSplitter, SingleSidecarDataIterator};
+use sidecar::{create_sidecar_action_batch, SidecarSplitter};
 #[cfg(test)]
 mod tests;
 
@@ -617,32 +617,43 @@ impl CheckpointWriter {
         let iter_state = data_iter.state();
 
         let splitter = SidecarSplitter::new_mut_shared(
-            data_iter,
             engine.evaluation_handler().as_ref(),
             self.output_schema.clone(),
         )?;
 
-        // Write sidecar files
-        let mut sidecar_metas: Vec<(String, FileMeta)> = Vec::new();
-        loop {
-            if let Some(entry) = write_single_sidecar(
-                engine,
-                &splitter,
-                file_actions_per_sidecar_hint,
-                self.snapshot.table_root(),
-                self.snapshot.version(),
-            )? {
-                sidecar_metas.push(entry);
-            }
-            let is_exhausted = splitter
-                .lock()
-                .map_err(|e| {
-                    KernelError::internal_error(format!("sidecar splitter lock poisoned: {e}"))
-                })?
-                .is_exhausted();
-            if is_exhausted {
-                break;
-            }
+        let file_actions_per_sidecar_hint = NonZero::new(file_actions_per_sidecar_hint)
+            .ok_or_else(|| {
+                KernelError::checkpoint_write(
+                    "file_actions_per_sidecar_hint must be greater than 0",
+                )
+            })?;
+        let write = path::sidecar_parquet_write(
+            self.snapshot.table_root(),
+            self.snapshot.version(),
+            Some(file_actions_per_sidecar_hint),
+        )?;
+        let data = SidecarSplitter::file_action_batches(splitter.clone(), data_iter);
+        let sidecar_files = engine
+            .parquet_handler()
+            .write_parquet_files(write.clone(), Box::new(data))?;
+        let mut sidecar_metas = Vec::with_capacity(sidecar_files.len());
+        for (url, written_size) in sidecar_files {
+            let filename = write
+                .directory
+                .make_relative(&url)
+                .filter(|name| !name.contains('/'))
+                .filter(|name| {
+                    name.starts_with(&write.file_name_prefix)
+                        && name.ends_with(&write.file_name_suffix)
+                })
+                .ok_or_else(|| {
+                    KernelError::checkpoint_write(format!(
+                        "connector returned invalid sidecar path: {url}"
+                    ))
+                })?;
+            let meta = engine.storage_handler().head(&url)?;
+            verify_written_size(&url, written_size, meta.size)?;
+            sidecar_metas.push((filename, meta));
         }
 
         // Collect non-file action batches(e.g., `protocol`, `metaData`, `txn`, etc.)
@@ -891,28 +902,6 @@ pub(crate) async fn create_last_checkpoint_data_with_channel(
             ]],
         )
         .await
-}
-
-/// Writes one sidecar file. Returns `None` if the splitter yielded no rows for this sidecar.
-fn write_single_sidecar(
-    engine: &dyn Engine,
-    splitter: &Arc<Mutex<SidecarSplitter>>,
-    file_actions_per_sidecar_hint: usize,
-    table_root: &Url,
-    version: Version,
-) -> KernelResult<Option<(String, FileMeta)>> {
-    let mut iter =
-        SingleSidecarDataIterator::new(splitter.clone(), file_actions_per_sidecar_hint)?.peekable();
-    if iter.peek().is_none() {
-        return Ok(None);
-    }
-    let (filename, sidecar_url) = path::new_sidecar(table_root, version)?;
-    let written_size = engine
-        .parquet_handler()
-        .write_parquet_file(sidecar_url.clone(), Box::new(iter))?;
-    let meta = engine.storage_handler().head(&sidecar_url)?;
-    verify_written_size(&sidecar_url, written_size, meta.size)?;
-    Ok(Some((filename, meta)))
 }
 
 /// Verifies that the size the parquet writer reported matches the size the storage layer reports

@@ -1,3 +1,4 @@
+use std::num::NonZero;
 use std::sync::Arc;
 
 use rstest::rstest;
@@ -10,7 +11,7 @@ use crate::action_reconciliation::{
 use crate::actions::{Add, ADD_NAME, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::arrow::array::{Array, ArrayRef, AsArray, RecordBatch, StructArray};
 use crate::arrow::datatypes::{ArrowPrimitiveType, Int32Type, Int64Type};
-use crate::checkpoint::sidecar::{SidecarSplitter, SingleSidecarDataIterator};
+use crate::checkpoint::sidecar::SidecarSplitter;
 use crate::checkpoint::tests::{
     create_add_action, create_metadata_action, create_metadata_with_stats_config_and_partitions,
     create_remove_action, create_v2_checkpoint_protocol_action, new_in_memory_store,
@@ -24,9 +25,9 @@ use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
 use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use crate::schema::{schema, schema_ref, DataType, StructType};
+use crate::schema::{schema, DataType, StructType};
 use crate::unit_test_utils::Action;
-use crate::{Engine, EngineData, KernelResult, Snapshot};
+use crate::{Engine, EngineData, KernelResult, ParquetMultiFileWrite, Snapshot};
 
 struct CheckpointParts {
     sidecar_files: Vec<Url>,
@@ -34,10 +35,8 @@ struct CheckpointParts {
     iter_state: Arc<ActionReconciliationIteratorState>,
 }
 
-/// Test helper: generates sidecar parquet files using the [`SidecarSplitter`] +
-/// [`SingleSidecarDataIterator`] pipeline. Writes real parquet files to storage via
-/// `engine.parquet_handler().write_parquet_file()` with names `sidecar_1.parquet`,
-/// `sidecar_2.parquet`, etc. Does NOT write the main checkpoint or `_last_checkpoint`.
+/// Test helper: generates sidecar parquet files using the [`SidecarSplitter`] pipeline. Writes
+/// real parquet files to storage. Does NOT write the main checkpoint or `_last_checkpoint`.
 fn generate_checkpoint_parts(
     writer: &CheckpointWriter,
     engine: &dyn Engine,
@@ -48,31 +47,24 @@ fn generate_checkpoint_parts(
     let output_schema = writer.output_schema.clone();
 
     let splitter = SidecarSplitter::new_mut_shared(
-        data_iter,
         engine.evaluation_handler().as_ref(),
         output_schema,
     )?;
 
-    let sidecars_base = writer.snapshot.log_segment().log_root.join("_sidecars/")?;
-    let mut sidecar_files = Vec::new();
-    let mut sidecar_index = 1usize;
-    loop {
-        let mut single_sidecar_iter =
-            SingleSidecarDataIterator::new(splitter.clone(), file_actions_per_sidecar_hint)?
-                .peekable();
-        if single_sidecar_iter.peek().is_some() {
-            let sidecar_url = sidecars_base.join(&format!("sidecar_{sidecar_index}.parquet"))?;
-            engine
-                .parquet_handler()
-                .write_parquet_file(sidecar_url.clone(), Box::new(single_sidecar_iter))?;
-            sidecar_files.push(sidecar_url);
-            sidecar_index += 1;
-        }
-
-        if splitter.lock().expect("splitter lock").is_exhausted() {
-            break;
-        }
-    }
+    let directory = writer.snapshot.log_segment().log_root.join("_sidecars/")?;
+    let write = ParquetMultiFileWrite::new(
+        directory,
+        "sidecar_",
+        ".parquet",
+        NonZero::new(file_actions_per_sidecar_hint),
+    );
+    let data = SidecarSplitter::file_action_batches(splitter.clone(), data_iter);
+    let sidecar_files = engine
+        .parquet_handler()
+        .write_parquet_files(write, Box::new(data))?
+        .into_iter()
+        .map(|(url, _)| url)
+        .collect();
 
     let non_file_batches = Arc::into_inner(splitter)
         .expect("splitter Arc should have no other references")
@@ -651,28 +643,13 @@ async fn test_splitter_no_file_actions() -> KernelResult<()> {
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
-    let data_iter = writer.checkpoint_data(&engine)?;
-    let output_schema = writer.output_schema.clone();
-
-    let splitter = SidecarSplitter::new_mut_shared(
-        data_iter,
-        engine.evaluation_handler().as_ref(),
-        output_schema,
-    )?;
-
-    let iter = SingleSidecarDataIterator::new(splitter.clone(), usize::MAX)?;
-    let total_file_rows: usize = iter.map(|batch| batch.unwrap().len()).sum();
-    assert_eq!(total_file_rows, 0, "should have no file-action rows");
-
-    assert!(splitter.lock().expect("splitter lock").is_exhausted());
-
-    let non_file_batches = Arc::into_inner(splitter)
-        .expect("splitter Arc should have no other references")
-        .into_inner()
-        .expect("splitter Mutex should not be poisoned")
-        .into_non_file_batches();
+    let result = generate_checkpoint_parts(&writer, &engine, usize::MAX)?;
+    assert!(
+        result.sidecar_files.is_empty(),
+        "should have no file-action rows"
+    );
     verify_non_file_batches(
-        &non_file_batches,
+        &result.non_file_batches,
         &ExpectedNonFileContent {
             reader_version: 3,
             writer_version: 7,
@@ -713,30 +690,11 @@ fn dummy_struct() -> DataType {
     "'remove' field must be nullable"
 )]
 fn test_splitter_rejects_invalid_schema(#[case] schema: StructType, #[case] expected_msg: &str) {
-    let iter = ActionReconciliationIterator::new(Box::new(std::iter::empty()), Arc::default());
-    let result = SidecarSplitter::new(iter, &ArrowEvaluationHandler, Arc::new(schema));
+    let result = SidecarSplitter::new(&ArrowEvaluationHandler, Arc::new(schema));
     assert!(result.is_err(), "should reject invalid schema");
     let err = result.err().unwrap();
     assert!(
         err.to_string().contains(expected_msg),
         "error '{err}' should contain '{expected_msg}'"
-    );
-}
-
-#[test]
-fn test_single_sidecar_data_iterator_rejects_zero_max_file_actions_hint() {
-    let schema = schema_ref! {
-        nullable "add": (dummy_struct()),
-        nullable "remove": (dummy_struct()),
-    };
-    let iter = ActionReconciliationIterator::new(Box::new(std::iter::empty()), Arc::default());
-    let splitter = SidecarSplitter::new_mut_shared(iter, &ArrowEvaluationHandler, schema).unwrap();
-    let result = SingleSidecarDataIterator::new(splitter, 0);
-    assert!(result.is_err());
-    let err = result.err().unwrap();
-    assert!(
-        err.to_string()
-            .contains("max_file_actions_hint must be greater than 0"),
-        "error '{err}' should mention max_file_actions_hint"
     );
 }

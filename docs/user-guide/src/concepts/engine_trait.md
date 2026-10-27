@@ -69,6 +69,7 @@ checkpoint sidecars) and for reading data files during scans.
 | `read_parquet_files(files, schema, predicate)` | Read Parquet files into `EngineData` |
 | `read_parquet_files_with_cancellation(files, schema, predicate, token)` | As above, but a cooperative engine can abandon the read when `token` fires — see [Cancellation](#cancellation) |
 | `write_parquet_file(url, data)` | Write a stream of `EngineData` batches as a single Parquet file at the given URL |
+| `write_parquet_files(policy, data)` | Write a stream to zero or more connector-named Parquet files and return each URL and exact byte size |
 | `read_parquet_footer(file)` | Read file footer metadata (schema, field IDs) without reading data |
 | `read_parquet_footer_with_cancellation(file, token)` | As above, but a cooperative engine can abandon the footer read when `token` fires — see [Cancellation](#cancellation) |
 

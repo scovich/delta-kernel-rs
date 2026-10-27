@@ -11,7 +11,7 @@ use crate::engine::test_delegating::DelegatingEngine;
 use crate::{
     CancellationTokenRef, Engine, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
     FileSlice, FilteredEngineData, JsonHandler, KernelError, KernelResult, KernelResultIterator,
-    ParquetFooter, ParquetHandler, PredicateRef, SchemaRef, StorageHandler,
+    ParquetFooter, ParquetHandler, ParquetMultiFileWrite, PredicateRef, SchemaRef, StorageHandler,
 };
 
 /// Read boundary observed by the recording handlers.
@@ -246,5 +246,15 @@ impl ParquetHandler for RecordingReads {
         self.inner
             .parquet_handler()
             .write_parquet_file(location, data)
+    }
+
+    fn write_parquet_files(
+        &self,
+        write: ParquetMultiFileWrite,
+        data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
+    ) -> KernelResult<Vec<(Url, FileSize)>> {
+        self.inner
+            .parquet_handler()
+            .write_parquet_files(write, data)
     }
 }

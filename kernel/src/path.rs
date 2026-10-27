@@ -1,5 +1,6 @@
 //! Utilities to make working with directory and file paths easier
 
+use std::num::NonZero;
 use std::slice;
 use std::str::FromStr;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -25,7 +26,7 @@ use crate::schema::SchemaRef;
 use crate::utils::require;
 #[cfg(test)]
 use crate::Engine;
-use crate::{EngineData, FileMeta, KernelError, KernelResult, Version};
+use crate::{EngineData, FileMeta, KernelError, KernelResult, ParquetMultiFileWrite, Version};
 
 /// The delta log subdirectory with a trailing slash for directory URL joins.
 pub(crate) const DELTA_LOG_DIR_WITH_SLASH: &str = "_delta_log/";
@@ -596,13 +597,20 @@ impl ParsedLogPath<Url> {
 ///
 /// Sidecar paths should be URI-encoded. All characters in the filename here are Unreserved
 /// Characters, so we can just retain them. Ref: <https://www.ietf.org/rfc/rfc2396.txt>
-pub(crate) fn new_sidecar(table_root: &Url, version: Version) -> KernelResult<(String, Url)> {
-    let filename = format!("{version:020}.checkpoint.{}.parquet", Uuid::new_v4());
-    let url = table_root
+pub(crate) fn sidecar_parquet_write(
+    table_root: &Url,
+    version: Version,
+    preferred_rows_per_file: Option<NonZero<usize>>,
+) -> KernelResult<ParquetMultiFileWrite> {
+    let directory = table_root
         .join(DELTA_LOG_DIR_WITH_SLASH)?
-        .join(SIDECAR_DIR_WITH_SLASH)?
-        .join(&filename)?;
-    Ok((filename, url))
+        .join(SIDECAR_DIR_WITH_SLASH)?;
+    Ok(ParquetMultiFileWrite::new(
+        directory,
+        format!("{version:020}.checkpoint."),
+        ".parquet",
+        preferred_rows_per_file,
+    ))
 }
 
 /// A wrapper around parsed log path to provide more structure/safety when handling
@@ -1395,18 +1403,21 @@ pub(crate) mod tests {
         }
     }
 
-    /// Verifies `new_sidecar` builds a `<version:020>.checkpoint.<uuid>.parquet` filename
-    /// under `<table_root>/_delta_log/_sidecars/`.
+    /// Verifies `sidecar_parquet_write` names files
+    /// `<version:020>.checkpoint.<uuid>.parquet` under `<table_root>/_delta_log/_sidecars/`.
     #[rstest::rstest]
     #[case::version_zero(0)]
     #[case::small_version(7)]
     #[case::large_version(1_234_567_890)]
-    fn test_new_sidecar_path(#[case] version: Version) {
+    fn test_sidecar_parquet_write_path(#[case] version: Version) {
         let table_root = Url::parse("memory:///table/").unwrap();
-        let (filename, url) = new_sidecar(&table_root, version).unwrap();
+        let write = sidecar_parquet_write(&table_root, version, None).unwrap();
+        assert_eq!(write.preferred_rows_per_file, None);
+        let url = write.new_file_url().unwrap();
+        let filename = url.path_segments().unwrap().next_back().unwrap();
 
         // Filename: `<version:020>.checkpoint.<uuid>.parquet`
-        let prefix = format!("{version:020}.checkpoint.");
+        let prefix = write.file_name_prefix;
         assert!(
             filename.starts_with(&prefix) && filename.ends_with(".parquet"),
             "unexpected filename: {filename}"
@@ -1422,7 +1433,7 @@ pub(crate) mod tests {
         let expected = table_root
             .join("_delta_log/_sidecars/")
             .unwrap()
-            .join(&filename)
+            .join(filename)
             .unwrap();
         assert_eq!(url, expected);
     }

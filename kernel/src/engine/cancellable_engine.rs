@@ -17,7 +17,8 @@ use crate::plans::PlanExecutor;
 use crate::{
     CancellationTokenRef, Engine, EngineData, EvaluationHandler, FileDataReadResultIterator,
     FileMeta, FileSize, FileSlice, FilteredEngineData, JsonHandler, KernelResult,
-    KernelResultIterator, ParquetFooter, ParquetHandler, PredicateRef, SchemaRef, StorageHandler,
+    KernelResultIterator, ParquetFooter, ParquetHandler, ParquetMultiFileWrite, PredicateRef,
+    SchemaRef, StorageHandler,
 };
 
 /// An engine adapter that supplies a default cancellation token to storage, JSON, and
@@ -224,6 +225,12 @@ impl ParquetHandler for ReadHandler<dyn ParquetHandler> {
         fn write_parquet_file(
             location: Url, data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
         ) -> KernelResult<FileSize>;
+
+        /// Writes multiple Parquet files without applying read cancellation.
+        fn write_parquet_files(
+            write: ParquetMultiFileWrite,
+            data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
+        ) -> KernelResult<Vec<(Url, FileSize)>>;
     }
 }
 

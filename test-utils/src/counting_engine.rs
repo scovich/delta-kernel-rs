@@ -12,7 +12,8 @@ use delta_kernel::schema::{DataType, SchemaRef};
 use delta_kernel::{
     Engine, EngineData, EvaluationHandler, ExpressionEvaluator, FileDataReadResultIterator,
     FileMeta, FileSize, FileSlice, FilteredEngineData, JsonHandler, KernelResult,
-    KernelResultIterator, ParquetFooter, ParquetHandler, PredicateEvaluator, StorageHandler,
+    KernelResultIterator, ParquetFooter, ParquetHandler, ParquetMultiFileWrite, PredicateEvaluator,
+    StorageHandler,
 };
 use url::Url;
 
@@ -270,6 +271,14 @@ impl ParquetHandler for CountingHandlers {
         data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
     ) -> KernelResult<FileSize> {
         self.parquet.write_parquet_file(location, data)
+    }
+
+    fn write_parquet_files(
+        &self,
+        write: ParquetMultiFileWrite,
+        data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
+    ) -> KernelResult<Vec<(Url, FileSize)>> {
+        self.parquet.write_parquet_files(write, data)
     }
 
     fn read_parquet_footer(&self, file: &FileMeta) -> KernelResult<ParquetFooter> {

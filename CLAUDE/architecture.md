@@ -149,7 +149,7 @@ handlers below and an optional `PlanExecutor` under the `declarative-plans` feat
 |----------------------|----------------------------------|--------------------------------------------|
 | `StorageHandler`     | File system operations           | `list_from`, `read_files`, etc.            |
 | `JsonHandler`        | Delta log commit parsing/writing | `parse_json`, `read_json_files`            |
-| `ParquetHandler`     | Data file and checkpoint I/O     | `read_parquet_files`, `write_parquet_file`  |
+| `ParquetHandler`     | Data file and checkpoint I/O     | Parquet read/write methods                 |
 | `EvaluationHandler`  | Expression/predicate evaluation  | `new_expression_evaluator`, etc.           |
 
 Metrics are emitted as tracing events and collected by tracing layers. A `DefaultEngine` (Arrow +

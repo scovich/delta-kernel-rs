@@ -638,15 +638,13 @@ impl Clone for Box<dyn EngineData> {
     }
 }
 
-/// Evaluates a predicate on the batch, extracts the resulting selection vector, and applies
-/// it to filter out rows that don't satisfy the predicate.
+/// Extracts and applies the selection vector produced by a predicate evaluation.
 pub(crate) fn filter_by_predicate(
-    filter: &dyn crate::PredicateEvaluator,
     batch: Box<dyn EngineData>,
+    predicate_result: &dyn EngineData,
 ) -> KernelResult<Box<dyn EngineData>> {
-    let predicate_result = filter.evaluate(batch.as_ref())?;
     let mut visitor = SelectionVectorVisitor::default();
-    visitor.visit_rows_of(predicate_result.as_ref())?;
+    visitor.visit_rows_of(predicate_result)?;
     require!(
         visitor.selection_vector.len() == batch.len(),
         KernelError::internal_error(format!(

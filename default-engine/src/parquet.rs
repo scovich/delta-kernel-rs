@@ -33,7 +33,7 @@ use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{
     CancellationTokenRef, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
     FoldWithOption as _, KernelError, KernelResult, KernelResultIterator, ParquetFooter,
-    ParquetHandler, PredicateRef,
+    ParquetHandler, ParquetMultiFileWrite, PredicateRef,
 };
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
@@ -43,6 +43,8 @@ use crate::executor::TaskExecutor;
 use crate::file_stream::{FileOpenFuture, FileOpener, FileStream};
 use crate::stats::collect_stats;
 use crate::UrlExt;
+
+pub(crate) const DEFAULT_ROWS_PER_FILE: usize = 50_000;
 
 #[derive(Debug)]
 pub struct DefaultParquetHandler<E: TaskExecutor> {
@@ -406,6 +408,42 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         })
     }
 
+    fn write_parquet_files(
+        &self,
+        write: ParquetMultiFileWrite,
+        data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
+    ) -> KernelResult<Vec<(url::Url, FileSize)>> {
+        // Cut files between batches using the advisory row target. When the caller omits a target,
+        // use `DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT`. Batches are never split.
+        let mut files = Vec::new();
+        let mut rows = 0usize;
+        let mut batches = Vec::new();
+        let preferred_rows_per_file = write
+            .preferred_rows_per_file
+            .map(NonZero::get)
+            .unwrap_or(DEFAULT_ROWS_PER_FILE);
+        let write_batches =
+            |batches: Vec<Box<dyn EngineData>>| -> KernelResult<(url::Url, FileSize)> {
+                let location = write.new_file_url()?;
+                let data = Box::new(batches.into_iter().map(Ok));
+                let size = ParquetHandler::write_parquet_file(self, location.clone(), data)?;
+                Ok((location, size))
+            };
+        for batch in data {
+            let batch = batch?;
+            rows = rows.saturating_add(batch.len());
+            batches.push(batch);
+            if rows >= preferred_rows_per_file {
+                files.push(write_batches(std::mem::take(&mut batches))?);
+                rows = 0;
+            }
+        }
+        if !batches.is_empty() {
+            files.push(write_batches(batches)?);
+        }
+        Ok(files)
+    }
+
     fn read_parquet_footer(&self, file: &FileMeta) -> KernelResult<ParquetFooter> {
         self.read_parquet_footer_with_cancellation(file, None)
     }
@@ -628,7 +666,7 @@ mod tests {
     use delta_kernel::schema::{
         schema, schema_ref, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
     };
-    use delta_kernel::EngineData;
+    use delta_kernel::{EngineData, ParquetMultiFileWrite};
     use delta_kernel_default_engine_test_utils::{
         assert_result_error_with_message, current_time_ms,
         try_into_record_batch as into_record_batch,
@@ -1260,6 +1298,59 @@ mod tests {
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].num_rows(), 3);
         assert_eq!(data[0].num_columns(), 2);
+    }
+
+    #[tokio::test]
+    async fn multi_file_write_keeps_small_input_in_one_file_and_allows_empty() {
+        let store = Arc::new(InMemory::new());
+        let handler =
+            DefaultParquetHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let write = ParquetMultiFileWrite::new(
+            Url::parse("memory:///sidecars/").unwrap(),
+            "00000000000000000001.checkpoint.",
+            ".parquet",
+            None,
+        );
+        let batch = || {
+            Box::new(ArrowEngineData::new(
+                RecordBatch::try_from_iter(vec![(
+                    "a",
+                    Arc::new(Int64Array::from(vec![1])) as Arc<dyn Array>,
+                )])
+                .unwrap(),
+            )) as Box<dyn EngineData>
+        };
+        let data = Box::new(vec![Ok(batch()), Ok(batch()), Ok(batch())].into_iter());
+
+        let files = handler.write_parquet_files(write.clone(), data).unwrap();
+
+        assert_eq!(files.len(), 1);
+        for (file, size) in &files {
+            let name = file.path_segments().unwrap().next_back().unwrap();
+            let stored_size = store
+                .head(&Path::from_url_path(file.path()).unwrap())
+                .await
+                .unwrap()
+                .size;
+            assert!(name.starts_with("00000000000000000001.checkpoint."));
+            assert!(name.ends_with(".parquet"));
+            assert_eq!(*size, stored_size);
+        }
+
+        let preferred_write = ParquetMultiFileWrite::new(
+            Url::parse("memory:///preferred/").unwrap(),
+            "part-",
+            ".parquet",
+            NonZero::new(2),
+        );
+        let data = Box::new(vec![Ok(batch()), Ok(batch()), Ok(batch())].into_iter());
+        let files = handler.write_parquet_files(preferred_write, data).unwrap();
+        assert_eq!(files.len(), 2);
+
+        let empty = handler
+            .write_parquet_files(write, Box::new(std::iter::empty()))
+            .unwrap();
+        assert!(empty.is_empty());
     }
 
     #[tokio::test]
