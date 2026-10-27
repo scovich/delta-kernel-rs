@@ -16,17 +16,21 @@ use url::Url;
 use super::request::{
     CreateEngineData, CreateExpressionEvaluator, CreatePredicateEvaluator, EvaluateExpression,
     EvaluatePredicate, ExpressionEvaluatorHandle, PredicateEvaluatorHandle, ReadJsonFiles,
-    ReadParquetFiles,
+    ReadParquetFiles, WriteJsonFile, WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
 };
-use super::Request;
+use super::{Request, StaticCoroutine};
 use crate::committer::{Commit, CommitResponse, PublishMetadata};
 use crate::coroutine::generator::{self, BoundGenerator, Flatten, Generator, GeneratorExt as _};
 use crate::coroutine::{
     ChannelExchange, Cursor, KernelFuture, Page, PageGenerator, PageRequest, PagedOperation,
 };
+use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ExpressionRef, PredicateRef};
 use crate::schema::{DataType, SchemaRef};
-use crate::{EngineData, FileIndex, FileMeta, KernelResult, ParquetFooter, Scalar};
+use crate::{
+    EngineData, FileIndex, FileMeta, FileSize, KernelResult, ParquetFooter, ParquetMultiFileWrite,
+    Scalar,
+};
 
 /// Kernel's [`crate::coroutine::Channel`] specialized to [`Request`].
 ///
@@ -59,6 +63,11 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
     /// Reads one Parquet file footer via [`Request::ReadParquetFooter`].
     fn read_parquet_footer(&self, file: &FileMeta) -> impl KernelFuture<ParquetFooter> {
         self.exchange(file.clone(), Request::ReadParquetFooter)
+    }
+
+    /// Fetches metadata for one object via [`Request::Head`].
+    fn head(&self, url: &Url) -> impl KernelFuture<FileMeta> {
+        self.exchange(url.clone(), Request::Head)
     }
 
     /// Reads JSON files via [`Request::ReadJson`] as a stream of result batches.
@@ -171,6 +180,32 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
     ) -> impl KernelFuture<Box<dyn EngineData>> {
         let evaluation = EvaluatePredicate::new(Arc::clone(evaluator), input);
         self.exchange(evaluation, Request::EvaluatePredicate)
+    }
+
+    /// Writes generated row batches to one newline-delimited JSON file.
+    fn write_json_file(
+        &self,
+        url: &Url,
+        input: StaticCoroutine<FilteredEngineData>,
+        overwrite: bool,
+    ) -> impl KernelFuture<FileSize> {
+        let operation = WriteJsonFile::new(url.clone(), input, overwrite);
+        self.exchange(Box::new(operation), Request::WriteJson)
+    }
+
+    /// Writes generated row batches to one Parquet file.
+    fn write_parquet_file(&self, operation: WriteParquetFile) -> impl KernelFuture<FileSize> {
+        self.exchange(Box::new(operation), Request::WriteParquet)
+    }
+
+    /// Writes generated row batches to connector-selected Parquet files.
+    fn write_parquet_files(
+        &self,
+        write: ParquetMultiFileWrite,
+        input: StaticCoroutine<Box<dyn EngineData>>,
+    ) -> impl KernelFuture<WriteParquetFilesResult> {
+        let operation = WriteParquetFiles::new(write, input);
+        self.exchange(Box::new(operation), Request::WriteParquetFiles)
     }
 
     /// Delegates a prepared transaction to the connector's committer.

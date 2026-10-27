@@ -12,7 +12,7 @@ use derive_more::Constructor;
 
 use super::request::{
     ExpressionEvaluatorHandle, ForwardListing, PredicateEvaluatorHandle, ReadJsonFiles,
-    ReadParquetFiles,
+    ReadParquetFiles, WriteJsonFile, WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
 };
 use super::{Coroutine, CoroutineStep, KernelResultGenerator, Request, Workflow};
 use crate::cancellation::{check_cancelled, CancellationTokenRef};
@@ -20,8 +20,8 @@ use crate::committer::Committer;
 use crate::coroutine::{drive_workflow, Cursor, Page, PageRequest, PagedOperation, Reply};
 use crate::{
     Engine, EngineData, EvaluationHandler, ExpressionEvaluator, FileDataReadResultIterator,
-    FileMeta, JsonHandler, KernelError, KernelResult, KernelResultIterator, ParquetHandler,
-    PredicateEvaluator, StorageHandler,
+    FileMeta, FileSize, JsonHandler, KernelError, KernelResult, KernelResultIterator,
+    ParquetHandler, PredicateEvaluator, StorageHandler,
 };
 
 /// Maps a paged request onto synchronous Engine state stored in an opaque cursor.
@@ -202,7 +202,9 @@ impl EngineConnector {
     fn respond(&self, request: Request) -> KernelResult<()> {
         match request {
             Request::ListForward(request) => respond_paged(&self.storage_connector(), request)?,
-            Request::ReadSmallFile(..) => self.storage_connector().respond(request)?,
+            Request::ReadSmallFile(..) | Request::Head(..) => {
+                self.storage_connector().respond(request)?
+            }
             Request::ReadParquetFooter(file, reply) => complete(
                 reply,
                 self.parquet
@@ -252,6 +254,15 @@ impl EngineConnector {
                         .and_then(|evaluator| evaluator.evaluate(operation.input.as_ref()))
                 }),
             )?,
+            Request::WriteJson(operation, reply) => {
+                complete(reply, self.write_json_file(*operation))?
+            }
+            Request::WriteParquet(operation, reply) => {
+                complete(reply, self.write_parquet_file(*operation))?
+            }
+            Request::WriteParquetFiles(operation, reply) => {
+                complete(reply, self.write_parquet_files(*operation))?
+            }
             Request::Commit(..) | Request::RequireCatalogCommitter(..) | Request::Publish(..) => {
                 return Err(KernelError::internal_error(
                     "committer request requires a committer-aware driver",
@@ -259,6 +270,36 @@ impl EngineConnector {
             }
         }
         Ok(())
+    }
+
+    fn write_json_file(&self, operation: WriteJsonFile) -> KernelResult<FileSize> {
+        let mut iterator = self.clone().iterate_coroutine(operation.input);
+        let written_size = self.json.write_json_file(
+            &operation.url,
+            Box::new(&mut iterator),
+            operation.overwrite,
+        )?;
+        if !matches!(iterator.state, CoroutineState::Complete(())) {
+            return Err(KernelError::internal_error(
+                "JSON handler completed before exhausting its input",
+            ));
+        }
+        Ok(written_size)
+    }
+
+    fn write_parquet_file(&self, operation: WriteParquetFile) -> KernelResult<FileSize> {
+        let WriteParquetFile { url, input } = operation;
+        let iterator = self.clone().iterate_coroutine(input);
+        self.parquet.write_parquet_file(url, Box::new(iterator))
+    }
+
+    fn write_parquet_files(
+        &self,
+        operation: WriteParquetFiles,
+    ) -> KernelResult<WriteParquetFilesResult> {
+        let WriteParquetFiles { write, input } = operation;
+        let iterator = self.clone().iterate_coroutine(input);
+        self.parquet.write_parquet_files(write, Box::new(iterator))
     }
 }
 
@@ -444,6 +485,7 @@ impl StorageConnector<'_> {
                 self.storage
                     .read_small_file_with_cancellation(file, self.cancellation_token.clone()),
             ),
+            Request::Head(url, reply) => complete(reply, self.storage.head(&url)),
             Request::ReadJson(_) => Err(KernelError::internal_error(
                 "JSON reads require an Engine connector",
             )),
@@ -457,6 +499,11 @@ impl StorageConnector<'_> {
             | Request::EvaluatePredicate(..) => Err(KernelError::internal_error(
                 "evaluation requires an Engine connector",
             )),
+            Request::WriteJson(..) | Request::WriteParquet(..) | Request::WriteParquetFiles(..) => {
+                Err(KernelError::internal_error(
+                    "file writes require an Engine connector",
+                ))
+            }
             Request::Commit(..) => Err(KernelError::internal_error(
                 "commit request requires an Engine connector with a committer",
             )),

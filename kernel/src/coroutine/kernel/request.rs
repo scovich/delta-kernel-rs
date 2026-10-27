@@ -9,12 +9,17 @@ use bytes::Bytes;
 use derive_more::{Constructor, From};
 use url::Url;
 
+use super::StaticCoroutine;
 use crate::committer::{Commit, CommitResponse, PublishMetadata};
 use crate::coroutine::{PageRequest, PagedOperation, Reply};
+use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ExpressionRef, PredicateRef};
 use crate::path::may_begin_listable_log_path;
 use crate::schema::{DataType, SchemaRef};
-use crate::{EngineData, FileMeta, FileSlice, KernelResult, ParquetFooter, Scalar, Version};
+use crate::{
+    EngineData, FileMeta, FileSize, FileSlice, KernelResult, ParquetFooter, ParquetMultiFileWrite,
+    Scalar, Version,
+};
 
 /// Operations Kernel can request from a connector.
 #[derive(From)]
@@ -26,6 +31,8 @@ pub enum Request {
     /// Missing-object failures remain connector errors. `Ok(None)` means the connector returned no
     /// result. Extra objects from a single-file read are an error.
     ReadSmallFile(FileSlice, Reply<Option<Bytes>>),
+    /// Fetch metadata for one object.
+    Head(Url, Reply<FileMeta>),
     /// Read one Parquet footer.
     ReadParquetFooter(FileMeta, Reply<ParquetFooter>),
     /// Read JSON files as ordered [`EngineData`] batches. Each file may produce multiple batches,
@@ -44,6 +51,15 @@ pub enum Request {
     EvaluateExpression(EvaluateExpression, Reply<Box<dyn EngineData>>),
     /// Evaluate a prepared predicate against one [`EngineData`] batch.
     EvaluatePredicate(EvaluatePredicate, Reply<Box<dyn EngineData>>),
+    /// Write one newline-delimited JSON file from streamed row batches.
+    // Boxed to keep the request enum small without boxing every variant.
+    WriteJson(Box<WriteJsonFile>, Reply<FileSize>),
+    /// Write one Parquet file from streamed row batches.
+    // Boxed to keep the request enum small without boxing every variant.
+    WriteParquet(Box<WriteParquetFile>, Reply<FileSize>),
+    /// Write streamed row batches to connector-selected Parquet files.
+    // Boxed to keep the request enum small without boxing every variant.
+    WriteParquetFiles(Box<WriteParquetFiles>, Reply<WriteParquetFilesResult>),
     /// Commit one prepared transaction through a connector-selected committer.
     Commit(Box<Commit>, Reply<CommitResponse>),
     /// Verifies that the connector selected a catalog committer.
@@ -219,6 +235,40 @@ pub struct EvaluateExpression {
 pub struct EvaluatePredicate {
     pub evaluator: PredicateEvaluatorHandle,
     pub input: Box<dyn EngineData>,
+}
+
+// === Writes ===
+
+/// Files written from one input stream.
+pub type WriteParquetFilesResult = Vec<(Url, FileSize)>;
+
+/// Writes newline-delimited JSON rows to one file.
+#[derive(Constructor)]
+pub struct WriteJsonFile {
+    /// Destination URL.
+    pub url: Url,
+    /// Row batches to serialize in yield order.
+    pub input: StaticCoroutine<FilteredEngineData>,
+    /// Whether an existing destination may be overwritten.
+    pub overwrite: bool,
+}
+
+/// Writes row batches to one Parquet file.
+#[derive(Constructor)]
+pub struct WriteParquetFile {
+    /// Destination URL.
+    pub url: Url,
+    /// Row batches to serialize in yield order.
+    pub input: StaticCoroutine<Box<dyn EngineData>>,
+}
+
+/// Writes one row stream to connector-selected Parquet files.
+#[derive(Constructor)]
+pub struct WriteParquetFiles {
+    /// Connector-owned file placement and sizing policy.
+    pub write: ParquetMultiFileWrite,
+    /// Row batches to serialize in yield order.
+    pub input: StaticCoroutine<Box<dyn EngineData>>,
 }
 
 #[cfg(test)]

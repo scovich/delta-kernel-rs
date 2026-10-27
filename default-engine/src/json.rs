@@ -129,7 +129,7 @@ pub(crate) async fn read_json_files_impl(
 
 /// Internal async implementation of write_json_file
 /// Note: for now we just buffer all the data and write it out all at once
-async fn write_json_file_impl(
+pub(crate) async fn write_json_file_impl(
     store: Arc<DynObjectStore>,
     path: Url,
     buffer: Vec<u8>,

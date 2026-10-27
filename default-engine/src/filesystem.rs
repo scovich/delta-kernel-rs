@@ -184,7 +184,7 @@ async fn delete_impl(store: Arc<DynObjectStore>, path: Path) -> KernelResult<()>
 }
 
 /// Native async implementation for head
-async fn head_impl(store: Arc<DynObjectStore>, url: Url) -> KernelResult<FileMeta> {
+pub(crate) async fn head_impl(store: Arc<DynObjectStore>, url: Url) -> KernelResult<FileMeta> {
     let meta = store.head(&Path::from_url_path(url.path())?).await?;
     Ok(FileMeta {
         location: url,
