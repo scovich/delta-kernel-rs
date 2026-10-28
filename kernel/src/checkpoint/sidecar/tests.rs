@@ -46,10 +46,11 @@ fn generate_checkpoint_parts(
     let iter_state = data_iter.state();
     let output_schema = writer.output_schema.clone();
 
-    let splitter = SidecarSplitter::new_mut_shared(
+    let splitter = SidecarSplitter::new(
         engine.evaluation_handler().as_ref(),
         output_schema,
     )?;
+    let non_file_action_batches = splitter.non_file_action_batches();
 
     let directory = writer.snapshot.log_segment().log_root.join("_sidecars/")?;
     let write = ParquetMultiFileWrite::new(
@@ -58,7 +59,7 @@ fn generate_checkpoint_parts(
         ".parquet",
         NonZero::new(file_actions_per_sidecar_hint),
     );
-    let data = SidecarSplitter::file_action_batches(splitter.clone(), data_iter);
+    let data = SidecarSplitter::file_action_batches(splitter, data_iter);
     let sidecar_files = engine
         .parquet_handler()
         .write_parquet_files(write, Box::new(data))?
@@ -66,11 +67,10 @@ fn generate_checkpoint_parts(
         .map(|(url, _)| url)
         .collect();
 
-    let non_file_batches = Arc::into_inner(splitter)
-        .expect("splitter Arc should have no other references")
+    let non_file_batches = Arc::into_inner(non_file_action_batches)
+        .expect("non-file-action batches Arc should have no other references")
         .into_inner()
-        .expect("splitter Mutex should not be poisoned")
-        .into_non_file_batches();
+        .expect("non-file-action batches Mutex should not be poisoned");
 
     Ok(CheckpointParts {
         sidecar_files,
