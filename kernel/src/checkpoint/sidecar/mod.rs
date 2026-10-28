@@ -146,7 +146,7 @@ pub(super) struct SidecarSplitter {
     /// Nulls out add/remove columns and filters out rows where all remaining columns are null.
     non_file_actions_picker: NonNullRowsPicker,
     /// Accumulated non-file-action batches (protocol, metadata, txn, etc.).
-    non_file_action_batches: Vec<Box<dyn EngineData>>,
+    non_file_action_batches: Arc<Mutex<Vec<Box<dyn EngineData>>>>,
 }
 
 impl SidecarSplitter {
@@ -228,39 +228,22 @@ impl SidecarSplitter {
                 transform: non_file_action_nullifier,
                 null_row_filter: non_file_actions_null_row_filter,
             },
-            non_file_action_batches: Vec::new(),
+            non_file_action_batches: Arc::default(),
         })
     }
 
-    /// Creates a new `SidecarSplitter` wrapped in `Arc<Mutex<_>>` for
-    /// shared mutable access. This is useful for passing [`Self::file_action_batches`] to
-    /// [`crate::ParquetHandler::write_parquet_files`], which requires
-    /// `Box<dyn KernelResultIterator<_>>`.
-    pub(super) fn new_mut_shared(
-        eval_handler: &dyn EvaluationHandler,
-        checkpoint_data_schema: SchemaRef,
-    ) -> KernelResult<Arc<Mutex<Self>>> {
-        Self::new(eval_handler, checkpoint_data_schema).map(|s| Arc::new(Mutex::new(s)))
-    }
-
-    /// Consume the splitter and return the buffered non-file-action batches.
-    pub(super) fn into_non_file_batches(self) -> Vec<Box<dyn EngineData>> {
-        self.non_file_action_batches
+    /// Returns shared access to the non-file-action batches that [`Self::file_action_batches`]
+    /// buffers as it drains; they are complete once that stream is exhausted.
+    pub(super) fn non_file_action_batches(&self) -> Arc<Mutex<Vec<Box<dyn EngineData>>>> {
+        Arc::clone(&self.non_file_action_batches)
     }
 
     /// Yields every file-action batch from `splitter`, buffering non-file actions as it drains.
     pub(super) fn file_action_batches(
-        splitter: Arc<Mutex<Self>>,
+        mut splitter: Self,
         mut checkpoint_data_iter: ActionReconciliationIterator,
     ) -> impl KernelResultIterator<Box<dyn EngineData>> {
-        std::iter::from_fn(move || {
-            let Ok(mut splitter) = splitter.lock() else {
-                return Some(Err(KernelError::internal_error(
-                    "sidecar splitter lock poisoned",
-                )));
-            };
-            splitter.next_file_actions_batch(&mut checkpoint_data_iter)
-        })
+        std::iter::from_fn(move || splitter.next_file_actions_batch(&mut checkpoint_data_iter))
     }
 
     /// Pull the next batch from the input iterator, split it into file-action and non-file-action
@@ -281,7 +264,12 @@ impl SidecarSplitter {
                 Err(e) => return Some(Err(e)),
             };
             if !non_file_actions_batch.is_empty() {
-                self.non_file_action_batches.push(non_file_actions_batch);
+                let Ok(mut batches) = self.non_file_action_batches.lock() else {
+                    return Some(Err(KernelError::internal_error(
+                        "non-file-action batches lock poisoned",
+                    )));
+                };
+                batches.push(non_file_actions_batch);
             }
             match self.file_actions_picker.pick(batch.as_ref()) {
                 Ok(file_actions_batch) if file_actions_batch.is_empty() => continue,
