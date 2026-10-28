@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
+use delta_kernel::coroutine::kernel::iterate_prepared_result_coroutine_with_engine;
 use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::scan::{PartitionValuesOptions, Scan, ScanBuilder, ScanMetadata, StatsOptions};
 use delta_kernel::schema::MetadataValue;
@@ -563,7 +564,9 @@ fn scan_metadata_iter_init_impl(
     engine: &Arc<dyn ExternEngine>,
     scan: &Scan,
 ) -> KernelResult<Handle<SharedScanMetadataIterator>> {
-    let scan_metadata = scan.scan_metadata(engine.engine().as_ref())?;
+    let workflow = scan.scan_metadata_workflow();
+    let scan_metadata =
+        iterate_prepared_result_coroutine_with_engine(engine.engine().as_ref(), None, workflow)?;
     let data = ScanMetadataIterator {
         data: Mutex::new(Box::new(scan_metadata)),
         engine: engine.clone(),
@@ -944,7 +947,8 @@ fn selection_vector_from_dv_impl(
     extern_engine: &dyn ExternEngine,
     root_url: KernelResult<Url>,
 ) -> KernelResult<KernelBoolSlice> {
-    match dv_info.get_selection_vector(extern_engine.engine().as_ref(), &root_url?)? {
+    let workflow = dv_info.get_selection_vector_workflow(&root_url?);
+    match crate::drive_kernel(extern_engine, workflow)? {
         Some(v) => Ok(v.into()),
         None => Ok(KernelBoolSlice::empty()),
     }
@@ -970,7 +974,8 @@ fn row_indexes_from_dv_impl(
     extern_engine: &dyn ExternEngine,
     root_url: KernelResult<Url>,
 ) -> KernelResult<KernelRowIndexArray> {
-    match dv_info.get_row_indexes(extern_engine.engine().as_ref(), &root_url?)? {
+    let workflow = dv_info.get_row_indexes_workflow(&root_url?);
+    match crate::drive_kernel(extern_engine, workflow)? {
         Some(v) => Ok(v.into()),
         None => Ok(KernelRowIndexArray::empty()),
     }

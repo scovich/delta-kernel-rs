@@ -3,13 +3,15 @@ use std::sync::LazyLock;
 use delta_kernel_derive::internal_api;
 use url::Url;
 
+use crate::coroutine::generator::BoundGenerator;
+use crate::coroutine::kernel::{
+    drive_with_plan_executor, static_workflow, Channel, ChannelExt as _, StaticWorkflow,
+};
 use crate::engine_data::TypedGetData as _;
 use crate::expressions::{column_name, ColumnName};
-use crate::plans::{Operation, PlanBuilder, RelationRef, ScopedPlanExecutor};
+use crate::plans::{PlanBuilder, RelationRef, ScopedPlanExecutor};
 use crate::schema::DataType;
-use crate::{
-    EngineData, FileMeta, GetData, KernelError, KernelResult, KernelResultIterator, RowVisitor as _,
-};
+use crate::{EngineData, FileMeta, GetData, KernelError, KernelResult, RowVisitor as _};
 
 /// Writes out ordered [`RelationRef`] inputs as JSON and returns metadata for the written file.
 ///
@@ -22,6 +24,23 @@ pub(crate) fn write_commit_json_declarative(
     actions: impl IntoIterator<Item = RelationRef>,
     path: Url,
 ) -> KernelResult<FileMeta> {
+    let workflow = write_commit_json_declarative_workflow(actions, path);
+    drive_with_plan_executor(executor, workflow)
+}
+
+fn write_commit_json_declarative_workflow(
+    actions: impl IntoIterator<Item = RelationRef>,
+    path: Url,
+) -> StaticWorkflow<FileMeta> {
+    let actions = Vec::from_iter(actions);
+    static_workflow!(|channel| write_commit_json_declarative_with_channel(channel, actions, path))
+}
+
+pub(crate) async fn write_commit_json_declarative_with_channel(
+    channel: &Channel,
+    actions: impl IntoIterator<Item = RelationRef>,
+    path: Url,
+) -> KernelResult<FileMeta> {
     let plan = PlanBuilder::write_json(
         actions.into_iter().map(PlanBuilder::relation_source),
         path.clone(),
@@ -29,20 +48,16 @@ pub(crate) fn write_commit_json_declarative(
         true,  // ordered
     )?
     .build()?;
-    let file_meta = file_meta_from_batches(
-        executor
-            .execute_op(Operation::QueryPlan(plan))?
-            .into_data()?,
-    )?;
+    let file_meta = file_meta_from_batches(channel.execute_query_plan(plan).await?).await?;
     debug_assert_eq!(file_meta.location, path);
     Ok(file_meta)
 }
 
-fn file_meta_from_batches(
-    batches: impl KernelResultIterator<Box<dyn EngineData>>,
+async fn file_meta_from_batches(
+    mut batches: impl BoundGenerator<Item = KernelResult<Box<dyn EngineData>>, Output = ()> + Unpin,
 ) -> KernelResult<FileMeta> {
     let mut visitor = FileMetaVisitor::default();
-    for batch in batches {
+    while let Some(batch) = batches.next().await? {
         let batch = batch?;
         if !batch.is_empty() {
             visitor.visit_rows_of(batch.as_ref())?;

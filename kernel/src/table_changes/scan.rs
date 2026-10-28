@@ -15,7 +15,8 @@ use crate::coroutine::generator::{
 };
 use crate::coroutine::kernel::engine::EngineConnector;
 use crate::coroutine::kernel::{
-    coroutine, workflow, Channel, ChannelExt as _, Coroutine, KernelResultGenerator, Request,
+    coroutine, static_workflow, workflow, Channel, ChannelExt as _, Coroutine,
+    KernelResultGenerator, Request, StaticWorkflow,
 };
 use crate::coroutine::{AsyncOption as _, Generator};
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
@@ -235,6 +236,14 @@ impl TableChangesScan {
         let connector = EngineConnector::new(engine.as_ref());
         let workflow = workflow!(|channel| self.execute_with_channel(channel));
         connector.iterate_prepared_result_coroutine(workflow)
+    }
+
+    /// Returns a lazy workflow that prepares a generator over change data feed batches.
+    pub fn execute_workflow(
+        self: &Arc<Self>,
+    ) -> StaticWorkflow<impl KernelResultGenerator<Box<dyn EngineData>> + 'static> {
+        let scan = Arc::clone(self);
+        static_workflow!(|channel| scan.execute_with_channel(channel))
     }
 
     /// Returns a connector-driven coroutine over change data feed batches.

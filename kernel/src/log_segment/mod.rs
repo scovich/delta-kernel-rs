@@ -19,12 +19,12 @@ use crate::cancellation::CancellationTokenRef;
 use crate::committer::CatalogCommit;
 use crate::coroutine::generator::{self, BoundGenerator, Generator as _, GeneratorExt as _};
 use crate::coroutine::kernel::engine::EngineConnector;
-#[cfg(test)]
-use crate::coroutine::kernel::run_workflow_with_engine;
 use crate::coroutine::kernel::{
-    iterate_prepared_result_coroutine_with_engine, run_workflow_with_storage, workflow, Channel,
-    ChannelExt as _, KernelResultGenerator,
+    iterate_prepared_result_coroutine_with_engine, workflow, Channel, ChannelExt as _,
+    KernelResultGenerator,
 };
+#[cfg(test)]
+use crate::coroutine::kernel::{run_workflow_with_engine, run_workflow_with_storage};
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
 use crate::log_replay::ActionsBatch;
@@ -47,9 +47,11 @@ use crate::utils::require;
 use crate::EngineData;
 #[cfg(feature = "declarative-plans")]
 use crate::Scalar;
+#[cfg(test)]
+use crate::StorageHandler;
 use crate::{
     Engine, FileMeta, KernelError, KernelResult, KernelResultIterator, Predicate, PredicateRef,
-    RowVisitor, StorageHandler, Version,
+    RowVisitor, Version,
 };
 
 mod crc_replay;
@@ -139,7 +141,7 @@ pub(crate) struct ActionsWithCheckpointInfo<A> {
 ///
 /// [`LogSegment`] is used in [`Snapshot`] when built with
 /// [`LogSegment::for_snapshot_with_channel`], and in `TableChanges` when built with
-/// [`LogSegment::for_table_changes`].
+/// [`LogSegment::for_table_changes_with_channel`].
 ///
 /// [`Snapshot`]: crate::snapshot::Snapshot
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -633,6 +635,7 @@ impl LogSegment {
     /// and all commits between versions `start_version` (inclusive) and `end_version`
     /// (inclusive). If no `end_version` is specified it will be the most recent version by
     /// default.
+    #[cfg(test)]
     #[internal_api]
     pub(crate) fn for_table_changes(
         storage: &dyn StorageHandler,
@@ -647,7 +650,7 @@ impl LogSegment {
         })
     }
 
-    /// Channel-driven counterpart to [`Self::for_table_changes`].
+    /// Constructs a table-changes log segment through `channel`.
     #[internal_api]
     pub(crate) async fn for_table_changes_with_channel(
         channel: &Channel,

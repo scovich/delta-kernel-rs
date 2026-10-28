@@ -5,11 +5,13 @@ use tracing::{info, instrument};
 #[cfg(feature = "declarative-plans")]
 use super::commit_types::CommitMetadata;
 use super::commit_types::CommitResponse;
+#[cfg(feature = "declarative-plans")]
+use super::declarative::write_commit_json_declarative_with_channel;
 use super::publish_types::PublishMetadata;
 use super::{Commit, Committer};
-#[cfg(feature = "declarative-plans")]
-use crate::committer::write_commit_json_declarative;
 use crate::coroutine::generator::GeneratorExt as _;
+#[cfg(feature = "declarative-plans")]
+use crate::coroutine::kernel::drive_with_plan_executor;
 use crate::coroutine::kernel::engine::EngineConnector;
 use crate::coroutine::kernel::{
     static_workflow, Channel, ChannelExt as _, StaticCoroutine, StaticWorkflow,
@@ -90,11 +92,16 @@ impl FileSystemCommitter {
             });
         Self::commit_response(result, version)
     }
-}
 
-impl Committer for FileSystemCommitter {
-    fn commit(&self, engine: &dyn Engine, commit: Commit) -> KernelResult<CommitResponse> {
-        EngineConnector::new(engine).drive(Self::commit_workflow(commit))
+    /// Returns a lazy workflow that writes a declarative path-based commit.
+    #[cfg(feature = "declarative-plans")]
+    pub fn commit_declarative_workflow(
+        actions: Vec<RelationRef>,
+        commit_metadata: CommitMetadata,
+    ) -> StaticWorkflow<CommitResponse> {
+        static_workflow!(|channel| {
+            Self::commit_declarative_with_channel(channel, actions, commit_metadata)
+        })
     }
 
     #[cfg(feature = "declarative-plans")]
@@ -104,17 +111,33 @@ impl Committer for FileSystemCommitter {
         fields(version = commit_metadata.version()),
         err
     )]
+    async fn commit_declarative_with_channel(
+        channel: &Channel,
+        actions: Vec<RelationRef>,
+        commit_metadata: CommitMetadata,
+    ) -> KernelResult<CommitResponse> {
+        Self::validate_commit_type(&commit_metadata)?;
+        let version = commit_metadata.version();
+        let path = commit_metadata.published_commit_path()?;
+        let result = write_commit_json_declarative_with_channel(channel, actions, path).await;
+        Self::commit_response(result, version)
+    }
+}
+
+impl Committer for FileSystemCommitter {
+    fn commit(&self, engine: &dyn Engine, commit: Commit) -> KernelResult<CommitResponse> {
+        EngineConnector::new(engine).drive(Self::commit_workflow(commit))
+    }
+
+    #[cfg(feature = "declarative-plans")]
     fn commit_declarative(
         &self,
         executor: &dyn ScopedPlanExecutor,
         actions: Box<dyn Iterator<Item = RelationRef> + '_>,
         commit_metadata: CommitMetadata,
     ) -> KernelResult<CommitResponse> {
-        Self::validate_commit_type(&commit_metadata)?;
-        let version = commit_metadata.version();
-        let path = commit_metadata.published_commit_path()?;
-        let result = write_commit_json_declarative(executor, actions, path);
-        Self::commit_response(result, version)
+        let workflow = Self::commit_declarative_workflow(Vec::from_iter(actions), commit_metadata);
+        drive_with_plan_executor(executor, workflow)
     }
 
     fn is_catalog_committer(&self) -> bool {

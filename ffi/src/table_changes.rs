@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use delta_kernel::arrow::array::{Array, ArrayData, StructArray};
 use delta_kernel::arrow::ffi::to_ffi;
+use delta_kernel::coroutine::kernel::iterate_prepared_result_coroutine_with_engine;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::table_changes::scan::TableChangesScan;
 use delta_kernel::table_changes::TableChanges;
@@ -74,12 +75,8 @@ fn table_changes_impl(
     start_version: Version,
     end_version: Option<Version>,
 ) -> KernelResult<Handle<ExclusiveTableChanges>> {
-    let table_changes = TableChanges::try_new(
-        url?,
-        extern_engine.engine().as_ref(),
-        start_version,
-        end_version,
-    );
+    let workflow = TableChanges::try_new_workflow(url?, start_version, end_version);
+    let table_changes = crate::drive_kernel(extern_engine, workflow);
     Ok(Box::new(table_changes?).into())
 }
 
@@ -261,17 +258,19 @@ pub unsafe extern "C" fn table_changes_scan_execute(
     table_changes_scan: Handle<SharedTableChangesScan>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedScanTableChangesIterator>> {
-    let table_changes_scan = unsafe { table_changes_scan.as_ref() };
+    let table_changes_scan = unsafe { table_changes_scan.clone_as_arc() };
     let engine = unsafe { engine.clone_as_arc() };
     table_changes_scan_execute_impl(table_changes_scan, engine.clone())
         .into_extern_result(&engine.as_ref())
 }
 
 fn table_changes_scan_execute_impl(
-    table_changes_scan: &TableChangesScan,
+    table_changes_scan: Arc<TableChangesScan>,
     engine: Arc<dyn ExternEngine>,
 ) -> KernelResult<Handle<SharedScanTableChangesIterator>> {
-    let table_changes_iter = table_changes_scan.execute(engine.engine().clone())?;
+    let workflow = table_changes_scan.execute_workflow();
+    let table_changes_iter =
+        iterate_prepared_result_coroutine_with_engine(engine.engine().as_ref(), None, workflow)?;
     let data = ScanTableChangesIterator {
         data: Mutex::new(Box::new(table_changes_iter)),
         engine: engine.clone(),

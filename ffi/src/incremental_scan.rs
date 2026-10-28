@@ -176,11 +176,12 @@ fn incremental_scan_builder_build_impl(
     builder: FfiIncrementalScanBuilder,
 ) -> KernelResult<OptionalValue<Handle<SharedIncrementalScanStream>>> {
     let engine = builder.engine.engine();
-    let maybe_stream = builder
+    let workflow = builder
         .target_snapshot
         .incremental_scan_builder(builder.base_version)
         .with_predicate(builder.predicate)
-        .build(engine.as_ref())?;
+        .build_workflow();
+    let maybe_stream = IncrementalScanStream::from_workflow(engine.as_ref(), workflow)?;
     let handle = maybe_stream.map(|stream| {
         Arc::new(FfiIncrementalScanStream {
             stream: Mutex::new(Some(stream)),

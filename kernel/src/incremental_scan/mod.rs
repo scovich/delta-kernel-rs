@@ -4,6 +4,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
+use delta_kernel_derive::internal_api;
 use url::Url;
 
 use crate::coroutine::kernel::engine::{EngineConnector, EngineResultCoroutineIterator};
@@ -88,12 +89,7 @@ impl IncrementalScanBuilder {
     /// - `Err` if the target snapshot's protocol contains an unsupported reader feature.
     /// - `Err` if the engine fails to open the commit stream.
     pub fn build(self, engine: &dyn Engine) -> KernelResult<Option<IncrementalScanStream>> {
-        let connector = EngineConnector::new(engine);
-        let stream = connector.drive(self.build_workflow())?;
-        Ok(stream.map(|stream| IncrementalScanStream {
-            inner: connector.iterate_result_coroutine(stream),
-            errored: false,
-        }))
+        IncrementalScanStream::from_workflow(engine, self.build_workflow())
     }
 
     /// Returns a lazy workflow with the same error contract as [`Self::build`].
@@ -375,6 +371,22 @@ type IncrementalScanEngineIterator = EngineResultCoroutineIterator<
     FilteredEngineData,
     KernelResult<IncrementalScanSummary>,
 >;
+
+impl IncrementalScanStream {
+    /// Drives `workflow` and wraps its coroutine in the Engine iterator compatibility adapter.
+    #[internal_api]
+    pub(crate) fn from_workflow(
+        engine: &dyn Engine,
+        workflow: StaticWorkflow<Option<IncrementalScanCoroutine>>,
+    ) -> KernelResult<Option<Self>> {
+        let connector = EngineConnector::new(engine);
+        let stream = connector.drive(workflow)?;
+        Ok(stream.map(|stream| Self {
+            inner: connector.iterate_result_coroutine(stream),
+            errored: false,
+        }))
+    }
+}
 
 impl Iterator for IncrementalScanStream {
     type Item = KernelResult<FilteredEngineData>;
