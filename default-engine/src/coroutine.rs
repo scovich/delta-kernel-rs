@@ -32,7 +32,7 @@ use delta_kernel::coroutine::kernel::request::{
     WriteParquetFilesResult,
 };
 use delta_kernel::coroutine::kernel::{
-    Coroutine, CoroutineStep, Request, StaticCoroutine, Workflow,
+    Coroutine, CoroutineStep, PlanRequest, Request, StaticCoroutine, Workflow,
 };
 use delta_kernel::coroutine::{
     drive_workflow_async, AsyncResult as _, Cursor, Page, PageRequest, PagedOperation,
@@ -173,6 +173,20 @@ impl AsyncEngineConnector {
             }
             Request::ReadJson(request) => respond_paged(self, request).await?,
             Request::ReadParquet(request) => respond_paged(self, request).await?,
+            Request::ExecutePlan(PlanRequest::Require(reply)) => reply.send(Err(
+                KernelError::unsupported("Default async connector does not execute plans"),
+            )),
+            Request::ExecutePlan(PlanRequest::Query(request)) => {
+                let error =
+                    KernelError::unsupported("Default async connector does not execute plans");
+                match request {
+                    PageRequest::Prepare(_, reply) => reply.send(Err(error)),
+                    PageRequest::Next(_, reply) => reply.send(Err(error)),
+                }
+            }
+            Request::ExecutePlan(PlanRequest::ParquetFooter(_, reply)) => reply.send(Err(
+                KernelError::unsupported("Default async connector does not execute plans"),
+            )),
             Request::CreateEngineData(operation, reply) => {
                 reply.send(ArrowEvaluationHandler.create_many(operation.schema, operation.rows))
             }

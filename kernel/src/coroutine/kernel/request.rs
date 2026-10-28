@@ -15,6 +15,8 @@ use crate::coroutine::{PageRequest, PagedOperation, Reply};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ExpressionRef, PredicateRef};
 use crate::path::may_begin_listable_log_path;
+#[cfg(feature = "declarative-plans")]
+pub use crate::plans::Operation as PlanOperation;
 use crate::schema::{DataType, SchemaRef};
 use crate::{
     EngineData, FileMeta, FileSize, FileSlice, KernelError, KernelResult, ParquetFooter,
@@ -43,6 +45,8 @@ pub enum Request {
     /// Read Parquet files as ordered [`EngineData`] batches. Each file may produce multiple
     /// batches, but batches may not span files.
     ReadParquet(PageRequest<ReadParquetFiles>),
+    /// Execute a declarative plan operation.
+    ExecutePlan(PlanRequest),
     /// Materialize scalar rows as one [`EngineData`] batch.
     CreateEngineData(CreateEngineData, Reply<Box<dyn EngineData>>),
     /// Prepare an expression evaluator for repeated use.
@@ -71,6 +75,30 @@ pub enum Request {
     /// Publish catalog commits through a connector-selected committer.
     Publish(PublishMetadata, Reply<()>),
 }
+
+/// Declarative plan operations with result-specific reply types.
+pub enum PlanRequest {
+    /// Verifies that the connector provides a declarative plan executor.
+    Require(Reply<()>),
+    /// Executes a query plan in connector-selected pages.
+    Query(PageRequest<PlanOperation>),
+    /// Reads a Parquet footer through the plan-execution path.
+    ParquetFooter(FileMeta, Reply<ParquetFooter>),
+}
+
+impl From<PageRequest<PlanOperation>> for Request {
+    fn from(request: PageRequest<PlanOperation>) -> Self {
+        Self::ExecutePlan(PlanRequest::Query(request))
+    }
+}
+
+impl PagedOperation for PlanOperation {
+    type Page = Vec<KernelResult<Box<dyn EngineData>>>;
+}
+
+/// Uninhabited plan operation used when declarative plans are disabled.
+#[cfg(not(feature = "declarative-plans"))]
+pub enum PlanOperation {}
 
 /// An ascending listing of every object beneath one directory URL.
 pub struct DirectoryListing {

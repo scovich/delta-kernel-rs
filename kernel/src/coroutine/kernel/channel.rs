@@ -19,6 +19,8 @@ use super::request::{
     ReadJsonFiles, ReadParquetFiles, WriteBytes, WriteJsonFile, WriteParquetFile,
     WriteParquetFiles, WriteParquetFilesResult,
 };
+#[cfg(feature = "declarative-plans")]
+use super::PlanRequest;
 use super::{Request, StaticCoroutine};
 use crate::committer::{Commit, CommitResponse, PublishMetadata};
 use crate::coroutine::generator::{self, BoundGenerator, Flatten, Generator, GeneratorExt as _};
@@ -27,6 +29,8 @@ use crate::coroutine::{
 };
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ExpressionRef, PredicateRef};
+#[cfg(feature = "declarative-plans")]
+use crate::plans::{Operation, Plan};
 use crate::schema::{DataType, SchemaRef};
 use crate::{
     EngineData, FileIndex, FileMeta, FileSize, KernelResult, ParquetFooter, ParquetMultiFileWrite,
@@ -76,6 +80,34 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
     /// Reads one Parquet file footer via [`Request::ReadParquetFooter`].
     fn read_parquet_footer(&self, file: &FileMeta) -> impl KernelFuture<ParquetFooter> {
         self.exchange(file.clone(), Request::ReadParquetFooter)
+    }
+
+    /// Verifies that the connector provides a declarative plan executor.
+    #[cfg(feature = "declarative-plans")]
+    fn require_plan_executor(&self) -> impl KernelFuture<()> {
+        self.exchange((), |(), reply| {
+            Request::ExecutePlan(PlanRequest::Require(reply))
+        })
+    }
+
+    /// Executes `plan`, streaming its output batches.
+    #[cfg(feature = "declarative-plans")]
+    async fn execute_query_plan(
+        &self,
+        plan: Plan,
+    ) -> KernelResult<
+        impl BoundGenerator<Item = KernelResult<Box<dyn EngineData>>, Output = ()> + Unpin + '_,
+    > {
+        let cursor = self.prepare_paged(Operation::QueryPlan(plan)).await?;
+        Ok(self.bind(PageGenerator::Next(cursor).flatten()))
+    }
+
+    /// Reads one Parquet footer through the declarative plan executor.
+    #[cfg(feature = "declarative-plans")]
+    fn read_plan_parquet_footer(&self, file: &FileMeta) -> impl KernelFuture<ParquetFooter> {
+        self.exchange(file.clone(), |file, reply| {
+            Request::ExecutePlan(PlanRequest::ParquetFooter(file, reply))
+        })
     }
 
     /// Fetches metadata for one object via [`Request::Head`].
