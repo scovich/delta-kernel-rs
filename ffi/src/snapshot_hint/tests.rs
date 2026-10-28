@@ -5,32 +5,30 @@ use std::sync::Arc;
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use delta_kernel::actions::{Add, LastManifestCommit};
+use delta_kernel::coroutine::kernel::{Request, WorkflowStep};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use delta_kernel::crc::Crc;
 use delta_kernel::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
 use delta_kernel::log_segment::LogSegment;
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::snapshot::{IncrementalReplay, PublicationWatermark, Snapshot};
-use delta_kernel::{
-    Engine, EvaluationHandler, FileMeta, JsonHandler, ParquetHandler, StorageHandler,
-};
+use delta_kernel::FileMeta;
 use test_utils::table_builder::{LogState, TestTableBuilder};
-use test_utils::{compacted_log_path_for_versions, create_log_path, TestCatalogCommitter};
+use test_utils::{compacted_log_path_for_versions, create_log_path};
 
 use super::*;
 use crate::delta_types::*;
 use crate::error::FFIKernelError;
 use crate::ffi_test_utils::{
-    allocate_err, assert_extern_result_error_contains, assert_extern_result_error_with_message,
-    ok_or_panic,
+    assert_extern_result_error_contains, assert_extern_result_error_with_message,
+    error_only_engine_handle, ok_or_panic,
 };
 use crate::log_path::FfiLogPath;
 use crate::{
-    engine_to_handle, free_engine, free_snapshot, get_snapshot_builder, get_snapshot_builder_from,
-    snapshot_builder_build, snapshot_builder_with_incremental_crc_replay,
-    snapshot_builder_with_max_catalog_version, snapshot_builder_with_version,
-    snapshot_log_segment_stats, FfiFileStats, FfiIncrementalReplay, FfiLogSegmentStats,
-    KernelI64Slice, KernelStringSlice, OptionalValue, SharedExternEngine,
+    free_engine, free_snapshot, get_snapshot_builder, get_snapshot_builder_from,
+    snapshot_builder_with_incremental_crc_replay, snapshot_builder_with_max_catalog_version,
+    snapshot_builder_with_version, snapshot_log_segment_stats, FfiFileStats, FfiIncrementalReplay,
+    FfiLogSegmentStats, KernelI64Slice, KernelStringSlice, OptionalValue, SharedExternEngine,
 };
 
 fn slice(value: &'static str) -> KernelStringSlice {
@@ -139,13 +137,22 @@ fn empty_crc() -> FfiCrc {
 }
 
 fn test_engine() -> Handle<SharedExternEngine> {
-    engine_to_handle(Arc::new(NoIoEngine), allocate_err)
+    error_only_engine_handle()
 }
 
 unsafe fn build_without_io(
-    builder: Handle<ExclusiveSnapshotBuilder>,
+    mut builder: Handle<ExclusiveSnapshotBuilder>,
 ) -> ExternResult<Handle<SharedSnapshot>> {
-    unsafe { snapshot_builder_build(builder) }
+    let engine = unsafe { builder.as_mut() }.engine.clone();
+    let engine_ref = engine.as_ref();
+    let builder = unsafe { builder.into_inner() };
+    let result = crate::snapshot_builder_workflow(*builder).and_then(|(_, mut workflow)| {
+        match workflow.try_advance()? {
+            WorkflowStep::Done(snapshot) => Ok(Handle::from(snapshot)),
+            WorkflowStep::Request(_) => panic!("snapshot hint build requested engine work"),
+        }
+    });
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 #[rstest::rstest]
@@ -209,26 +216,6 @@ fn log_segment_stats_borrows_handles_and_propagates_errors_without_io(
     unsafe {
         free_snapshot(snapshot);
         free_engine(engine);
-    }
-}
-
-struct NoIoEngine;
-
-impl Engine for NoIoEngine {
-    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-        panic!("snapshot hints must not require evaluation")
-    }
-
-    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-        panic!("snapshot hints must not require storage")
-    }
-
-    fn json_handler(&self) -> Arc<dyn JsonHandler> {
-        panic!("snapshot hints must not require JSON I/O")
-    }
-
-    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-        panic!("snapshot hints must not require Parquet I/O")
     }
 }
 
@@ -842,26 +829,26 @@ fn visited_hint_preserves_partial_crc_maps_and_indeterminate_file_stats() {
     };
     let snapshot = unsafe { ok_or_panic(build_without_io(builder)) };
     let rebuilt = rebuild_through_visitor(&snapshot, &engine);
-    let rebuilt_ref = unsafe { rebuilt.as_ref() };
+    let rebuilt_ref = unsafe { rebuilt.clone_as_arc() };
     assert_eq!(
         rebuilt_ref.crc_at_version(),
         unsafe { snapshot.as_ref() }.crc_at_version()
     );
     assert!(rebuilt_ref.get_file_stats_if_present().is_none());
-    let kernel_engine = unsafe { engine.as_ref() }.engine();
-    assert_eq!(
+    assert!(matches!(
         rebuilt_ref
-            .get_app_id_version("app", kernel_engine.as_ref())
+            .get_app_id_version_workflow("app")
+            .try_advance()
             .unwrap(),
-        Some(7)
-    );
-    assert_eq!(
+        WorkflowStep::Done(Some(7))
+    ));
+    assert!(matches!(
         rebuilt_ref
-            .get_domain_metadata("example.domain", kernel_engine.as_ref())
-            .unwrap()
-            .as_deref(),
-        Some("payload")
-    );
+            .get_domain_metadata_workflow("example.domain")
+            .try_advance()
+            .unwrap(),
+        WorkflowStep::Done(Some(domain)) if domain == "payload"
+    ));
     unsafe {
         free_snapshot(rebuilt);
         free_snapshot(snapshot);
@@ -931,10 +918,15 @@ fn visited_hint_after_publish_preserves_staged_paths_and_advanced_watermark() {
         source_ref.log_segment().listed.max_published_version,
         Some(0)
     );
-    let kernel_engine = unsafe { engine.as_ref() }.engine();
-    let published = source_ref
-        .publish(kernel_engine.as_ref(), &TestCatalogCommitter)
-        .unwrap();
+    let mut workflow = source_ref.publish_workflow();
+    let published = loop {
+        match workflow.try_advance().unwrap() {
+            WorkflowStep::Done(snapshot) => break snapshot,
+            WorkflowStep::Request(Request::RequireCatalogCommitter(reply)) => reply.send(Ok(())),
+            WorkflowStep::Request(Request::Publish(_, reply)) => reply.send(Ok(())),
+            WorkflowStep::Request(_) => panic!("publish workflow requested engine work"),
+        }
+    };
     assert_eq!(
         published.log_segment().listed.max_published_version,
         Some(1)
@@ -965,6 +957,7 @@ fn visited_hint_after_publish_preserves_staged_paths_and_advanced_watermark() {
         free_snapshot(source);
         free_snapshot(published);
     }
+    drop(workflow);
     drop(source_ref);
     assert_eq!(
         state.watermark,
@@ -1045,11 +1038,12 @@ fn typed_export_rejects_adaptive_crc_without_visiting_or_consuming_snapshot(
         SnapshotHintFreshness::Unverified,
     )
     .unwrap();
-    let kernel_engine = unsafe { engine.as_ref() }.engine();
-    let source = Snapshot::builder_for("memory:///hinted-table/")
+    let mut workflow = Snapshot::builder_for("memory:///hinted-table/")
         .with_snapshot_hint(hint)
-        .build(kernel_engine.as_ref())
-        .unwrap();
+        .build_workflow();
+    let WorkflowStep::Done(source) = workflow.try_advance().unwrap() else {
+        panic!("snapshot hint build requested engine work");
+    };
     let source: Handle<SharedSnapshot> = source.into();
     let mut state = VisitedHint {
         builder: Some(test_builder(&engine)),
@@ -1687,7 +1681,7 @@ fn aggregate_with_builds_latest_snapshot_from_rich_crc(
     let builder = unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) };
 
     let snapshot = unsafe { ok_or_panic(build_without_io(builder)) };
-    let snapshot_ref = unsafe { snapshot.as_ref() };
+    let snapshot_ref = unsafe { snapshot.clone_as_arc() };
     assert_eq!(snapshot_ref.version(), 0);
     assert!(snapshot_ref.is_built_as_latest());
     assert_eq!(
@@ -1697,20 +1691,20 @@ fn aggregate_with_builds_latest_snapshot_from_rich_crc(
             .num_files(),
         num_files
     );
-    let kernel_engine = unsafe { engine.as_ref() }.engine();
-    assert_eq!(
+    assert!(matches!(
         snapshot_ref
-            .get_app_id_version("app", kernel_engine.as_ref())
+            .get_app_id_version_workflow("app")
+            .try_advance()
             .unwrap(),
-        Some(7)
-    );
-    assert_eq!(
+        WorkflowStep::Done(Some(7))
+    ));
+    assert!(matches!(
         snapshot_ref
-            .get_domain_metadata("example.domain", kernel_engine.as_ref())
-            .unwrap()
-            .as_deref(),
-        Some("payload")
-    );
+            .get_domain_metadata_workflow("example.domain")
+            .try_advance()
+            .unwrap(),
+        WorkflowStep::Done(Some(domain)) if domain == "payload"
+    ));
 
     let rebuilt = rebuild_through_visitor(&snapshot, &engine);
     let rebuilt_ref = unsafe { rebuilt.as_ref() };

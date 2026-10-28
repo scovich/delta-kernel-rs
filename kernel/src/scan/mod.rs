@@ -25,6 +25,8 @@ use crate::coroutine::generator::{
 };
 use crate::coroutine::kernel::engine::EngineConnector;
 use crate::coroutine::kernel::request::ReadParquetFiles;
+#[cfg(feature = "declarative-plans")]
+use crate::coroutine::kernel::run_workflow_with_engine;
 use crate::coroutine::kernel::{
     coroutine, run_workflow_with_storage, static_workflow, workflow, Channel, ChannelExt as _,
     Coroutine, KernelResultGenerator, Request, StaticWorkflow, Workflow,
@@ -1384,15 +1386,33 @@ impl Scan {
     /// with `TIMESTAMP` partition columns,
     /// if the engine provides no [`PlanExecutor`](crate::plans::PlanExecutor),
     /// or if log discovery, checkpoint inspection, or plan construction fails.
+    pub fn declarative_metadata_scan_plan(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<Plan>> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.declarative_metadata_scan_plan_with_channel(channel)
+        })
+    }
+
+    /// Returns a lazy workflow that builds this scan's declarative metadata plan.
+    #[cfg(feature = "declarative-plans")]
+    #[internal_api]
+    pub(crate) fn declarative_metadata_scan_plan_workflow(&self) -> Workflow<'_, Option<Plan>> {
+        workflow!(|channel| self.declarative_metadata_scan_plan_with_channel(channel))
+    }
+
+    #[cfg(feature = "declarative-plans")]
     #[tracing::instrument(
         name = "scan.declarative_metadata_scan_plan",
         skip_all,
         fields(enable_call_frame),
         err
     )]
-    pub fn declarative_metadata_scan_plan(
+    #[internal_api]
+    pub(crate) async fn declarative_metadata_scan_plan_with_channel(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
     ) -> KernelResult<Option<Plan>> {
         // TODO(#3609): Support connector-supplied timezone in declarative metadata scans.
         require!(
@@ -1408,13 +1428,13 @@ impl Scan {
         );
         // Resolve the checkpoint shape once. Retain the leaf schema only when parsed metadata is
         // needed for output or pruning.
-        let plan_executor = engine.require_plan_executor()?;
+        channel.require_plan_executor().await?;
         let needs_leaf_schema = self.state_info.physical_stats_read_schema().is_some()
             || self.state_info.physical_partition_schema.is_some();
         let shape = if needs_leaf_schema {
-            CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), &self.snapshot)?
+            CheckpointShape::try_new_with_leaf_schema_with_channel(channel, &self.snapshot).await?
         } else {
-            CheckpointShape::try_new(plan_executor.as_ref(), &self.snapshot)?
+            CheckpointShape::try_new_with_channel(channel, &self.snapshot).await?
         };
         self.build_metadata_scan_plan(&shape)
     }

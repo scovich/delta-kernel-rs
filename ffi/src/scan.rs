@@ -488,17 +488,16 @@ pub unsafe extern "C" fn scan_declarative_metadata_plan(
 ) -> ExternResult<OptionalValue<crate::KernelOwnedBytes>> {
     let scan = unsafe { scan.as_ref() };
     let extern_engine = unsafe { engine.as_ref() };
-    let inner_engine = extern_engine.engine();
-    scan_declarative_metadata_plan_impl(scan, inner_engine.as_ref())
-        .into_extern_result(&extern_engine)
+    scan_declarative_metadata_plan_impl(scan, extern_engine).into_extern_result(&extern_engine)
 }
 
 #[cfg(feature = "declarative-plans")]
 fn scan_declarative_metadata_plan_impl(
     scan: &Scan,
-    engine: &dyn delta_kernel::Engine,
+    extern_engine: &dyn ExternEngine,
 ) -> KernelResult<OptionalValue<crate::KernelOwnedBytes>> {
-    let plan = scan.declarative_metadata_scan_plan(engine)?;
+    let workflow = scan.declarative_metadata_scan_plan_workflow();
+    let plan = crate::drive_kernel(extern_engine, workflow)?;
     Ok(plan
         .map(|plan| {
             delta_kernel::Operation::QueryPlan(plan)

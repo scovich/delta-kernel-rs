@@ -1,9 +1,7 @@
-//! Applies snapshot-build cancellation to reads through the connector's engine handlers.
+//! Test engine wrapper that applies one cancellation token to reads through its handlers.
 //!
-//! `SnapshotBuilder::build` uses `CancellableEngine` for builds with a token and no snapshot
-//! hint. The wrappers supply that token when loading code calls an ordinary read method,
-//! or a cancellation-aware one with no token of its own, so discovery and replay share
-//! cancellation without threading a token through each helper.
+//! The wrappers supply that token when code calls an ordinary read method, or a
+//! cancellation-aware one with no token of its own.
 
 use std::sync::Arc;
 

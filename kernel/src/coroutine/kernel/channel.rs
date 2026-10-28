@@ -98,8 +98,15 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
     ) -> KernelResult<
         impl BoundGenerator<Item = KernelResult<Box<dyn EngineData>>, Output = ()> + Unpin + '_,
     > {
+        let query = self.prepare_query_plan(plan).await?;
+        Ok(self.bind(query))
+    }
+
+    /// Prepares a declarative query as an unbound stream of result batches.
+    #[cfg(feature = "declarative-plans")]
+    async fn prepare_query_plan(&self, plan: Plan) -> KernelResult<FlattenedPages<Operation>> {
         let cursor = self.prepare_paged(Operation::QueryPlan(plan)).await?;
-        Ok(self.bind(PageGenerator::Next(cursor).flatten()))
+        Ok(PageGenerator::Next(cursor).flatten())
     }
 
     /// Reads one Parquet footer through the declarative plan executor.

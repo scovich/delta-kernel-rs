@@ -1,14 +1,16 @@
 //! Incremental [`Snapshot`] update.
 //!
 //! Public API: `Snapshot::builder_from(existing).build(engine)`. The case-by-case
-//! behavior lives in [`Snapshot::try_new_from`].
+//! behavior lives in [`Snapshot::try_new_from_with_channel`].
 
 use std::sync::Arc;
 
 use tracing::{error, instrument};
 
 use super::{IncrementalReplay, PreparedSnapshot, Snapshot};
-use crate::coroutine::kernel::{run_workflow_with_storage, Channel};
+#[cfg(test)]
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::Channel;
 use crate::log_segment::{LogSegment, PmResolution};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::metrics::{
@@ -17,12 +19,14 @@ use crate::metrics::{
 };
 use crate::path::ParsedLogPath;
 use crate::table_configuration::TableConfiguration;
-use crate::{Engine, KernelError, KernelResult, Version};
+#[cfg(test)]
+use crate::Engine;
+use crate::{KernelError, KernelResult, Version};
 
-/// The assembled outcome of the listing phase of an incremental update. Listing/assembly
-/// failures surface as `Err` from [`Snapshot::build_new_segment`], not a variant here.
+/// The assembled outcome of the listing phase of an incremental update. Listing/assembly failures
+/// surface as `Err` from [`Snapshot::build_new_segment_with_channel`], not a variant here.
 ///
-/// See [`Snapshot::try_new_from`] for the case taxonomy these outcomes map onto.
+/// See [`Snapshot::try_new_from_with_channel`] for the case taxonomy these outcomes map onto.
 enum NewSegment {
     /// No new segment to build; the caller returns the existing snapshot unchanged.
     Unchanged,
@@ -96,12 +100,12 @@ impl Snapshot {
     ///     lightweight P+M replay on commits `> S1` and merge them into the existing log segment.
     ///
     /// Cases A and B are marked in `try_new_from_impl`; cases C through F are marked in
-    /// `build_new_segment`.
+    /// `build_new_segment_with_channel`.
     ///
     /// [`SnapshotBuilder::at_version`]: crate::snapshot::SnapshotBuilder::at_version
     /// [`SnapshotBuilder::with_max_catalog_version`]: crate::snapshot::SnapshotBuilder::with_max_catalog_version
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip_all, fields(path = %existing_snapshot.table_root(), enable_call_frame, version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or(""), incremental_replay = ?incremental_replay, built_as_latest = built_as_latest))]
     pub(super) fn try_new_from(
         existing_snapshot: Arc<Snapshot>,
         log_tail: Vec<ParsedLogPath>,
@@ -113,18 +117,46 @@ impl Snapshot {
         built_as_latest: bool,
     ) -> KernelResult<Arc<Self>> {
         let requested_version = target_version.into();
+        run_workflow_with_engine!(engine, async move |channel| {
+            Self::try_new_from_with_channel(
+                existing_snapshot,
+                log_tail,
+                channel,
+                requested_version,
+                metric_context,
+                incremental_replay,
+                checkpoint_handling,
+                built_as_latest,
+            )
+            .await
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(name = "try_new_from", skip_all, fields(path = %existing_snapshot.table_root(), enable_call_frame, version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or(""), incremental_replay = ?incremental_replay, built_as_latest = built_as_latest))]
+    pub(super) async fn try_new_from_with_channel(
+        existing_snapshot: Arc<Snapshot>,
+        log_tail: Vec<ParsedLogPath>,
+        channel: &Channel,
+        requested_version: Option<Version>,
+        metric_context: SnapshotLoadMetricContext,
+        incremental_replay: IncrementalReplay,
+        checkpoint_handling: CheckpointHandling,
+        built_as_latest: bool,
+    ) -> KernelResult<Arc<Self>> {
         let mut current_segment = None;
         let result = Self::try_new_from_impl(
             existing_snapshot.clone(),
             log_tail,
-            engine,
+            channel,
             requested_version,
             &metric_context,
             incremental_replay,
             checkpoint_handling,
             built_as_latest,
             &mut current_segment,
-        );
+        )
+        .await;
         result.inspect_err(|error| {
             error!(
                 %error,
@@ -140,10 +172,10 @@ impl Snapshot {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn try_new_from_impl(
+    async fn try_new_from_impl(
         existing_snapshot: Arc<Snapshot>,
         log_tail: Vec<ParsedLogPath>,
-        engine: &dyn Engine,
+        channel: &Channel,
         requested_version: Option<Version>,
         metric_context: &SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
@@ -175,16 +207,18 @@ impl Snapshot {
         // Assemble the new segment as one fallible unit so a load failure emits exactly once, via
         // the `inspect_err` below.
         let segment_load_start = std::time::Instant::now();
-        let (combined_log_segment, new_end_version) = match Self::build_new_segment(
-            engine,
+        let new_segment = Self::build_new_segment_with_channel(
+            channel,
             existing_log_segment,
             existing_snapshot_version,
             log_tail,
             requested_version,
             checkpoint_handling,
         )
-        .inspect_err(|_| emit_log_segment_load_failure(metric_context))?
-        {
+        .await;
+        let new_segment =
+            new_segment.inspect_err(|_| emit_log_segment_load_failure(metric_context))?;
+        let (combined_log_segment, new_end_version) = match new_segment {
             NewSegment::Unchanged => {
                 return Self::reuse_with_build_metadata(
                     &existing_snapshot,
@@ -211,11 +245,12 @@ impl Snapshot {
                 } = Self::prepare_new_from_log_segment(
                     existing_snapshot.table_root(),
                     segment,
-                    engine,
+                    channel,
                     metric_context,
                     incremental_replay,
                     built_as_latest,
-                )?;
+                )
+                .await?;
                 let log_segment = current_segment
                     .take()
                     .ok_or_else(|| KernelError::internal_error("Missing prepared log segment"))?;
@@ -250,10 +285,16 @@ impl Snapshot {
         // matching the fresh path.
         let pm_start = std::time::Instant::now();
         let base_crc = combined_log_segment
-            .pick_latest_base_crc(engine, existing_snapshot.base_crc())
+            .pick_latest_base_crc_with_channel(channel, existing_snapshot.base_crc())
+            .await
             .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
         let crc_at_version = combined_log_segment
-            .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
+            .try_build_crc_within_budget_with_channel(
+                channel,
+                base_crc.as_ref(),
+                incremental_replay,
+            )
+            .await
             .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
 
         let existing_table_config = existing_snapshot.table_configuration();
@@ -280,7 +321,8 @@ impl Snapshot {
                     .filter(|c| c.version > existing_snapshot_version);
                 combined_log_segment
                     .segment_after_version(existing_snapshot_version)
-                    .read_protocol_metadata_opt(engine, newer_base)
+                    .read_protocol_metadata_opt_with_channel(channel, newer_base)
+                    .await
                     .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?
             }
         };
@@ -323,27 +365,6 @@ impl Snapshot {
     /// List the log after the existing snapshot and assemble the new [`NewSegment`] for this
     /// incremental update. Returns a non-failure [`NewSegment`] on the C/D.1/E/F cases; a
     /// propagated `Err` is a genuine listing/assembly failure.
-    fn build_new_segment(
-        engine: &dyn Engine,
-        existing_log_segment: &LogSegment,
-        existing_snapshot_version: Version,
-        log_tail: Vec<ParsedLogPath>,
-        requested_version: Option<Version>,
-        checkpoint_handling: CheckpointHandling,
-    ) -> KernelResult<NewSegment> {
-        let storage = engine.storage_handler();
-        run_workflow_with_storage!(storage.as_ref(), None, |channel| {
-            Self::build_new_segment_with_channel(
-                channel,
-                existing_log_segment,
-                existing_snapshot_version,
-                log_tail,
-                requested_version,
-                checkpoint_handling,
-            )
-        })
-    }
-
     async fn build_new_segment_with_channel(
         channel: &Channel,
         existing_log_segment: &LogSegment,

@@ -55,38 +55,53 @@ impl CheckpointShape {
     ///
     /// Returns an error if checkpoint metadata is invalid or required checkpoint data cannot be
     /// read.
+    pub(crate) fn try_new(
+        exec: &dyn PlanExecutor,
+        snapshot: &Snapshot,
+    ) -> KernelResult<CheckpointShape> {
+        let workflow = workflow!(|channel| Self::try_new_with_channel(channel, snapshot));
+        drive_with_plan_executor(exec, workflow)
+    }
+
+    /// Resolves `snapshot`'s checkpoint topology through `channel` without retaining its schema.
     #[tracing::instrument(
         name = "checkpoint_shape.try_new",
         skip_all,
         fields(enable_call_frame),
         err
     )]
-    pub(crate) fn try_new(
-        exec: &dyn PlanExecutor,
+    pub(crate) async fn try_new_with_channel(
+        channel: &Channel,
         snapshot: &Snapshot,
     ) -> KernelResult<CheckpointShape> {
-        let workflow =
-            workflow!(|channel| Self::try_new_impl_with_channel(channel, snapshot, false));
-        drive_with_plan_executor(exec, workflow)
+        Self::try_new_impl_with_channel(channel, snapshot, false).await
     }
 
     /// Resolves `snapshot`'s checkpoint topology and retains the checkpoint leaf schema.
     ///
     /// Returns an error if checkpoint metadata is invalid or required checkpoint data cannot be
     /// read.
+    pub(crate) fn try_new_with_leaf_schema(
+        exec: &dyn PlanExecutor,
+        snapshot: &Snapshot,
+    ) -> KernelResult<CheckpointShape> {
+        let workflow =
+            workflow!(|channel| Self::try_new_with_leaf_schema_with_channel(channel, snapshot));
+        drive_with_plan_executor(exec, workflow)
+    }
+
+    /// Resolves `snapshot`'s checkpoint topology and schema through `channel`.
     #[tracing::instrument(
         name = "checkpoint_shape.try_new_with_leaf_schema",
         skip_all,
         fields(enable_call_frame),
         err
     )]
-    pub(crate) fn try_new_with_leaf_schema(
-        exec: &dyn PlanExecutor,
+    pub(crate) async fn try_new_with_leaf_schema_with_channel(
+        channel: &Channel,
         snapshot: &Snapshot,
     ) -> KernelResult<CheckpointShape> {
-        let workflow =
-            workflow!(|channel| Self::try_new_impl_with_channel(channel, snapshot, true));
-        drive_with_plan_executor(exec, workflow)
+        Self::try_new_impl_with_channel(channel, snapshot, true).await
     }
 
     async fn try_new_impl_with_channel(

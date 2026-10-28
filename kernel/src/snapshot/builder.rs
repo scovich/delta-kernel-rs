@@ -6,7 +6,9 @@ use delta_kernel_derive::internal_api;
 use tracing::{info, instrument};
 
 use crate::cancellation::CancellationTokenRef;
-use crate::engine::CancellableEngine;
+use crate::coroutine::kernel::{
+    run_workflow_with_engine, static_workflow, Channel, StaticWorkflow,
+};
 use crate::log_path::LogPath;
 use crate::log_segment::{validate_catalog_managed_log_tail, LogSegment};
 use crate::log_segment_files::CheckpointHandling;
@@ -325,13 +327,32 @@ impl<Mode> SnapshotBuilder<Mode> {
     /// [`MetricEvent::SnapshotBuildFailure`]: crate::metrics::MetricEvent::SnapshotBuildFailure
     // `is_catalog_managed` is the requested load mode, not the confirmed protocol
     // (see `IS_CATALOG_MANAGED_FIELD`).
+    pub fn build(mut self, engine: &dyn Engine) -> KernelResult<SnapshotRef> {
+        let cancellation_token = self.cancellation_token.take();
+        run_workflow_with_engine!(engine, cancellation_token, async move |channel| {
+            self.build_with_channel(channel).await
+        })
+    }
+
+    /// Returns a lazy workflow that builds this snapshot.
+    ///
+    /// Cancellation is connector-owned. A caller that configured this builder with
+    /// [`Self::with_cancellation_token`] must install the same token on the workflow driver.
+    pub fn build_workflow(self) -> StaticWorkflow<SnapshotRef>
+    where
+        Mode: 'static,
+    {
+        static_workflow!(async move |channel| self.build_with_channel(channel).await)
+    }
+
+    /// Builds this snapshot through `channel`.
     #[instrument(
         name = SNAPSHOT_COMPLETED_SPAN,
         skip_all,
         fields(path = %self.table_path(), report, enable_call_frame, version = tracing::field::Empty, operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some(), correlation_id = self.correlation_id.as_deref().unwrap_or(""), load_type = self.load_type().as_ref()),
         err
     )]
-    pub fn build(self, engine: &dyn Engine) -> KernelResult<SnapshotRef> {
+    pub(crate) async fn build_with_channel(self, channel: &Channel) -> KernelResult<SnapshotRef> {
         // Fold the context into the message string rather than passing structured fields: this
         // `info!` fires inside the `snap.build` metrics span, where any field the
         // `SnapshotBuildSuccess` event doesn't recognize would trip a spurious "Invalid field"
@@ -359,7 +380,7 @@ impl<Mode> SnapshotBuilder<Mode> {
             snapshot_hint,
             operation_id,
             correlation_id,
-            cancellation_token,
+            cancellation_token: _,
             mode: _,
         } = self;
 
@@ -379,11 +400,6 @@ impl<Mode> SnapshotBuilder<Mode> {
                 incremental_replay,
             )?
         } else {
-            let scoped_engine =
-                cancellation_token.map(|token| CancellableEngine::new(engine, token));
-            let engine = scoped_engine
-                .as_ref()
-                .map_or(engine, |engine| engine as &dyn Engine);
             let log_tail: Vec<_> = log_tail.into_iter().map(Into::into).collect();
 
             // Pre-build validations for catalog-managed tables
@@ -400,22 +416,23 @@ impl<Mode> SnapshotBuilder<Mode> {
 
             if let Some(table_root) = table_root {
                 let table_url = try_parse_uri(table_root)?;
-                let log_segment = LogSegment::for_snapshot(
-                    engine.storage_handler().as_ref(),
+                let log_segment = LogSegment::for_snapshot_with_channel(
+                    channel,
                     table_url.join(DELTA_LOG_DIR_WITH_SLASH)?,
                     log_tail,
                     effective_version,
                     metric_context.clone(),
-                    None,
-                )?;
+                )
+                .await?;
                 Snapshot::try_new_from_log_segment(
                     table_url,
                     log_segment,
-                    engine,
+                    channel,
                     metric_context,
                     incremental_replay,
                     built_as_latest,
                 )
+                .await
                 .map(Into::into)?
             } else {
                 let Some(existing_snapshot) = existing_snapshot else {
@@ -423,16 +440,17 @@ impl<Mode> SnapshotBuilder<Mode> {
                         "SnapshotBuilder should have either table_root or existing_snapshot",
                     ));
                 };
-                Snapshot::try_new_from(
+                Snapshot::try_new_from_with_channel(
                     existing_snapshot,
                     log_tail,
-                    engine,
+                    channel,
                     effective_version,
                     metric_context,
                     incremental_replay,
                     checkpoint_handling,
                     built_as_latest,
-                )?
+                )
+                .await?
             }
         };
 
