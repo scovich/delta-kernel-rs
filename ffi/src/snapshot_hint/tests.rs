@@ -142,6 +142,12 @@ fn test_engine() -> Handle<SharedExternEngine> {
     engine_to_handle(Arc::new(NoIoEngine), allocate_err)
 }
 
+unsafe fn build_without_io(
+    builder: Handle<ExclusiveSnapshotBuilder>,
+) -> ExternResult<Handle<SharedSnapshot>> {
+    unsafe { snapshot_builder_build(builder) }
+}
+
 #[rstest::rstest]
 #[case::ordinary(17, 23, Some(40))]
 #[case::unsigned(i64::MAX as u64, 1, Some(1 << 63))]
@@ -171,7 +177,7 @@ fn log_segment_stats_borrows_handles_and_propagates_errors_without_io(
             &hint,
         ))
     };
-    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let snapshot = unsafe { ok_or_panic(build_without_io(builder)) };
     for _ in 0..2 {
         let result =
             unsafe { snapshot_log_segment_stats(snapshot.shallow_copy(), engine.shallow_copy()) };
@@ -296,7 +302,7 @@ fn exported_hint_copy_outlives_snapshot_and_preserves_state(
             &hint,
         ))
     };
-    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let snapshot = unsafe { ok_or_panic(build_without_io(builder)) };
     let expected_segment = unsafe { snapshot.as_ref() }.log_segment().clone();
     let expected_crc = unsafe { snapshot.as_ref() }.crc_at_version().cloned();
     let builder = ok_or_panic(install_through_visitor(
@@ -305,7 +311,7 @@ fn exported_hint_copy_outlives_snapshot_and_preserves_state(
         &engine,
     ));
     unsafe { free_snapshot(snapshot) };
-    let rebuilt = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let rebuilt = unsafe { ok_or_panic(build_without_io(builder)) };
     let rebuilt_ref = unsafe { rebuilt.as_ref() };
     assert_eq!(rebuilt_ref.version(), 0);
     assert_eq!(rebuilt_ref.is_built_as_latest(), expected_latest);
@@ -321,7 +327,7 @@ fn exported_hint_copy_outlives_snapshot_and_preserves_state(
 fn snapshot_hint_export_borrows_inputs_and_calls_visitor_once() {
     let engine = test_engine();
     let builder = unsafe { with_minimal_hint(test_builder(&engine)) };
-    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let snapshot = unsafe { ok_or_panic(build_without_io(builder)) };
     let mut visits = 0usize;
     for expected_visits in 1..=2 {
         assert!(unsafe {
@@ -368,7 +374,7 @@ fn snapshot_hint_export_rejects_compaction_without_calling_visitor() {
             &hint,
         ))
     };
-    let source = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let source = unsafe { ok_or_panic(build_without_io(builder)) };
     let source_ref = unsafe { source.as_ref() };
     let mut files = source_ref.log_segment().listed.clone();
     files.ascending_compaction_files.push(
@@ -488,7 +494,7 @@ fn assert_exported_paths_and_round_trip(snapshot: Handle<SharedSnapshot>) {
     };
     let builder = ok_or_panic(install_through_visitor(&snapshot, builder, &engine));
     unsafe { free_snapshot(snapshot) };
-    let rebuilt = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let rebuilt = unsafe { ok_or_panic(build_without_io(builder)) };
     let rebuilt_ref = unsafe { rebuilt.as_ref() };
     assert_eq!(rebuilt_ref.log_segment(), &expected_segment);
     assert_eq!(rebuilt_ref.crc_at_version(), expected_crc.as_ref());
@@ -534,7 +540,7 @@ fn exported_hint_sorts_and_deduplicates_supplied_paths(#[case] checkpoint_versio
             &hint,
         ))
     };
-    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let snapshot = unsafe { ok_or_panic(build_without_io(builder)) };
     assert_exported_paths_and_round_trip(snapshot);
     unsafe { free_engine(engine) };
 }
@@ -634,7 +640,7 @@ fn rebuild_through_visitor(
         test_builder(engine),
         engine,
     ));
-    unsafe { ok_or_panic(snapshot_builder_build(builder)) }
+    unsafe { ok_or_panic(build_without_io(builder)) }
 }
 
 #[rstest::rstest]
@@ -667,7 +673,7 @@ fn publication_watermark_distinguishes_inference_from_explicit_state(
             &hint,
         ))
     };
-    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let snapshot = unsafe { ok_or_panic(build_without_io(builder)) };
     assert_eq!(
         unsafe { snapshot.as_ref() }
             .log_segment()
@@ -738,7 +744,7 @@ fn visited_hint_round_trips_explicit_watermark_and_outlives_source(
             &hint,
         ))
     };
-    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let snapshot = unsafe { ok_or_panic(build_without_io(builder)) };
     let expected_segment = unsafe { snapshot.as_ref() }.log_segment().clone();
     let expected_crc = unsafe { snapshot.as_ref() }.crc_at_version().cloned();
     let mut state = VisitedHint {
@@ -766,7 +772,7 @@ fn visited_hint_round_trips_explicit_watermark_and_outlives_source(
         ))
     );
     let builder = ok_or_panic(state.result.take().unwrap());
-    let rebuilt = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let rebuilt = unsafe { ok_or_panic(build_without_io(builder)) };
     assert_eq!(unsafe { rebuilt.as_ref() }.log_segment(), &expected_segment);
     assert_eq!(
         unsafe { rebuilt.as_ref() }.crc_at_version(),
@@ -834,7 +840,7 @@ fn visited_hint_preserves_partial_crc_maps_and_indeterminate_file_stats() {
             &hint,
         ))
     };
-    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let snapshot = unsafe { ok_or_panic(build_without_io(builder)) };
     let rebuilt = rebuild_through_visitor(&snapshot, &engine);
     let rebuilt_ref = unsafe { rebuilt.as_ref() };
     assert_eq!(
@@ -919,7 +925,7 @@ fn visited_hint_after_publish_preserves_staged_paths_and_advanced_watermark() {
     hint.crc = &crc;
     let builder = unsafe { snapshot_builder_with_max_catalog_version(test_builder(&engine), 1) };
     let builder = unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) };
-    let source = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let source = unsafe { ok_or_panic(build_without_io(builder)) };
     let source_ref = unsafe { source.clone_as_arc() };
     assert_eq!(
         source_ref.log_segment().listed.max_published_version,
@@ -964,8 +970,7 @@ fn visited_hint_after_publish_preserves_staged_paths_and_advanced_watermark() {
         state.watermark,
         Some(PublicationWatermark::PublishedThrough(1))
     );
-    let rebuilt =
-        unsafe { ok_or_panic(snapshot_builder_build(ok_or_panic(state.result.unwrap()))) };
+    let rebuilt = unsafe { ok_or_panic(build_without_io(ok_or_panic(state.result.unwrap()))) };
     assert_eq!(
         unsafe { rebuilt.as_ref() }.log_segment().listed,
         expected_segment
@@ -1087,7 +1092,7 @@ fn typed_export_rejects_adaptive_crc_without_visiting_or_consuming_snapshot(
 fn visited_hint_rejects_incremental_builder_without_consuming_snapshot() {
     let engine = test_engine();
     let builder = unsafe { with_minimal_hint(test_builder(&engine)) };
-    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let snapshot = unsafe { ok_or_panic(build_without_io(builder)) };
     let builder = unsafe {
         ok_or_panic(get_snapshot_builder_from(
             snapshot.shallow_copy(),
@@ -1116,7 +1121,7 @@ fn exported_hint_rejects_cross_table_paths_at_install_and_version_mismatch_at_bu
 ) {
     let engine = test_engine();
     let builder = unsafe { with_minimal_hint(test_builder(&engine)) };
-    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let snapshot = unsafe { ok_or_panic(build_without_io(builder)) };
     let builder = unsafe {
         ok_or_panic(get_snapshot_builder(
             slice(table_root),
@@ -1131,7 +1136,7 @@ fn exported_hint_rejects_cross_table_paths_at_install_and_version_mismatch_at_bu
     let result = match install_through_visitor(&snapshot, builder, &engine) {
         ExternResult::Ok(builder) => {
             assert!(version_mismatch);
-            unsafe { snapshot_builder_build(builder) }
+            unsafe { build_without_io(builder) }
         }
         ExternResult::Err(error) => {
             assert!(!version_mismatch);
@@ -1288,7 +1293,7 @@ fn aggregate_with_replaces_existing_hint_after_successful_validation() {
     let builder =
         unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &replacement)) };
 
-    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let snapshot = unsafe { ok_or_panic(build_without_io(builder)) };
     assert!(unsafe { snapshot.as_ref() }.is_built_as_latest());
     unsafe {
         free_snapshot(snapshot);
@@ -1681,7 +1686,7 @@ fn aggregate_with_builds_latest_snapshot_from_rich_crc(
     hint.crc = &crc;
     let builder = unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) };
 
-    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let snapshot = unsafe { ok_or_panic(build_without_io(builder)) };
     let snapshot_ref = unsafe { snapshot.as_ref() };
     assert_eq!(snapshot_ref.version(), 0);
     assert!(snapshot_ref.is_built_as_latest());
@@ -1743,7 +1748,7 @@ fn aggregate_with_validates_explicit_builder_version_at_build(
     );
     let builder = unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) };
 
-    let result = unsafe { snapshot_builder_build(builder) };
+    let result = unsafe { build_without_io(builder) };
     if should_build {
         let snapshot = ok_or_panic(result);
         assert_eq!(unsafe { snapshot.as_ref() }.version(), requested_version);
@@ -1775,7 +1780,7 @@ fn aggregate_with_validates_incremental_crc_replay_at_build(
         }
     };
 
-    let result = unsafe { snapshot_builder_build(builder) };
+    let result = unsafe { build_without_io(builder) };
     if should_build {
         let snapshot = ok_or_panic(result);
         assert_eq!(unsafe { snapshot.as_ref() }.version(), 0);
@@ -1809,7 +1814,7 @@ fn assert_typed_checkpoint_build(
     hint.crc = &crc;
     let builder = unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) };
 
-    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let snapshot = unsafe { ok_or_panic(build_without_io(builder)) };
     let snapshot_ref = unsafe { snapshot.as_ref() };
     assert_eq!(snapshot_ref.version(), 0);
     assert_eq!(
@@ -2064,7 +2069,7 @@ fn aggregate_checkpoint_build_preserves_identity_and_reconstructed_state(
 fn aggregate_with_reports_unsupported_for_existing_snapshot_builder() {
     let engine = test_engine();
     let initial_builder = unsafe { with_minimal_hint(test_builder(&engine)) };
-    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(initial_builder)) };
+    let snapshot = unsafe { ok_or_panic(build_without_io(initial_builder)) };
 
     let update_builder = unsafe {
         ok_or_panic(get_snapshot_builder_from(
@@ -2099,13 +2104,13 @@ fn aggregate_with_reports_unsupported_for_existing_snapshot_builder() {
 fn build_rejects_internally_supplied_hint_for_existing_snapshot_builder() {
     let engine = test_engine();
     let initial_builder = unsafe { with_minimal_hint(test_builder(&engine)) };
-    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(initial_builder)) };
+    let snapshot = unsafe { ok_or_panic(build_without_io(initial_builder)) };
 
     let mut update_builder = unsafe { with_minimal_hint(test_builder(&engine)) };
     unsafe { update_builder.as_mut() }.source =
         FfiSnapshotBuilderSource::ExistingSnapshot(unsafe { snapshot.clone_as_arc() });
 
-    let result = unsafe { snapshot_builder_build(update_builder) };
+    let result = unsafe { build_without_io(update_builder) };
     assert_extern_result_error_contains(
         result,
         FFIKernelError::InvalidSnapshotHint,
