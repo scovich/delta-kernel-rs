@@ -16,7 +16,8 @@ use url::Url;
 use super::request::{
     CreateEngineData, CreateExpressionEvaluator, CreatePredicateEvaluator, EvaluateExpression,
     EvaluatePredicate, ExpressionEvaluatorHandle, PredicateEvaluatorHandle, ReadJsonFiles,
-    ReadParquetFiles, WriteJsonFile, WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
+    ReadParquetFiles, WriteBytes, WriteJsonFile, WriteParquetFile, WriteParquetFiles,
+    WriteParquetFilesResult,
 };
 use super::{Request, StaticCoroutine};
 use crate::committer::{Commit, CommitResponse, PublishMetadata};
@@ -206,6 +207,12 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
     ) -> impl KernelFuture<WriteParquetFilesResult> {
         let operation = WriteParquetFiles::new(write, input);
         self.exchange(Box::new(operation), Request::WriteParquetFiles)
+    }
+
+    /// Writes one complete object.
+    fn write_bytes(&self, url: &Url, data: Bytes, overwrite: bool) -> impl KernelFuture<()> {
+        let operation = WriteBytes::new(url.clone(), data, overwrite);
+        self.exchange(operation, Request::WriteBytes)
     }
 
     /// Delegates a prepared transaction to the connector's committer.

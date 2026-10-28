@@ -587,7 +587,7 @@ impl CheckpointWriter {
         workflow!(|channel| self.finalize_with_channel(channel, last_checkpoint_stats))
     }
 
-    async fn finalize_with_channel(
+    pub(crate) async fn finalize_with_channel(
         self,
         channel: &Channel,
         last_checkpoint_stats: &LastCheckpointHintStats,
@@ -629,21 +629,7 @@ impl CheckpointWriter {
         Ok(())
     }
 
-    pub(crate) fn write_v2_checkpoint_with_sidecars(
-        &self,
-        engine: &dyn Engine,
-        file_actions_per_sidecar_hint: usize,
-    ) -> KernelResult<WrittenCheckpointInfo> {
-        run_workflow_with_engine!(engine, async move |channel| {
-            self.write_v2_checkpoint_with_sidecars_with_channel(
-                channel,
-                file_actions_per_sidecar_hint,
-            )
-            .await
-        })
-    }
-
-    async fn write_v2_checkpoint_with_sidecars_with_channel(
+    pub(crate) async fn write_v2_checkpoint_with_sidecars_with_channel(
         &self,
         channel: &Channel,
         file_actions_per_sidecar_hint: usize,
@@ -735,17 +721,7 @@ impl CheckpointWriter {
 
     /// Writes a checkpoint without sidecars, will automatically choose V1 or V2
     /// based on the table features.
-    pub(crate) fn write_checkpoint_without_sidecars(
-        &self,
-        engine: &dyn Engine,
-    ) -> KernelResult<WrittenCheckpointInfo> {
-        run_workflow_with_engine!(engine, async move |channel| {
-            self.write_checkpoint_without_sidecars_with_channel(channel)
-                .await
-        })
-    }
-
-    async fn write_checkpoint_without_sidecars_with_channel(
+    pub(crate) async fn write_checkpoint_without_sidecars_with_channel(
         &self,
         channel: &Channel,
     ) -> KernelResult<WrittenCheckpointInfo> {

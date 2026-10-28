@@ -57,7 +57,7 @@ use futures::{Stream, StreamExt as _};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::filesystem::{head_impl, list_from_impl, read_files_impl};
+use crate::filesystem::{head_impl, list_from_impl, put_impl, read_files_impl};
 use crate::json::{read_json_files_impl, write_json_file_impl};
 use crate::parquet::{read_parquet_files_impl, read_parquet_footer_impl, DEFAULT_ROWS_PER_FILE};
 use crate::{DEFAULT_READ_BATCH_SIZE, DEFAULT_READ_BUFFER_SIZE};
@@ -204,6 +204,22 @@ impl AsyncEngineConnector {
             }
             Request::WriteParquetFiles(operation, reply) => {
                 reply.send(Box::pin(self.write_parquet_files(*operation)).await)
+            }
+            Request::WriteBytes(operation, reply) => {
+                let path = Path::from_url_path(operation.url.path());
+                let result = match path {
+                    Ok(path) => {
+                        put_impl(
+                            Arc::clone(&self.object_store),
+                            path,
+                            operation.data,
+                            operation.overwrite,
+                        )
+                        .await
+                    }
+                    Err(err) => Err(err.into()),
+                };
+                reply.send(result)
             }
             Request::Commit(commit, reply) => {
                 let workflow = FileSystemCommitter::commit_workflow(*commit);
@@ -623,6 +639,23 @@ mod tests {
 
         assert!(matches!(result, Err(KernelError::Cancelled)));
         assert!(workflow.advance().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn writes_bytes_through_native_async_storage() {
+        let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
+        let connector = AsyncEngineConnector::new(Arc::clone(&store));
+        let url = Url::parse("memory:///data").unwrap();
+        let workflow = static_workflow!(async move |channel| {
+            channel
+                .write_bytes(&url, Bytes::from_static(b"delta"), false)
+                .await
+        });
+
+        connector.run(workflow).await.unwrap();
+
+        let data = store.get(&Path::from("data")).await.unwrap().bytes().await;
+        assert_eq!(data.unwrap(), Bytes::from_static(b"delta"));
     }
 
     #[tokio::test]

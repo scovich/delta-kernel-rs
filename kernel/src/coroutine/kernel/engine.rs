@@ -202,7 +202,7 @@ impl EngineConnector {
     fn respond(&self, request: Request) -> KernelResult<()> {
         match request {
             Request::ListForward(request) => respond_paged(&self.storage_connector(), request)?,
-            Request::ReadSmallFile(..) | Request::Head(..) => {
+            Request::ReadSmallFile(..) | Request::Head(..) | Request::WriteBytes(..) => {
                 self.storage_connector().respond(request)?
             }
             Request::ReadParquetFooter(file, reply) => complete(
@@ -486,6 +486,11 @@ impl StorageConnector<'_> {
                     .read_small_file_with_cancellation(file, self.cancellation_token.clone()),
             ),
             Request::Head(url, reply) => complete(reply, self.storage.head(&url)),
+            Request::WriteBytes(operation, reply) => {
+                let storage = self.storage;
+                let result = storage.put(&operation.url, operation.data, operation.overwrite);
+                complete(reply, result)
+            }
             Request::ReadJson(_) => Err(KernelError::internal_error(
                 "JSON reads require an Engine connector",
             )),

@@ -155,7 +155,7 @@ async fn copy_atomic_impl(
 }
 
 /// Native async implementation for put
-async fn put_impl(
+pub(crate) async fn put_impl(
     store: Arc<DynObjectStore>,
     path: Path,
     data: Bytes,

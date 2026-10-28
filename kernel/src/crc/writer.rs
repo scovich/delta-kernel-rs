@@ -3,9 +3,14 @@
 use url::Url;
 
 use super::Crc;
+#[cfg(test)]
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::{Channel, ChannelExt as _};
 use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
 use crate::utils::require;
-use crate::{Engine, KernelError, KernelResult};
+#[cfg(test)]
+use crate::Engine;
+use crate::{KernelError, KernelResult};
 
 /// Serialize and write a CRC file to storage.
 ///
@@ -18,7 +23,18 @@ use crate::{Engine, KernelError, KernelResult};
 /// Per the Delta protocol, writers MUST NOT overwrite existing CRC files, so this always
 /// writes with `overwrite = false`. If the file already exists, returns
 /// `Err(KernelError::FileAlreadyExists)`.
+#[cfg(test)]
 pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> KernelResult<()> {
+    run_workflow_with_engine!(engine, |channel| {
+        try_write_crc_file_with_channel(channel, path, crc)
+    })
+}
+
+pub(crate) async fn try_write_crc_file_with_channel(
+    channel: &Channel,
+    path: &Url,
+    crc: &Crc,
+) -> KernelResult<()> {
     require!(
         crc.file_stats_state.is_complete(),
         KernelError::ChecksumWriteUnsupported(format!(
@@ -41,9 +57,9 @@ pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> 
         )
     );
     let data = serde_json::to_vec(crc)?;
-    engine
-        .storage_handler()
-        .put(path, data.into(), false /* overwrite */)
+    channel
+        .write_bytes(path, data.into(), false /* overwrite */)
+        .await
 }
 
 #[cfg(test)]

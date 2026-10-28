@@ -1652,8 +1652,8 @@ pub unsafe extern "C" fn checkpoint_snapshot(
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot_ref: SnapshotRef = unsafe { snapshot.clone_as_arc() };
     let kernel_spec = spec.map(|s| s.to_kernel());
-    snapshot_ref
-        .checkpoint(engine_ref.engine().as_ref(), kernel_spec.as_ref())
+    let workflow = snapshot_ref.checkpoint_workflow(kernel_spec.as_ref());
+    drive_kernel(engine_ref, workflow)
         .map(|(result, updated)| FfiCheckpointWriteResult::from_kernel(result, updated))
         .into_extern_result(&engine_ref)
 }

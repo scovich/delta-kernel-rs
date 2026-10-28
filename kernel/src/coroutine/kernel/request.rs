@@ -60,6 +60,8 @@ pub enum Request {
     /// Write streamed row batches to connector-selected Parquet files.
     // Boxed to keep the request enum small without boxing every variant.
     WriteParquetFiles(Box<WriteParquetFiles>, Reply<WriteParquetFilesResult>),
+    /// Write one complete object.
+    WriteBytes(WriteBytes, Reply<()>),
     /// Commit one prepared transaction through a connector-selected committer.
     Commit(Box<Commit>, Reply<CommitResponse>),
     /// Verifies that the connector selected a catalog committer.
@@ -269,6 +271,17 @@ pub struct WriteParquetFiles {
     pub write: ParquetMultiFileWrite,
     /// Row batches to serialize in yield order.
     pub input: StaticCoroutine<Box<dyn EngineData>>,
+}
+
+/// Writes one complete object.
+#[derive(Constructor)]
+pub struct WriteBytes {
+    /// Destination URL.
+    pub url: Url,
+    /// Complete object contents.
+    pub data: Bytes,
+    /// Whether an existing destination may be overwritten.
+    pub overwrite: bool,
 }
 
 #[cfg(test)]
