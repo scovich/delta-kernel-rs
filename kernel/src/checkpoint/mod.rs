@@ -599,10 +599,9 @@ impl CheckpointWriter {
         let (data_iter, output_schema) = self.checkpoint_data_with_schema(engine)?;
         let iter_state = data_iter.state();
 
-        let splitter = SidecarSplitter::new_mut_shared(
-            engine.evaluation_handler().as_ref(),
-            output_schema.clone(),
-        )?;
+        let splitter =
+            SidecarSplitter::new(engine.evaluation_handler().as_ref(), output_schema.clone())?;
+        let non_file_batches = splitter.non_file_action_batches();
 
         // Write sidecar files
         let file_actions_per_sidecar_hint = NonZero::new(file_actions_per_sidecar_hint)
@@ -616,7 +615,7 @@ impl CheckpointWriter {
             self.snapshot.version(),
             Some(file_actions_per_sidecar_hint),
         )?;
-        let data = SidecarSplitter::file_action_batches(splitter.clone(), data_iter);
+        let data = SidecarSplitter::file_action_batches(splitter, data_iter);
         let sidecar_files = engine
             .parquet_handler()
             .write_parquet_files(write.clone(), Box::new(data))?;
@@ -641,13 +640,12 @@ impl CheckpointWriter {
         }
 
         // Collect non-file action batches(e.g., `protocol`, `metaData`, `txn`, etc.)
-        let non_file_batches = Arc::into_inner(splitter)
+        let non_file_batches = Arc::into_inner(non_file_batches)
             .ok_or_else(|| {
-                KernelError::internal_error("sidecar splitter Arc should have no other references")
+                KernelError::internal_error("non-file batches Arc should have no other references")
             })?
             .into_inner()
-            .map_err(|_| KernelError::internal_error("sidecar splitter lock poisoned"))?
-            .into_non_file_batches();
+            .map_err(|_| KernelError::internal_error("non-file-action batches lock poisoned"))?;
 
         // Create sidecar action rows for the main checkpoint file. Each row populates only
         // the `sidecar` column, e.g. `sidecar: { path: "<sidecar_filename>.parquet", sizeInBytes:
