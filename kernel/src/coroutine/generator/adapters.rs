@@ -165,6 +165,66 @@ where
     }
 }
 
+/// Generator returned by [`GeneratorExt::promote_errors`].
+pub struct PromoteErrors<G>(G);
+
+impl<G> PromoteErrors<G> {
+    pub(super) fn new(inner: G) -> Self {
+        Self(inner)
+    }
+}
+
+impl<G: Unpin> Unpin for PromoteErrors<G> {}
+
+impl<G> GeneratorExt for PromoteErrors<G> {}
+
+impl<P, G, T> Generator<P> for PromoteErrors<G>
+where
+    P: Send + 'static,
+    G: Generator<P, Item = KernelResult<T>>,
+    T: Send + 'static,
+{
+    type Item = T;
+    type Output = G::Output;
+
+    fn bind_to<'a>(
+        self,
+        channel: ChannelBinding<'a, P>,
+    ) -> impl BoundGenerator<Item = T, Output = G::Output> + Unpin + 'a
+    where
+        Self: 'a,
+    {
+        PromoteErrors(self.0.bind_to(channel))
+    }
+
+    fn bind_boxed<'a>(
+        self: Box<Self>,
+        channel: ChannelBinding<'a, P>,
+    ) -> BoxedBoundGenerator<'a, T, G::Output>
+    where
+        Self: 'a,
+    {
+        Box::new((*self).bind_to(channel))
+    }
+}
+
+impl<G, T> BoundGenerator for PromoteErrors<G>
+where
+    G: BoundGenerator<Item = KernelResult<T>> + Unpin,
+    T: Send + 'static,
+{
+    type Item = T;
+    type Output = G::Output;
+
+    fn poll_step(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<KernelResult<GeneratorStep<T, G::Output>>> {
+        let item = ready_yield!(Pin::new(&mut self.get_mut().0).poll_step(context));
+        Poll::Ready(item.map(GeneratorStep::Yield))
+    }
+}
+
 /// Witnesses one call to an asynchronous mapper.
 pub async fn map_async_witness<'a, P, F, I, U>(
     mapper: &'a mut F,

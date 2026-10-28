@@ -2,18 +2,16 @@ use std::sync::{Arc, Mutex};
 
 use itertools::Itertools;
 
-use crate::action_reconciliation::ActionReconciliationIterator;
 use crate::actions::{ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
-use crate::coroutine::kernel::{run_workflow_with_engine, Channel, ChannelExt as _};
+use crate::coroutine::generator::{generator_fn, BoundGenerator, Generator};
+use crate::coroutine::kernel::request::{ExpressionEvaluatorHandle, PredicateEvaluatorHandle};
+use crate::coroutine::kernel::{Channel, ChannelExt as _, KernelResultGenerator, Request};
 use crate::engine_data::filter_by_predicate;
 use crate::expressions::{
     col, null_lit, Expression, ExpressionStructPatchBuilder, Predicate, Scalar, StructData,
 };
 use crate::schema::{try_schema, DataType, SchemaRef, StructField};
-use crate::{
-    Engine, EngineData, EvaluationHandler, ExpressionEvaluator, FileMeta, KernelError,
-    KernelResult, PredicateEvaluator,
-};
+use crate::{EngineData, FileMeta, FilteredEngineData, KernelError, KernelResult};
 
 /// Field names of the `sidecar` action struct.
 const SIDECAR_SCHEMA_PATH: &str = "path";
@@ -24,25 +22,14 @@ const SIDECAR_SCHEMA_TAGS: &str = "tags";
 /// Creates a single [`EngineData`] batch containing one row per sidecar file.
 ///
 /// Each row has the `sidecar` field populated and all other fields set to null.
-/// All rows are created in one batch via [`EvaluationHandler::create_many`].
+/// All rows are created in one batch through the connector channel.
 ///
 /// Returns `None` when there are no sidecars.
 ///
 /// # Parameters
-/// - `engine`: Implementation of [`Engine`] apis.
+/// - `channel`: Connector channel for creating the batch.
 /// - `checkpoint_data_schema`: The checkpoint data schema.
 /// - `sidecar_metas`: Pairs of (sidecar filename, FileMeta) for each sidecar file.
-pub(super) fn create_sidecar_action_batch(
-    engine: &dyn Engine,
-    checkpoint_data_schema: &SchemaRef,
-    sidecar_metas: &[(String, FileMeta)],
-) -> KernelResult<Option<Box<dyn EngineData>>> {
-    run_workflow_with_engine!(engine, |channel| {
-        create_sidecar_action_batch_with_channel(channel, checkpoint_data_schema, sidecar_metas)
-    })
-}
-
-/// Channel-driven counterpart to [`create_sidecar_action_batch`].
 pub(super) async fn create_sidecar_action_batch_with_channel(
     channel: &Channel,
     checkpoint_data_schema: &SchemaRef,
@@ -114,14 +101,22 @@ pub(super) async fn create_sidecar_action_batch_with_channel(
 
 /// Transforms [`EngineData`] and filters out all-null rows.
 struct NonNullRowsPicker {
-    transform: Arc<dyn ExpressionEvaluator>,
-    null_row_filter: Arc<dyn PredicateEvaluator>,
+    transform: ExpressionEvaluatorHandle,
+    null_row_filter: PredicateEvaluatorHandle,
 }
 
 impl NonNullRowsPicker {
-    fn pick(&self, batch: &dyn EngineData) -> KernelResult<Box<dyn EngineData>> {
-        let transformed = self.transform.evaluate(batch)?;
-        let predicate_result = self.null_row_filter.evaluate(transformed.as_ref())?;
+    async fn pick(
+        &self,
+        channel: &Channel,
+        batch: &dyn EngineData,
+    ) -> KernelResult<Box<dyn EngineData>> {
+        let transformed = channel
+            .evaluate_expression(&self.transform, batch.clone_data())
+            .await?;
+        let predicate_result = channel
+            .evaluate_predicate(&self.null_row_filter, transformed.clone_data())
+            .await?;
         filter_by_predicate(transformed, predicate_result.as_ref())
     }
 }
@@ -163,8 +158,8 @@ pub(super) struct SidecarSplitter {
 }
 
 impl SidecarSplitter {
-    pub(super) fn new(
-        eval_handler: &dyn EvaluationHandler,
+    pub(super) async fn new_with_channel(
+        channel: &Channel,
         checkpoint_data_schema: SchemaRef,
     ) -> KernelResult<Self> {
         // Derive sidecar output schema from the checkpoint data schema (add + remove only).
@@ -194,24 +189,26 @@ impl SidecarSplitter {
         }?);
 
         // Sidecar projector: select only add/remove columns.
-        let file_action_projector = eval_handler.new_expression_evaluator(
+        let file_action_projector = channel.create_expression_evaluator(
             checkpoint_data_schema.clone(),
             Arc::new(Expression::struct_from([col!(ADD_NAME), col!(REMOVE_NAME)])),
             sidecar_output_schema.clone().into(),
-        )?;
+        );
+        let file_action_projector = file_action_projector.await?;
 
         // Filters out rows where both add and remove are null.
-        let file_actions_null_row_filter = eval_handler.new_predicate_evaluator(
+        let file_actions_null_row_filter = channel.create_predicate_evaluator(
             sidecar_output_schema,
             Arc::new(Predicate::or(
                 Predicate::is_not_null(col!(ADD_NAME)),
                 Predicate::is_not_null(col!(REMOVE_NAME)),
             )),
-        )?;
+        );
+        let file_actions_null_row_filter = file_actions_null_row_filter.await?;
 
         // Nulls out add/remove instead of dropping them so the data schema stays the
         // same as checkpoint_data_schema (add/remove columns are already nullable).
-        let non_file_action_nullifier = eval_handler.new_expression_evaluator(
+        let non_file_action_nullifier = channel.create_expression_evaluator(
             checkpoint_data_schema.clone(),
             Arc::new(Expression::struct_patch(
                 ExpressionStructPatchBuilder::new()
@@ -219,7 +216,8 @@ impl SidecarSplitter {
                     .replace(REMOVE_NAME, null_lit(remove_field.data_type.clone())),
             )?),
             checkpoint_data_schema.clone().into(),
-        )?;
+        );
+        let non_file_action_nullifier = non_file_action_nullifier.await?;
 
         // Filters out rows where all non-file-action columns are null.
         let non_file_actions_null_row_filter = {
@@ -229,7 +227,9 @@ impl SidecarSplitter {
                     .filter(|f| f.name != ADD_NAME && f.name != REMOVE_NAME)
                     .map(|f| Expression::column([&f.name]).is_not_null()),
             );
-            eval_handler.new_predicate_evaluator(checkpoint_data_schema, Arc::new(predicate))?
+            channel
+                .create_predicate_evaluator(checkpoint_data_schema, Arc::new(predicate))
+                .await?
         };
 
         Ok(Self {
@@ -251,28 +251,46 @@ impl SidecarSplitter {
     }
 
     /// Yields every file-action batch from `splitter`, buffering non-file actions as it drains.
-    pub(super) fn file_action_batches(
+    pub(super) fn file_action_batches<G>(
         mut splitter: Self,
-        mut checkpoint_data_iter: ActionReconciliationIterator,
-    ) -> impl Iterator<Item = KernelResult<Box<dyn EngineData>>> + Send {
-        std::iter::from_fn(move || splitter.next_file_actions_batch(&mut checkpoint_data_iter))
+        checkpoint_data_iter: G,
+    ) -> impl Generator<Request, Item = Box<dyn EngineData>, Output = ()> + 'static
+    where
+        G: KernelResultGenerator<FilteredEngineData> + 'static,
+    {
+        generator_fn!(async move |channel| {
+            let mut checkpoint_data_iter = checkpoint_data_iter.bind(&channel);
+            while let Some(result) = splitter
+                .next_file_actions_batch(&channel, &mut checkpoint_data_iter)
+                .await
+            {
+                channel.yield_item(result?).await?;
+            }
+            Ok(())
+        })
     }
 
     /// Pull the next batch from the inner iterator, split it into file-action and non-file-action
     /// parts. Buffers the non-file-action part; returns the next non-empty file-action batch.
     /// Returns `None` when the inner iterator is exhausted.
-    fn next_file_actions_batch(
+    async fn next_file_actions_batch<G>(
         &mut self,
-        checkpoint_data_iter: &mut ActionReconciliationIterator,
-    ) -> Option<KernelResult<Box<dyn EngineData>>> {
+        channel: &Channel,
+        checkpoint_data_iter: &mut G,
+    ) -> Option<KernelResult<Box<dyn EngineData>>>
+    where
+        G: BoundGenerator<Item = KernelResult<FilteredEngineData>, Output = ()> + Unpin,
+    {
         loop {
-            let result = checkpoint_data_iter.next()?;
+            let result = checkpoint_data_iter.next();
+            let result = result.await.transpose()?.and_then(std::convert::identity);
             let result = result.and_then(|f| f.apply_selection_vector());
             let batch = match result {
                 Ok(b) => b,
                 Err(e) => return Some(Err(e)),
             };
-            let non_file_actions_batch = self.non_file_actions_picker.pick(batch.as_ref());
+            let non_file_actions_batch = self.non_file_actions_picker.pick(channel, batch.as_ref());
+            let non_file_actions_batch = non_file_actions_batch.await;
             let non_file_actions_batch = match non_file_actions_batch {
                 Ok(b) => b,
                 Err(e) => return Some(Err(e)),
@@ -288,7 +306,7 @@ impl SidecarSplitter {
                 };
                 batches.push(non_file_actions_batch);
             }
-            let file_actions_batch = self.file_actions_picker.pick(batch.as_ref());
+            let file_actions_batch = self.file_actions_picker.pick(channel, batch.as_ref()).await;
             match file_actions_batch {
                 Ok(file_actions_batch) if file_actions_batch.is_empty() => continue,
                 other => return Some(other),

@@ -2,18 +2,24 @@
 
 use tracing::{info, instrument};
 
-use super::commit_types::{CommitMetadata, CommitResponse};
+#[cfg(feature = "declarative-plans")]
+use super::commit_types::CommitMetadata;
+use super::commit_types::CommitResponse;
 use super::publish_types::PublishMetadata;
 use super::{Commit, Committer};
 #[cfg(feature = "declarative-plans")]
 use crate::committer::write_commit_json_declarative;
+use crate::coroutine::generator::GeneratorExt as _;
+use crate::coroutine::kernel::engine::EngineConnector;
+use crate::coroutine::kernel::{
+    static_workflow, Channel, ChannelExt as _, StaticCoroutine, StaticWorkflow,
+};
 #[cfg(feature = "declarative-plans")]
 use crate::plans::{RelationRef, ScopedPlanExecutor};
 use crate::{Engine, FileMeta, KernelError, KernelResult};
 
-/// The `FileSystemCommitter` is an internal implementation of the `Committer` trait which
-/// commits to a file system directly via `Engine::json_handler().write_json_file` for
-/// non-catalog-managed tables.
+/// Commits path-based tables directly to `_delta_log` through connector-native file writes or the
+/// [`Committer`] compatibility interface.
 ///
 /// SAFETY: it is _incorrect_ to use this committer for catalog-managed tables.
 #[derive(Debug, Default)]
@@ -23,6 +29,11 @@ impl FileSystemCommitter {
     /// Creates a filesystem committer for a path-based table.
     pub fn new() -> Self {
         Self {}
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    fn validate_commit_type(commit_metadata: &CommitMetadata) -> KernelResult<()> {
+        commit_metadata.validate_committer(false)
     }
 
     fn commit_response(
@@ -47,23 +58,29 @@ impl FileSystemCommitter {
             Err(e) => Err(e),
         }
     }
-}
 
-impl Committer for FileSystemCommitter {
+    /// Returns a lazy workflow that writes a prepared path-based commit.
+    pub fn commit_workflow(commit: Commit) -> StaticWorkflow<CommitResponse> {
+        static_workflow!(|channel| Self::commit_with_channel(channel, commit))
+    }
+
     #[instrument(
         name = "fs_committer.commit",
         skip_all,
         fields(version = commit.version()),
         err
     )]
-    fn commit(&self, engine: &dyn Engine, commit: Commit) -> KernelResult<CommitResponse> {
-        let (commit_metadata, actions) = commit.try_into_engine_parts(engine, false)?;
+    async fn commit_with_channel(
+        channel: &Channel,
+        commit: Commit,
+    ) -> KernelResult<CommitResponse> {
+        let (commit_metadata, actions) = commit.try_into_parts(false)?;
         let version = commit_metadata.version();
         let published_commit_path = commit_metadata.published_commit_path()?;
-
-        let result = engine
-            .json_handler()
+        let actions = StaticCoroutine::from_generator(actions.promote_errors());
+        let result = channel
             .write_json_file(&published_commit_path, actions, false)
+            .await
             .map(|written_size| {
                 FileMeta::new(
                     published_commit_path,
@@ -72,6 +89,12 @@ impl Committer for FileSystemCommitter {
                 )
             });
         Self::commit_response(result, version)
+    }
+}
+
+impl Committer for FileSystemCommitter {
+    fn commit(&self, engine: &dyn Engine, commit: Commit) -> KernelResult<CommitResponse> {
+        EngineConnector::new(engine).drive(Self::commit_workflow(commit))
     }
 
     #[cfg(feature = "declarative-plans")]
@@ -87,6 +110,7 @@ impl Committer for FileSystemCommitter {
         actions: Box<dyn Iterator<Item = RelationRef> + '_>,
         commit_metadata: CommitMetadata,
     ) -> KernelResult<CommitResponse> {
+        Self::validate_commit_type(&commit_metadata)?;
         let version = commit_metadata.version();
         let path = commit_metadata.published_commit_path()?;
         let result = write_commit_json_declarative(executor, actions, path);
@@ -120,6 +144,7 @@ mod tests {
     use super::*;
     use crate::actions::{Metadata, Protocol, LOG_METADATA_SCHEMA};
     use crate::committer::{CommitProtocolMetadata, CommitType};
+    use crate::coroutine::generator::AsyncIntoIterator as _;
     #[cfg(feature = "declarative-plans")]
     use crate::engine::arrow_data::ArrowEngineData;
     #[cfg(feature = "declarative-plans")]
@@ -136,6 +161,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum CommitStyle {
         Imperative,
+        Native,
         #[cfg(feature = "declarative-plans")]
         Declarative,
     }
@@ -156,6 +182,13 @@ mod tests {
                     FilteredEngineData::with_all_rows_selected(action),
                 )));
                 committer.commit(engine, Commit::from_iterator(actions, commit_metadata))
+            }
+            CommitStyle::Native => {
+                let actions =
+                    std::iter::once(Ok(FilteredEngineData::with_all_rows_selected(action)))
+                        .into_generator();
+                let commit = Commit::new(commit_metadata, Box::new(actions));
+                EngineConnector::new(engine).drive(FileSystemCommitter::commit_workflow(commit))
             }
             #[cfg(feature = "declarative-plans")]
             CommitStyle::Declarative => {
@@ -202,12 +235,16 @@ mod tests {
             .unwrap();
         assert!(matches!(
             err,
-            crate::KernelError::Generic(e) if e.contains("This table is catalog-managed and requires a catalog committer.")
+            crate::KernelError::Generic(e)
+                if e.contains(
+                    "This catalog-managed commit requires a catalog-aware connector."
+                )
         ));
     }
 
     #[rstest]
     #[case::imperative(CommitStyle::Imperative)]
+    #[case::native(CommitStyle::Native)]
     #[cfg_attr(
         feature = "declarative-plans",
         case::declarative(CommitStyle::Declarative)
@@ -255,7 +292,9 @@ mod tests {
         match result {
             CommitResponse::Committed { file_meta } => {
                 match style {
-                    CommitStyle::Imperative => assert_eq!(file_meta.last_modified, 12345),
+                    CommitStyle::Imperative | CommitStyle::Native => {
+                        assert_eq!(file_meta.last_modified, 12345)
+                    }
                     #[cfg(feature = "declarative-plans")]
                     CommitStyle::Declarative => {
                         let stored_meta = storage
@@ -281,6 +320,7 @@ mod tests {
 
     #[rstest]
     #[case::imperative(CommitStyle::Imperative)]
+    #[case::native(CommitStyle::Native)]
     #[cfg_attr(
         feature = "declarative-plans",
         case::declarative(CommitStyle::Declarative)

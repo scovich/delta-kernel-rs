@@ -34,7 +34,7 @@ use tracing::{error, Instrument as _, Span};
 pub use self::adapters::{
     empty, map_async_witness, unfold, AsyncIntoIterator, Chain, Enumerate, FilterMap, FilterOk,
     Flatten, FlattenBy, FlattenIdent, FlattenResult, Iter, Map, MapAsync, MapAsyncWitness, MapOk,
-    OnComplete, Peekable, Unfold,
+    OnComplete, Peekable, PromoteErrors, Unfold,
 };
 pub(crate) use self::adapters::{unfold_mut_with, unfold_mut_witness};
 use super::witness::invoke_witness;
@@ -89,6 +89,14 @@ pub trait GeneratorExt {
         Self: Sized,
     {
         FilterMap::new(self, FilterOk::new(predicate))
+    }
+
+    /// Promotes yielded [`KernelResult`] errors to generator errors.
+    fn promote_errors(self) -> PromoteErrors<Self>
+    where
+        Self: Sized,
+    {
+        PromoteErrors::new(self)
     }
 
     /// Maps items asynchronously through the bound request channel.

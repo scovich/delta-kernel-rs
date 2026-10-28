@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::coroutine::generator::AsyncIntoIterator as _;
 use delta_kernel::coroutine::kernel::request::{
     ExpressionEvaluatorHandle, ForwardListing, PredicateEvaluatorHandle, ReadJsonFiles,
@@ -204,9 +205,10 @@ impl AsyncEngineConnector {
             Request::WriteParquetFiles(operation, reply) => {
                 reply.send(Box::pin(self.write_parquet_files(*operation)).await)
             }
-            Request::Commit(_, reply) => reply.send(Err(KernelError::internal_error(
-                "commit request requires a committer-aware driver",
-            ))),
+            Request::Commit(commit, reply) => {
+                let workflow = FileSystemCommitter::commit_workflow(*commit);
+                reply.send(Box::pin(self.run_inner(workflow)).await);
+            }
             Request::RequireCatalogCommitter(reply) => reply.send(Err(KernelError::unsupported(
                 "Default async connector does not handle catalog commits",
             ))),

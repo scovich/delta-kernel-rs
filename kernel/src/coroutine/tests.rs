@@ -448,6 +448,24 @@ fn generator_fn_erasure_preserves_requests_and_items() {
 }
 
 #[test]
+fn promote_errors_turns_yielded_errors_into_generator_errors() {
+    let items = [
+        Ok(1),
+        Err(KernelError::generic("yielded item failed")),
+        Ok(2),
+    ]
+    .into_generator()
+    .promote_errors();
+    let mut generator = StaticCoroutine::from_generator(items);
+
+    assert!(matches!(
+        generator.try_advance().unwrap(),
+        CoroutineStep::Yield(1)
+    ));
+    assert_result_error_with_message(generator.try_advance(), "yielded item failed");
+}
+
+#[test]
 fn channel_taking_generator_supports_static_and_borrowed_state() {
     fn operation<'a>(
         channel: impl Deref<Target = Channel> + Send + 'a,
