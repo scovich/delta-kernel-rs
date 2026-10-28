@@ -1118,7 +1118,8 @@ impl TryFrom<AggregateBuilder> for Aggregate {
 }
 
 /// Exclusive prefix sum of one LONG input column, appended as a new output column with the same
-/// nullability as the input. All other input columns pass through unchanged.
+/// nullability as the input (respecting parent column nullability). All other input columns pass
+/// through unchanged.
 ///
 /// # Semantics
 ///
@@ -1130,7 +1131,7 @@ impl TryFrom<AggregateBuilder> for Aggregate {
 /// # Output schema
 ///
 /// `schema` is the input schema with one appended LONG column named `output`. That column's
-/// nullability matches the resolved `input` field (NULL inputs produce NULL outputs).
+/// nullability is true if the `input` field or any of its ancestor structs is nullable.
 ///
 /// # Example
 ///
@@ -1189,7 +1190,8 @@ impl PrefixSum {
     ) -> KernelResult<Self> {
         let input = input.into();
         let output = output.into();
-        let field = input_schema.field_at(&input)?;
+        let fields = input_schema.fields_of_path(&input)?;
+        let field = fields[fields.len() - 1];
         if field.data_type() != &DataType::LONG {
             return Err(KernelError::generic(format!(
                 "prefix sum: input `{input}` must be LONG, got {}",
@@ -1199,7 +1201,7 @@ impl PrefixSum {
         let schema = Arc::new(input_schema.add([StructField::new(
             output.clone(),
             DataType::LONG,
-            field.nullable,
+            fields.iter().any(|field| field.nullable),
         )])?);
         Ok(Self {
             input,
@@ -1292,7 +1294,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::column_name;
-    use crate::schema::{schema_ref, DataType, MetadataValue, StructField};
+    use crate::schema::{schema, schema_ref, DataType, MetadataValue, StructField};
     use crate::unit_test_utils::assert_result_error_with_message;
 
     /// Builds a flat `LONG` schema from `(name, nullable)` pairs.
@@ -1516,19 +1518,46 @@ mod tests {
         );
     }
     #[rstest::rstest]
-    fn prefix_sum_appends_long_output_matching_input_nullability(
-        #[values(true, false)] nullable: bool,
+    #[case::top_level(column_name!("numRecords"), false)]
+    #[case::non_null_parent(column_name!("required.numRecords"), false)]
+    #[case::nullable_parent(column_name!("optional.numRecords"), true)]
+    #[case::non_null_ancestors(column_name!("required.required.numRecords"), false)]
+    #[case::nullable_parent_under_non_null_ancestor(
+        column_name!("required.optional.numRecords"), true
+    )]
+    #[case::nullable_ancestor_over_non_null_parent(
+        column_name!("optional.required.numRecords"), true
+    )]
+    #[case::nullable_ancestors(column_name!("optional.optional.numRecords"), true)]
+    fn prefix_sum_appends_long_output_matching_path_nullability(
+        #[case] column: ColumnName,
+        #[case] ancestor_nullable: bool,
+        #[values(true, false)] leaf_nullable: bool,
     ) {
-        let input = schema(&[("path", false), ("numRecords", nullable)]);
-        let prefix =
-            PrefixSum::try_new(input.as_ref(), column_name!("numRecords"), "offset").unwrap();
+        let field = StructField::new("numRecords", DataType::LONG, leaf_nullable);
+        let leaf = schema! { (field.clone()), };
+        let nested = schema! {
+            (field.clone()),
+            not_null "required": (leaf.clone()),
+            nullable "optional": (leaf),
+        };
+        let input = schema_ref! {
+            not_null "path": STRING,
+            (field),
+            not_null "required": (nested.clone()),
+            nullable "optional": (nested),
+        };
+        let prefix = PrefixSum::try_new(input.as_ref(), column.clone(), "offset").unwrap();
         let names: Vec<&str> = prefix.schema.fields().map(|f| f.name().as_str()).collect();
-        assert_eq!(names, ["path", "numRecords", "offset"]);
+        assert_eq!(
+            names,
+            ["path", "numRecords", "required", "optional", "offset"]
+        );
         let offset = prefix.schema.field("offset").unwrap();
         assert_eq!(offset.data_type(), &DataType::LONG);
-        assert_eq!(offset.nullable, nullable);
+        assert_eq!(offset.nullable, leaf_nullable || ancestor_nullable);
         assert_eq!(prefix.output, "offset");
-        assert_eq!(prefix.input, column_name!("numRecords"));
+        assert_eq!(prefix.input, column);
     }
 
     #[test]
