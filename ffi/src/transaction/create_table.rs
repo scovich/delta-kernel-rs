@@ -172,9 +172,10 @@ pub unsafe extern "C" fn create_table_txn_commit(
 ) -> ExternResult<Handle<ExclusiveCommittedTransaction>> {
     let txn = unsafe { txn.into_inner() };
     let extern_engine = unsafe { engine.as_ref() };
-    let engine = extern_engine.engine();
-    commit_result_to_committed_handle(txn.commit(engine.as_ref()))
-        .into_extern_result(&extern_engine)
+    let (workflow, committer) = txn.commit_workflow();
+    let result = crate::drive_kernel_with_committer(extern_engine, workflow, committer.as_ref());
+    let result = result.map(|result| (result, committer));
+    commit_result_to_committed_handle(result).into_extern_result(&extern_engine)
 }
 
 // ============================================================================
@@ -564,9 +565,9 @@ fn create_table_txn_builder_build_impl(
     committer: Box<dyn Committer>,
     extern_engine: &dyn ExternEngine,
 ) -> KernelResult<Handle<ExclusiveCreateTableTransaction>> {
-    let engine = extern_engine.engine();
-    let create_txn = builder.build_with_committer(engine.as_ref(), committer)?;
-    Ok(Box::new(create_txn).into())
+    let workflow = builder.build_workflow();
+    let create_txn = crate::drive_kernel(extern_engine, workflow)?;
+    Ok(Box::new(create_txn.with_committer(committer)).into())
 }
 
 /// Free a [`CreateTableTransactionBuilder`] without building.

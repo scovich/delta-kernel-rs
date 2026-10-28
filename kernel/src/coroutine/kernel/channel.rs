@@ -14,10 +14,10 @@ use delta_kernel_derive::internal_api;
 use url::Url;
 
 use super::request::{
-    CreateEngineData, CreateExpressionEvaluator, CreatePredicateEvaluator, EvaluateExpression,
-    EvaluatePredicate, ExpressionEvaluatorHandle, PredicateEvaluatorHandle, ReadJsonFiles,
-    ReadParquetFiles, WriteBytes, WriteJsonFile, WriteParquetFile, WriteParquetFiles,
-    WriteParquetFilesResult,
+    CreateEngineData, CreateExpressionEvaluator, CreatePredicateEvaluator, DirectoryListing,
+    EvaluateExpression, EvaluatePredicate, ExpressionEvaluatorHandle, PredicateEvaluatorHandle,
+    ReadJsonFiles, ReadParquetFiles, WriteBytes, WriteJsonFile, WriteParquetFile,
+    WriteParquetFiles, WriteParquetFilesResult,
 };
 use super::{Request, StaticCoroutine};
 use crate::committer::{Commit, CommitResponse, PublishMetadata};
@@ -51,6 +51,18 @@ type FlattenedPages<Op> =
 #[internal_api]
 #[allow(async_fn_in_trait)]
 pub(crate) trait ChannelExt: ChannelExchange<Request> {
+    /// Lists every object beneath one directory URL in ascending order.
+    async fn list_directory(
+        &self,
+        prefix: Url,
+    ) -> KernelResult<impl BoundGenerator<Item = KernelResult<FileMeta>, Output = ()> + Unpin + '_>
+    {
+        let cursor = self
+            .prepare_paged(DirectoryListing::try_new(prefix)?)
+            .await?;
+        Ok(self.bind(PageGenerator::Next(cursor).flatten()))
+    }
+
     /// Read one small file, or one half-open byte range, completely into memory via
     /// [`Request::ReadSmallFile`].
     fn read_small_file(

@@ -5,6 +5,8 @@ use delta_kernel_derive::internal_api;
 use super::state::TransactionBuilderState;
 use super::TransactionBuilder;
 use crate::committer::Committer;
+use crate::coroutine::kernel::engine::EngineConnector;
+use crate::coroutine::kernel::{static_workflow, Channel, StaticWorkflow};
 use crate::expressions::ColumnName;
 use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
@@ -212,10 +214,7 @@ impl TransactionBuilder<UpdateTable> {
     /// `allowColumnDefaults` is enabled. This applies to standalone ALTER TABLE transactions and
     /// schema evolution during data-changing writes.
     pub fn build(self, engine: &dyn Engine) -> KernelResult<Transaction> {
-        self.validate()?;
-        let transaction = try_new_update_table(self, engine)?;
-        transaction.validate_domain_metadata_operations()?;
-        Ok(transaction)
+        EngineConnector::new(engine).drive(self.build_workflow())
     }
 
     /// Binds `committer` to the transaction produced by [`Self::build`].
@@ -233,6 +232,18 @@ impl TransactionBuilder<UpdateTable> {
         engine: &dyn Engine,
     ) -> KernelResult<TransactionWithCommitter> {
         Ok(self.build(engine)?.with_filesystem_committer())
+    }
+
+    /// Returns a lazy workflow that validates this builder and creates its transaction.
+    pub fn build_workflow(self) -> StaticWorkflow<Transaction> {
+        static_workflow!(|channel| self.build_with_channel(channel))
+    }
+
+    async fn build_with_channel(self, channel: &Channel) -> KernelResult<Transaction> {
+        self.validate()?;
+        let transaction = try_new_update_table_with_channel(self, channel).await?;
+        transaction.validate_domain_metadata_operations()?;
+        Ok(transaction)
     }
 
     fn validate(&self) -> KernelResult<()> {
@@ -293,9 +304,9 @@ impl TransactionBuilder<UpdateTable> {
     }
 }
 
-fn try_new_update_table<MODE: ExecutionMode>(
+async fn try_new_update_table_with_channel<MODE: ExecutionMode>(
     builder: UpdateTableTransactionBuilder,
-    engine: &dyn Engine,
+    channel: &Channel,
 ) -> KernelResult<Transaction<UpdateTable, MODE>> {
     let TransactionBuilder {
         common_state,
@@ -319,7 +330,9 @@ fn try_new_update_table<MODE: ExecutionMode>(
     // collide with physical data columns.
 
     // Read clustering columns from snapshot (returns None if clustering not enabled)
-    let clustering_columns = read_snapshot.get_physical_clustering_columns(engine)?;
+    let clustering_columns = read_snapshot
+        .get_physical_clustering_columns_with_channel(channel)
+        .await?;
 
     let commit_timestamp = current_time_ms()?;
 

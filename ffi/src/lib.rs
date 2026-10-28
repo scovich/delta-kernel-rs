@@ -14,7 +14,10 @@ use std::sync::Arc;
 
 use delta_kernel::actions::{Metadata, Protocol};
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
-use delta_kernel::coroutine::kernel::{drive_with_engine, Workflow};
+use delta_kernel::committer::Committer;
+use delta_kernel::coroutine::kernel::{
+    drive_with_catalog_committer, drive_with_committer, drive_with_engine, Workflow,
+};
 use delta_kernel::history_manager::{
     first_version_after as kernel_first_version_after,
     get_earliest_commit as kernel_get_earliest_commit,
@@ -757,6 +760,24 @@ pub(crate) fn drive_kernel<O: Send + 'static>(
     workflow: Workflow<'_, O>,
 ) -> KernelResult<O> {
     drive_with_engine(extern_engine.engine().as_ref(), None, workflow)
+}
+
+/// Drives a commit workflow through the engine exposed by `extern_engine`.
+pub(crate) fn drive_kernel_with_committer<O: Send + 'static>(
+    extern_engine: &dyn ExternEngine,
+    workflow: Workflow<'_, O>,
+    committer: &dyn Committer,
+) -> KernelResult<O> {
+    drive_with_committer(extern_engine.engine().as_ref(), workflow, committer)
+}
+
+/// Drives a catalog-publish workflow through the engine exposed by `extern_engine`.
+pub(crate) fn drive_kernel_with_catalog_committer<O: Send + 'static>(
+    extern_engine: &dyn ExternEngine,
+    workflow: Workflow<'_, O>,
+    committer: &dyn Committer,
+) -> KernelResult<O> {
+    drive_with_catalog_committer(extern_engine.engine().as_ref(), workflow, committer)
 }
 
 #[handle_descriptor(target=dyn ExternEngine, mutable=false)]
@@ -1682,8 +1703,8 @@ pub unsafe extern "C" fn snapshot_publish_with_committer(
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot_ref: SnapshotRef = unsafe { snapshot.clone_as_arc() };
     let committer = unsafe { committer.into_inner() };
-    snapshot_ref
-        .publish(engine_ref.engine().as_ref(), committer.as_ref())
+    let workflow = snapshot_ref.publish_workflow();
+    drive_kernel_with_catalog_committer(engine_ref, workflow, committer.as_ref())
         .map(|updated| updated.into())
         .into_extern_result(&engine_ref)
 }

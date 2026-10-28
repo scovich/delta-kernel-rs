@@ -11,8 +11,9 @@ use delta_kernel_derive::internal_api;
 use derive_more::Constructor;
 
 use super::request::{
-    ExpressionEvaluatorHandle, ForwardListing, PredicateEvaluatorHandle, ReadJsonFiles,
-    ReadParquetFiles, WriteJsonFile, WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
+    DirectoryListing, ExpressionEvaluatorHandle, ForwardListing, PredicateEvaluatorHandle,
+    ReadJsonFiles, ReadParquetFiles, WriteJsonFile, WriteParquetFile, WriteParquetFiles,
+    WriteParquetFilesResult,
 };
 use super::{Coroutine, CoroutineStep, KernelResultGenerator, Request, Workflow};
 use crate::cancellation::{check_cancelled, CancellationTokenRef};
@@ -201,6 +202,7 @@ impl EngineConnector {
 
     fn respond(&self, request: Request) -> KernelResult<()> {
         match request {
+            Request::ListDirectory(request) => respond_paged(&self.storage_connector(), request)?,
             Request::ListForward(request) => respond_paged(&self.storage_connector(), request)?,
             Request::ReadSmallFile(..) | Request::Head(..) | Request::WriteBytes(..) => {
                 self.storage_connector().respond(request)?
@@ -330,6 +332,26 @@ pub(crate) fn drive_with_engine<O>(
 ) -> KernelResult<O> {
     let connector = EngineConnector::new(engine).with_cancellation_token(cancellation_token);
     connector.drive(workflow)
+}
+
+/// Drives `workflow` through `engine`, using `committer` for commit requests.
+#[internal_api]
+pub(crate) fn drive_with_committer<O>(
+    engine: &dyn Engine,
+    workflow: Workflow<'_, O>,
+    committer: &dyn Committer,
+) -> KernelResult<O> {
+    EngineConnector::new(engine).drive_with_committer(workflow, engine, committer)
+}
+
+/// Drives `workflow` through `engine`, using `committer` for catalog publish requests.
+#[internal_api]
+pub(crate) fn drive_with_catalog_committer<O>(
+    engine: &dyn Engine,
+    workflow: Workflow<'_, O>,
+    committer: &dyn Committer,
+) -> KernelResult<O> {
+    EngineConnector::new(engine).drive_with_catalog_committer(workflow, engine, committer)
 }
 
 /// Return an iterator that drives a fallible result coroutine through `engine`.
@@ -479,6 +501,7 @@ struct StorageConnector<'a> {
 impl StorageConnector<'_> {
     fn respond(&self, request: Request) -> KernelResult<()> {
         match request {
+            Request::ListDirectory(request) => respond_paged(self, request),
             Request::ListForward(request) => respond_paged(self, request),
             Request::ReadSmallFile(file, reply) => complete(
                 reply,
@@ -557,6 +580,31 @@ impl EnginePagination<ForwardListing> for StorageConnector<'_> {
     }
 
     fn next(&self, mut listing: Self::State) -> KernelResult<Page<ForwardListing>> {
+        let data = Vec::from_iter(listing.by_ref().take(ForwardListing::DEFAULT_PAGE_SIZE));
+        if data
+            .iter()
+            .any(|entry| matches!(entry, Err(KernelError::Cancelled)))
+        {
+            return Err(KernelError::Cancelled);
+        }
+        let next = (data.len() == ForwardListing::DEFAULT_PAGE_SIZE).then(|| Cursor::new(listing));
+        Ok(Page { data, next })
+    }
+}
+
+impl EnginePagination<DirectoryListing> for StorageConnector<'_> {
+    type State = Box<dyn KernelResultIterator<FileMeta>>;
+
+    fn prepare(&self, listing: DirectoryListing) -> KernelResult<Self::State> {
+        let prefix = listing.prefix().clone();
+        let files = self
+            .storage
+            .list_from_with_cancellation(&prefix, self.cancellation_token.clone())?
+            .take_while(move |entry| listing.contains(entry));
+        Ok(Box::new(files))
+    }
+
+    fn next(&self, mut listing: Self::State) -> KernelResult<Page<DirectoryListing>> {
         let data = Vec::from_iter(listing.by_ref().take(ForwardListing::DEFAULT_PAGE_SIZE));
         if data
             .iter()

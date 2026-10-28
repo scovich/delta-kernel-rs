@@ -17,13 +17,15 @@ use crate::expressions::{ExpressionRef, PredicateRef};
 use crate::path::may_begin_listable_log_path;
 use crate::schema::{DataType, SchemaRef};
 use crate::{
-    EngineData, FileMeta, FileSize, FileSlice, KernelResult, ParquetFooter, ParquetMultiFileWrite,
-    Scalar, Version,
+    EngineData, FileMeta, FileSize, FileSlice, KernelError, KernelResult, ParquetFooter,
+    ParquetMultiFileWrite, Scalar, Version,
 };
 
 /// Operations Kernel can request from a connector.
 #[derive(From)]
 pub enum Request {
+    /// List every object beneath one directory URL in ascending order.
+    ListDirectory(PageRequest<DirectoryListing>),
     /// List a bounded path range in ascending order.
     ListForward(PageRequest<ForwardListing>),
     /// Read a whole file when the range is `None`, or exactly the half-open range otherwise.
@@ -68,6 +70,43 @@ pub enum Request {
     RequireCatalogCommitter(Reply<()>),
     /// Publish catalog commits through a connector-selected committer.
     Publish(PublishMetadata, Reply<()>),
+}
+
+/// An ascending listing of every object beneath one directory URL.
+pub struct DirectoryListing {
+    prefix: Url,
+}
+
+impl DirectoryListing {
+    /// Creates a listing rooted at `prefix`.
+    ///
+    /// Returns an error unless `prefix` ends in `/`, preventing sibling paths with the same textual
+    /// prefix from entering the listing.
+    pub fn try_new(prefix: Url) -> KernelResult<Self> {
+        if !prefix.path().ends_with('/') {
+            return Err(KernelError::generic(format!(
+                "directory listing prefix must end in '/': {prefix}"
+            )));
+        }
+        Ok(Self { prefix })
+    }
+
+    /// Returns the listed directory URL.
+    pub fn prefix(&self) -> &Url {
+        &self.prefix
+    }
+
+    /// Returns whether `entry` remains within this directory.
+    pub fn contains(&self, entry: &KernelResult<FileMeta>) -> bool {
+        let Ok(entry) = entry else {
+            return true;
+        };
+        entry.location.as_str().starts_with(self.prefix.as_str())
+    }
+}
+
+impl PagedOperation for DirectoryListing {
+    type Page = Vec<KernelResult<FileMeta>>;
 }
 
 /// URL bounds for a forward listing.
