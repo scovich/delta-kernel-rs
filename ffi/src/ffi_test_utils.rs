@@ -82,7 +82,7 @@ pub(crate) fn ok_or_panic<T>(result: ExternResult<T>) -> T {
                 "Got engine error with type {:?} message: {}",
                 error.etype, error.message
             );
-        }
+        },
     }
 }
 
