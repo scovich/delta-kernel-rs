@@ -85,7 +85,7 @@ let mut txn = snapshot.clone()
         "my-app/1.0",
         /* data_change */ true,
     )
-    .build(&engine, committer)?;
+    .build_with_committer(&engine, committer)?;
 ```
 
 `UCCommitter` requires a multi-threaded tokio runtime. The default Kernel
@@ -297,7 +297,7 @@ let mut txn = snapshot.clone()
         "my-app/1.0",
         /* data_change */ true,
     )
-    .build(&engine, committer)?;
+    .build_with_committer(&engine, committer)?;
 
 // 6. Write data
 let write_state = txn.write_state()?;

@@ -832,7 +832,6 @@ mod tests {
     };
     use crate::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
     use crate::arrow::record_batch::RecordBatch;
-    use crate::committer::FileSystemCommitter;
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
@@ -1054,7 +1053,7 @@ mod tests {
         let snapshot = Snapshot::builder_for(url).build(&engine)?;
         let txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", data_change)
-            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+            .build_with_filesystem_committer(&engine)?;
         Ok((engine, txn, tempdir))
     }
 
@@ -1165,7 +1164,7 @@ mod tests {
             "test-engine",
             data_change,
         )
-        .build(&engine, Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(&engine)?;
         transaction.add_files(Box::new(ArrowEngineData::new(create_valid_add_file_batch(
             false, /* all_nullable */
         ))));
@@ -1337,7 +1336,7 @@ mod tests {
         let (engine, snapshot) = non_dv_table();
         let txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .build_with_filesystem_committer(&engine)
             .unwrap()
             .with_clustering_columns_for_test(vec![column_name!("value")]);
 
@@ -1356,7 +1355,7 @@ mod tests {
         let (engine, snapshot) = non_dv_table();
         let txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .build_with_filesystem_committer(&engine)
             .unwrap()
             // Enable clustering columns for this test
             .with_clustering_columns_for_test(vec![column_name!("value")]);
@@ -1384,7 +1383,7 @@ mod tests {
         let (engine, snapshot) = non_dv_table();
         let txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .build_with_filesystem_committer(&engine)
             .unwrap()
             // Enable clustering columns for this test
             .with_clustering_columns_for_test(vec![column_name!("value")]);
@@ -1406,7 +1405,7 @@ mod tests {
         let (engine, snapshot) = non_dv_table();
         let txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .build_with_filesystem_committer(&engine)
             .unwrap();
         // No clustering columns set (default)
 

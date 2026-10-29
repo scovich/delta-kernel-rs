@@ -238,7 +238,7 @@ pub struct CreateTable;
 /// ```rust,ignore
 /// let txn = snapshot
 ///     .update_table(UpdateTableOperation::Write, "my-app/1.0", /* data_change */ true)
-///     .build(&engine, Box::new(FileSystemCommitter::new()))?;
+///     .build_with_filesystem_committer(&engine)?;
 /// txn.commit(&engine)?;
 /// ```
 ///
@@ -1912,7 +1912,7 @@ mod tests {
     ) -> KernelResult<Transaction> {
         snapshot
             .update_table(UpdateTableOperation::Delete, "test_engine", true)
-            .build(engine, Box::new(FileSystemCommitter::new()))
+            .build_with_filesystem_committer(engine)
     }
 
     // TODO: create a finer-grained unit tests for transactions (issue#1091)
@@ -1928,7 +1928,7 @@ mod tests {
             true,
         )
         .with_data_layout(layout)
-        .build(&engine, Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(&engine)?;
 
         let expected = schema! {
             not_null "path": STRING,
@@ -1959,7 +1959,7 @@ mod tests {
             .unwrap();
         let txn = snapshot
             .update_table(UpdateTableOperation::Write, "default engine", true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+            .build_with_filesystem_committer(&engine)?;
         let write_state = txn.write_state().unwrap();
         let write_context = write_state.write_context_builder().build().unwrap();
 
@@ -1989,7 +1989,7 @@ mod tests {
         let txn = snapshot
             .clone()
             .update_table(UpdateTableOperation::Write, "default engine", true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+            .build_with_filesystem_committer(&engine)?;
 
         // Independently built transactions must retain their own write schemas.
         let initial_write_state = txn.write_state()?;
@@ -2001,7 +2001,7 @@ mod tests {
         let txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
             .add_column(StructField::nullable("fresh_column", DataType::INTEGER))
-            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+            .build_with_filesystem_committer(&engine)?;
 
         let updated_write_state = txn.write_state()?;
         let updated_write_context = updated_write_state.write_context_builder().build()?;
@@ -2030,7 +2030,7 @@ mod tests {
         let snapshot = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
             .add_column(StructField::nullable("second_column", DataType::STRING))
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .build_with_filesystem_committer(engine.as_ref())?
             .commit(engine.as_ref())?
             .unwrap_post_commit_snapshot();
 
@@ -2057,14 +2057,14 @@ mod tests {
             StructField::nullable("name", DataType::STRING),
         ])?);
         let snapshot = create_table("memory:///set_nullable", schema, "test", true)
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .build_with_filesystem_committer(engine.as_ref())?
             .commit(engine.as_ref())?
             .unwrap_post_commit_snapshot();
 
         let snapshot = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
             .set_nullable(column_name!("id"))
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .build_with_filesystem_committer(engine.as_ref())?
             .commit(engine.as_ref())?
             .unwrap_post_commit_snapshot();
 
@@ -2151,7 +2151,7 @@ mod tests {
             let (engine, snapshot) = setup_non_dv_table();
             let mut txn = snapshot
                 .update_table(UpdateTableOperation::Write, "test-engine", true)
-                .build(&engine, Box::new(FileSystemCommitter::new()))
+                .build_with_filesystem_committer(&engine)
                 .unwrap();
             let table_config = try_table_config(&txn, schema, writer_features).unwrap();
             txn.replace_effective_table_config(table_config);
@@ -2190,7 +2190,7 @@ mod tests {
             let (engine, snapshot) = setup_non_dv_table();
             snapshot
                 .update_table(UpdateTableOperation::Write, "test-engine", true)
-                .build(&engine, Box::new(FileSystemCommitter::new()))
+                .build_with_filesystem_committer(&engine)
                 .unwrap()
         }
 
@@ -2266,7 +2266,7 @@ mod tests {
         let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
         let txn = snapshot
             .update_table(UpdateTableOperation::Write, "default engine", true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+            .build_with_filesystem_committer(&engine)?;
 
         let write_state = txn.write_state()?;
         let write_context = write_state
@@ -2316,7 +2316,7 @@ mod tests {
         let txn = snapshot
             .clone()
             .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+            .build_with_filesystem_committer(&engine)?;
         let write_state = txn.write_state()?;
         let wc = write_state
             .write_context_builder()
@@ -2425,7 +2425,7 @@ mod tests {
                 ("delta.feature.materializePartitionColumns", "supported"),
                 ("delta.columnMapping.mode", cm),
             ])
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+            .build_with_filesystem_committer(engine.as_ref())?;
 
         let write_state = txn.write_state()?;
         let wc = write_state
@@ -2533,7 +2533,7 @@ mod tests {
         let snapshot = Snapshot::builder_for(url).build(&engine)?;
         let txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+            .build_with_filesystem_committer(&engine)?;
         let write_state = txn.write_state()?;
         let mut builder = write_state.write_context_builder();
         if let Some(partition_values) = partition_values {
@@ -2793,7 +2793,7 @@ mod tests {
             "test-engine",
             data_change,
         ))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(engine.as_ref())?;
         Ok((engine, txn, tempdir))
     }
 
@@ -2855,7 +2855,7 @@ mod tests {
                 "test-engine",
                 true,
             )
-            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+            .build_with_filesystem_committer(&engine)?;
             txn.operation = operation;
             txn.validate_operation_compatibility()
         } else {
@@ -2951,7 +2951,7 @@ mod tests {
             "test_engine",
             true,
         )
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(engine.as_ref())?;
         // Create-table builders do not expose with_blind_append(). Set the field directly to
         // exercise the defensive runtime check.
         txn.is_blind_append = true;
@@ -3019,7 +3019,7 @@ mod tests {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let mut txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(engine.as_ref(), Box::new(IoErrorCommitter))?;
+            .build_with_committer(engine.as_ref(), Box::new(IoErrorCommitter))?;
         add_dummy_file(&mut txn);
         let result = txn.commit(engine.as_ref())?;
         assert!(
@@ -3207,7 +3207,7 @@ mod tests {
             ("delta.columnMapping.mode", column_mapping_mode),
             ("delta.feature.rowTracking", "supported"),
         ])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(engine.as_ref())?;
         let mut metadata = txn.effective_table_config.metadata().clone();
         for (key, value) in row_tracking_state.properties() {
             metadata = metadata.with_configuration_entry(key, value);
@@ -3318,7 +3318,7 @@ mod tests {
         let committer = Box::new(MockCatalogCommitter);
         let err = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(&engine, committer)
+            .build_with_committer(&engine, committer)
             .unwrap()
             .commit(&engine)
             .unwrap_err();
@@ -3337,7 +3337,7 @@ mod tests {
         let schema = schema_ref! { nullable "id": INTEGER };
         let committer = Box::new(MockCatalogCommitter);
         let err = create_table("memory:///", schema, "test-engine", true)
-            .build(&engine, committer)
+            .build_with_committer(&engine, committer)
             .unwrap()
             .commit(&engine)
             .unwrap_err();
@@ -3446,7 +3446,7 @@ mod tests {
         let (committer, captured_ts) = CapturingCommitter::new();
         let mut txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(&engine, Box::new(committer))?;
+            .build_with_committer(&engine, Box::new(committer))?;
         add_dummy_file(&mut txn);
 
         let result = txn.commit(&engine)?;
@@ -3485,7 +3485,7 @@ mod tests {
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let mut txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(engine.as_ref(), Box::new(IoErrorCommitter))?;
+            .build_with_committer(engine.as_ref(), Box::new(IoErrorCommitter))?;
         add_dummy_file(&mut txn);
         let result = txn.commit(engine.as_ref())?;
         assert!(matches!(result, CommitResult::Retryable(_)));
@@ -3502,7 +3502,7 @@ mod tests {
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let mut txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(engine.as_ref(), Box::new(GenericErrorCommitter))?;
+            .build_with_committer(engine.as_ref(), Box::new(GenericErrorCommitter))?;
         add_dummy_file(&mut txn);
         assert!(txn.commit(engine.as_ref()).is_err());
         let failure = commit_failure_event(&reporter).expect("commit failure event");
