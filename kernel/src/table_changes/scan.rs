@@ -400,7 +400,6 @@ mod tests {
 
     use rstest::rstest;
 
-    use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{col, lit};
     use crate::object_store::memory::InMemory;
@@ -570,10 +569,11 @@ mod tests {
         };
         create_table(url_str, schema, "DefaultEngine", true)
             .with_table_properties([("delta.enableChangeDataFeed", "true")])
-            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .build_with_filesystem_committer(&engine)
             .unwrap()
             .commit(&engine)
             .unwrap()
+            .0
             .unwrap_committed();
 
         let url = url::Url::parse(url_str).unwrap();

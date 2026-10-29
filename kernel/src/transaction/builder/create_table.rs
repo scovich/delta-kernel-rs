@@ -50,7 +50,9 @@ use crate::table_properties::{
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
-use crate::transaction::{CommitOperation, CreateTable, ExecutionMode, Transaction};
+use crate::transaction::{
+    CommitOperation, CreateTable, ExecutionMode, Transaction, TransactionWithCommitter,
+};
 use crate::utils::{current_time_ms, try_parse_uri};
 use crate::{Engine, KernelError, KernelResult, StorageHandler};
 
@@ -939,8 +941,6 @@ impl TransactionBuilder<CreateTable> {
     /// # Arguments
     ///
     /// * `engine` - The engine instance to use for validation
-    /// * `committer` - The committer to use for the transaction
-    ///
     /// # Errors
     ///
     /// Returns an error if:
@@ -952,11 +952,7 @@ impl TransactionBuilder<CreateTable> {
     /// - Connector commit information does not contain exactly one row
     /// - An application transaction identifier occurs more than once
     #[internal_api]
-    pub(crate) fn build(
-        self,
-        engine: &dyn Engine,
-        committer: Box<dyn Committer>,
-    ) -> KernelResult<CreateTableTransaction> {
+    pub(crate) fn build(self, engine: &dyn Engine) -> KernelResult<CreateTableTransaction> {
         self.common_state.validate()?;
 
         // Validate path
@@ -1067,7 +1063,6 @@ impl TransactionBuilder<CreateTable> {
         // Create Transaction<CreateTable> with the effective table configuration
         let transaction = try_new_create_table(
             table_configuration,
-            committer,
             data_layout_result.system_domain_metadata,
             data_layout_result.clustering_columns,
             self.common_state,
@@ -1075,11 +1070,29 @@ impl TransactionBuilder<CreateTable> {
         transaction.validate_domain_metadata_operations()?;
         Ok(transaction)
     }
+
+    /// Binds `committer` to the transaction produced by [`Self::build`].
+    #[internal_api]
+    pub(crate) fn build_with_committer(
+        self,
+        engine: &dyn Engine,
+        committer: Box<dyn Committer>,
+    ) -> KernelResult<TransactionWithCommitter<CreateTable>> {
+        Ok(self.build(engine)?.with_committer(committer))
+    }
+
+    /// Binds a filesystem committer to the transaction produced by [`Self::build`].
+    #[internal_api]
+    pub(crate) fn build_with_filesystem_committer(
+        self,
+        engine: &dyn Engine,
+    ) -> KernelResult<TransactionWithCommitter<CreateTable>> {
+        Ok(self.build(engine)?.with_filesystem_committer())
+    }
 }
 
 fn try_new_create_table<MODE: ExecutionMode>(
     effective_table_config: TableConfiguration,
-    committer: Box<dyn Committer>,
     system_domain_metadata: Vec<DomainMetadata>,
     clustering_columns: Option<Vec<ColumnName>>,
     common_state: TransactionBuilderState,
@@ -1104,7 +1117,6 @@ fn try_new_create_table<MODE: ExecutionMode>(
         ..Transaction::new(
             common_state,
             effective_table_config,
-            committer,
             CommitOperation::CreateTable,
             span,
             commit_timestamp,
@@ -1122,7 +1134,6 @@ mod tests {
     use crate::arrow::array::StringArray;
     use crate::arrow::datatypes::Schema as ArrowSchema;
     use crate::arrow::record_batch::RecordBatch;
-    use crate::committer::FileSystemCommitter;
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
@@ -1182,7 +1193,7 @@ mod tests {
         .with_correlation_id("test-correlation")
         .with_operation_parameters([("mode", Some("Create"))])
         .with_transaction_id("app", 7);
-        let transaction = builder.build(&engine, Box::new(FileSystemCommitter::new()))?;
+        let transaction = builder.build_with_filesystem_committer(&engine)?;
 
         assert_eq!(transaction.engine_info, "test-engine");
         assert_eq!(
@@ -1200,7 +1211,7 @@ mod tests {
             Some(transaction.commit_timestamp)
         );
         assert_eq!(transaction.data_change, expected_data_change);
-        let committed = transaction.commit(&engine)?.unwrap_committed();
+        let committed = transaction.commit(&engine)?.0.unwrap_committed();
         assert_eq!(committed.commit_version(), 0);
         let metrics = reporter
             .events()
@@ -1237,7 +1248,7 @@ mod tests {
             true,
         )
         .with_commit_info(commit_info, commit_info_schema)
-        .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&SyncEngine::new())
         .unwrap_err();
         assert!(
             error
@@ -1261,7 +1272,7 @@ mod tests {
         )
         .with_transaction_id("app", 1)
         .with_transaction_id("app", 2)
-        .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&SyncEngine::new())
         .unwrap_err();
         assert!(
             error
@@ -1299,7 +1310,7 @@ mod tests {
         }
 
         assert_result_error_with_message(
-            builder.build(&SyncEngine::new(), Box::new(FileSystemCommitter::new())),
+            builder.build_with_filesystem_committer(&SyncEngine::new()),
             expected,
         );
         Ok(())
@@ -1318,7 +1329,7 @@ mod tests {
         )
         .with_data_layout(DataLayout::clustered(["id"]))
         .with_domain_metadata("delta.clustering", "{}")
-        .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&SyncEngine::new())
         .unwrap_err();
 
         assert!(error.to_string().contains("system controlled"), "{error}");

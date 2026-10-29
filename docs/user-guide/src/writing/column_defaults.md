@@ -128,7 +128,7 @@ async fn append_with_defaults(
     let table_schema = snapshot.schema();
     let mut txn = snapshot
         .update_table(UpdateTableOperation::Write, "my-app/1.0", /* data_change */ true)
-        .build(engine, Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(engine)?;
 
     // 2. Build one reusable mapping from input columns or parsed defaults.
     let defaults = txn.top_level_column_defaults()?;

@@ -28,7 +28,7 @@ use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{schema_ref, SchemaRef, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::{
-    BoundWriteContext, CommitResult, Transaction, UpdateTableOperation,
+    BoundWriteContext, CommitResult, TransactionWithCommitter, UpdateTableOperation,
 };
 use delta_kernel::{Engine, KernelResult, Snapshot, Version};
 use serde_json::json;
@@ -250,7 +250,7 @@ pub async fn write_data_and_check_result_and_stats(
     }
 
     // commit!
-    match txn.commit(engine.as_ref())? {
+    match txn.commit(engine.as_ref())?.0 {
         CommitResult::Committed(committed) => {
             assert_eq!(committed.commit_version(), expected_since_commit as Version);
             assert_eq!(
@@ -403,10 +403,7 @@ pub async fn create_dv_table_with_files(
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = snapshot
         .update_table(UpdateTableOperation::Write, "test engine", true)
-        .build(
-            engine.as_ref(),
-            Box::new(delta_kernel::committer::FileSystemCommitter::new()),
-        )?;
+        .build_with_filesystem_committer(engine.as_ref())?;
 
     let add_files_schema = txn.add_files_schema();
 
@@ -506,12 +503,9 @@ pub async fn write_deletion_vector_to_store(
 pub fn create_dv_update_transaction(
     table_url: &Url,
     engine: &dyn Engine,
-) -> KernelResult<Transaction> {
+) -> KernelResult<TransactionWithCommitter> {
     Snapshot::builder_for(table_url.clone())
         .build(engine)?
         .update_table(UpdateTableOperation::Delete, "test engine", true)
-        .build(
-            engine,
-            Box::new(delta_kernel::committer::FileSystemCommitter::new()),
-        )
+        .build_with_filesystem_committer(engine)
 }

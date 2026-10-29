@@ -3,13 +3,15 @@
 use super::committed::commit_result_to_committed_handle;
 use super::*;
 
-/// A handle for a create-table transaction (`Transaction<CreateTable>`).
+type CreateTableTransactionWithCommitter = TransactionWithCommitter<CreateTable>;
+
+/// A handle for a create-table transaction bound to its legacy committer.
 ///
 /// Returned by [`create_table_txn_builder_build`]. Only supports operations valid during table
 /// creation: adding files, late-bound commit information, domain metadata, and committing.
 /// Operations like
 /// file removal, blind append, and deletion vector updates are not available.
-#[handle_descriptor(target=CreateTableTransaction, mutable=true, sized=true)]
+#[handle_descriptor(target=CreateTableTransactionWithCommitter, mutable=true, sized=true)]
 pub struct ExclusiveCreateTableTransaction;
 
 // ============================================================================
@@ -57,7 +59,11 @@ pub unsafe extern "C" fn create_table_txn_with_operation_metrics(
     let txn = unsafe { *txn.into_inner() };
     let engine = unsafe { engine.as_ref() };
     unsafe {
-        apply_nullable_string_map(txn, metrics, CreateTableTransaction::with_operation_metrics)
+        apply_nullable_string_map(
+            txn,
+            metrics,
+            TransactionWithCommitter::with_operation_metrics,
+        )
     }
     .map(|txn| Box::new(txn).into())
     .into_extern_result(&engine)
@@ -84,7 +90,7 @@ pub unsafe extern "C" fn create_table_txn_with_commit_info(
             txn,
             commit_info,
             schema,
-            CreateTableTransaction::with_commit_info,
+            TransactionWithCommitter::with_commit_info,
         )
     }
     .map(|txn| Box::new(txn).into())
@@ -125,7 +131,7 @@ pub unsafe extern "C" fn create_table_txn_with_domain_metadata(
             txn,
             domain,
             configuration,
-            CreateTableTransaction::with_domain_metadata,
+            TransactionWithCommitter::with_domain_metadata,
         )
     }
     .map(|txn| Box::new(txn).into())
@@ -559,7 +565,7 @@ fn create_table_txn_builder_build_impl(
     extern_engine: &dyn ExternEngine,
 ) -> KernelResult<Handle<ExclusiveCreateTableTransaction>> {
     let engine = extern_engine.engine();
-    let create_txn = builder.build(engine.as_ref(), committer)?;
+    let create_txn = builder.build_with_committer(engine.as_ref(), committer)?;
     Ok(Box::new(create_txn).into())
 }
 

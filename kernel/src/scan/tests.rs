@@ -14,7 +14,6 @@ use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema};
 use crate::arrow::record_batch::RecordBatch;
 use crate::arrow::util::display::array_value_to_string;
-use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
@@ -370,10 +369,11 @@ fn test_scan_builder_accepts_predicate_on_unprojected_data_column() {
         nullable "a_float": FLOAT,
     };
     create_table(url, schema, "DefaultEngine", true)
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&engine)
         .unwrap()
         .commit(&engine)
         .unwrap()
+        .0
         .unwrap_committed();
 
     let snapshot = Snapshot::builder_for(url::Url::parse(url).unwrap())
@@ -401,10 +401,11 @@ fn test_scan_builder_rejects_predicate_on_projection_only_metadata_column() {
 
     let schema = schema_ref! { nullable "id": LONG };
     create_table(url, schema, "DefaultEngine", true)
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&engine)
         .unwrap()
         .commit(&engine)
         .unwrap()
+        .0
         .unwrap_committed();
 
     let snapshot = Snapshot::builder_for(url::Url::parse(url).unwrap())
@@ -719,10 +720,11 @@ fn scan_metadata_from_requires_timezone_support_only_for_timestamp_partitions(
     };
     let snapshot = create_table(table_root, schema, "SyncEngine", true)
         .with_data_layout(DataLayout::partitioned(["p"]))
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&engine)
         .unwrap()
         .commit(&engine)
         .unwrap()
+        .0
         .unwrap_post_commit_snapshot();
     let version = snapshot.version();
     let options = if parsed_struct {
@@ -2401,10 +2403,11 @@ fn scan_builder_stats_output_schemas_match_scan_output(#[case] column_mapping_mo
         create_builder = create_builder.with_table_properties([("delta.columnMapping.mode", mode)]);
     }
     create_builder
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&engine)
         .unwrap()
         .commit(&engine)
         .unwrap()
+        .0
         .unwrap_committed();
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
@@ -2480,10 +2483,11 @@ fn scan_builder_stats_output_schemas_returns_none_without_data_columns(
         create_builder = create_builder.with_table_properties([("delta.columnMapping.mode", mode)]);
     }
     create_builder
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&engine)
         .unwrap()
         .commit(&engine)
         .unwrap()
+        .0
         .unwrap_committed();
 
     let builder = Snapshot::builder_for(&table_root)
@@ -2523,10 +2527,11 @@ fn scan_builder_stats_output_schemas_respect_explicit_columns_and_partitions(
         create_builder = create_builder.with_table_properties([("delta.columnMapping.mode", mode)]);
     }
     create_builder
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&engine)
         .unwrap()
         .commit(&engine)
         .unwrap()
+        .0
         .unwrap_committed();
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
@@ -2575,10 +2580,11 @@ fn scan_builder_stats_output_schemas_handle_extra_column_shapes() {
     create_table(table_root, schema, "DefaultEngine", true)
         .with_data_layout(DataLayout::partitioned(["part"]))
         .with_table_properties([("delta.dataSkippingNumIndexedCols", "1")])
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&engine)
         .unwrap()
         .commit(&engine)
         .unwrap()
+        .0
         .unwrap_committed();
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
@@ -2624,10 +2630,11 @@ fn scan_builder_stats_output_schemas_validate_selected_columns() {
     };
     create_table(table_root, schema, "DefaultEngine", true)
         .with_data_layout(DataLayout::partitioned(["part"]))
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&engine)
         .unwrap()
         .commit(&engine)
         .unwrap()
+        .0
         .unwrap_committed();
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
@@ -2680,10 +2687,11 @@ fn scan_builder_stats_output_schemas_follow_struct_columns(
         create_builder = create_builder.with_table_properties([("delta.columnMapping.mode", mode)]);
     }
     create_builder
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&engine)
         .unwrap()
         .commit(&engine)
         .unwrap()
+        .0
         .unwrap_committed();
 
     let snapshot = Snapshot::builder_for(&table_root).build(&engine).unwrap();

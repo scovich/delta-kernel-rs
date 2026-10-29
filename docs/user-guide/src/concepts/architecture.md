@@ -160,13 +160,13 @@ let mut txn = snapshot                              // Arc<Snapshot>
         "my-app/1.0",
         /* data_change */ true,
     )
-    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    .build_with_filesystem_committer(&engine)?;
 
 // Write Parquet files, then register their metadata.
 txn.add_files(file_metadata);
 
 // Commit atomically
-match txn.commit(&engine)? {
+match txn.commit(&engine)?.0 {
     CommitResult::Committed(c) => println!("v{}", c.commit_version()),
     CommitResult::Conflicted(_) => { /* handle conflict */ }
     CommitResult::Retryable(_) => { /* retry */ }

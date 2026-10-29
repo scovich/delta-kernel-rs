@@ -9,7 +9,6 @@ use test_utils::{add_commit, assert_result_error_with_message, delta_path_for_ve
 use super::tests::add_checkpoint_to_store;
 use super::LogSegment;
 use crate::actions::LastManifestCommit;
-use crate::committer::FileSystemCommitter;
 use crate::crc::{Crc, FileStats, FileStatsState};
 use crate::engine::sync::SyncEngine;
 #[cfg(feature = "declarative-plans")]
@@ -679,7 +678,7 @@ async fn post_commit_snapshot_resolves_latest_checkpoint_action(
 
     let mut txn = snapshot
         .update_table(UpdateTableOperation::Write, "test-engine", true)
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&engine)
         .unwrap();
     // A root manifest commit captures the action it writes; a plain commit carries the read
     // snapshot's action forward.
@@ -692,7 +691,7 @@ async fn post_commit_snapshot_resolves_latest_checkpoint_action(
             })
             .unwrap();
     }
-    let post_commit = txn.commit(&engine).unwrap().unwrap_post_commit_snapshot();
+    let post_commit = txn.commit(&engine).unwrap().0.unwrap_post_commit_snapshot();
 
     // With every commit file deleted, resolving the action proves no log scan is needed.
     for version in 0..=1 {
@@ -735,10 +734,11 @@ async fn post_commit_snapshot_follows_transaction_last_manifest_commit() {
 
     let post_commit = snapshot
         .update_table(UpdateTableOperation::Write, "test-engine", true)
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&engine)
         .unwrap()
         .commit(&engine)
         .unwrap()
+        .0
         .unwrap_post_commit_snapshot();
 
     store

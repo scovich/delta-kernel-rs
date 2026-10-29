@@ -61,7 +61,7 @@ async fn main() -> KernelResult<()> {
     ])?);
 
     create_table(url.as_str(), schema.clone(), "quick-start/1.0", /* data_change */ true)
-        .build(&engine, Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(&engine)?
         .commit(&engine)?;
     println!("Created table at {url}");
 
@@ -74,7 +74,7 @@ async fn main() -> KernelResult<()> {
             "quick-start/1.0",
             /* data_change */ true,
         )
-        .build(&engine, Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(&engine)?;
 
     // Build an Arrow RecordBatch
     let arrow_schema: delta_kernel::arrow::datatypes::Schema =
@@ -97,7 +97,7 @@ async fn main() -> KernelResult<()> {
     txn.add_files(file_metadata);
 
     // Commit
-    match txn.commit(&engine)? {
+    match txn.commit(&engine)?.0 {
         CommitResult::Committed(committed) => {
             println!("Committed version {}", committed.commit_version());
         }
@@ -135,7 +135,7 @@ let schema = Arc::new(StructType::try_new(vec![
 ])?);
 
 create_table(url.as_str(), schema.clone(), "quick-start/1.0", /* data_change */ true)
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build_with_filesystem_committer(&engine)?
     .commit(&engine)?;
 ```
 
@@ -162,7 +162,7 @@ let mut txn = snapshot
         "quick-start/1.0",
         /* data_change */ true,
     )
-    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    .build_with_filesystem_committer(&engine)?;
 ```
 
 **Build your data as an Arrow RecordBatch and wrap it:**
@@ -197,14 +197,14 @@ transaction needs. `add_files` registers that metadata with the transaction.
 
 **Commit:**
 ```rust,ignore
-match txn.commit(&engine)? {
+match txn.commit(&engine)?.0 {
     CommitResult::Committed(committed) => { /* success */ }
     CommitResult::Conflicted(_) => { /* another writer won */ }
     CommitResult::Retryable(retry) => { /* transient error, retry */ }
 }
 ```
 
-`commit()` returns a `CommitResult` with three variants. For blind appends to a table with no
+The returned `CommitResult` has three variants. For blind appends to a table with no
 concurrent writers, you'll always get `CommitResult::Committed`.
 
 ## Run it

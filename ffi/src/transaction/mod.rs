@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub use committed::{
-    committed_transaction_post_commit_snapshot, committed_transaction_version,
-    free_committed_transaction,
+    committed_transaction_post_commit_snapshot, committed_transaction_publish,
+    committed_transaction_version, free_committed_transaction,
 };
 pub use create_table::*;
 pub use deletion_vector::{
@@ -22,12 +22,11 @@ pub use deletion_vector::{
 };
 use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::schema::SchemaRef;
-use delta_kernel::transaction::create_table::{
-    CreateTableTransaction, CreateTableTransactionBuilder,
-};
+use delta_kernel::transaction::create_table::CreateTableTransactionBuilder;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::{
-    CommittedTransaction, Transaction, UpdateTableOperation, UpdateTableTransactionBuilder,
+    CommittedTransaction, CreateTable, TransactionWithCommitter, UpdateTableOperation,
+    UpdateTableTransactionBuilder,
 };
 use delta_kernel::EngineData;
 use delta_kernel_ffi_macros::handle_descriptor;
@@ -92,13 +91,20 @@ fn decode_engine_schema(schema: &EngineSchema) -> KernelResult<delta_kernel::sch
     extract_kernel_schema(&mut visitor_state, schema_id)
 }
 
-/// A handle for a [`CommittedTransaction`].
+/// A successful transaction and the committer that executed it.
+#[doc(hidden)]
+pub struct FfiCommittedTransaction {
+    transaction: CommittedTransaction,
+    committer: Box<dyn Committer>,
+}
+
+/// A handle for a successful transaction and its retained committer.
 ///
 /// Returned by [`update_table_txn_commit`] and [`create_table_txn_commit`]. Carries the committed
 /// version and, when available, the post-commit snapshot. Use [`committed_transaction_version`] and
 /// [`committed_transaction_post_commit_snapshot`] to read the contents, then release with
 /// [`free_committed_transaction`].
-#[handle_descriptor(target=CommittedTransaction, mutable=true, sized=true)]
+#[handle_descriptor(target=FfiCommittedTransaction, mutable=true, sized=true)]
 pub struct ExclusiveCommittedTransaction;
 
 /// Handle for a mutable boxed committer that can be passed across FFI
@@ -4150,8 +4156,9 @@ mod tests {
             "test-engine/1.0",
             true,
         )
-        .build(&kernel_engine, Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(&kernel_engine)?
         .commit(&kernel_engine)?
+        .0
         .unwrap_committed();
         let engine = engine_handle_for_store(store);
 
@@ -4513,14 +4520,14 @@ mod tests {
         let mut add_txn = snapshot
             .clone()
             .update_table(UpdateTableOperation::Write, "test-engine/1.0", true)
-            .build(kernel_engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+            .build_with_filesystem_committer(kernel_engine.as_ref())?;
         let add_files_schema = add_txn.add_files_schema();
         let add_metadata = test_utils::create_add_files_metadata(
             add_files_schema,
             vec![(&data_file_path, parquet_len as i64, 1_000_000, Some(4))],
         )?;
         add_txn.add_files(add_metadata);
-        let _ = add_txn.commit(kernel_engine.as_ref())?.unwrap_committed();
+        let _ = add_txn.commit(kernel_engine.as_ref())?.0.unwrap_committed();
 
         // Build and write a connector-authored DV file deleting rows 1 and 2 (ids 20, 30).
         let mut dv = KernelDeletionVector::new();

@@ -150,7 +150,7 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let mut txn = snapshot
     .clone()
     .update_table(UpdateTableOperation::Delete, "my-app/1.0", /* data_change */ true)
-    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    .build_with_filesystem_committer(&engine)?;
 
 // 3. Build a scan and get file metadata
 let scan = snapshot.scan_builder().build()?;
@@ -176,7 +176,7 @@ for metadata in scan.scan_metadata(&engine)? {
 }
 
 // 6. Commit the transaction
-match txn.commit(&engine)? {
+match txn.commit(&engine)?.0 {
     CommitResult::Committed(committed) => {
         println!("Committed version {}", committed.commit_version());
     }

@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::crc::{Crc, DomainMetadataState, SetTransactionState};
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -63,7 +62,7 @@ async fn test_get_file_stats_no_crc() -> KernelResult<()> {
     };
 
     let _ = create_table(&table_path, schema, "Test/1.0", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
@@ -101,6 +100,7 @@ async fn test_get_file_stats_stale_crc_advances_via_safe_commit_serves_stats() -
         |builder| builder,
     )?
     .commit(engine.as_ref())?
+    .0
     .unwrap_committed();
 
     // ===== THEN =====
@@ -152,7 +152,7 @@ async fn test_get_all_files_no_crc() -> KernelResult<()> {
     };
 
     let _ = create_table(&table_path, schema, "Test/1.0", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
@@ -192,6 +192,7 @@ async fn test_get_all_files_none_when_crc_advanced_via_safe_commit() -> KernelRe
         |builder| builder,
     )?
     .commit(engine.as_ref())?
+    .0
     .unwrap_committed();
 
     // ===== THEN =====
@@ -348,7 +349,7 @@ async fn test_snapshot_loads_when_crc_at_version_is_corrupt() -> KernelResult<()
 
     let schema = schema_ref! { nullable "id": INTEGER };
     let _ = create_table(&table_path, schema, "Test/1.0", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     // Plant a garbage CRC file at the table version.
@@ -409,7 +410,7 @@ async fn test_crc_returns_none_when_no_crc() -> KernelResult<()> {
     let schema = schema_ref! { nullable "id": INTEGER };
 
     let _ = create_table(&table_path, schema, "Test/1.0", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
@@ -433,9 +434,9 @@ fn create_table_and_commit(
     let txn = create_table(table_path, schema, "test_engine", true)
         .with_data_layout(DataLayout::clustered(["id"]))
         .with_domain_metadata("zip", "zap0")
-        .build(engine, Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(engine)?;
 
-    Ok(txn.commit(engine)?.unwrap_committed())
+    Ok(txn.commit(engine)?.0.unwrap_committed())
 }
 
 #[tokio::test]
@@ -491,6 +492,7 @@ async fn test_post_commit_crc_chains_only_if_read_snapshot_has_crc(
         |builder| builder.with_domain_metadata("zip", "zap1"),
     )?
     .commit(engine.as_ref())?
+    .0
     .unwrap_committed();
 
     // The new post-commit snapshot should only have a CRC if the read snapshot had one.
@@ -577,7 +579,7 @@ async fn test_post_commit_crc_tracks_file_stats_across_inserts() -> KernelResult
     for sm in scan.scan_metadata(engine.as_ref())? {
         txn.remove_files(sm?.scan_files);
     }
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let committed = txn.commit(engine.as_ref())?.0.unwrap_committed();
 
     // ===== THEN: should have CRC at v3 with right file stats =====
     assert_eq!(committed.commit_version(), 3);
@@ -616,7 +618,7 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> KernelResult<(
                 .with_domain_metadata("foo", "bar") // <-- add foo
         },
     )?;
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let committed = txn.commit(engine.as_ref())?.0.unwrap_committed();
 
     // ===== THEN: should have CRC at v1 with zip -> zap1, foo -> bar =====
     let snapshot_v1 = committed.post_commit_snapshot().unwrap();
@@ -630,8 +632,8 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> KernelResult<(
         .clone()
         .update_table(UpdateTableOperation::Write, "test-engine", true)
         .with_domain_metadata_removed("zip")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+        .build_with_filesystem_committer(engine.as_ref())?;
+    let committed = txn.commit(engine.as_ref())?.0.unwrap_committed();
 
     // ===== THEN: should have CRC at v2 with zip gone, foo still there =====
     let snapshot_v2 = committed.post_commit_snapshot().unwrap();
@@ -668,6 +670,7 @@ async fn test_post_commit_crc_non_incremental_op_makes_file_stats_indeterminate(
         |builder| builder,
     )?
     .commit(engine.as_ref())?
+    .0
     .unwrap_committed();
 
     // ===== THEN: CRC at v2 has indeterminate file stats =====
@@ -766,8 +769,9 @@ async fn test_write_checksum_resolves_correct_crc_from_each_root(
         builder = builder.with_table_properties([("delta.enableInCommitTimestamps", "true")]);
     }
     let mut snap = builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
 
     const CHECKPOINT_OR_CRC_VERSION: i64 = 4;
@@ -800,13 +804,13 @@ async fn test_write_checksum_resolves_correct_crc_from_each_root(
         if v == 3 {
             txn = txn.with_domain_metadata_removed(removed_domain.to_string());
         }
-        let mut txn = txn.build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        let mut txn = txn.build_with_filesystem_committer(engine.as_ref())?;
         let write_context = txn.write_state()?.write_context_builder().build()?;
         let adds = engine
             .write_parquet(&ArrowEngineData::new(batch), &write_context)
             .await?;
         txn.add_files(adds);
-        snap = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+        snap = txn.commit(engine.as_ref())?.0.unwrap_post_commit_snapshot();
 
         if checkpoint_or_crc_version == Some(v) {
             match root {
@@ -907,6 +911,7 @@ async fn test_disabled_load_retains_stale_crc_as_base() -> KernelResult<()> {
         |builder| builder,
     )?
     .commit(engine.as_ref())?
+    .0
     .unwrap_committed();
 
     // Default Disabled load at v1: the stale CRC@0 is not advanced, but it is retained as a base.
@@ -953,6 +958,7 @@ async fn test_write_checksum_after_checkpoint_with_stale_base_resolves_from_chec
         |builder| builder,
     )?
     .commit(engine.as_ref())?
+    .0
     .unwrap_committed();
 
     // Disabled load retains stale CRC@0 as base; checkpoint at v1 carries state forward and drops
@@ -985,8 +991,9 @@ async fn setup_incremental_below_checkpoint_base<E: TaskExecutor>(
 ) -> KernelResult<SnapshotRef> {
     let schema = schema_ref! { nullable "id": INTEGER };
     let mut snap = create_table(table_path, schema, "test_engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
     for v in 1..=3i32 {
         let arrow_schema = TryFromKernel::try_from_kernel(snap.schema().as_ref())?;
@@ -997,13 +1004,13 @@ async fn setup_incremental_below_checkpoint_base<E: TaskExecutor>(
         .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
         let mut txn = snap
             .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+            .build_with_filesystem_committer(engine.as_ref())?;
         let write_context = txn.write_state()?.write_context_builder().build()?;
         let adds = engine
             .write_parquet(&ArrowEngineData::new(batch), &write_context)
             .await?;
         txn.add_files(adds);
-        snap = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+        snap = txn.commit(engine.as_ref())?.0.unwrap_post_commit_snapshot();
         if v == 1 {
             snap.write_checksum(engine.as_ref())?;
         }
@@ -1086,8 +1093,9 @@ async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_p
             ("delta.feature.inCommitTimestamp", "supported"),
             ("delta.enableInCommitTimestamps", "true"),
         ])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
     let snap = insert_data(
         snap,
@@ -1124,8 +1132,9 @@ async fn test_write_checksum_no_crc_with_non_incremental_tail_returns_unsupporte
 
     let schema = schema_ref! { nullable "id": INTEGER };
     let snap = create_table(&table_path, schema, "test_engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
     let snap = insert_data(
         snap,
@@ -1145,6 +1154,7 @@ async fn test_write_checksum_no_crc_with_non_incremental_tail_returns_unsupporte
         |builder| builder,
     )?
     .commit(engine.as_ref())?
+    .0
     .unwrap_committed();
 
     let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -1320,8 +1330,9 @@ async fn test_write_checksum_with_no_dms_writes_empty_list(
         builder = builder.with_table_properties(properties);
     }
     let committed = builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     let snapshot = committed.post_commit_snapshot().unwrap();
@@ -1364,6 +1375,7 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> KernelResult<()
         },
     )?
     .commit(engine.as_ref())?
+    .0
     .unwrap_committed();
 
     // Asserts domain metadata on any snapshot, regardless of how it was loaded.
@@ -1470,6 +1482,7 @@ async fn test_partial_dm_serves_hits_and_falls_through_for_misses() -> KernelRes
         |builder| builder.with_domain_metadata("foo", "bar"),
     )?
     .commit(engine.as_ref())?
+    .0
     .unwrap_committed();
     let snapshot_v1 = committed.post_commit_snapshot().unwrap();
 
@@ -1556,8 +1569,9 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> KernelResult<()> {
         .clone()
         .update_table(UpdateTableOperation::Write, "test-engine", true)
         .with_transaction_id("my-app", 1)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     let snapshot_v1 = committed.post_commit_snapshot().unwrap();
 
@@ -1602,8 +1616,9 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> KernelResult<()> {
         .update_table(UpdateTableOperation::Write, "test-engine", true)
         .with_transaction_id("my-app", 2)
         .with_transaction_id("other-app", 1)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     let snapshot_v2 = committed.post_commit_snapshot().unwrap();
 
@@ -1656,8 +1671,9 @@ async fn test_partial_set_txn_serves_hits_and_falls_through_for_misses() -> Kern
         .clone()
         .update_table(UpdateTableOperation::Write, "test-engine", true)
         .with_transaction_id("v1-app", 1)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     let snapshot_v1 = committed.post_commit_snapshot().unwrap();
     snapshot_v1.write_checksum(engine.as_ref())?;
@@ -1679,8 +1695,9 @@ async fn test_partial_set_txn_serves_hits_and_falls_through_for_misses() -> Kern
         .clone()
         .update_table(UpdateTableOperation::Write, "test-engine", true)
         .with_transaction_id("my-app", 1)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     let snapshot_v2 = committed.post_commit_snapshot().unwrap();
 
@@ -1747,8 +1764,9 @@ async fn test_set_txn_expiration_via_crc_fast_path(
         builder = builder.with_table_properties([("delta.setTransactionRetentionDuration", r)]);
     }
     let committed = builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     // v1: commit a set transaction for "my-app" (lastUpdated = now)
@@ -1756,8 +1774,9 @@ async fn test_set_txn_expiration_via_crc_fast_path(
     let committed = snapshot_v0
         .update_table(UpdateTableOperation::Write, "test-engine", true)
         .with_transaction_id("my-app", 1)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     // Write CRC at v1 so the fast path is used on reload
@@ -1796,8 +1815,9 @@ async fn test_partial_set_txn_expired_hit_returns_none_via_fast_path() -> Kernel
             "delta.setTransactionRetentionDuration",
             "interval 0 seconds",
         )])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     // v1: commit my-app=1, write CRC at v1.
@@ -1805,8 +1825,9 @@ async fn test_partial_set_txn_expired_hit_returns_none_via_fast_path() -> Kernel
     let committed = snapshot_v0
         .update_table(UpdateTableOperation::Write, "test-engine", true)
         .with_transaction_id("my-app", 1)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     committed
         .post_commit_snapshot()
@@ -1821,8 +1842,9 @@ async fn test_partial_set_txn_expired_hit_returns_none_via_fast_path() -> Kernel
     let committed = snapshot_v1_reloaded
         .update_table(UpdateTableOperation::Write, "test-engine", true)
         .with_transaction_id("my-app", 2)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     let snapshot_v2 = committed.post_commit_snapshot().unwrap();
 
@@ -1856,8 +1878,9 @@ async fn test_set_txn_null_last_updated_never_expires_via_log_replay() -> Kernel
             "delta.setTransactionRetentionDuration",
             "interval 0 seconds",
         )])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     // v1: raw commit with txn action that omits lastUpdated
@@ -1894,8 +1917,9 @@ async fn test_set_txn_expired_newest_returns_none_not_older_via_log_replay() -> 
     let schema = schema_ref! { nullable "id": INTEGER };
     create_table(&table_path, schema, "test_engine", true)
         .with_table_properties([("delta.setTransactionRetentionDuration", "interval 365 days")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     let store = Arc::new(LocalFileSystem::new());
@@ -2017,8 +2041,9 @@ async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> KernelResu
 
     // ===== v0: empty table =====
     let committed = create_table(&table_path, schema, "test_engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     let snapshot = committed.post_commit_snapshot().unwrap();
     let crc_v0 = write_and_verify_crc(snapshot, &table_path, engine.as_ref());
@@ -2100,7 +2125,7 @@ async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> KernelResu
     for sm in scan.scan_metadata(engine.as_ref())? {
         txn.remove_files(sm?.scan_files);
     }
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let committed = txn.commit(engine.as_ref())?.0.unwrap_committed();
     let snapshot = committed.post_commit_snapshot().unwrap();
 
     // Delete physical parquet files so disk ground truth reflects the empty table
@@ -2245,6 +2270,7 @@ async fn test_file_histogram_with_bin_type_and_operation_type(
             |builder| builder,
         )?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
         assert_eq!(committed.commit_version(), 2);
         committed.post_commit_snapshot().unwrap().clone()
@@ -2321,14 +2347,13 @@ async fn commit_data<E: TaskExecutor>(
     )
     .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
     let builder = snapshot.update_table(UpdateTableOperation::Write, "test-engine", true);
-    let mut txn =
-        customize(builder).build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    let mut txn = customize(builder).build_with_filesystem_committer(engine.as_ref())?;
     let write_context = txn.write_state()?.write_context_builder().build()?;
     let adds = engine
         .write_parquet(&ArrowEngineData::new(batch), &write_context)
         .await?;
     txn.add_files(adds);
-    Ok(txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot())
+    Ok(txn.commit(engine.as_ref())?.0.unwrap_post_commit_snapshot())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2367,8 +2392,9 @@ async fn test_stale_crc_fresh_build_advance_matrix(
             ("delta.enableInCommitTimestamps", "true"),
         ])
         .with_domain_metadata("domain_at_create".to_string(), "value_0".to_string())
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
 
     // === Step 2: Commits up to CHECKPOINT_VERSION, followed by a checkpoint. ===
@@ -2512,6 +2538,7 @@ async fn test_stale_crc_fresh_build_non_incremental_op_trips_indeterminate() -> 
         |builder| builder,
     )?
     .commit(engine.as_ref())?
+    .0
     .unwrap_committed();
 
     // ===== THEN: advancing the stale CRC trips file stats to Indeterminate, so they are not
@@ -2583,8 +2610,9 @@ async fn setup_stale_crc_dm_table<E: TaskExecutor>(
     let schema = schema_ref! { nullable "id": INTEGER };
     let mut snap = create_table(table_path, schema, "test_engine", true)
         .with_table_properties([("delta.feature.domainMetadata", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
 
     for v in 1..=20i64 {
@@ -2728,8 +2756,9 @@ async fn setup_stale_crc_txn_table<E: TaskExecutor>(
 ) -> KernelResult<()> {
     let schema = schema_ref! { nullable "id": INTEGER };
     let mut snap = create_table(table_path, schema, "test_engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
 
     for v in 1..=20i64 {

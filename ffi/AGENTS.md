@@ -949,20 +949,18 @@ Write context: `update_table_txn_get_unpartitioned_write_context` covers unparti
 Catalog-managed publish flow (after a catalog committer stages commits):
 
 ```
-committed_transaction_post_commit_snapshot()
-  -> snapshot_publish_with_committer(snapshot, committer, engine)
-     // borrows snapshot; consumes committer (do not free)
+committed_transaction_publish(committed_transaction, engine)
+  // reuses the committer retained by the committed-transaction handle
   -> use returned snapshot for a subsequent update_table_txn_builder_build_with_committer / checkpoint
-     // mint a fresh get_uc_committer for that transaction -- it also consumes
   -> free_snapshot (returned snapshot) when done
-  -> free_snapshot (post-commit input snapshot)
+  -> free_committed_transaction when done
 ```
 
-`snapshot_publish_with_committer` mirrors kernel `Snapshot::publish`: it copies ratified staged
-commits into `_delta_log/` via the catalog committer's `publish()` implementation. The input
-snapshot is borrowed; the committer is consumed (do not free). The caller owns the returned
-snapshot handle. The returned snapshot carries the published watermark (`max_published_version`)
-needed for the next catalog commit; do not continue from the pre-publish post-commit snapshot.
+`committed_transaction_publish` mirrors kernel `Snapshot::publish`: it copies ratified staged
+commits into `_delta_log/` via the retained catalog committer's `publish()` implementation. The
+caller owns the returned snapshot handle. The returned snapshot carries the published watermark
+(`max_published_version`) needed for the next catalog commit; do not continue from the pre-publish
+post-commit snapshot.
 
 Column defaults (`allowColumnDefaults`) live in `ffi/src/column_default.rs`. The kernel reports
 defaults but never materializes them, so the connector fills every omitted column itself:

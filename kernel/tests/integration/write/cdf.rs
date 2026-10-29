@@ -69,7 +69,7 @@ async fn write_data_to_table(
     add_files_to_transaction(&mut txn, engine, schema, values).await?;
 
     let result = txn.commit(engine.as_ref())?;
-    match result {
+    match result.0 {
         CommitResult::Committed(committed) => Ok(committed.commit_version()),
         _ => panic!("Transaction should be committed"),
     }
@@ -143,7 +143,7 @@ async fn test_cdf_write_all_removes_succeeds() -> Result<(), Box<dyn std::error:
 
     // This should succeed - remove-only transactions are allowed with CDF
     let result = txn.commit(engine.as_ref())?;
-    match result {
+    match result.0 {
         CommitResult::Committed(committed) => {
             assert_eq!(committed.commit_version(), 2);
         }
@@ -190,7 +190,7 @@ async fn test_cdf_write_mixed_no_data_change_succeeds() -> Result<(), Box<dyn st
 
     // This should succeed - mixed operations are allowed when dataChange=false
     let result = txn.commit(engine.as_ref())?;
-    match result {
+    match result.0 {
         CommitResult::Committed(committed) => {
             assert_eq!(committed.commit_version(), 2);
         }
@@ -283,6 +283,7 @@ async fn test_file_rewrite_validates_explicit_data_change(
     setup_txn.add_files(existing_file);
     let before = setup_txn
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
 
     let schema_change = schema_change_operation.is_some();
@@ -350,7 +351,7 @@ async fn test_file_rewrite_validates_explicit_data_change(
         assert_eq!(fresh.version(), before.version());
         assert_eq!(fresh.schema(), before.schema());
     } else {
-        let post = commit_result?.unwrap_post_commit_snapshot();
+        let post = commit_result?.0.unwrap_post_commit_snapshot();
         let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
         for snapshot in [post, fresh] {
             assert_eq!(snapshot.version(), 2);

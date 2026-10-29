@@ -77,10 +77,10 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let result = snapshot
     .update_table(UpdateTableOperation::AlterTable, "my-app/1.0", /* data_change */ false)
     .add_column(StructField::nullable("country", DataType::STRING))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build_with_filesystem_committer(&engine)?
     .commit(&engine)?;
 
-match result {
+match result.0 {
     CommitResult::Committed(committed) => {
         println!("Schema altered at version {}", committed.commit_version());
     }
@@ -124,7 +124,7 @@ let result = snapshot
     .update_table(UpdateTableOperation::AlterTable, "my-app/1.0", /* data_change */ false)
     .add_column(StructField::nullable("country", DataType::STRING))
     .add_column(StructField::nullable("postal_code", DataType::STRING))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build_with_filesystem_committer(&engine)?
     .commit(&engine)?;
 ```
 
@@ -143,7 +143,7 @@ during `build()`, so the transaction's `WriteState` uses the evolved schema.
 let mut transaction = snapshot
     .update_table(UpdateTableOperation::Write, "my-app/1.0", /* data_change */ true)
     .add_column(StructField::nullable("country", DataType::STRING))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    .build_with_filesystem_committer(&engine)?;
 
 let write_state = transaction.write_state()?;
 let write_context = write_state.write_context_builder().build()?;

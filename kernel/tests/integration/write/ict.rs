@@ -122,7 +122,7 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
 
     // First commit
     let commit_result = txn.commit(&engine)?;
-    match commit_result {
+    match commit_result.0 {
         CommitResult::Committed(committed) => {
             assert_eq!(
                 committed.commit_version(),
@@ -173,7 +173,7 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
 
     // Second commit
     let commit_result2 = txn2.commit(&engine)?;
-    match commit_result2 {
+    match commit_result2.0 {
         CommitResult::Committed(committed) => {
             assert_eq!(
                 committed.commit_version(),

@@ -29,7 +29,7 @@ let schema = Arc::new(StructType::try_new([
 ])?);
 
 create_table(url.as_str(), schema, "my-app/1.0", /* data_change */ true)
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build_with_filesystem_committer(&engine)?
     .commit(&engine)?;
 # Ok(())
 # }
@@ -117,7 +117,7 @@ create_table(url.as_str(), schema, "my-app/1.0", /* data_change */ true)
         ("myapp.version", "2.0"),
         ("myapp.owner", "data-team"),
     ])
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build_with_filesystem_committer(&engine)?
     .commit(&engine)?;
 # Ok(())
 # }
@@ -154,7 +154,7 @@ let schema = Arc::new(StructType::try_new([
 
 create_table(url.as_str(), schema, "my-app/1.0", /* data_change */ true)
     .with_data_layout(DataLayout::clustered(["region", "timestamp"]))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build_with_filesystem_committer(&engine)?
     .commit(&engine)?;
 # Ok(())
 # }
@@ -211,7 +211,7 @@ let schema = Arc::new(StructType::try_new([
 
 create_table(url.as_str(), schema, "my-app/1.0", /* data_change */ true)
     .with_data_layout(DataLayout::partitioned(["year", "month"]))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build_with_filesystem_committer(&engine)?
     .commit(&engine)?;
 # Ok(())
 # }
@@ -259,10 +259,10 @@ persisted:
 
 ## Handling the result
 
-`commit()` returns a `CommitResult`:
+`commit()` returns its `CommitResult` and committer:
 
 ```rust,ignore
-match txn.commit(&engine)? {
+match txn.commit(&engine)?.0 {
     CommitResult::Committed(committed) => {
         println!("Created table at version {}", committed.commit_version());
     }

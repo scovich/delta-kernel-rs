@@ -61,7 +61,6 @@ use delta_kernel::arrow::array::{
 use delta_kernel::arrow::buffer::NullBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema, TimeUnit};
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::Scalar;
@@ -1327,8 +1326,9 @@ impl TestTableBuilder {
         let mut stale_hint_bytes: Option<Vec<u8>> = None;
 
         let mut snapshot = builder
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .build_with_filesystem_committer(engine.as_ref())?
             .commit(engine.as_ref())?
+            .0
             .unwrap_post_commit_snapshot();
 
         let crcs_at = self.log_state.crcs_at();
@@ -1459,7 +1459,7 @@ async fn write_data_commit<E: TaskExecutor>(
             "test-utils",
             true,
         )
-        .build(engine, Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(engine)?;
     let write_state = txn.write_state()?;
 
     let partition_set: HashSet<&str> = partition_columns.iter().map(String::as_str).collect();
@@ -1509,7 +1509,7 @@ async fn write_data_commit<E: TaskExecutor>(
         txn.add_files(add_files);
     }
 
-    txn.commit(engine)
+    txn.commit(engine).map(|(result, _)| result)
 }
 
 /// Generate a single column of data based on its Arrow type.

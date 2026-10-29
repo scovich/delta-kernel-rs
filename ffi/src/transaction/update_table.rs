@@ -5,11 +5,11 @@ use delta_kernel::engine_data::FilteredEngineData;
 use super::committed::commit_result_to_committed_handle;
 use super::*;
 
-/// A handle for an update-table transaction (`Transaction<UpdateTable>`).
+/// A handle for an update-table transaction bound to its legacy committer.
 ///
 /// Returned by an update-table builder's build function. Supports all transaction
 /// operations including existing-table-only operations like blind append and file removal.
-#[handle_descriptor(target=Transaction, mutable=true, sized=true)]
+#[handle_descriptor(target=TransactionWithCommitter, mutable=true, sized=true)]
 pub struct ExclusiveUpdateTableTransaction;
 
 /// A handle for configuring a transaction against an existing table.
@@ -142,7 +142,7 @@ fn update_table_txn_builder_build_with_committer_impl(
     committer: Box<dyn Committer>,
 ) -> KernelResult<Handle<ExclusiveUpdateTableTransaction>> {
     let engine = extern_engine.engine();
-    let transaction = builder.build(engine.as_ref(), committer);
+    let transaction = builder.build_with_committer(engine.as_ref(), committer);
     Ok(Box::new(transaction?).into())
 }
 
@@ -213,8 +213,9 @@ pub unsafe extern "C" fn update_table_txn_builder_with_operation_parameters(
 /// Replaces the operation metrics recorded in `commitInfo` before writes begin.
 ///
 /// Duplicate keys are rejected by the FFI map decoder. Metrics supplied later through
-/// [`Transaction::with_operation_metrics`] replace these builder metrics. Dedicated metrics
-/// override the nested `operationMetrics` field in connector commit information.
+/// [`delta_kernel::transaction::Transaction::with_operation_metrics`] replace these builder
+/// metrics. Dedicated metrics override the nested `operationMetrics` field in connector commit
+/// information.
 ///
 /// # Safety
 ///
@@ -417,9 +418,15 @@ pub unsafe extern "C" fn update_table_txn_with_operation_metrics(
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransaction>> {
     let txn = unsafe { *txn.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    unsafe { apply_nullable_string_map(txn, metrics, Transaction::with_operation_metrics) }
-        .map(|txn| Box::new(txn).into())
-        .into_extern_result(&engine)
+    unsafe {
+        apply_nullable_string_map(
+            txn,
+            metrics,
+            TransactionWithCommitter::with_operation_metrics,
+        )
+    }
+    .map(|txn| Box::new(txn).into())
+    .into_extern_result(&engine)
 }
 
 /// Replaces the connector-defined `commitInfo` row after writing and before commit.
@@ -441,9 +448,16 @@ pub unsafe extern "C" fn update_table_txn_with_commit_info(
     let txn = unsafe { *txn.into_inner() };
     let commit_info = unsafe { commit_info.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    unsafe { apply_commit_info(txn, commit_info, schema, Transaction::with_commit_info) }
-        .map(|txn| Box::new(txn).into())
-        .into_extern_result(&engine)
+    unsafe {
+        apply_commit_info(
+            txn,
+            commit_info,
+            schema,
+            TransactionWithCommitter::with_commit_info,
+        )
+    }
+    .map(|txn| Box::new(txn).into())
+    .into_extern_result(&engine)
 }
 
 /// Free an existing-table transaction handle without committing.
@@ -511,7 +525,7 @@ pub unsafe extern "C" fn update_table_txn_with_domain_metadata(
             txn,
             domain,
             configuration,
-            Transaction::with_domain_metadata,
+            TransactionWithCommitter::with_domain_metadata,
         )
     }
     .map(|txn| Box::new(txn).into())
@@ -585,7 +599,7 @@ pub unsafe extern "C" fn update_table_txn_with_row_tracking_high_water_mark(
 }
 
 fn with_row_tracking_high_water_mark_impl(
-    txn: Transaction,
+    txn: TransactionWithCommitter,
     high_water_mark: i64,
 ) -> KernelResult<Handle<ExclusiveUpdateTableTransaction>> {
     Ok(Box::new(txn.with_row_tracking_high_water_mark(high_water_mark)?).into())
@@ -611,7 +625,7 @@ pub unsafe extern "C" fn update_table_txn_with_root_manifest_file(
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn with_root_manifest_file_impl(
-    txn: Transaction,
+    txn: TransactionWithCommitter,
     file: &FileMeta,
 ) -> KernelResult<Handle<ExclusiveUpdateTableTransaction>> {
     let path: &str = unsafe { TryFromStringSlice::try_from_slice(&file.path) }?;

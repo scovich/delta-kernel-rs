@@ -218,11 +218,10 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::arrow::record_batch::RecordBatch;
-    use crate::committer::FileSystemCommitter;
     use crate::engine::arrow_conversion::TryIntoKernel;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::schema::{schema_ref, Schema, SchemaRef, ToSchema};
-    use crate::transaction::Transaction;
+    use crate::transaction::TransactionWithCommitter;
     use crate::unit_test_utils::{assert_result_error_with_message, load_test_table};
     use crate::utils::FoldWithOption as _;
     use crate::{Engine, EngineData, KernelResult, RowVisitor};
@@ -316,7 +315,7 @@ mod tests {
     /// Create a transaction with the given engine_commit_info, using the shared test table.
     fn make_txn(
         engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
-    ) -> KernelResult<(Arc<dyn Engine>, Transaction)> {
+    ) -> KernelResult<(Arc<dyn Engine>, TransactionWithCommitter)> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let txn = snapshot
             .update_table(
@@ -324,7 +323,7 @@ mod tests {
                 "test-engine",
                 true,
             )
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .build_with_filesystem_committer(engine.as_ref())?
             .fold_with(engine_commit_info, |txn, (data, schema)| {
                 txn.with_commit_info(data, schema)
             });

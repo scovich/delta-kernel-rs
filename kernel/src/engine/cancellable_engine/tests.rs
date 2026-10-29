@@ -9,7 +9,6 @@ use url::Url;
 
 use crate::actions::LOG_METADATA_SCHEMA;
 use crate::arrow::array::{Int32Array, StringArray};
-use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::EngineDataArrowExt;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
@@ -588,10 +587,11 @@ fn post_build_metadata_reads_inherit_operation_token(
     .with_data_layout(DataLayout::Clustered {
         columns: vec![ColumnName::new(["id"])],
     })
-    .build(&original, Box::new(FileSystemCommitter::new()))
+    .build_with_filesystem_committer(&original)
     .unwrap()
     .commit(&original)
     .unwrap()
+    .0
     .unwrap_committed();
     let mut reads = RecordingReads::new(None);
     Arc::get_mut(&mut reads).unwrap().inner = Arc::new(original);

@@ -20,7 +20,7 @@
 //!
 //! let result = create_table("/path/to/table", schema, "MyApp/1.0", /* data_change */ true)
 //!     .with_table_properties([("myapp.version", "1.0")])
-//!     .build(engine, Box::new(FileSystemCommitter::new()))?
+//!     .build_with_filesystem_committer(engine)?
 //!     .commit(engine)?;
 //! # Ok(())
 //! # }
@@ -67,7 +67,7 @@ use crate::transaction::{CreateTable, Transaction};
 /// ])?);
 ///
 /// let result = create_table("/path/to/table", schema, "MyApp/1.0", /* data_change */ true)
-///     .build(engine, Box::new(FileSystemCommitter::new()))?
+///     .build_with_filesystem_committer(engine)?
 ///     .commit(engine)?;
 /// # Ok(())
 /// # }
@@ -136,7 +136,7 @@ pub type CreateTableTransaction = Transaction<CreateTable>;
 /// let engine = DefaultEngineBuilder::new(store_from_url(&url)?).build();
 ///
 /// let transaction = create_table("/tmp/my_table", schema, "MyApp/1.0", /* data_change */ true)
-///     .build(&engine, Box::new(FileSystemCommitter::new()))?;
+///     .build_with_filesystem_committer(&engine)?;
 ///
 /// // Commit the transaction to create the table
 /// transaction.commit(&engine)?;

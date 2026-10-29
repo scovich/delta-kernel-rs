@@ -85,7 +85,7 @@ let mut txn = snapshot.clone()
         "my-app/1.0",
         /* data_change */ true,
     )
-    .build(&engine, committer)?;
+    .build_with_committer(&engine, committer)?;
 ```
 
 `UCCommitter` requires a multi-threaded tokio runtime. The default Kernel
@@ -128,18 +128,18 @@ Call `txn.commit()` to stage the commit and ratify it through UC.
 use delta_kernel::transaction::CommitResult;
 
 match txn.commit(&engine)? {
-    CommitResult::Committed(committed) => {
+    (CommitResult::Committed(committed), committer) => {
         let version = committed.commit_version();
         let post_commit_snapshot = committed
             .post_commit_snapshot()
             .expect("post-commit snapshot");
         // Proceed to publish (next step)
     }
-    CommitResult::Conflicted(conflicted) => {
+    (CommitResult::Conflicted(conflicted), _committer) => {
         // Another writer committed this version first. Rebase onto the new
         // snapshot and retry. UCCommitter does not retry at this level.
     }
-    CommitResult::Retryable(_retryable) => {
+    (CommitResult::Retryable(_retryable), _committer) => {
         // Transient I/O or server error after the UC HTTP client's own retry
         // budget was exhausted. Retry the commit from scratch.
     }
@@ -297,7 +297,7 @@ let mut txn = snapshot.clone()
         "my-app/1.0",
         /* data_change */ true,
     )
-    .build(&engine, committer)?;
+    .build_with_committer(&engine, committer)?;
 
 // 6. Write data
 let write_state = txn.write_state()?;
@@ -306,27 +306,21 @@ let write_context = write_state.write_context_builder().build()?;
 txn.add_files(file_metadata);
 
 // 7. Commit, publish, and checkpoint
-let committer_for_publish: Box<dyn delta_kernel::committer::Committer> = Box::new(UCCommitter::new(
-    update_client.clone(),
-    table_id.clone(),
-    TableIdentifier::new("my_catalog", "my_schema", "my_table"),
-));
-
 match txn.commit(&engine)? {
-    CommitResult::Committed(committed) => {
+    (CommitResult::Committed(committed), committer) => {
         let post_commit_snapshot = committed
             .post_commit_snapshot()
             .expect("post-commit snapshot");
 
         // Publish staged commits to _delta_log/
         let published_snapshot = post_commit_snapshot
-            .publish(&engine, committer_for_publish.as_ref())?;
+            .publish(&engine, committer.as_ref())?;
 
         // Checkpoint the published snapshot
         published_snapshot.checkpoint(&engine, None)?;
     }
-    CommitResult::Conflicted(_) => { /* rebase and retry */ }
-    CommitResult::Retryable(_) => { /* retry the commit */ }
+    (CommitResult::Conflicted(_), _committer) => { /* rebase and retry */ }
+    (CommitResult::Retryable(_), _committer) => { /* retry the commit */ }
 }
 ```
 

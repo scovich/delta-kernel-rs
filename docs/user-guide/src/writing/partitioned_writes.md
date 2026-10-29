@@ -50,7 +50,7 @@ let mut txn = snapshot
         "my-app/1.0",
         /* data_change */ true,
     )
-    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    .build_with_filesystem_committer(&engine)?;
 
 // Build the write state before iterating over partitions.
 let write_state = txn.write_state()?;

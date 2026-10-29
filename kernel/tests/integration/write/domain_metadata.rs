@@ -1,6 +1,5 @@
 //! Integration tests for domain metadata set/remove flows.
 
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::transaction::UpdateTableOperation;
@@ -55,7 +54,7 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
     // write context does not conflict with domain metadata
     let _write_context = txn.write_state()?.write_context_builder().build()?;
 
-    assert!(txn.commit(&engine)?.is_committed());
+    assert!(txn.commit(&engine)?.0.is_committed());
 
     let commit_data = store
         .get(&Path::from(format!(
@@ -289,7 +288,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
         .update_table(UpdateTableOperation::Write, "test-engine", true)
         .with_domain_metadata("app.config", "v1")
         .with_domain_metadata_removed("app.config")
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&engine)
         .unwrap_err();
     assert!(err
         .to_string()
@@ -301,7 +300,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
         .update_table(UpdateTableOperation::Write, "test-engine", true)
         .with_domain_metadata_removed("test.domain")
         .with_domain_metadata("test.domain", "v1")
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&engine)
         .unwrap_err();
     assert!(err
         .to_string()
@@ -313,7 +312,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
         .update_table(UpdateTableOperation::Write, "test-engine", true)
         .with_domain_metadata_removed("another.domain")
         .with_domain_metadata_removed("another.domain")
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&engine)
         .unwrap_err();
     assert!(err.to_string().contains("removed more than once"));
 
@@ -361,6 +360,7 @@ async fn test_builder_domain_metadata_with_late_operation(
         |builder| builder.with_domain_metadata("app.other", "original"),
     )?
     .commit(&engine)?
+    .0
     .unwrap_post_commit_snapshot();
     let transaction = begin_transaction_with(
         snapshot.clone(),
@@ -387,7 +387,7 @@ async fn test_builder_domain_metadata_with_late_operation(
             Some("original")
         );
     } else {
-        let latest = result?.unwrap_post_commit_snapshot();
+        let latest = result?.0.unwrap_post_commit_snapshot();
         assert_eq!(latest.version(), snapshot.version() + 1);
         assert_eq!(
             latest

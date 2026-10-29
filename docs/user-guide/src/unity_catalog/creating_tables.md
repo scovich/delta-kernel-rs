@@ -91,9 +91,10 @@ let create_txn = create_table(
     table_uri.as_str(), Arc::new(schema), "MyApp/1.0", /* data_change */ true,
 )
     .with_table_properties(disk_props)
-    .build(&engine, committer)?;
+    .build_with_committer(&engine, committer)?;
 
-let post_commit_snapshot = match create_txn.commit(&engine)? {
+let (commit_result, _committer) = create_txn.commit(&engine)?;
+let post_commit_snapshot = match commit_result {
     CommitResult::Committed(committed) => committed
         .post_commit_snapshot()
         .cloned()
@@ -167,7 +168,7 @@ let create_txn = create_table(
 )
     .with_table_properties(disk_props)
     .with_data_layout(DataLayout::clustered(["region"]))
-    .build(&engine, committer)?;
+    .build_with_committer(&engine, committer)?;
 ```
 
 `build_uc_create_table_request` forwards the committed `delta.clustering` domain verbatim into the

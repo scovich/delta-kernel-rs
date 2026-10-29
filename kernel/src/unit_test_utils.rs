@@ -25,7 +25,6 @@ use crate::arrow::array::{
 use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::concat_batches;
 use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_conversion::{parquet_field_id_metadata, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::SyncEngine;
@@ -46,7 +45,7 @@ use crate::table_properties::{
     ENABLE_DELETION_VECTORS, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
 };
 use crate::transaction::create_table::create_table;
-use crate::transaction::{CreateTable, Transaction, BASE_ADD_FILES_SCHEMA};
+use crate::transaction::{CreateTable, TransactionWithCommitter, BASE_ADD_FILES_SCHEMA};
 use crate::{
     Engine, EngineData, FileMeta, KernelError, KernelResult, Snapshot, SnapshotRef, Version,
 };
@@ -375,7 +374,7 @@ pub(crate) mod adaptive_metadata_fixtures {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
         let schema = schema_ref! { nullable "id": INTEGER };
         let _ = create_table("memory:///", schema, "test", true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .build_with_filesystem_committer(&engine)?
             .commit(&engine)?;
         let table_root = Snapshot::builder_for("memory:///")
             .build(&engine)?
@@ -1187,7 +1186,7 @@ pub(crate) fn test_deep_nested_schema_missing_leaf_cm() -> StructType {
 pub(crate) fn setup_column_mapping_txn(
     schema: SchemaRef,
     mode: ColumnMappingMode,
-) -> KernelResult<(Arc<dyn Engine>, Transaction<CreateTable>)> {
+) -> KernelResult<(Arc<dyn Engine>, TransactionWithCommitter<CreateTable>)> {
     let mode_str = match mode {
         ColumnMappingMode::Name => "name",
         ColumnMappingMode::Id => "id",
@@ -1198,7 +1197,7 @@ pub(crate) fn setup_column_mapping_txn(
 
     let txn = create_table("memory:///test_table", schema, "DefaultEngine", true)
         .with_table_properties([("delta.columnMapping.mode", mode_str)])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(engine.as_ref())?;
     Ok((engine, txn))
 }
 

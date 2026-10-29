@@ -233,7 +233,7 @@ use delta_kernel::schema::{
 };
 use delta_kernel::table_features::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 use delta_kernel::transaction::{
-    CommitResult, Transaction, UpdateTableOperation, UpdateTableTransactionBuilder,
+    CommitResult, TransactionWithCommitter, UpdateTableOperation, UpdateTableTransactionBuilder,
 };
 use delta_kernel::{
     try_parse_uri, CancellationToken, CancellationTokenRef, CancelledFuture, Engine, EngineData,
@@ -1237,7 +1237,7 @@ pub async fn insert_data_with<E: TaskExecutor>(
     if is_blind_append {
         builder = builder.with_blind_append();
     }
-    let mut txn = builder.build(engine.as_ref(), committer)?;
+    let mut txn = builder.build_with_committer(engine.as_ref(), committer)?;
     txn.ack_column_defaults();
 
     let write_state = txn.write_state()?;
@@ -1247,14 +1247,14 @@ pub async fn insert_data_with<E: TaskExecutor>(
         .await?;
     txn.add_files(add_files_metadata);
 
-    txn.commit(engine.as_ref())
+    txn.commit(engine.as_ref()).map(|(result, _)| result)
 }
 
 /// Starts a `WRITE` transaction using the passed snapshot and a [`FileSystemCommitter`].
 pub fn begin_transaction(
     snapshot: Arc<Snapshot>,
     engine: &dyn Engine,
-) -> KernelResult<Transaction> {
+) -> KernelResult<TransactionWithCommitter> {
     begin_transaction_with(
         snapshot,
         engine,
@@ -1277,9 +1277,9 @@ pub fn begin_transaction_with(
     engine_info: impl Into<String>,
     data_change: bool,
     configure: impl FnOnce(UpdateTableTransactionBuilder) -> UpdateTableTransactionBuilder,
-) -> KernelResult<Transaction> {
+) -> KernelResult<TransactionWithCommitter> {
     configure(snapshot.update_table(operation, engine_info, data_change))
-        .build(engine, Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(engine)
 }
 
 /// A catalog [`Committer`] for tests: writes every commit directly to the published Delta log
@@ -1319,7 +1319,7 @@ impl Committer for TestCatalogCommitter {
 pub fn load_and_begin_transaction(
     table_url: impl AsRef<str>,
     engine: &dyn Engine,
-) -> KernelResult<Transaction> {
+) -> KernelResult<TransactionWithCommitter> {
     load_and_begin_transaction_with(
         table_url,
         engine,
@@ -1342,7 +1342,7 @@ pub fn load_and_begin_transaction_with(
     engine_info: impl Into<String>,
     data_change: bool,
     configure: impl FnOnce(UpdateTableTransactionBuilder) -> UpdateTableTransactionBuilder,
-) -> KernelResult<Transaction> {
+) -> KernelResult<TransactionWithCommitter> {
     let snapshot = Snapshot::builder_for(table_url).build(engine)?;
     begin_transaction_with(
         snapshot,
@@ -1708,7 +1708,7 @@ pub async fn write_batch_to_table(
     let mut txn = snapshot
         .clone()
         .update_table(UpdateTableOperation::Write, "DefaultEngine", true)
-        .build(engine, Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(engine)?;
     txn.ack_column_defaults();
     let write_state = txn.write_state()?;
     let write_context = if txn.logical_partition_columns().is_empty() {
@@ -1727,7 +1727,7 @@ pub async fn write_batch_to_table(
         .write_parquet(&ArrowEngineData::new(data), &write_context)
         .await?;
     txn.add_files(add_meta);
-    match txn.commit(engine)? {
+    match txn.commit(engine)?.0 {
         delta_kernel::transaction::CommitResult::Committed(c) => Ok(c
             .post_commit_snapshot()
             .expect("Failed to get post_commit_snapshot")
@@ -2014,12 +2014,11 @@ pub fn create_table_and_load_snapshot(
     engine: &dyn Engine,
     properties: &[(&str, &str)],
 ) -> KernelResult<Arc<Snapshot>> {
-    use delta_kernel::committer::FileSystemCommitter;
     use delta_kernel::transaction::create_table::create_table;
 
     let _ = create_table(table_path, schema, "Test/1.0", true)
         .with_table_properties(properties.to_vec())
-        .build(engine, Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine)?
         .commit(engine)?;
 
     let table_url = delta_kernel::try_parse_uri(table_path)?;
@@ -2189,11 +2188,11 @@ pub fn remove_all_and_get_remove_actions(
     let mut txn = snapshot
         .clone()
         .update_table(UpdateTableOperation::Write, "DefaultEngine", true)
-        .build(engine, Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(engine)?;
     for sm in all_scan_metadata {
         txn.remove_files(sm.scan_files);
     }
-    let committed = match txn.commit(engine)? {
+    let committed = match txn.commit(engine)?.0 {
         CommitResult::Committed(c) => c,
         _ => panic!("Transaction should be committed"),
     };
