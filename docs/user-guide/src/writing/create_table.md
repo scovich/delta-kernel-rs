@@ -242,16 +242,13 @@ features may additionally materialize them into the data files; see
 
 ## The Committer
 
-The `build()` method takes a `Box<dyn Committer>` that controls how the commit is
-persisted:
+`build_with_filesystem_committer()` uses a `FileSystemCommitter` for standalone
+filesystem-based tables. It writes commit files directly to `_delta_log/` using
+atomic put-if-absent.
 
-- **`FileSystemCommitter`**: For standalone filesystem-based tables. Writes commit files
-  directly to `_delta_log/` using atomic put-if-absent. This is the default for most use
-  cases.
-
-- **Custom `Committer`**: For catalog-managed tables (e.g. Unity Catalog), you implement
-  the `Committer` trait to route commits through the catalog. See
-  [Catalog-Managed Tables](../catalog_managed/overview.md).
+`build_with_committer()` takes a `Box<dyn Committer>` when you supply your own,
+including for catalog-managed tables (e.g. Unity Catalog). See
+[Catalog-Managed Tables](../catalog_managed/overview.md).
 
 ## Handling the result
 

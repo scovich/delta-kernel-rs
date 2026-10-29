@@ -28,8 +28,9 @@ use crate::{Engine, KernelError, KernelResult};
 /// This builder does not create or replace tables. Construct it with
 /// [`Snapshot::update_table`](crate::Snapshot::update_table); operation, engine info, and
 /// `data_change` cannot be changed afterward.
-/// [`build`](UpdateTableTransactionBuilder::build) validates the accumulated intent and constructs
-/// the transaction.
+/// [`build_with_committer`](UpdateTableTransactionBuilder::build_with_committer) and
+/// [`build_with_filesystem_committer`](UpdateTableTransactionBuilder::build_with_filesystem_committer)
+/// validate the accumulated intent and construct the transaction.
 ///
 /// # Schema changes
 ///
@@ -46,7 +47,8 @@ use crate::{Engine, KernelError, KernelResult};
 ///
 /// Set `data_change` when constructing the builder: `true` for logical data changes, or `false`
 /// for metadata-only changes and data-preserving rewrites. `ALTER TABLE` requires `false`, while
-/// blind append requires `true`. [`build`](UpdateTableTransactionBuilder::build) rejects
+/// blind append requires `true`.
+/// [`build_with_committer`](UpdateTableTransactionBuilder::build_with_committer) rejects
 /// incompatible intent; commit validates the staged file actions and rejects any staged
 /// data-file batches or manifest writes for `ALTER TABLE`.
 ///
@@ -108,7 +110,8 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         self
     }
 
-    /// Adds schema changes to validate and apply during [`build`](Self::build).
+    /// Adds schema changes to validate and apply during
+    /// [`build_with_committer`](Self::build_with_committer).
     ///
     /// Appends `changes` in call order and returns the updated builder. Each change observes the
     /// result of prior changes. Empty input is rejected immediately.
@@ -139,7 +142,8 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// must be nullable because existing data files do not contain it. On column-mapping tables,
     /// Kernel assigns or preserves column-mapping IDs and physical names.
     ///
-    /// Schema changes are applied in call order and validated by [`build`](Self::build).
+    /// Schema changes are applied in call order and validated by
+    /// [`build_with_committer`](Self::build_with_committer).
     pub fn add_column(mut self, field: StructField) -> Self {
         self.local_state
             .schema_changes
@@ -156,7 +160,8 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// sibling. On column-mapping tables, Kernel assigns or preserves column-mapping IDs and
     /// physical names.
     ///
-    /// Schema changes are applied in call order and validated by [`build`](Self::build).
+    /// Schema changes are applied in call order and validated by
+    /// [`build_with_committer`](Self::build_with_committer).
     pub fn add_column_at(mut self, parent: ColumnName, field: StructField) -> Self {
         self.local_state
             .schema_changes
@@ -183,7 +188,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// Removing a domain that does not exist is a no-op.
     ///
     /// Each domain may occur only once across additions and removals. Conflicts are rejected by
-    /// [`build`](Self::build).
+    /// [`build_with_committer`](Self::build_with_committer).
     pub fn with_domain_metadata_removed(mut self, domain: impl Into<String>) -> Self {
         self.local_state
             .domain_metadata_removals
@@ -217,6 +222,19 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// Schema changes are rejected when `icebergCompatV2`, `icebergCompatV3`, or
     /// `allowColumnDefaults` is enabled. This applies to standalone ALTER TABLE transactions and
     /// schema evolution during data-changing writes.
+    ///
+    /// For path-based tables that use the default filesystem committer,
+    /// [`Self::build_with_filesystem_committer`] is shorter.
+    pub fn build_with_committer(
+        self,
+        engine: &dyn Engine,
+        committer: Box<dyn Committer>,
+    ) -> KernelResult<Transaction<UpdateTable, MODE>> {
+        self.build(engine, committer)
+    }
+
+    /// Compatibility alias for [`Self::build_with_committer`].
+    #[doc(hidden)]
     pub fn build(
         self,
         engine: &dyn Engine,
@@ -228,16 +246,10 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         Ok(transaction)
     }
 
-    /// Equivalent to [`Self::build`] with the given `committer`.
-    pub fn build_with_committer(
-        self,
-        engine: &dyn Engine,
-        committer: Box<dyn Committer>,
-    ) -> KernelResult<Transaction<UpdateTable, MODE>> {
-        self.build(engine, committer)
-    }
-
-    /// Equivalent to [`Self::build`] with a [`FileSystemCommitter`].
+    /// Builds a transaction with a [`FileSystemCommitter`].
+    ///
+    /// This is the usual choice for path-based tables. Catalog-managed tables require a catalog
+    /// committer via [`Self::build_with_committer`].
     pub fn build_with_filesystem_committer(
         self,
         engine: &dyn Engine,

@@ -877,7 +877,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
     /// # }
     /// ```
     ///
-    /// [`build()`]: CreateTableTransactionBuilder::build
+    /// [`build()`]: CreateTableTransactionBuilder::build_with_committer
     #[internal_api]
     pub(crate) fn with_table_properties<I, K, V>(mut self, properties: I) -> Self
     where
@@ -971,6 +971,20 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
     /// - Unsupported delta properties or feature flags are specified
     /// - Connector commit information does not contain exactly one row
     /// - An application transaction identifier occurs more than once
+    ///
+    /// For path-based tables that use the default filesystem committer,
+    /// [`Self::build_with_filesystem_committer`] is shorter.
+    #[internal_api]
+    pub(crate) fn build_with_committer(
+        self,
+        engine: &dyn Engine,
+        committer: Box<dyn Committer>,
+    ) -> KernelResult<CreateTableTransaction<MODE>> {
+        self.build(engine, committer)
+    }
+
+    /// Compatibility alias for [`Self::build_with_committer`].
+    #[doc(hidden)]
     #[internal_api]
     pub(crate) fn build(
         self,
@@ -1097,17 +1111,10 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
         Ok(transaction)
     }
 
-    /// Equivalent to [`Self::build`] with the given `committer`.
-    #[internal_api]
-    pub(crate) fn build_with_committer(
-        self,
-        engine: &dyn Engine,
-        committer: Box<dyn Committer>,
-    ) -> KernelResult<CreateTableTransaction<MODE>> {
-        self.build(engine, committer)
-    }
-
-    /// Equivalent to [`Self::build`] with a [`FileSystemCommitter`].
+    /// Builds a transaction with a [`FileSystemCommitter`].
+    ///
+    /// This is the usual choice for path-based tables. Catalog-managed tables require a catalog
+    /// committer via [`Self::build_with_committer`].
     #[internal_api]
     pub(crate) fn build_with_filesystem_committer(
         self,

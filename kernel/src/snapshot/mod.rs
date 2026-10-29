@@ -1262,7 +1262,7 @@ impl Snapshot {
     /// nullable column with `ALTER TABLE`, or compaction that rewrites files without changing any
     /// records. Kernel preserves this value even when no files are staged; it does not compare
     /// file contents to verify it. Invalid names and incompatible intent are rejected by
-    /// [`UpdateTableTransactionBuilder::build`].
+    /// [`UpdateTableTransactionBuilder::build_with_committer`].
     ///
     /// Operation, engine info, and data-change intent are required:
     ///
