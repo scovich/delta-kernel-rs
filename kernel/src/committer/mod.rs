@@ -36,25 +36,34 @@ pub use declarative::write_commit_json_declarative;
 pub use filesystem::FileSystemCommitter;
 pub use publish_types::{CatalogCommit, PublishMetadata};
 
+use crate::coroutine::generator::{AsyncIntoIterator as _, Generator};
+use crate::coroutine::kernel::engine::EngineConnector;
+use crate::coroutine::kernel::{Coroutine, Request};
 #[cfg(feature = "declarative-plans")]
 use crate::plans::{RelationRef, ScopedPlanExecutor};
 #[cfg(feature = "declarative-plans")]
 use crate::KernelError;
 use crate::{Engine, FilteredEngineData, KernelResult, KernelResultIterator};
 
-/// Actions ready to be committed in Delta log order.
-pub type CommitActions = Box<dyn KernelResultIterator<FilteredEngineData>>;
+/// Unpolled actions for one prepared Delta log commit.
+pub type CommitActions =
+    Box<dyn Generator<Request, Item = KernelResult<FilteredEngineData>, Output = ()>>;
 
-/// A Delta log commit ready for a [`Committer`] to persist.
+/// A Delta log commit ready for a connector-selected committer.
 pub struct Commit {
     metadata: CommitMetadata,
     actions: CommitActions,
 }
 
 impl Commit {
-    /// Creates a prepared commit from owned actions and their metadata.
-    pub fn new(metadata: CommitMetadata, actions: CommitActions) -> Self {
+    /// Creates a prepared commit from connector-driven actions and their metadata.
+    pub(crate) fn new(metadata: CommitMetadata, actions: CommitActions) -> Self {
         Self { metadata, actions }
+    }
+
+    /// Creates a prepared commit from an Engine compatibility iterator.
+    pub fn from_iterator(actions: CommitActionsIterator, metadata: CommitMetadata) -> Self {
+        Self::new(metadata, Box::new(actions.into_generator()))
     }
 
     /// Validates the selected committer and returns this commit's metadata and actions.
@@ -66,10 +75,25 @@ impl Commit {
         Ok((self.metadata, self.actions))
     }
 
+    /// Validates the selected committer and returns Engine-compatible metadata and actions.
+    pub fn try_into_engine_parts(
+        self,
+        engine: &dyn Engine,
+        is_catalog_committer: bool,
+    ) -> KernelResult<(CommitMetadata, CommitActionsIterator)> {
+        let (metadata, actions) = self.try_into_parts(is_catalog_committer)?;
+        let actions = EngineConnector::new(engine)
+            .iterate_result_coroutine(Coroutine::from_generator(actions));
+        Ok((metadata, Box::new(actions)))
+    }
+
     pub(crate) fn version(&self) -> crate::Version {
         self.metadata.version()
     }
 }
+
+/// Engine compatibility actions ready to be committed in Delta log order.
+pub type CommitActionsIterator = Box<dyn KernelResultIterator<FilteredEngineData>>;
 
 /// A Committer is the system by which transactions are committed to a table. Transactions are
 /// effectively a collection of actions performed on the table at a specific version. The kernel

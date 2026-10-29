@@ -191,9 +191,9 @@ pub(crate) mod parallel;
 pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliationIteratorState};
 use cancellation::{check_cancelled, CancellableIterator};
 pub use cancellation::{CancellationToken, CancellationTokenRef, CancelledFuture};
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use coroutine::kernel::Channel;
-use coroutine::kernel::{run_workflow_with_engine, ChannelExt as _};
+#[cfg(test)]
+use coroutine::kernel::run_workflow_with_engine;
+use coroutine::kernel::{Channel, ChannelExt as _};
 pub use delta_kernel_derive;
 pub use engine_data::{
     EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
@@ -546,6 +546,7 @@ pub trait EvaluationHandler: AsAny {
 /// Creates one row containing a single scalar value.
 ///
 /// `schema` must contain exactly one top-level field whose type matches `value`.
+#[cfg(test)]
 pub(crate) fn create_row(
     engine: &dyn Engine,
     schema: SchemaRef,
@@ -556,7 +557,6 @@ pub(crate) fn create_row(
 }
 
 /// Creates one row through `channel`.
-#[cfg(feature = "adaptive-metadata-in-dev")]
 pub(crate) async fn create_row_with_channel(
     channel: &Channel,
     schema: SchemaRef,

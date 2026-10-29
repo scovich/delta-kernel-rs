@@ -9,6 +9,7 @@ use bytes::Bytes;
 use derive_more::{Constructor, From};
 use url::Url;
 
+use crate::committer::{Commit, CommitResponse};
 use crate::coroutine::{PageRequest, PagedOperation, Reply};
 use crate::expressions::{ExpressionRef, PredicateRef};
 use crate::path::may_begin_listable_log_path;
@@ -43,6 +44,8 @@ pub enum Request {
     EvaluateExpression(EvaluateExpression, Reply<Box<dyn EngineData>>),
     /// Evaluate a prepared predicate against one [`EngineData`] batch.
     EvaluatePredicate(EvaluatePredicate, Reply<Box<dyn EngineData>>),
+    /// Commit one prepared transaction through a connector-selected committer.
+    Commit(Box<Commit>, Reply<CommitResponse>),
 }
 
 /// URL bounds for a forward listing.

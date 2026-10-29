@@ -1329,7 +1329,7 @@ impl Snapshot {
     ///
     /// Returns [`KernelError::MissingVersion`] when this version's commit file must be read but is
     /// not in the log segment, or an error if the file cannot be read.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
     pub(crate) fn last_manifest_commit(
         &self,
         engine: &dyn Engine,

@@ -5,14 +5,18 @@ use std::sync::Arc;
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::visitors::SetTransactionMap;
 use crate::actions::{CheckpointAction, ContentRoot, DomainMetadata, SetTransaction};
-use crate::coroutine::kernel::{run_workflow_with_engine, Channel};
+#[cfg(test)]
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::Channel;
 use crate::crc::{merge_domain_metadata, DomainMetadataState, SetTransactionState};
 use crate::error::KernelError;
 use crate::log_segment::DomainMetadataMap;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
-use crate::{version_as_i64, Engine, FileMeta, KernelResult, Version};
+#[cfg(test)]
+use crate::Engine;
+use crate::{version_as_i64, FileMeta, KernelResult, Version};
 
 /// A pointer to an on-disk root manifest file to be committed as the table's content root via a
 /// `checkpoint` action.
@@ -38,6 +42,7 @@ impl RootManifestFile {
     ///
     /// Errors if an existing checkpoint does not already cover the read snapshot's version, meaning
     /// delta log commits are still pending replay since it.
+    #[cfg(test)]
     pub(super) fn compute_checkpoint_action(
         &self,
         engine: &dyn Engine,

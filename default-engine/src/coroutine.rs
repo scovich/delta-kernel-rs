@@ -112,7 +112,7 @@ impl AsyncEngineConnector {
         self
     }
 
-    /// Serve every request from `workflow` until it completes.
+    /// Serve supported requests from `workflow` until it completes.
     ///
     /// Cancellation is owned entirely by this driver and is never delivered through a
     /// [`delta_kernel::coroutine::Reply`]. Because this API otherwise returns [`KernelResult`],
@@ -180,6 +180,9 @@ impl AsyncEngineConnector {
                 predicate_evaluator(&operation.evaluator)
                     .and_then(|evaluator| evaluator.evaluate(operation.input.as_ref())),
             ),
+            Request::Commit(_, reply) => reply.send(Err(KernelError::internal_error(
+                "commit request requires a committer-aware driver",
+            ))),
         }
         Ok(())
     }

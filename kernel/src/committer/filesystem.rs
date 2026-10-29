@@ -57,7 +57,7 @@ impl Committer for FileSystemCommitter {
         err
     )]
     fn commit(&self, engine: &dyn Engine, commit: Commit) -> KernelResult<CommitResponse> {
-        let (commit_metadata, actions) = commit.try_into_parts(false)?;
+        let (commit_metadata, actions) = commit.try_into_engine_parts(engine, false)?;
         let version = commit_metadata.version();
         let published_commit_path = commit_metadata.published_commit_path()?;
 
@@ -155,7 +155,7 @@ mod tests {
                 let actions = Box::new(std::iter::once(Ok(
                     FilteredEngineData::with_all_rows_selected(action),
                 )));
-                committer.commit(engine, Commit::new(commit_metadata, actions))
+                committer.commit(engine, Commit::from_iterator(actions, commit_metadata))
             }
             #[cfg(feature = "declarative-plans")]
             CommitStyle::Declarative => {

@@ -16,6 +16,7 @@ use super::request::{
 };
 use super::{Coroutine, CoroutineStep, KernelResultGenerator, Request, Workflow};
 use crate::cancellation::{check_cancelled, CancellationTokenRef};
+use crate::committer::Committer;
 use crate::coroutine::{drive_workflow, Cursor, Page, PageRequest, PagedOperation, Reply};
 use crate::{
     Engine, EngineData, EvaluationHandler, ExpressionEvaluator, FileDataReadResultIterator,
@@ -86,6 +87,26 @@ impl EngineConnector {
         let mut cancellation = CancellationLatch::default();
         let output = drive_workflow!(workflow, |request| {
             cancellation.record(self.respond(request))?
+        });
+        cancellation.finish(output)
+    }
+
+    /// Drives a workflow using `committer` for commit requests.
+    pub(crate) fn drive_with_committer<O>(
+        &self,
+        workflow: Workflow<'_, O>,
+        engine: &dyn Engine,
+        committer: &dyn Committer,
+    ) -> KernelResult<O> {
+        let mut cancellation = CancellationLatch::default();
+        let output = drive_workflow!(workflow, |request| {
+            let result = match request {
+                Request::Commit(commit, reply) => {
+                    complete(reply, committer.commit(engine, *commit))
+                }
+                request => self.respond(request),
+            };
+            cancellation.record(result)?
         });
         cancellation.finish(output)
     }
@@ -200,6 +221,11 @@ impl EngineConnector {
                         .and_then(|evaluator| evaluator.evaluate(operation.input.as_ref()))
                 }),
             )?,
+            Request::Commit(..) => {
+                return Err(KernelError::internal_error(
+                    "commit request requires a committer-aware driver",
+                ));
+            }
         }
         Ok(())
     }
@@ -399,6 +425,9 @@ impl StorageConnector<'_> {
             | Request::EvaluateExpression(..)
             | Request::EvaluatePredicate(..) => Err(KernelError::internal_error(
                 "evaluation requires an Engine connector",
+            )),
+            Request::Commit(..) => Err(KernelError::internal_error(
+                "commit request requires an Engine connector with a committer",
             )),
         }
     }

@@ -2,12 +2,13 @@ use std::collections::HashSet;
 
 use super::{ExecutionMode, Transaction};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
+use crate::coroutine::kernel::Channel;
 use crate::error::KernelError;
 use crate::row_tracking::{
     RowTrackingDomainMetadata, ROW_TRACKING_DOMAIN_NAME, ROW_TRACKING_INITIAL_HIGH_WATER_MARK,
 };
 use crate::table_features::TableFeature;
-use crate::{Engine, KernelResult};
+use crate::KernelResult;
 
 impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// Validate domain metadata operations for both create-table and existing-table transactions.
@@ -158,9 +159,9 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// This performs an expensive log replay operation to fetch the previous configuration
     /// value for each domain being removed, as required by the Delta spec for tombstones.
     /// Returns an empty vector if there are no domain removals.
-    pub(super) fn generate_user_domain_removal_actions(
+    async fn generate_user_domain_removal_actions_with_channel(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
     ) -> KernelResult<Vec<DomainMetadata>> {
         if self.user_domain_removals.is_empty() {
             return Ok(vec![]);
@@ -176,7 +177,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             .collect();
         let existing_domains = self
             .read_snapshot()?
-            .get_domain_metadatas_internal(engine, Some(&domains))?;
+            .get_domain_metadatas_internal_with_channel(channel, Some(&domains))
+            .await?;
 
         // Create removal tombstones with pre-image configurations
         Ok(self
@@ -202,12 +204,14 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// This function may perform an expensive log replay operation if there are any domain
     /// removals. The log replay is required to fetch the previous configuration value for the
     /// domain to preserve in removal tombstones as mandated by the Delta spec.
-    pub(super) fn generate_domain_metadata_actions(
+    pub(super) async fn generate_domain_metadata_actions_with_channel(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         row_tracking_high_watermark: Option<RowTrackingDomainMetadata>,
     ) -> KernelResult<Vec<DomainMetadata>> {
-        let removal_actions = self.generate_user_domain_removal_actions(engine)?;
+        let removal_actions = self
+            .generate_user_domain_removal_actions_with_channel(channel)
+            .await?;
 
         let row_tracking_high_watermark =
             if let Some(provided) = self.provided_row_tracking_high_water_mark {
@@ -215,7 +219,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
                     Some(metadata) => metadata.high_water_mark(),
                     None => self
                         .read_snapshot()?
-                        .get_row_tracking_high_water_mark(engine)?
+                        .get_row_tracking_high_water_mark_with_channel(channel)
+                        .await?
                         .unwrap_or(ROW_TRACKING_INITIAL_HIGH_WATER_MARK),
                 };
                 if provided < calculated {

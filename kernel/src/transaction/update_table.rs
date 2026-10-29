@@ -21,8 +21,10 @@ use crate::actions::deletion_vector::DeletionVectorDescriptor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::BackReference;
 use crate::actions::{LOG_ADD_SCHEMA, NUM_RECORDS, TIGHT_BOUNDS};
+use crate::coroutine::generator::{map_async, AsyncIntoIterator as _, GeneratorExt as _};
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::coroutine::kernel::{run_workflow_with_engine, Channel};
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::{Channel, ChannelExt as _, KernelResultGenerator};
 use crate::engine_data::{
     FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData,
 };
@@ -39,9 +41,9 @@ use crate::schema::{lazy_schema_ref, ArrayType, SchemaRef, StructField, ToSchema
 use crate::table_features::TableFeature;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::utils::require;
+use crate::{DataType, Expression, KernelResult, KernelResultIterator};
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::FileMeta;
-use crate::{DataType, Engine, Expression, KernelResult, KernelResultIterator};
+use crate::{Engine, FileMeta};
 
 // =============================================================================
 // Update table transactions only
@@ -540,10 +542,10 @@ impl<STATE> Transaction<STATE, Imperative> {
     /// actions. For each file:
     /// 1. A Remove action is generated for the old file
     /// 2. An Add action is generated with the new DV descriptor
-    pub(super) fn generate_dv_update_actions(
+    pub(super) async fn generate_dv_update_actions_with_channel(
         &self,
-        engine: &dyn Engine,
-    ) -> KernelResult<impl KernelResultIterator<FilteredEngineData>> {
+        channel: &Channel,
+    ) -> KernelResult<impl KernelResultGenerator<FilteredEngineData> + 'static> {
         // Create-table transactions should not have any DV update actions
         if self.is_create_table() && !self.staged_data_changes.dv_matched_files.is_empty() {
             return Err(crate::error::KernelError::internal_error(
@@ -556,17 +558,20 @@ impl<STATE> Transaction<STATE, Imperative> {
             .dv_matched_files
             .clone()
             .into_iter();
-        let remove_actions = self.generate_remove_actions(
-            engine,
+        let remove_actions = self.generate_remove_actions_with_channel(
+            channel,
             remove_files_metadata,
             true, /* has_dv_update_columns */
-        )?;
+        );
+        let remove_actions = remove_actions.await?;
         let file_metadata_batch = self
             .staged_data_changes
             .dv_matched_files
             .clone()
             .into_iter();
-        let add_actions = self.generate_adds_for_dv_update(engine, file_metadata_batch)?;
+        let add_actions = self
+            .generate_adds_for_dv_update_with_channel(channel, file_metadata_batch)
+            .await?;
         Ok(remove_actions.chain(add_actions))
     }
 
@@ -574,12 +579,11 @@ impl<STATE> Transaction<STATE, Imperative> {
     ///
     /// This transforms scan file metadata with new DV descriptors (appended as a temporary column)
     /// into Add actions for the Delta log.
-    fn generate_adds_for_dv_update(
+    async fn generate_adds_for_dv_update_with_channel(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         file_metadata_batch: impl Iterator<Item = Arc<FilteredEngineData>> + Send + 'static,
-    ) -> KernelResult<impl KernelResultIterator<FilteredEngineData>> {
-        let evaluation_handler = engine.evaluation_handler();
+    ) -> KernelResult<impl KernelResultGenerator<FilteredEngineData> + 'static> {
         // Struct patch to replace the deletionVector field with the new DV/stats from
         // NEW_DELETION_VECTOR_NAME/NEW_STATS_NAME, then drop the
         // NEW_DELETION_VECTOR_NAME/NEW_STATS_NAME columns.
@@ -592,16 +596,18 @@ impl<STATE> Transaction<STATE, Imperative> {
         )?;
         // TODO(#3263): `file_metadata_batch` may contain `stats_parsed` and
         // `partitionValues_parsed`; provide its full schema to both evaluators.
-        let with_new_dv_eval = evaluation_handler.new_expression_evaluator(
+        let with_new_dv_eval = channel.create_expression_evaluator(
             intermediate_dv_schema().clone(),
             Arc::new(with_new_dv_expr),
             nullable_scan_rows_schema().clone().into(),
-        )?;
-        let restored_add_eval = evaluation_handler.new_expression_evaluator(
+        );
+        let with_new_dv_eval = with_new_dv_eval.await?;
+        let restored_add_eval = channel.create_expression_evaluator(
             nullable_scan_rows_schema().clone(),
             get_scan_metadata_transform_expr(),
             nullable_restored_add_schema().clone().into(),
-        )?;
+        );
+        let restored_add_eval = restored_add_eval.await?;
         #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_mut))]
         let mut add_patch = ExpressionStructPatchBuilder::new_nested(["add"])
             .insert_after("modificationTime", lit(self.data_change));
@@ -613,25 +619,32 @@ impl<STATE> Transaction<STATE, Imperative> {
         }
         let with_data_change_patch = Expression::struct_patch(add_patch)?;
         let with_data_change_expr = Arc::new(Expression::struct_from([with_data_change_patch]));
-        let with_data_change_eval = evaluation_handler.new_expression_evaluator(
+        let with_data_change_eval = channel.create_expression_evaluator(
             nullable_restored_add_schema().clone(),
             with_data_change_expr,
             nullable_add_log_schema().clone().into(),
-        )?;
-        Ok(file_metadata_batch.map(
-            move |file_metadata_batch| -> KernelResult<FilteredEngineData> {
-                let with_new_dv_data = with_new_dv_eval.evaluate(file_metadata_batch.data())?;
+        );
+        let with_data_change_eval = with_data_change_eval.await?;
+        Ok(map_async!(
+            file_metadata_batch.into_generator(),
+            async move |channel, file_metadata_batch| {
+                let with_new_dv_data = channel
+                    .evaluate_expression(&with_new_dv_eval, file_metadata_batch.data().clone_data())
+                    .await?;
 
-                let as_partial_add_data = restored_add_eval.evaluate(with_new_dv_data.as_ref())?;
+                let as_partial_add_data = channel
+                    .evaluate_expression(&restored_add_eval, with_new_dv_data)
+                    .await?;
 
-                let with_data_change_data =
-                    with_data_change_eval.evaluate(as_partial_add_data.as_ref())?;
+                let with_data_change_data = channel
+                    .evaluate_expression(&with_data_change_eval, as_partial_add_data)
+                    .await?;
 
                 FilteredEngineData::try_new(
                     with_data_change_data,
                     file_metadata_batch.selection_vector().to_vec(),
                 )
-            },
+            }
         ))
     }
 }
