@@ -15,8 +15,8 @@ use crate::actions::{
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{BackReference, CheckpointAction, LastManifestCommit};
 use crate::committer::{
-    CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
-    FileSystemCommitter,
+    Commit, CommitActions, CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType,
+    Committer, FileSystemCommitter,
 };
 use crate::crc::{CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
@@ -609,7 +609,6 @@ impl<STATE> Transaction<STATE, Imperative> {
             metadata,
             dm_changes.clone(),
         )?;
-        commit_metadata.validate_committer(committer.is_catalog_committer())?;
         let prepare_duration = commit_start.elapsed();
         let (commit_response, committer_duration) =
             self.perform_commit(engine, committer, actions, commit_metadata);
@@ -915,7 +914,7 @@ struct NonfileCommitActions {
 
 /// The encoded commit actions, plus the state the post-commit CRC and snapshot are built from.
 struct CommitBatches {
-    actions: Box<dyn KernelResultIterator<FilteredEngineData>>,
+    actions: CommitActions,
     dm_changes: Vec<DomainMetadata>,
     /// The `checkpoint` action this commit writes, if any (adaptiveMetadata).
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1762,11 +1761,11 @@ impl<STATE> Transaction<STATE, Imperative> {
         &self,
         engine: &dyn Engine,
         committer: &dyn Committer,
-        actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
+        actions: CommitActions,
         commit_metadata: CommitMetadata,
     ) -> (KernelResult<CommitResponse>, Duration) {
         let committer_start = Instant::now();
-        let commit_response = committer.commit(engine, actions, commit_metadata);
+        let commit_response = committer.commit(engine, Commit::new(commit_metadata, actions));
         (commit_response, committer_start.elapsed())
     }
 
@@ -2363,7 +2362,7 @@ mod tests {
         test_schema_flat, test_schema_nested, test_schema_with_array, test_schema_with_map,
         CapturingReporter, MockProtocolBuilder, MockTableConfigurationBuilder,
     };
-    use crate::{EvaluationHandler, KernelResultIterator, Snapshot};
+    use crate::{EvaluationHandler, Snapshot};
 
     #[rstest]
     fn transaction_constructor_initializes_all_defaults(
@@ -2551,12 +2550,7 @@ mod tests {
     struct IoErrorCommitter;
 
     impl Committer for IoErrorCommitter {
-        fn commit(
-            &self,
-            _engine: &dyn Engine,
-            _actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
-            _commit_metadata: CommitMetadata,
-        ) -> KernelResult<CommitResponse> {
+        fn commit(&self, _engine: &dyn Engine, _commit: Commit) -> KernelResult<CommitResponse> {
             Err(KernelError::IOError(std::io::Error::other(
                 "simulated IO error",
             )))
@@ -2578,12 +2572,7 @@ mod tests {
     struct GenericErrorCommitter;
 
     impl Committer for GenericErrorCommitter {
-        fn commit(
-            &self,
-            _engine: &dyn Engine,
-            _actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
-            _commit_metadata: CommitMetadata,
-        ) -> KernelResult<CommitResponse> {
+        fn commit(&self, _engine: &dyn Engine, _commit: Commit) -> KernelResult<CommitResponse> {
             Err(KernelError::generic("simulated commit error"))
         }
         fn is_catalog_committer(&self) -> bool {
@@ -2602,13 +2591,8 @@ mod tests {
     struct MockCatalogCommitter;
 
     impl Committer for MockCatalogCommitter {
-        fn commit(
-            &self,
-            _engine: &dyn Engine,
-            _actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
-            _commit_metadata: CommitMetadata,
-        ) -> KernelResult<CommitResponse> {
-            // This won't be reached in tests — the validation error fires before commit.
+        fn commit(&self, _engine: &dyn Engine, commit: Commit) -> KernelResult<CommitResponse> {
+            let _ = commit.try_into_parts(true)?;
             Ok(CommitResponse::Conflict { version: 0 })
         }
         fn is_catalog_committer(&self) -> bool {
@@ -4609,12 +4593,8 @@ mod tests {
     }
 
     impl Committer for CapturingCommitter {
-        fn commit(
-            &self,
-            _engine: &dyn Engine,
-            _actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
-            commit_metadata: CommitMetadata,
-        ) -> KernelResult<CommitResponse> {
+        fn commit(&self, _engine: &dyn Engine, commit: Commit) -> KernelResult<CommitResponse> {
+            let (commit_metadata, _actions) = commit.try_into_parts(false)?;
             *self.captured.lock().unwrap() = Some(commit_metadata.in_commit_timestamp());
             Ok(CommitResponse::Conflict {
                 version: commit_metadata.version(),

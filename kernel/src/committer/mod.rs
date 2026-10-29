@@ -8,9 +8,8 @@
 //! kernel needs to commit a transaction to a table. The goal terminal state of every
 //! [`Transaction`] is to be committed to the table. This means writing the changes (we call these
 //! actions) in the transaction as a new version of the table. The [`Committer`] trait exposes
-//! [`commit`] for engine data actions and, with declarative plans, `commit_declarative` for ordered
-//! relation references. Both take [`CommitMetadata`] (which includes critical commit metadata like
-//! the version to commit) to allow different catalogs to define what it means to 'commit' the
+//! [`commit`] for a prepared [`Commit`] and, with declarative plans, `commit_declarative` for
+//! ordered relation references. Both allow different catalogs to define what it means to commit
 //! actions to a table.
 //! For some, this may mean writing staged commits to object storage and retaining an in-memory list
 //! (server side) of commits. For others, this may mean writing new (version, actions) tuples to a
@@ -24,7 +23,6 @@
 //! [`Transaction`]: crate::transaction::Transaction
 //! [`commit`]: crate::committer::Committer::commit
 //! [`log_tail`]: crate::snapshot::SnapshotBuilder::with_log_tail
-//! [`EngineData`]: crate::EngineData
 
 mod commit_types;
 #[cfg(feature = "declarative-plans")]
@@ -44,36 +42,58 @@ use crate::plans::{RelationRef, ScopedPlanExecutor};
 use crate::KernelError;
 use crate::{Engine, FilteredEngineData, KernelResult, KernelResultIterator};
 
+/// Actions ready to be committed in Delta log order.
+pub type CommitActions = Box<dyn KernelResultIterator<FilteredEngineData>>;
+
+/// A Delta log commit ready for a [`Committer`] to persist.
+pub struct Commit {
+    metadata: CommitMetadata,
+    actions: CommitActions,
+}
+
+impl Commit {
+    /// Creates a prepared commit from owned actions and their metadata.
+    pub fn new(metadata: CommitMetadata, actions: CommitActions) -> Self {
+        Self { metadata, actions }
+    }
+
+    /// Validates the selected committer and returns this commit's metadata and actions.
+    pub fn try_into_parts(
+        self,
+        is_catalog_committer: bool,
+    ) -> KernelResult<(CommitMetadata, CommitActions)> {
+        self.metadata.validate_committer(is_catalog_committer)?;
+        Ok((self.metadata, self.actions))
+    }
+
+    pub(crate) fn version(&self) -> crate::Version {
+        self.metadata.version()
+    }
+}
+
 /// A Committer is the system by which transactions are committed to a table. Transactions are
 /// effectively a collection of actions performed on the table at a specific version. The kernel
 /// exposes this trait so different catalogs can build their own commit implementations. For
 /// example, different catalogs may: commit directly to a database, commit to an object store, or
 /// use another system entirely.
 ///
-/// Critically, a Committer must implement [`commit`] which takes an engine and an iterator of
-/// actions (as [`EngineData`] batches) to commit to the table at the given version
-/// ([`CommitMetadata::version`]).
+/// Critically, a Committer must implement [`commit`] which takes an engine and a prepared
+/// [`Commit`] to commit to the table.
 ///
 /// [`commit`]: Committer::commit
-/// [`EngineData`]: crate::EngineData
 //
 // Note: While we could omit the Send bound, we keep it here for simplicity - so usage can be
 // Arc<dyn Committer> (instead of Arc<dyn Committer + Send>). If there is a strong case for a !Send
 // Committer then we can remove this bound and possibly just do an alias like CommitterRef =
 // Arc<dyn Committer + Send>.
 pub trait Committer: Send {
-    /// Commits actions to the table at the version specified in [`CommitMetadata`].
+    /// Commits a prepared transaction.
     ///
     /// Implementations must ensure that actions are committed atomically and either:
     /// 1. Persisted directly to object storage as published deltas (for filesystem-based tables),
     ///    or
     /// 2. Persisted as per the managing catalog's semantics (for catalog-managed tables)
-    fn commit(
-        &self,
-        engine: &dyn Engine,
-        actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
-        commit_metadata: CommitMetadata,
-    ) -> KernelResult<CommitResponse>;
+    fn commit(&self, engine: &dyn Engine, commit: Commit) -> KernelResult<CommitResponse>;
 
     /// Commits `actions`, at the version in `commit_metadata`, using a declarative plan `executor`.
     ///

@@ -216,7 +216,7 @@ use delta_kernel::arrow::datatypes::{
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::committer::{
-    CommitMetadata, CommitResponse, Committer, FileSystemCommitter, PublishMetadata,
+    Commit, CommitResponse, Committer, FileSystemCommitter, PublishMetadata,
 };
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
@@ -1287,17 +1287,12 @@ pub fn begin_transaction_with(
 pub struct TestCatalogCommitter;
 
 impl Committer for TestCatalogCommitter {
-    fn commit(
-        &self,
-        engine: &dyn Engine,
-        actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
-        commit_metadata: CommitMetadata,
-    ) -> KernelResult<CommitResponse> {
+    fn commit(&self, engine: &dyn Engine, commit: Commit) -> KernelResult<CommitResponse> {
+        let (commit_metadata, actions) = commit.try_into_parts(true)?;
         let path = commit_metadata.published_commit_path()?;
-        let written_size =
-            engine
-                .json_handler()
-                .write_json_file(&path, Box::new(actions), false)?;
+        let written_size = engine
+            .json_handler()
+            .write_json_file(&path, actions, false)?;
         Ok(CommitResponse::Committed {
             file_meta: FileMeta::new(path, commit_metadata.in_commit_timestamp(), written_size),
         })

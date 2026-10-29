@@ -4,14 +4,11 @@ use std::sync::Arc;
 #[cfg(feature = "declarative-plans")]
 use delta_kernel::committer::write_commit_json_declarative;
 use delta_kernel::committer::{
-    CommitMetadata, CommitResponse, CommitType, Committer, PublishMetadata,
+    Commit as KernelCommit, CommitMetadata, CommitResponse, CommitType, Committer, PublishMetadata,
 };
 #[cfg(feature = "declarative-plans")]
 use delta_kernel::plans::{RelationRef, ScopedPlanExecutor};
-use delta_kernel::{
-    Engine, FileMeta, FilteredEngineData, KernelError as DeltaError, KernelResult,
-    KernelResultIterator,
-};
+use delta_kernel::{Engine, FileMeta, KernelError as DeltaError, KernelResult};
 use tracing::{debug, info};
 use unity_catalog_delta_client_api::{
     Commit, DeltaTableRequirement, DeltaTableUpdate, TableIdentifier, UpdateTableClient,
@@ -255,18 +252,13 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
     /// commit path; the caller finalizes the table in UC via the create-table API. For version >=
     /// 1, connectors should publish staged commits to the delta log immediately after writing;
     /// UC expects to be informed of the last known published version during commit.
-    fn commit(
-        &self,
-        engine: &dyn Engine,
-        actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
-        commit_metadata: CommitMetadata,
-    ) -> KernelResult<CommitResponse> {
+    fn commit(&self, engine: &dyn Engine, commit: KernelCommit) -> KernelResult<CommitResponse> {
+        let (commit_metadata, actions) = commit.try_into_parts(true)?;
         if commit_metadata.version() == 0 {
             return self.commit_version_0(&commit_metadata, |path| {
-                let file_size =
-                    engine
-                        .json_handler()
-                        .write_json_file(path, Box::new(actions), false)?;
+                let file_size = engine
+                    .json_handler()
+                    .write_json_file(path, actions, false)?;
                 Ok(FileMeta::new(
                     path.clone(),
                     commit_metadata.in_commit_timestamp(),
@@ -277,7 +269,7 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
         self.commit_version_non_zero(commit_metadata, |path| {
             engine
                 .json_handler()
-                .write_json_file(path, Box::new(actions), false)?;
+                .write_json_file(path, actions, false)?;
             engine.storage_handler().head(path)
         })
     }
@@ -386,9 +378,15 @@ mod tests {
 
     /// Creates a valid catalog-managed CommitMetadata with all required UC features and properties.
     fn catalog_managed_commit_metadata(table_root: url::Url, version: Version) -> CommitMetadata {
+        let commit_type = if version == 0 {
+            CommitType::CatalogManagedCreate
+        } else {
+            CommitType::CatalogManagedWrite
+        };
         CommitMetadata::new_unchecked_with(
             table_root,
             version,
+            commit_type,
             vec!["catalogManaged", "vacuumProtocolCheck"],
             vec!["catalogManaged", "inCommitTimestamp", "vacuumProtocolCheck"],
             HashMap::from([
@@ -430,18 +428,21 @@ mod tests {
     ) -> delta_kernel::KernelResult<CommitResponse> {
         match style {
             CommitStyle::Imperative => {
-                let actions = values.iter().map(|value| {
-                    let action: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
-                        RecordBatch::try_from_iter(vec![(
-                            "test",
-                            Arc::new(StringArray::from(vec![*value])) as Arc<dyn Array>,
-                        )])
-                        .unwrap(),
-                    ));
-                    Ok(FilteredEngineData::with_all_rows_selected(action))
-                });
-                let actions = Box::new(actions);
-                committer.commit(engine, actions, commit_metadata)
+                let actions: Vec<_> = values
+                    .iter()
+                    .map(|value| {
+                        let action: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+                            RecordBatch::try_from_iter(vec![(
+                                "test",
+                                Arc::new(StringArray::from(vec![*value])) as Arc<dyn Array>,
+                            )])
+                            .unwrap(),
+                        ));
+                        Ok(FilteredEngineData::with_all_rows_selected(action))
+                    })
+                    .collect();
+                let commit = KernelCommit::new(commit_metadata, Box::new(actions.into_iter()));
+                committer.commit(engine, commit)
             }
             #[cfg(feature = "declarative-plans")]
             CommitStyle::Declarative => {
@@ -599,7 +600,8 @@ mod tests {
     fn commit_version_0_rejects_missing_catalog_managed_feature(#[case] style: CommitStyle) {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
-        let commit_metadata = CommitMetadata::new_unchecked(table_root, 0).unwrap();
+        let commit_metadata =
+            CommitMetadata::new_unchecked(table_root, 0, CommitType::CatalogManagedCreate).unwrap();
         let committer = test_committer();
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
         fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
@@ -624,6 +626,7 @@ mod tests {
         let commit_metadata = CommitMetadata::new_unchecked_with(
             table_root,
             0,
+            CommitType::CatalogManagedCreate,
             vec!["catalogManaged", "vacuumProtocolCheck"],
             vec!["catalogManaged", "inCommitTimestamp", "vacuumProtocolCheck"],
             HashMap::from([(
@@ -656,6 +659,7 @@ mod tests {
         let commit_metadata = CommitMetadata::new_unchecked_with(
             table_root,
             0,
+            CommitType::CatalogManagedCreate,
             vec!["catalogManaged", "vacuumProtocolCheck"],
             vec!["catalogManaged", "inCommitTimestamp", "vacuumProtocolCheck"],
             HashMap::from([(
@@ -685,7 +689,8 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         // Version >= 1 but without catalogManaged feature (simulates downgrade attempt)
-        let commit_metadata = CommitMetadata::new_unchecked(table_root, 1).unwrap();
+        let commit_metadata =
+            CommitMetadata::new_unchecked(table_root, 1, CommitType::CatalogManagedWrite).unwrap();
         let committer = test_committer();
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
 

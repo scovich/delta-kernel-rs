@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use delta_kernel::committer::Committer;
-use delta_kernel::{KernelResult, KernelResultIterator};
+use delta_kernel::KernelResult;
 use delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
@@ -172,8 +172,7 @@ impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
     fn commit(
         &self,
         engine: &dyn delta_kernel::Engine,
-        actions: Box<dyn KernelResultIterator<delta_kernel::FilteredEngineData> + '_>,
-        commit_metadata: delta_kernel::committer::CommitMetadata,
+        commit: delta_kernel::committer::Commit,
     ) -> KernelResult<delta_kernel::committer::CommitResponse> {
         // We hold this guard until the end of the function so we stay in the tokio context until
         // we're done
@@ -192,7 +191,7 @@ impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
                     "FFIUCCommitter can only be used with the default engine",
                 )
             })?;
-        self.inner.commit(engine, actions, commit_metadata)
+        self.inner.commit(engine, commit)
     }
 
     fn is_catalog_committer(&self) -> bool {
