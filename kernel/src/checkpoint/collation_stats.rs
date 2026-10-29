@@ -618,7 +618,7 @@ mod tests {
         commit(store.as_ref(), 0, &actions).await;
         let mut add = add_action("mixed.parquet", expected.clone());
         add["add"]["stats"] = json!(has_json.then(|| expected.to_string()));
-        add["add"]["stats_parsed"] = source_stats;
+        add["add"]["stats_parsed"] = source_stats.clone();
         actions.push(add);
         write_checkpoint_rows(&engine, source, &actions, has_json)?;
         let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
@@ -654,13 +654,23 @@ mod tests {
                 .require_plan_executor()?
                 .execute_op(crate::plans::Operation::QueryPlan(plan))?
                 .into_data()?;
-            let rows =
+            let actual =
                 json_rows(data.map(|data| data.map(FilteredEngineData::with_all_rows_selected)))?;
-            assert_eq!(rows.len(), 1);
-            let stats_json = rows[0]["add"]["stats"].as_str().unwrap();
-            assert_eq!(serde_json::from_str::<Value>(stats_json)?, expected);
+            assert_eq!(actual.len(), 1);
+            let stats_json = actual[0]["add"]["stats"].as_str().unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(stats_json)?,
+                if has_json {
+                    expected.clone()
+                } else {
+                    source_stats
+                }
+            );
             if has_json {
                 assert_eq!(stats_json, expected.to_string());
+            }
+            if parsed {
+                assert_eq!(actual[0]["add"]["stats_parsed"], rows[0]["stats_parsed"]);
             }
         }
         Ok(())
