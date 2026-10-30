@@ -4,7 +4,6 @@ use clap::Parser;
 use common::{LocationArgs, ParseWithExamples};
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::util::pretty::print_batches;
-use delta_kernel::coroutine::kernel::drive_with_engine;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::table_changes::TableChanges;
 use delta_kernel::KernelResult;
@@ -25,7 +24,8 @@ struct Cli {
     end_version: Option<u64>,
 }
 
-fn main() -> KernelResult<()> {
+#[tokio::main]
+async fn main() -> KernelResult<()> {
     let cli = Cli::parse_with_examples(
         env!("CARGO_PKG_NAME"),
         "Read changes in",
@@ -34,8 +34,9 @@ fn main() -> KernelResult<()> {
     );
     let url = delta_kernel::try_parse_uri(cli.location_args.path.as_str())?;
     let engine = common::get_engine(&url, &cli.location_args)?;
+    let connector = engine.async_connector();
     let workflow = TableChanges::try_new_workflow(url, cli.start_version, cli.end_version);
-    let table_changes = drive_with_engine(&engine, None, workflow)?;
+    let table_changes = connector.run(workflow).await?;
 
     let table_changes_scan = table_changes.into_scan_builder().build()?;
     let batches: Vec<RecordBatch> = table_changes_scan

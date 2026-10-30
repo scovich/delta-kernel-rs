@@ -51,7 +51,8 @@ enum Commands {
     },
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
@@ -60,7 +61,7 @@ fn main() -> ExitCode {
         .with_metrics_reporter_layer(Arc::new(LoggingMetricsReporter::new(tracing::Level::INFO)))
         .with(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-    match try_main() {
+    match try_main().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             println!("{e:#?}");
@@ -195,12 +196,14 @@ fn print_scan_file(_: &mut (), file: ScanFile) {
     );
 }
 
-fn try_main() -> KernelResult<()> {
+async fn try_main() -> KernelResult<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Inspect", "inspect", "<COMMAND>");
 
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
     let engine = common::get_engine(&url, &cli.location_args)?;
-    let snapshot = Snapshot::builder_for(url).build(&engine)?;
+    let connector = engine.async_connector();
+    let workflow = Snapshot::builder_for(url).build_workflow();
+    let snapshot = connector.run(workflow).await?;
 
     match cli.command {
         Commands::TableVersion => {

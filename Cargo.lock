@@ -2701,6 +2701,7 @@ dependencies = [
  "delta_kernel",
  "delta_kernel_default_engine",
  "env_logger",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4014,6 +4015,7 @@ dependencies = [
  "delta_kernel",
  "delta_kernel_default_engine",
  "itertools 0.14.0",
+ "tokio",
 ]
 
 [[package]]
@@ -4026,6 +4028,7 @@ dependencies = [
  "delta_kernel_default_engine",
  "env_logger",
  "spmc",
+ "tokio",
  "url",
 ]
 
@@ -4039,6 +4042,7 @@ dependencies = [
  "delta_kernel_default_engine",
  "env_logger",
  "itertools 0.14.0",
+ "tokio",
 ]
 
 [[package]]

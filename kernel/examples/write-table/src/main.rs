@@ -15,9 +15,9 @@ use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table as create_delta_table;
 use delta_kernel::transaction::{CommitResult, RetryableTransaction, UpdateTableOperation};
-use delta_kernel::{Engine, KernelError, KernelResult, Snapshot, SnapshotRef};
+use delta_kernel::{KernelError, KernelResult, Snapshot, SnapshotRef};
 use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
+use delta_kernel_default_engine::{AsyncEngineConnector, DefaultEngine, DefaultEngineBuilder};
 use itertools::Itertools;
 use url::Url;
 
@@ -77,21 +77,23 @@ async fn try_main() -> KernelResult<()> {
     // Get the engine for local filesystem
     use delta_kernel_default_engine::storage::store_from_url;
     let engine = DefaultEngineBuilder::new(store_from_url(&url)?).build();
+    let connector = engine.async_connector();
 
     // Create or get the table
-    let snapshot = create_or_get_base_snapshot(&url, &engine, &cli.schema).await?;
+    let snapshot = create_or_get_base_snapshot(&url, &connector, &cli.schema).await?;
 
     // Create sample data based on the schema
     let sample_data = create_sample_data(&snapshot.schema(), cli.num_rows)?;
 
     // Write sample data to the table
-    let mut txn = snapshot
+    let workflow = snapshot
         .update_table(
             UpdateTableOperation::Custom("INSERT".to_string()),
             "default_engine/write-table-example",
             /* data_change */ true,
         )
-        .build_with_filesystem_committer(&engine)?;
+        .build_workflow();
+    let mut txn = connector.run(workflow).await?;
 
     // This example assumes the table is unpartitioned.
     let write_context = txn.write_state()?.write_context_builder().build()?;
@@ -108,8 +110,8 @@ async fn try_main() -> KernelResult<()> {
                 "Exceeded maximum 5 retries for committing transaction",
             ));
         }
-        let (result, committer) = txn.commit(&engine)?;
-        txn = match result {
+        let workflow = txn.commit_workflow();
+        txn = match connector.run(workflow).await? {
             CommitResult::Committed(committed) => break committed,
             CommitResult::Conflicted(conflicted) => {
                 let conflicting_version = conflicted.conflict_version();
@@ -118,7 +120,7 @@ async fn try_main() -> KernelResult<()> {
             }
             CommitResult::Retryable(RetryableTransaction { transaction, error }) => {
                 println!("✗ Failed to commit, retrying... retryable error: {error}");
-                transaction.with_committer(committer)
+                transaction
             }
         };
         retries += 1;
@@ -129,7 +131,7 @@ async fn try_main() -> KernelResult<()> {
     println!("✓ Successfully wrote {} rows to the table", cli.num_rows);
 
     // Read and display the data
-    read_and_display_data(&url, engine).await?;
+    read_and_display_data(&url, engine, &connector).await?;
     println!("✓ Successfully read data from the table");
 
     Ok(())
@@ -138,11 +140,12 @@ async fn try_main() -> KernelResult<()> {
 /// Creates a new Delta table or gets an existing one.
 async fn create_or_get_base_snapshot(
     url: &Url,
-    engine: &dyn Engine,
+    connector: &AsyncEngineConnector,
     schema_str: &str,
 ) -> KernelResult<SnapshotRef> {
     // Check if table already exists
-    match Snapshot::builder_for(url.clone()).build(engine) {
+    let workflow = Snapshot::builder_for(url.clone()).build_workflow();
+    match connector.run(workflow).await {
         Ok(snapshot) => {
             println!("✓ Found existing table at version {}", snapshot.version());
             Ok(snapshot)
@@ -151,8 +154,9 @@ async fn create_or_get_base_snapshot(
             // Create new table
             println!("Creating new Delta table...");
             let schema = parse_schema(schema_str)?;
-            create_table(url, &schema, engine).await?;
-            Snapshot::builder_for(url.clone()).build(engine)
+            create_table(url, &schema, connector).await?;
+            let workflow = Snapshot::builder_for(url.clone()).build_workflow();
+            connector.run(workflow).await
         }
     }
 }
@@ -195,18 +199,20 @@ fn parse_schema(schema_str: &str) -> KernelResult<SchemaRef> {
 async fn create_table(
     table_url: &Url,
     schema: &SchemaRef,
-    engine: &dyn Engine,
+    connector: &AsyncEngineConnector,
 ) -> KernelResult<()> {
     // Use the create_table API to create the table
     let table_path = table_url.as_str();
-    let _result = create_delta_table(
+    let workflow = create_delta_table(
         table_path,
         schema.clone(),
         "write-table-example/1.0",
         /* data_change */ true,
     )
-    .build_with_filesystem_committer(engine)?
-    .commit(engine)?;
+    .build_workflow();
+    let transaction = connector.run(workflow).await?;
+    let workflow = transaction.commit_workflow();
+    let _result = connector.run(workflow).await?;
 
     println!("✓ Created Delta table with schema: {schema:#?}");
     Ok(())
@@ -266,8 +272,10 @@ fn create_sample_data(schema: &SchemaRef, num_rows: usize) -> KernelResult<Arrow
 async fn read_and_display_data(
     table_url: &Url,
     engine: DefaultEngine<TokioBackgroundExecutor>,
+    connector: &AsyncEngineConnector,
 ) -> KernelResult<()> {
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let workflow = Snapshot::builder_for(table_url.clone()).build_workflow();
+    let snapshot = connector.run(workflow).await?;
     let scan = snapshot.scan_builder().build()?;
 
     let batches: Vec<RecordBatch> = scan
