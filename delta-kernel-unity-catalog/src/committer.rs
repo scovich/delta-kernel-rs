@@ -1,15 +1,21 @@
+use std::ops::AsyncFnOnce;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
-#[cfg(feature = "declarative-plans")]
-use delta_kernel::committer::write_commit_json_declarative;
 use delta_kernel::committer::{
-    Commit as KernelCommit, CommitMetadata, CommitResponse, CommitType, Committer, PublishMetadata,
+    Commit as KernelCommit, CommitActions, CommitMetadata, CommitResponse, CommitType, Committer,
+    PublishMetadata,
 };
+use delta_kernel::coroutine::drive_workflow;
+#[cfg(feature = "declarative-plans")]
+use delta_kernel::coroutine::kernel::drive_with_plan_executor;
+use delta_kernel::coroutine::kernel::request::WriteJsonFile;
+use delta_kernel::coroutine::kernel::{run_workflow_with_engine, Channel, ChannelExt as _};
 #[cfg(feature = "declarative-plans")]
 use delta_kernel::plans::{RelationRef, ScopedPlanExecutor};
 use delta_kernel::{Engine, FileMeta, KernelError as DeltaError, KernelResult};
 use tracing::{debug, info};
+use uc::ChannelExt as _;
 use unity_catalog_delta_client_api::{
     Commit, DeltaTableRequirement, DeltaTableUpdate, TableIdentifier, UpdateTableClient,
     UpdateTableRequest,
@@ -19,7 +25,7 @@ use crate::constants::{
     CATALOG_MANAGED_FEATURE, CLUSTERING_DOMAIN_NAME, ENABLE_IN_COMMIT_TIMESTAMPS,
     IN_COMMIT_TIMESTAMP_FEATURE, UC_TABLE_ID_KEY, VACUUM_PROTOCOL_CHECK_FEATURE,
 };
-use crate::errors;
+use crate::{coroutine as uc, errors};
 
 /// Convenience macro: returns an error if a condition is not met.
 macro_rules! require {
@@ -135,10 +141,10 @@ impl<C: UpdateTableClient> UCCommitter<C> {
 
     /// Commit version 0 (table creation). Validates that all required UC properties are present,
     /// then writes the version 0 commit file directly to the published commit path.
-    fn commit_version_0(
+    pub(crate) async fn commit_version_0_with_channel(
         &self,
         commit_metadata: &CommitMetadata,
-        write: impl FnOnce(&url::Url) -> KernelResult<FileMeta>,
+        write: impl AsyncFnOnce(&url::Url) -> KernelResult<FileMeta>,
     ) -> KernelResult<CommitResponse> {
         debug_assert!(
             commit_metadata.version() == 0,
@@ -147,7 +153,7 @@ impl<C: UpdateTableClient> UCCommitter<C> {
         );
         self.validate_catalog_managed_state(commit_metadata)?;
         let published_commit_path = commit_metadata.published_commit_path()?;
-        match write(&published_commit_path) {
+        match write(&published_commit_path).await {
             Ok(written_file) => {
                 info!("wrote version 0 commit file for UC table creation");
                 let file_meta = FileMeta::new(
@@ -167,10 +173,11 @@ impl<C: UpdateTableClient> UCCommitter<C> {
 
     /// Commit version >= 1. Validates catalog-managed status hasn't changed, writes a staged
     /// commit file, and calls the UC commit API to ratify it.
-    fn commit_version_non_zero(
+    pub(crate) async fn commit_version_non_zero_with_channel(
         &self,
+        channel: &uc::Channel,
         commit_metadata: CommitMetadata,
-        write: impl FnOnce(&url::Url) -> KernelResult<FileMeta>,
+        write: impl AsyncFnOnce(&url::Url) -> KernelResult<FileMeta>,
     ) -> KernelResult<CommitResponse>
     where
         C: 'static,
@@ -182,7 +189,7 @@ impl<C: UpdateTableClient> UCCommitter<C> {
         self.validate_catalog_managed_state(&commit_metadata)?;
         Self::validate_no_alter_table_changes(&commit_metadata)?;
         let staged_commit_path = commit_metadata.staged_commit_path()?;
-        let committed = write(&staged_commit_path)?;
+        let committed = write(&staged_commit_path).await?;
         debug!("wrote staged commit file: {:?}", committed);
 
         let mut updates = vec![DeltaTableUpdate::AddCommit {
@@ -206,8 +213,7 @@ impl<C: UpdateTableClient> UCCommitter<C> {
             updates,
         )
         .map_err(|e| DeltaError::generic(format!("invalid UC update_table request: {e}")))?;
-        let target = self.table.clone();
-        self.execute_update_table_blocking(target, update_req)?;
+        channel.update_table(self.table.clone(), update_req).await?;
         Ok(CommitResponse::Committed {
             file_meta: committed,
         })
@@ -254,6 +260,61 @@ impl<C: UpdateTableClient> UCCommitter<C> {
             ))
         })?
     }
+
+    /// Commit the given `actions` to the delta table in UC.
+    ///
+    /// For version 0 (table creation), the committer writes `000.json` directly to the published
+    /// commit path; the caller finalizes the table in UC via the create-table API. For version >=
+    /// 1, connectors should publish staged commits to the delta log immediately after writing;
+    /// UC expects to be informed of the last known published version during commit.
+    pub(crate) async fn commit_with_channel(
+        &self,
+        channel: &uc::Channel,
+        actions: CommitActions,
+        commit_metadata: CommitMetadata,
+    ) -> KernelResult<CommitResponse>
+    where
+        C: 'static,
+    {
+        if commit_metadata.version() == 0 {
+            let result = self.commit_version_0_with_channel(&commit_metadata, async |path| {
+                let file_size = channel.write_imperative_commit_file(path, actions).await?;
+                Ok(FileMeta::new(
+                    path.clone(),
+                    commit_metadata.in_commit_timestamp(),
+                    file_size,
+                ))
+            });
+            return result.await;
+        }
+        self.commit_version_non_zero_with_channel(channel, commit_metadata, async |path| {
+            channel.write_imperative_commit_file(path, actions).await?;
+            channel.head(path).await
+        })
+        .await
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) async fn commit_declarative_with_channel(
+        &self,
+        channel: &uc::Channel,
+        actions: Vec<RelationRef>,
+        commit_metadata: CommitMetadata,
+    ) -> KernelResult<CommitResponse>
+    where
+        C: 'static,
+    {
+        if commit_metadata.version() == 0 {
+            let result = self.commit_version_0_with_channel(&commit_metadata, async |path| {
+                channel.write_declarative_commit_file(path, actions).await
+            });
+            return result.await;
+        }
+        self.commit_version_non_zero_with_channel(channel, commit_metadata, async |path| {
+            channel.write_declarative_commit_file(path, actions).await
+        })
+        .await
+    }
 }
 
 impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
@@ -264,25 +325,33 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
     /// 1, connectors should publish staged commits to the delta log immediately after writing;
     /// UC expects to be informed of the last known published version during commit.
     fn commit(&self, engine: &dyn Engine, commit: KernelCommit) -> KernelResult<CommitResponse> {
-        let (commit_metadata, actions) = commit.try_into_engine_parts(engine, true)?;
-        if commit_metadata.version() == 0 {
-            return self.commit_version_0(&commit_metadata, |path| {
-                let file_size = engine
-                    .json_handler()
-                    .write_json_file(path, actions, false)?;
-                Ok(FileMeta::new(
-                    path.clone(),
-                    commit_metadata.in_commit_timestamp(),
-                    file_size,
-                ))
-            });
-        }
-        self.commit_version_non_zero(commit_metadata, |path| {
-            engine
-                .json_handler()
-                .write_json_file(path, actions, false)?;
-            engine.storage_handler().head(path)
-        })
+        let workflow = self.commit_workflow(commit);
+        Ok(drive_workflow!(workflow, |request| match request {
+            uc::Request::WriteJson(operation, reply) => {
+                let WriteJsonFile {
+                    url,
+                    input,
+                    overwrite,
+                } = *operation;
+                reply.send(run_workflow_with_engine!(engine, async move |channel| {
+                    channel.write_json_file(&url, input, overwrite).await
+                }));
+            }
+            uc::Request::Head(location, reply) => {
+                reply.send(run_workflow_with_engine!(engine, async move |channel| {
+                    channel.head(&location).await
+                }));
+            }
+            uc::Request::UpdateTable(target, request, reply) => {
+                reply.send(self.execute_update_table_blocking(target, request));
+            }
+            #[cfg(feature = "declarative-plans")]
+            uc::Request::WriteDeclarative(_, reply) => {
+                reply.send(Err(DeltaError::internal_error(
+                    "imperative commit requested a declarative JSON write",
+                )));
+            }
+        }))
     }
 
     #[cfg(feature = "declarative-plans")]
@@ -292,14 +361,21 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
         actions: Box<dyn Iterator<Item = RelationRef> + '_>,
         commit_metadata: CommitMetadata,
     ) -> KernelResult<CommitResponse> {
-        if commit_metadata.version() == 0 {
-            return self.commit_version_0(&commit_metadata, |path| {
-                write_commit_json_declarative(executor, actions, path.clone())
-            });
-        }
-        self.commit_version_non_zero(commit_metadata, |path| {
-            write_commit_json_declarative(executor, actions, path.clone())
-        })
+        let workflow = self.commit_declarative_workflow(Vec::from_iter(actions), commit_metadata);
+        Ok(drive_workflow!(workflow, |request| match request {
+            uc::Request::WriteDeclarative(workflow, reply) => {
+                reply.send(drive_with_plan_executor(executor, workflow));
+            }
+            uc::Request::UpdateTable(target, request, reply) => {
+                reply.send(self.execute_update_table_blocking(target, request));
+            }
+            uc::Request::WriteJson(_, reply) => reply.send(Err(DeltaError::internal_error(
+                "declarative commit requested an imperative JSON write",
+            ))),
+            uc::Request::Head(_, reply) => reply.send(Err(DeltaError::internal_error(
+                "declarative commit requested storage metadata",
+            ))),
+        }))
     }
 
     fn is_catalog_committer(&self) -> bool {
@@ -307,6 +383,18 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
     }
 
     fn publish(&self, engine: &dyn Engine, publish_metadata: PublishMetadata) -> KernelResult<()> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.publish_with_channel(channel, publish_metadata)
+        })
+    }
+}
+
+impl<C: UpdateTableClient> UCCommitter<C> {
+    pub(crate) async fn publish_with_channel(
+        &self,
+        channel: &Channel,
+        publish_metadata: PublishMetadata,
+    ) -> KernelResult<()> {
         if publish_metadata.commits_to_publish().is_empty() {
             return Ok(());
         }
@@ -314,7 +402,7 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
         for catalog_commit in publish_metadata.commits_to_publish() {
             let src = catalog_commit.location();
             let dest = catalog_commit.published_location();
-            match engine.storage_handler().copy_atomic(src, dest) {
+            match channel.copy_atomic(src, dest).await {
                 Ok(_) => (),
                 Err(DeltaError::FileAlreadyExists(_)) => (),
                 Err(e) => return Err(e),
@@ -357,7 +445,7 @@ mod tests {
     #[cfg(feature = "declarative-plans")]
     use delta_kernel::schema::schema_ref;
     use delta_kernel::{EngineData, FilteredEngineData, Version};
-    use delta_kernel_default_engine::DefaultEngine;
+    use delta_kernel_default_engine::{AsyncEngineConnector, DefaultEngine};
     use rstest::rstest;
     use unity_catalog_delta_client_api::error::Result;
 
@@ -837,8 +925,17 @@ mod tests {
             .unwrap()
     }
 
+    #[derive(Clone, Copy)]
+    enum PublishDriver {
+        Engine,
+        Connector,
+    }
+
+    #[rstest]
     #[tokio::test]
-    async fn test_publish() {
+    async fn test_publish(
+        #[values(PublishDriver::Engine, PublishDriver::Connector)] driver: PublishDriver,
+    ) {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let staged_dir = tmp_dir.path().join("_delta_log/_staged_commits");
@@ -878,8 +975,18 @@ mod tests {
             "testUcTableId",
             TableIdentifier::new("test_catalog", "test_schema", "test_table"),
         );
-        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
-        committer.publish(&engine, publish_metadata).unwrap();
+        let store = Arc::new(LocalFileSystem::new());
+        match driver {
+            PublishDriver::Engine => {
+                let engine = DefaultEngine::builder(store).build();
+                committer.publish(&engine, publish_metadata).unwrap();
+            }
+            PublishDriver::Connector => {
+                let connector = AsyncEngineConnector::new(store);
+                let workflow = committer.publish_workflow(publish_metadata);
+                connector.run(workflow).await.unwrap();
+            }
+        }
 
         // ===== THEN =====
         for v in versions {

@@ -133,7 +133,7 @@ pub(crate) async fn read_files_impl(
 }
 
 /// Native async implementation for copy_atomic
-async fn copy_atomic_impl(
+pub(crate) async fn copy_atomic_impl(
     store: Arc<DynObjectStore>,
     src_path: Path,
     dest_path: Path,

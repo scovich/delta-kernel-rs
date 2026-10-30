@@ -28,7 +28,8 @@ pub(crate) fn write_commit_json_declarative(
     drive_with_plan_executor(executor, workflow)
 }
 
-fn write_commit_json_declarative_workflow(
+#[internal_api]
+pub(crate) fn write_commit_json_declarative_workflow(
     actions: impl IntoIterator<Item = RelationRef>,
     path: Url,
 ) -> StaticWorkflow<FileMeta> {

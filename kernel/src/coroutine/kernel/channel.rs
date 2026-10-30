@@ -14,10 +14,10 @@ use delta_kernel_derive::internal_api;
 use url::Url;
 
 use super::request::{
-    CreateEngineData, CreateExpressionEvaluator, CreatePredicateEvaluator, DirectoryListing,
-    EvaluateExpression, EvaluatePredicate, ExpressionEvaluatorHandle, PredicateEvaluatorHandle,
-    ReadJsonFiles, ReadParquetFiles, WriteBytes, WriteJsonFile, WriteParquetFile,
-    WriteParquetFiles, WriteParquetFilesResult,
+    CopyAtomic, CreateEngineData, CreateExpressionEvaluator, CreatePredicateEvaluator,
+    DirectoryListing, EvaluateExpression, EvaluatePredicate, ExpressionEvaluatorHandle,
+    PredicateEvaluatorHandle, ReadJsonFiles, ReadParquetFiles, WriteBytes, WriteJsonFile,
+    WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
 };
 #[cfg(feature = "declarative-plans")]
 use super::PlanRequest;
@@ -264,6 +264,12 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
     fn write_bytes(&self, url: &Url, data: Bytes, overwrite: bool) -> impl KernelFuture<()> {
         let operation = WriteBytes::new(url.clone(), data, overwrite);
         self.exchange(operation, Request::WriteBytes)
+    }
+
+    /// Atomically copies `source` to a new `destination`.
+    fn copy_atomic(&self, source: &Url, destination: &Url) -> impl KernelFuture<()> {
+        let operation = CopyAtomic::new(source.clone(), destination.clone());
+        self.exchange(operation, Request::CopyAtomic)
     }
 
     /// Delegates a prepared transaction to the connector's committer.
