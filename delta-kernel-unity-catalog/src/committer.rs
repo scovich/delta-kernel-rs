@@ -207,7 +207,17 @@ impl<C: UpdateTableClient> UCCommitter<C> {
         )
         .map_err(|e| DeltaError::generic(format!("invalid UC update_table request: {e}")))?;
         let target = self.table.clone();
+        self.execute_update_table_blocking(target, update_req)?;
+        Ok(CommitResponse::Committed {
+            file_meta: committed,
+        })
+    }
 
+    fn execute_update_table_blocking(
+        &self,
+        target: TableIdentifier,
+        update_req: UpdateTableRequest,
+    ) -> KernelResult<()> {
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
             DeltaError::generic("UCCommitter may only be used within a tokio runtime")
         })?;
@@ -235,9 +245,7 @@ impl<C: UpdateTableClient> UCCommitter<C> {
             ))
         })?;
         match result {
-            Ok(_) => Ok(CommitResponse::Committed {
-                file_meta: committed,
-            }),
+            Ok(()) => Ok(()),
             // TODO(#2970): classify version conflicts as CommitResponse::Conflict so the
             // transaction layer can rebase/retry, instead of collapsing every error to Generic.
             Err(e) => Err(DeltaError::Generic(format!("UC update_table error: {e}"))),
