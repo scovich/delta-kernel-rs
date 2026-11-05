@@ -24,7 +24,7 @@
 
 use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
-use std::ops::{AsyncFnOnce, Deref};
+use std::ops::{AsyncFnMut, AsyncFnOnce, Deref};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, ready};
@@ -34,7 +34,8 @@ use tracing::{Instrument as _, Span, error};
 
 #[cfg_attr(not(feature = "internal-api"), expect(unused_imports))]
 pub use self::adapters::{
-    AsyncIntoIterator, Enumerate, FilterMap, Flatten, Iter, MapOk, Peekable, Unfold, empty, unfold,
+    AsyncIntoIterator, Enumerate, FilterMap, Flatten, Iter, MapAsync, MapAsyncWitness, MapOk,
+    Peekable, Unfold, empty, map_async_witness, unfold,
 };
 pub(crate) use self::adapters::{unfold_mut_with, unfold_mut_witness};
 use super::witness::invoke_witness;
@@ -64,6 +65,19 @@ pub trait GeneratorExt {
         Self: Sized,
     {
         FilterMap::new(self, MapOk::new(map))
+    }
+
+    /// Maps items asynchronously through the bound request channel.
+    fn map_async<P, U, F, W>(self, witness: W, mapper: F) -> MapAsync<Self, P, F, W, U>
+    where
+        Self: Generator<P> + Sized,
+        P: Send + 'static,
+        U: Send + 'static,
+        F: for<'a> AsyncFnMut(&'a Channel<P>, Self::Item) -> U + Send,
+        W: Send,
+        W: for<'a> MapAsyncWitness<'a, P, F, Self::Item, U>,
+    {
+        MapAsync::new(self, mapper, witness)
     }
 
     /// Counterpart of [`Iterator::flatten`]: yields the elements of each collection-valued item.
@@ -337,6 +351,14 @@ macro_rules! generator_fn {
         $crate::coroutine::generator::box_generator(move |channel| {
             $crate::coroutine::generator::generator!(channel, $body)
         })
+    };
+}
+
+/// Maps generator items asynchronously through the bound request channel.
+#[internal_api]
+macro_rules! map_async {
+    ($generator:expr, $body:expr $(,)?) => {
+        $generator.map_async($crate::coroutine::generator::map_async_witness, $body)
     };
 }
 
