@@ -108,7 +108,8 @@ mod tests {
     fn test_verifier_with_empty_add_files() {
         let columns = vec![(column_name!("col"), DataType::LONG)];
         let verifier = StatsColumnVerifier::new(columns);
-        let result = verifier.verify(&[]);
+        let add_files: [Box<dyn EngineData>; 0] = [];
+        let result = verifier.verify(&add_files);
         assert!(result.is_ok());
     }
 

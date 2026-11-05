@@ -7,6 +7,7 @@ mod dv;
 mod removefile;
 mod utils;
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
@@ -116,7 +117,7 @@ struct StagedDataValidator<'a> {
 
 impl<'a> StagedDataValidator<'a> {
     /// Run every validation against each batch. Returns the first validation error encountered.
-    fn validate_batches(mut self, batches: &[Box<dyn EngineData>]) -> KernelResult<()> {
+    fn validate_batches(mut self, batches: &[impl AsRef<dyn EngineData>]) -> KernelResult<()> {
         for batch in batches {
             RowVisitor::visit_rows_of(&mut self, batch.as_ref())?;
         }
@@ -124,9 +125,12 @@ impl<'a> StagedDataValidator<'a> {
     }
 
     /// Runs every validation against each selected staged-data row.
-    fn validate_selected_rows(mut self, batches: &[FilteredEngineData]) -> KernelResult<()> {
+    fn validate_selected_rows(
+        mut self,
+        batches: &[impl Borrow<FilteredEngineData>],
+    ) -> KernelResult<()> {
         for batch in batches {
-            FilteredRowVisitor::visit_rows_of(&mut self, batch)?;
+            FilteredRowVisitor::visit_rows_of(&mut self, batch.borrow())?;
         }
         Ok(())
     }

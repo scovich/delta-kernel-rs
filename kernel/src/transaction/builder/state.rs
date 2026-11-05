@@ -16,7 +16,7 @@ pub(in crate::transaction) struct TransactionBuilderState {
     pub(in crate::transaction) operation_parameters: Option<HashMap<String, Option<String>>>,
     pub(in crate::transaction) operation_metrics: Option<HashMap<String, Option<String>>>,
     pub(in crate::transaction) engine_info: String,
-    pub(in crate::transaction) engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
+    pub(in crate::transaction) engine_commit_info: Option<(Arc<dyn EngineData>, SchemaRef)>,
     pub(in crate::transaction) transaction_ids: Vec<(String, i64)>,
     pub(in crate::transaction) domain_metadata_additions: Vec<DomainMetadata>,
     pub(in crate::transaction) data_change: bool,

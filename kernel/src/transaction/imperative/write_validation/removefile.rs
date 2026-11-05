@@ -1,5 +1,6 @@
 //! Remove-file validations.
 
+use std::borrow::Borrow;
 use std::sync::LazyLock;
 
 use super::utils::{
@@ -47,7 +48,7 @@ static REMOVE_FILE_COLUMNS_FOR_VALIDATION: LazyLock<KernelResult<ColumnNamesAndT
 /// removeFile) already recorded in it.
 /// For example, this can detect a file staged for both removal and a DV update.
 pub(crate) fn validate_remove_files(
-    removes: &[FilteredEngineData],
+    removes: &[impl Borrow<FilteredEngineData>],
     row_tracking_enablement: RowTrackingEnablement,
     uniqueness_validator: Option<&mut FileActionUniquenessValidator>,
 ) -> KernelResult<()> {
