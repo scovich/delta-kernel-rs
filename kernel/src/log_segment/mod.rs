@@ -25,6 +25,14 @@ use crate::checkpoint::collation_stats::{
     build_collation_stats_read_transform, source_collation_stats,
 };
 use crate::committer::CatalogCommit;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::coroutine::generator::BoundGenerator;
+use crate::coroutine::generator::GeneratorExt as _;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::{
+    Channel, ChannelExt as _, KernelResultGenerator, iterate_prepared_result_coroutine_with_engine,
+};
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
 use crate::log_replay::ActionsBatch;
@@ -979,6 +987,17 @@ impl LogSegment {
         engine: &dyn Engine,
         pointer: &LastManifestCommit,
     ) -> KernelResult<CheckpointAction> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.read_last_checkpoint_action_from_pointer_with_channel(channel, pointer)
+        })
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    async fn read_last_checkpoint_action_from_pointer_with_channel(
+        &self,
+        channel: &Channel,
+        pointer: &LastManifestCommit,
+    ) -> KernelResult<CheckpointAction> {
         let commit = self.find_pointed_commit(pointer).ok_or_else(|| {
             last_manifest_commit_inconsistency(
                 pointer,
@@ -986,11 +1005,10 @@ impl LogSegment {
             )
         })?;
         let files = std::slice::from_ref(&commit.location);
-        let batches =
-            engine
-                .json_handler()
-                .read_json_files(files, LOG_CHECKPOINT_SCHEMA.clone(), None)?;
-        require_pointed_checkpoint_action(pointer, first_checkpoint_action(batches)?)
+        let batches = channel
+            .read_json_files(files, LOG_CHECKPOINT_SCHEMA.clone(), None)
+            .await?;
+        require_pointed_checkpoint_action(pointer, first_checkpoint_action(batches).await?)
     }
 
     /// The listed commit at `pointer`'s version, or `None` when this segment does not list it.
@@ -1018,7 +1036,18 @@ impl LogSegment {
         engine: &dyn Engine,
         schema: SchemaRef,
     ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
-        Self::read_commit_files(engine, &self.find_commit_cover(), schema)
+        iterate_prepared_result_coroutine_with_engine!(engine, |channel| {
+            self.read_commit_actions_generator(channel, schema)
+        })
+    }
+
+    /// Generates this segment's commit-cover action batches in descending version order.
+    pub(crate) async fn read_commit_actions_generator(
+        &self,
+        channel: &Channel,
+        schema: SchemaRef,
+    ) -> KernelResult<impl KernelResultGenerator<ActionsBatch> + 'static + use<>> {
+        Self::read_commit_files_with_channel(channel, &self.find_commit_cover(), schema).await
     }
 
     /// find a minimal set to cover the range of commits we want. This is greedy so not always
@@ -1082,14 +1111,14 @@ impl LogSegment {
     }
 
     /// Reads `commit_files` as log batches (`is_log_batch = true`), in the order given.
-    fn read_commit_files(
-        engine: &dyn Engine,
+    async fn read_commit_files_with_channel(
+        channel: &Channel,
         commit_files: &[FileMeta],
         schema: SchemaRef,
-    ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
-        let actions = engine
-            .json_handler()
-            .read_json_files(commit_files, schema, None)?
+    ) -> KernelResult<impl KernelResultGenerator<ActionsBatch> + 'static + use<>> {
+        let actions = channel
+            .prepare_json_files(commit_files, schema, None)
+            .await?
             .map_ok(|batch| ActionsBatch::new(batch, true));
         Ok(actions)
     }
@@ -1738,10 +1767,10 @@ impl LogSegment {
 
 /// The first checkpoint action in `batches`, or `None` when no batch carries one.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-fn first_checkpoint_action(
-    batches: impl KernelResultIterator<Box<dyn EngineData>>,
+async fn first_checkpoint_action(
+    mut batches: impl BoundGenerator<Item = KernelResult<Box<dyn EngineData>>, Output = ()> + Unpin,
 ) -> KernelResult<Option<CheckpointAction>> {
-    for batch in batches {
+    while let Some(batch) = batches.next().await? {
         if let Some(action) = CheckpointAction::try_new_from_data(batch?.as_ref())? {
             return Ok(Some(action));
         }

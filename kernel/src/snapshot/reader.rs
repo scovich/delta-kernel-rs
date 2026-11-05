@@ -7,6 +7,7 @@ use delta_kernel_derive::internal_api;
 use super::Snapshot;
 use crate::actions::DomainMetadata;
 use crate::clustering::ClusteringColumnInfo;
+use crate::coroutine::kernel::{Channel, Workflow, run_workflow_with_engine, workflow};
 use crate::engine::CancellableEngine;
 use crate::expressions::ColumnName;
 use crate::log_segment::DomainMetadataMap;
@@ -151,7 +152,7 @@ impl<'a> SnapshotReader<'a> {
     ///
     /// Use [`Self::get_timestamp_with_cancellation`] to add a per-call cancellation token.
     pub fn get_timestamp(&self, engine: &dyn Engine) -> KernelResult<i64> {
-        self.snapshot.get_timestamp(engine)
+        run_workflow_with_engine!(engine, |channel| self.get_timestamp_with_channel(channel))
     }
 
     /// Returns this version's timestamp with a cancellation token.
@@ -165,6 +166,23 @@ impl<'a> SnapshotReader<'a> {
         } else {
             self.get_timestamp(engine)
         }
+    }
+
+    /// Returns a lazy workflow that gets this snapshot's timestamp.
+    ///
+    /// Cancellation is the connector's.
+    pub fn get_timestamp_workflow(&self) -> Workflow<'a, i64> {
+        let snapshot = self.snapshot;
+        workflow!(|channel| snapshot.get_timestamp_with_channel(channel))
+    }
+
+    /// Gets this version's timestamp through `channel`, in milliseconds since the Unix epoch.
+    ///
+    /// Cancellation is the connector's.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[internal_api]
+    pub(crate) async fn get_timestamp_with_channel(&self, channel: &Channel) -> KernelResult<i64> {
+        self.snapshot.get_timestamp_with_channel(channel).await
     }
 
     /// Returns clustering descriptors in domain order.
@@ -250,7 +268,34 @@ impl<'a> SnapshotReader<'a> {
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
     pub(crate) fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> KernelResult<Option<i64>> {
-        self.snapshot.get_in_commit_timestamp(engine)
+        run_workflow_with_engine!(engine, |channel| {
+            self.get_in_commit_timestamp_with_channel(channel)
+        })
+    }
+
+    /// Returns a lazy workflow that gets this version's In-Commit Timestamp, or `None` when ICT is
+    /// disabled.
+    ///
+    /// Cancellation is the connector's.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[internal_api]
+    pub(crate) fn get_in_commit_timestamp_workflow(&self) -> Workflow<'a, Option<i64>> {
+        let snapshot = self.snapshot;
+        workflow!(|channel| snapshot.get_in_commit_timestamp_with_channel(channel))
+    }
+
+    /// Gets this version's In-Commit Timestamp through `channel`, or `None` when ICT is disabled.
+    ///
+    /// Cancellation is the connector's.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[internal_api]
+    pub(crate) async fn get_in_commit_timestamp_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<Option<i64>> {
+        self.snapshot
+            .get_in_commit_timestamp_with_channel(channel)
+            .await
     }
 
     /// Creates an unscoped metadata reader without issuing I/O.

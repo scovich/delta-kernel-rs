@@ -4,7 +4,8 @@
 //!
 //! Kernel functions return [`Generator`] values before a request [`Channel`] exists. Combinators
 //! from [`GeneratorExt`] transform that unbound pipeline without adding a per-item yield handshake.
-//! The initial surface includes [`GeneratorExt::flatten`],
+//! The initial surface includes [`GeneratorExt::flatten`], [`GeneratorExt::map_ok`],
+//! [`BoundGenerator::peekable`], [`BoundGenerator::enumerate`],
 //! [`AsyncIntoIterator::into_generator`](crate::coroutine::generator::AsyncIntoIterator::into_generator),
 //! [`empty`](crate::coroutine::generator::empty), and
 //! [`unfold`](crate::coroutine::generator::unfold); other iterator counterparts are added with
@@ -32,7 +33,9 @@ use delta_kernel_derive::internal_api;
 use tracing::{Instrument as _, Span, error};
 
 #[cfg_attr(not(feature = "internal-api"), expect(unused_imports))]
-pub use self::adapters::{AsyncIntoIterator, Flatten, Iter, Unfold, empty, unfold};
+pub use self::adapters::{
+    AsyncIntoIterator, Enumerate, FilterMap, Flatten, Iter, MapOk, Peekable, Unfold, empty, unfold,
+};
 pub(crate) use self::adapters::{unfold_mut_with, unfold_mut_witness};
 use super::witness::invoke_witness;
 use super::{Channel, KernelFuture};
@@ -55,6 +58,14 @@ pub enum GeneratorStep<Y, O> {
 /// type `P`, and naming `P` on a combinator would force it to be inferred before
 /// [`Generator::bind`]. Bound consume helpers live on [`BoundGenerator`].
 pub trait GeneratorExt {
+    /// Counterpart of [`itertools::Itertools::map_ok`]: transforms each successful yielded item.
+    fn map_ok<F>(self, map: F) -> FilterMap<Self, MapOk<F>>
+    where
+        Self: Sized,
+    {
+        FilterMap::new(self, MapOk::new(map))
+    }
+
     /// Counterpart of [`Iterator::flatten`]: yields the elements of each collection-valued item.
     ///
     /// Page-request failures remain control-plane `Err`. Collection elements are yielded as-is,
@@ -148,6 +159,22 @@ pub trait BoundGenerator: Send {
                 GeneratorStep::Done(()) => None,
             }))
         })
+    }
+
+    /// Counterpart of [`Iterator::peekable`]: allows inspecting the next item without consuming it.
+    fn peekable(self) -> Peekable<Self>
+    where
+        Self: Sized + Unpin,
+    {
+        Peekable::new(self)
+    }
+
+    /// Counterpart of [`Iterator::enumerate`]: pairs each yielded item with its index.
+    fn enumerate(self) -> Enumerate<Self>
+    where
+        Self: Sized + Unpin,
+    {
+        Enumerate::new(self)
     }
 }
 
