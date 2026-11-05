@@ -65,9 +65,12 @@ use crate::actions::{
     METADATA_FIELD, Metadata, PROTOCOL_FIELD, Protocol, REMOVE_FIELD, SET_TRANSACTION_FIELD,
     SIDECAR_FIELD,
 };
+use crate::coroutine::generator::{AsyncIntoIterator as _, GeneratorExt as _, map_async};
+use crate::coroutine::kernel::engine::EngineConnector;
+use crate::coroutine::kernel::{Channel, StaticCoroutine};
 use crate::path::ParsedLogPath;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
-use crate::snapshot::SnapshotRef;
+use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_features::Operation;
 use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::require;
@@ -184,6 +187,17 @@ impl CommitRange {
         start_snapshot: Option<SnapshotRef>,
         actions: &[DeltaAction],
     ) -> KernelResult<impl KernelResultIterator<CommitAction> + use<>> {
+        let commits = self.commits_generator(start_snapshot.as_deref(), actions)?;
+        Ok(EngineConnector::new(engine.as_ref()).iterate_result_coroutine(commits))
+    }
+
+    /// Returns a lazy generator over the commits in this range.
+    #[internal_api]
+    pub(crate) fn commits_generator(
+        &self,
+        start_snapshot: Option<&Snapshot>,
+        actions: &[DeltaAction],
+    ) -> KernelResult<StaticCoroutine<KernelResult<CommitAction>>> {
         require!(
             self.supports_commit_actions,
             KernelError::CommitRange(
@@ -227,18 +241,18 @@ impl CommitRange {
 
         let read_schema = Arc::new(StructType::try_new(actions.iter().map(action_to_field))?);
 
-        let state = CommitActionState {
+        let mut state = CommitActionState {
             table_root: self.table_root.clone(),
             commit_ordering: self.commit_ordering,
             read_schema,
             latest_protocol,
             latest_metadata,
         };
-        Ok(CommitActionsIterator {
-            engine,
-            log_path_iter: self.commit_files.clone().into_iter(),
-            state,
-        })
+        let commits = map_async!(
+            self.commit_files.clone().into_generator(),
+            async move |channel, log_path| state.try_advance(channel, log_path).await,
+        );
+        Ok(StaticCoroutine::from_generator(commits))
     }
 }
 
@@ -293,13 +307,6 @@ impl Iterator for CommitFileIterator {
     }
 }
 
-/// Iterator yielded by [`CommitRange::commits`].
-pub(crate) struct CommitActionsIterator {
-    engine: Arc<dyn Engine>,
-    log_path_iter: std::vec::IntoIter<ParsedLogPath>,
-    state: CommitActionState,
-}
-
 /// State behind [`CommitRange::commits`]. Holds the accumulated
 /// `latest_protocol` / `latest_metadata` and constructs a fresh [`CommitAction`] for each
 /// commit, running per-commit protocol validation before yielding.
@@ -320,20 +327,21 @@ impl CommitActionState {
     /// Commits below the anchor are validated/timestamped best-effort against only their own
     /// actions. Another solution is to walk the commit in ascending then reversing in the
     /// [`CommitOrdering::DescendingOrder`] scenario.
-    fn try_advance(
+    async fn try_advance(
         &mut self,
-        engine: &dyn Engine,
+        channel: &Channel,
         log_path: ParsedLogPath,
     ) -> KernelResult<CommitAction> {
         let version = log_path.version;
-        let commit_action = CommitAction::try_new(
-            engine,
+        let commit_action = CommitAction::try_new_with_channel(
+            channel,
             self.table_root.clone(),
             log_path,
             self.read_schema.clone(),
             self.latest_protocol.clone(),
             self.latest_metadata.clone(),
         )
+        .await
         .map_err(|e| with_version_context(version, e))?;
 
         match self.commit_ordering {
@@ -361,15 +369,6 @@ fn with_version_context(version: Version, err: KernelError) -> KernelError {
             KernelError::InvalidProtocol(format!("commit v={version}: {msg}"))
         }
         other => KernelError::generic(format!("commit v={version}: {other}")),
-    }
-}
-
-impl Iterator for CommitActionsIterator {
-    type Item = KernelResult<CommitAction>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let log_path = self.log_path_iter.next()?;
-        Some(self.state.try_advance(self.engine.as_ref(), log_path))
     }
 }
 
