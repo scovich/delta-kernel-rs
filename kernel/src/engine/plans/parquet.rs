@@ -9,7 +9,7 @@ use crate::plans::{IoOperation, Operation, PlanBuilder, PlanExecutor};
 use crate::schema::SchemaRef;
 use crate::{
     EngineData, FileDataReadResultIterator, FileMeta, FileSize, KernelError, KernelResult,
-    KernelResultIterator, ParquetFooter, ParquetHandler, PredicateRef,
+    KernelResultIterator, ParquetFooter, ParquetHandler, ParquetMultiFileWrite, PredicateRef,
 };
 
 /// A [`ParquetHandler`] that delegates to a [`PlanExecutor`].
@@ -63,6 +63,24 @@ impl ParquetHandler for PlanBasedParquetHandler {
         };
         debug!(%location, "PlanBasedParquetHandler delegating write_parquet_file to fallback handler");
         fallback.write_parquet_file(location, data)
+    }
+
+    fn write_parquet_files(
+        &self,
+        write: ParquetMultiFileWrite,
+        data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
+    ) -> KernelResult<Vec<(Url, FileSize)>> {
+        let Some(fallback) = &self.fallback else {
+            return Err(KernelError::unsupported(
+                "PlanBasedParquetHandler does not support write_parquet_files yet, and no fallback \
+                 handler is configured",
+            ));
+        };
+        debug!(
+            directory = %write.directory,
+            "PlanBasedParquetHandler delegating write_parquet_files to fallback handler"
+        );
+        fallback.write_parquet_files(write, data)
     }
 
     fn read_parquet_footer(&self, file: &FileMeta) -> KernelResult<ParquetFooter> {

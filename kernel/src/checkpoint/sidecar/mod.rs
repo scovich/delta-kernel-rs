@@ -11,7 +11,7 @@ use crate::expressions::{
 use crate::schema::{DataType, SchemaRef, StructField, try_schema};
 use crate::{
     Engine, EngineData, EvaluationHandler, ExpressionEvaluator, FileMeta, KernelError,
-    KernelResult, PredicateEvaluator,
+    KernelResult, KernelResultIterator, PredicateEvaluator,
 };
 
 /// Field names of the `sidecar` action struct.
@@ -141,20 +141,16 @@ impl NonNullRowsPicker {
 ///   - `[add: null, remove: null, protocol: <prot>, metadata: null, txn: null]`
 ///   - `[add: null, remove: null, protocol: null, metadata: <meta>, txn: null]`
 pub(super) struct SidecarSplitter {
-    checkpoint_data_iter: ActionReconciliationIterator,
     /// Projects to add/remove columns and filters out rows where both are null.
     file_actions_picker: NonNullRowsPicker,
     /// Nulls out add/remove columns and filters out rows where all remaining columns are null.
     non_file_actions_picker: NonNullRowsPicker,
     /// Accumulated non-file-action batches (protocol, metadata, txn, etc.).
     non_file_action_batches: Vec<Box<dyn EngineData>>,
-    /// Set to `true` when the inner `checkpoint_data_iter` is exhausted.
-    exhausted: bool,
 }
 
 impl SidecarSplitter {
     pub(super) fn new(
-        checkpoint_data_iterator: ActionReconciliationIterator,
         eval_handler: &dyn EvaluationHandler,
         checkpoint_data_schema: SchemaRef,
     ) -> KernelResult<Self> {
@@ -224,7 +220,6 @@ impl SidecarSplitter {
         };
 
         Ok(Self {
-            checkpoint_data_iter: checkpoint_data_iterator,
             file_actions_picker: NonNullRowsPicker {
                 transform: file_action_projector,
                 null_row_filter: file_actions_null_row_filter,
@@ -234,28 +229,18 @@ impl SidecarSplitter {
                 null_row_filter: non_file_actions_null_row_filter,
             },
             non_file_action_batches: Vec::new(),
-            exhausted: false,
         })
     }
 
     /// Creates a new `SidecarSplitter` wrapped in `Arc<Mutex<_>>` for
-    /// shared mutable access. This is useful for passing [`SingleSidecarDataIterator`] to
-    /// [`ParquetHandler::write_parquet_file`], which requires `Box<dyn KernelResultIterator<_>>`.
+    /// shared mutable access. This is useful for passing [`Self::file_action_batches`] to
+    /// [`crate::ParquetHandler::write_parquet_files`], which requires
+    /// `Box<dyn KernelResultIterator<_>>`.
     pub(super) fn new_mut_shared(
-        checkpoint_data_iterator: ActionReconciliationIterator,
         eval_handler: &dyn EvaluationHandler,
         checkpoint_data_schema: SchemaRef,
     ) -> KernelResult<Arc<Mutex<Self>>> {
-        Self::new(
-            checkpoint_data_iterator,
-            eval_handler,
-            checkpoint_data_schema,
-        )
-        .map(|s| Arc::new(Mutex::new(s)))
-    }
-
-    pub(super) fn is_exhausted(&self) -> bool {
-        self.exhausted
+        Self::new(eval_handler, checkpoint_data_schema).map(|s| Arc::new(Mutex::new(s)))
     }
 
     /// Consume the splitter and return the buffered non-file-action batches.
@@ -263,15 +248,30 @@ impl SidecarSplitter {
         self.non_file_action_batches
     }
 
-    /// Pull the next batch from the inner iterator, split it into file-action and non-file-action
+    /// Yields every file-action batch from `splitter`, buffering non-file actions as it drains.
+    pub(super) fn file_action_batches(
+        splitter: Arc<Mutex<Self>>,
+        mut checkpoint_data_iter: ActionReconciliationIterator,
+    ) -> impl KernelResultIterator<Box<dyn EngineData>> {
+        std::iter::from_fn(move || {
+            let Ok(mut splitter) = splitter.lock() else {
+                return Some(Err(KernelError::internal_error(
+                    "sidecar splitter lock poisoned",
+                )));
+            };
+            splitter.next_file_actions_batch(&mut checkpoint_data_iter)
+        })
+    }
+
+    /// Pull the next batch from the input iterator, split it into file-action and non-file-action
     /// parts. Buffers the non-file-action part; returns the next non-empty file-action batch.
-    /// Returns `None` and sets `exhausted` when the inner iterator is exhausted.
-    fn next_file_actions_batch(&mut self) -> Option<KernelResult<Box<dyn EngineData>>> {
+    /// Returns `None` when the input iterator is exhausted.
+    fn next_file_actions_batch(
+        &mut self,
+        checkpoint_data_iter: &mut ActionReconciliationIterator,
+    ) -> Option<KernelResult<Box<dyn EngineData>>> {
         loop {
-            let result = self.checkpoint_data_iter.next().or_else(|| {
-                self.exhausted = true;
-                None
-            })?;
+            let result = checkpoint_data_iter.next()?;
             let batch = match result.and_then(|f| f.apply_selection_vector()) {
                 Ok(b) => b,
                 Err(e) => return Some(Err(e)),
@@ -287,64 +287,6 @@ impl SidecarSplitter {
                 Ok(file_actions_batch) if file_actions_batch.is_empty() => continue,
                 other => return Some(other),
             }
-        }
-    }
-}
-
-/// Iterator that yields file-action batches for **one** sidecar file.
-pub(super) struct SingleSidecarDataIterator {
-    splitter: Arc<Mutex<SidecarSplitter>>,
-    /// Soft cap on the number of file-action rows per sidecar. The actual count may exceed this
-    /// because we operate on whole `EngineData` batches, which cannot be split.
-    max_file_actions_hint: usize,
-    yielded_row_count: usize,
-}
-
-impl SingleSidecarDataIterator {
-    pub(super) fn new(
-        splitter: Arc<Mutex<SidecarSplitter>>,
-        max_file_actions_hint: usize,
-    ) -> KernelResult<Self> {
-        if max_file_actions_hint == 0 {
-            return Err(KernelError::checkpoint_write(
-                "max_file_actions_hint must be greater than 0",
-            ));
-        }
-        Ok(Self {
-            splitter,
-            max_file_actions_hint,
-            yielded_row_count: 0,
-        })
-    }
-}
-
-impl Iterator for SingleSidecarDataIterator {
-    type Item = KernelResult<Box<dyn EngineData>>;
-
-    /// Yields the next file-action batch for current sidecar.
-    ///
-    /// Returns `None` when either:
-    /// - The row count for this chunk reaches `max_file_actions_hint`, or
-    /// - The underlying data stream is exhausted.
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.yielded_row_count >= self.max_file_actions_hint {
-            return None;
-        }
-        let mut splitter = match self.splitter.lock() {
-            Ok(guard) => guard,
-            Err(e) => {
-                return Some(Err(KernelError::internal_error(format!(
-                    "sidecar splitter lock poisoned: {e}"
-                ))));
-            }
-        };
-        match splitter.next_file_actions_batch() {
-            Some(Ok(file_batch)) => {
-                self.yielded_row_count += file_batch.len();
-                Some(Ok(file_batch))
-            }
-            Some(Err(e)) => Some(Err(e)),
-            None => None,
         }
     }
 }

@@ -106,7 +106,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine_data::FilteredEngineData;
-    use crate::{Engine as _, EngineData, KernelError};
+    use crate::{Engine as _, EngineData, KernelError, ParquetMultiFileWrite};
 
     fn plan_engine(fallback: Option<Arc<dyn crate::Engine>>) -> PlanBasedEngine {
         PlanBasedEngine::new(fallback, Arc::new(SyncPlanExecutor::default()))
@@ -200,8 +200,15 @@ mod tests {
 
         let parquet_err = engine
             .parquet_handler()
-            .write_parquet_file(location, Box::new(std::iter::empty()))
+            .write_parquet_file(location.clone(), Box::new(std::iter::empty()))
             .expect_err("no fallback is configured");
         assert!(matches!(parquet_err, KernelError::Unsupported(_)));
+
+        let write = ParquetMultiFileWrite::new(location, "part-", ".parquet", None);
+        let files_err = engine
+            .parquet_handler()
+            .write_parquet_files(write, Box::new(std::iter::empty()))
+            .expect_err("no fallback is configured");
+        assert!(matches!(files_err, KernelError::Unsupported(_)));
     }
 }
