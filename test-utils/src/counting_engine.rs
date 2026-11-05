@@ -176,17 +176,22 @@ impl EvaluationHandler for CountingHandlers {
 }
 
 impl StorageHandler for CountingHandlers {
-    fn list_from(&self, path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
-        self.storage.list_from(path)
+    fn list_from(
+        &self,
+        path: &Url,
+        end: Option<&Url>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        self.storage.list_from(path, end)
     }
 
     fn list_from_with_cancellation(
         &self,
         path: &Url,
+        end: Option<&Url>,
         cancellation_token: Option<CancellationTokenRef>,
     ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         self.storage
-            .list_from_with_cancellation(path, cancellation_token)
+            .list_from_with_cancellation(path, end, cancellation_token)
     }
 
     fn read_files(
