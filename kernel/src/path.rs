@@ -410,7 +410,7 @@ impl ParsedLogPath<FileMeta> {
     /// this is not a commit file, the file cannot be read, the In-Commit Timestamp is missing, or
     /// the `lastManifestCommit` is invalid, including a pointer to a manifest commit newer than
     /// this commit.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
     pub(crate) fn read_ict_and_last_manifest_commit(
         &self,
         engine: &dyn Engine,

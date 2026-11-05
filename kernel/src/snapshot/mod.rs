@@ -24,6 +24,7 @@ use crate::checkpoint::{
 };
 use crate::clustering::{CLUSTERING_DOMAIN_NAME, ClusteringColumnInfo, parse_clustering_columns};
 use crate::committer::{Committer, PublishMetadata};
+use crate::coroutine::kernel::{Channel, run_workflow_with_engine};
 use crate::crc::{
     Crc, CrcDelta, DomainMetadataState, FileSizeHistogram, FileStats, SetTransactionState,
     try_write_crc_file,
@@ -1177,8 +1178,17 @@ impl Snapshot {
     /// - `Ok(Some(timestamp))` - ICT is enabled and available for this version
     /// - `Ok(None)` - ICT is not enabled
     /// - `Err(...)` - ICT is enabled but cannot be read, or enablement version is invalid
-    #[instrument(parent = &self.span, name = "snap.get_ict", skip_all, err)]
     fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> KernelResult<Option<i64>> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.get_in_commit_timestamp_with_channel(channel)
+        })
+    }
+
+    #[instrument(parent = &self.span, name = "snap.get_ict", skip_all, err)]
+    async fn get_in_commit_timestamp_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<Option<i64>> {
         // Get ICT enablement info and check if we should read ICT for this version
         let enablement = self
             .table_configuration()
@@ -1219,7 +1229,9 @@ impl Snapshot {
         // Fallback: read the ICT from latest_commit_file
         match &self.log_segment.listed.latest_commit_file {
             Some(commit_file_meta) => {
-                let ict = commit_file_meta.read_in_commit_timestamp(engine)?;
+                let ict = commit_file_meta
+                    .read_in_commit_timestamp_with_channel(channel)
+                    .await?;
                 Ok(Some(ict))
             }
             None => Err(KernelError::MissingVersion(self.version())),
@@ -1237,10 +1249,20 @@ impl Snapshot {
     /// Returns [`KernelError::MissingVersion`] when this version's commit file must be read but is
     /// not in the log segment, or an error if the file cannot be read.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[instrument(parent = &self.span, name = "snap.last_manifest_commit", skip_all, err)]
     pub(crate) fn last_manifest_commit(
         &self,
         engine: &dyn Engine,
+    ) -> KernelResult<Option<LastManifestCommit>> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.last_manifest_commit_with_channel(channel)
+        })
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[instrument(parent = &self.span, name = "snap.last_manifest_commit", skip_all, err)]
+    async fn last_manifest_commit_with_channel(
+        &self,
+        channel: &Channel,
     ) -> KernelResult<Option<LastManifestCommit>> {
         if !self.has_adaptive_metadata() {
             return Ok(None);
@@ -1248,7 +1270,8 @@ impl Snapshot {
         if let Some(resolved) = self.last_manifest_commit.get() {
             return Ok(resolved.clone());
         }
-        Ok(self.read_ict_and_last_manifest_commit(engine)?.1)
+        let pair = self.read_ict_and_last_manifest_commit_with_channel(channel);
+        Ok(pair.await?.1)
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1264,10 +1287,22 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<(i64, Option<LastManifestCommit>)> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.read_ict_and_last_manifest_commit_with_channel(channel)
+        })
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    async fn read_ict_and_last_manifest_commit_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<(i64, Option<LastManifestCommit>)> {
         let (in_commit_timestamp, last_manifest_commit) =
             match &self.log_segment.listed.latest_commit_file {
                 Some(commit_file_meta) => {
-                    commit_file_meta.read_ict_and_last_manifest_commit(engine)?
+                    commit_file_meta
+                        .read_ict_and_last_manifest_commit_with_channel(channel)
+                        .await?
                 }
                 None => return Err(KernelError::MissingVersion(self.version())),
             };
@@ -1287,8 +1322,13 @@ impl Snapshot {
     /// See also [`get_in_commit_timestamp`] for ICT-only semantics.
     ///
     /// [`get_in_commit_timestamp`]: Self::get_in_commit_timestamp
-    #[instrument(parent = &self.span, name = "snap.get_ts", skip_all, err)]
+    #[cfg(test)]
     fn get_timestamp(&self, engine: &dyn Engine) -> KernelResult<i64> {
+        run_workflow_with_engine!(engine, |channel| self.get_timestamp_with_channel(channel))
+    }
+
+    #[instrument(parent = &self.span, name = "snap.get_ts", skip_all, err)]
+    async fn get_timestamp_with_channel(&self, channel: &Channel) -> KernelResult<i64> {
         match self
             .table_configuration()
             .in_commit_timestamp_enablement()?
@@ -1303,7 +1343,8 @@ impl Snapshot {
                 }
             }
             InCommitTimestampEnablement::Enabled { .. } => {
-                self.get_in_commit_timestamp(engine)?.ok_or_else(|| {
+                let ict = self.get_in_commit_timestamp_with_channel(channel);
+                ict.await?.ok_or_else(|| {
                     KernelError::internal_error(format!(
                         "Invalid state: version {}, ICT is enabled \
                         but get_in_commit_timestamp returned None",

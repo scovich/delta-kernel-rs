@@ -148,11 +148,10 @@ pub(crate) fn iterate_result_coroutine_with_engine<'a, Item: Send + 'static, O: 
 /// Prepare and iterate a fallible result coroutine through one connector captured from `engine`.
 #[doc(hidden)]
 #[internal_api]
-#[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
 pub(crate) fn iterate_prepared_result_coroutine_with_engine<'a, G, Item>(
     engine: &dyn Engine,
     workflow: Workflow<'_, G>,
-) -> KernelResult<impl Iterator<Item = KernelResult<Item>> + Send + 'a>
+) -> KernelResult<impl Iterator<Item = KernelResult<Item>> + Send + 'a + use<'a, G, Item>>
 where
     G: KernelResultGenerator<Item> + 'a,
     Item: Send + 'static,

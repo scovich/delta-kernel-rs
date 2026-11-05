@@ -28,7 +28,8 @@ use crate::actions::{
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{LAST_MANIFEST_COMMIT_FIELD, LastManifestCommit};
 use crate::coroutine::AsyncOption as _;
-use crate::coroutine::kernel::{Channel, run_workflow_with_engine};
+use crate::coroutine::generator::BoundGenerator as _;
+use crate::coroutine::kernel::{Channel, ChannelExt as _, run_workflow_with_engine};
 use crate::crc::{
     Crc, CrcDelta, FileSizeHistogram, FileStatsDelta, FileStatsPolicy,
     read_crc_file_or_none_with_channel, size_to_u64,
@@ -223,6 +224,15 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<Crc>> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.build_crc_from_version_zero_with_channel(channel)
+        })
+    }
+
+    pub(crate) async fn build_crc_from_version_zero_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<Option<Crc>> {
         require!(
             self.checkpoint_version.is_none(),
             KernelError::internal_error(
@@ -235,11 +245,12 @@ impl LogSegment {
         // A log with no checkpoint must start at version 0; a higher first version means a table
         // truncated without a checkpoint.
         require!(first.version == 0, KernelError::MissingVersion(0));
-        let delta = self.replay_commits_into_crc_delta(
-            engine,
+        let delta = self.replay_commits_into_crc_delta_with_channel(
+            channel,
             self.listed.ascending_commit_files.iter(),
             Some(FileSizeHistogram::create_default()),
-        )?;
+        );
+        let delta = delta.await?;
         Ok(delta.into_complete_crc(self.end_version))
     }
 
@@ -252,6 +263,17 @@ impl LogSegment {
     pub(crate) fn build_crc_delta_from_base(
         &self,
         engine: &dyn Engine,
+        base_version: Version,
+        seed_histogram: Option<FileSizeHistogram>,
+    ) -> KernelResult<CrcDelta> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.build_crc_delta_from_base_with_channel(channel, base_version, seed_histogram)
+        })
+    }
+
+    pub(crate) async fn build_crc_delta_from_base_with_channel(
+        &self,
+        channel: &Channel,
         base_version: Version,
         seed_histogram: Option<FileSizeHistogram>,
     ) -> KernelResult<CrcDelta> {
@@ -282,16 +304,17 @@ impl LogSegment {
             ))
         );
 
-        self.replay_commits_into_crc_delta(engine, deltas.into_iter(), seed_histogram)
+        self.replay_commits_into_crc_delta_with_channel(channel, deltas.into_iter(), seed_histogram)
+            .await
     }
 
     /// Replay the given commits into a [`CrcDelta`]. The shared core of
     /// [`Self::build_crc_delta_from_base`] and [`Self::build_crc_from_version_zero`].
     /// `ascending_commits` are taken oldest-first; `seed_histogram` is an empty histogram with the
     /// downstream base's bin boundaries, or `None` to skip histogram tracking.
-    fn replay_commits_into_crc_delta<'a>(
+    async fn replay_commits_into_crc_delta_with_channel<'a>(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         mut ascending_commits: impl DoubleEndedIterator<Item = &'a ParsedLogPath>,
         seed_histogram: Option<FileSizeHistogram>,
     ) -> KernelResult<CrcDelta> {
@@ -303,12 +326,11 @@ impl LogSegment {
             .map(|c| c.location.clone())
             .collect();
         let mut acc = CrcReplayAccumulator::new(seed_histogram);
-        let batches =
-            engine
-                .json_handler()
-                .read_json_files(&locations, REPLAY_SCHEMA.clone(), None)?;
+        let mut batches = channel
+            .read_json_files(locations, REPLAY_SCHEMA.clone(), None)
+            .await?;
 
-        for batch_result in batches {
+        while let Some(batch_result) = batches.next().await? {
             // Transient visitor borrows the shared accumulator for the duration of the
             // batch; same pattern as `ActionReconciliationVisitor`.
             let mut visitor = CommitCrcVisitor { acc: &mut acc };
