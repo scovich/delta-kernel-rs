@@ -27,9 +27,11 @@ use crate::actions::{
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{LAST_MANIFEST_COMMIT_FIELD, LastManifestCommit};
+use crate::coroutine::AsyncOption as _;
+use crate::coroutine::kernel::{Channel, run_workflow_with_engine};
 use crate::crc::{
-    Crc, CrcDelta, FileSizeHistogram, FileStatsDelta, FileStatsPolicy, read_crc_file_or_none,
-    size_to_u64,
+    Crc, CrcDelta, FileSizeHistogram, FileStatsDelta, FileStatsPolicy,
+    read_crc_file_or_none_with_channel, size_to_u64,
 };
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::metrics::ProtocolMetadataSource;
@@ -112,13 +114,24 @@ impl LogSegment {
         engine: &dyn Engine,
         in_memory_base: Option<&Arc<Crc>>,
     ) -> KernelResult<Option<Arc<Crc>>> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.pick_latest_base_crc_with_channel(channel, in_memory_base)
+        })
+    }
+
+    pub(crate) async fn pick_latest_base_crc_with_channel(
+        &self,
+        channel: &Channel,
+        in_memory_base: Option<&Arc<Crc>>,
+    ) -> KernelResult<Option<Arc<Crc>>> {
         let preferred_disk_crc = self
             .listed
             .latest_crc_file
             .as_ref()
             .filter(|f| in_memory_base.is_none_or(|m| f.version > m.version));
         let disk_crc = preferred_disk_crc
-            .map(|file| read_crc_file_or_none(engine, file))
+            .map_async(|file| read_crc_file_or_none_with_channel(channel, file))
+            .await
             .transpose()?
             .flatten();
         Ok(disk_crc.or_else(|| in_memory_base.cloned()).filter(|crc| {
@@ -131,7 +144,15 @@ impl LogSegment {
     /// Returns None when there is no CRC file or a non-cancellation read failure. The CRC may be
     /// stale (older than `end_version`).
     pub(crate) fn read_latest_crc(&self, engine: &dyn Engine) -> KernelResult<Option<Arc<Crc>>> {
-        self.pick_latest_base_crc(engine, /* in_memory_base */ None)
+        run_workflow_with_engine!(engine, |channel| self.read_latest_crc_with_channel(channel))
+    }
+
+    pub(crate) async fn read_latest_crc_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<Option<Arc<Crc>>> {
+        self.pick_latest_base_crc_with_channel(channel, /* in_memory_base */ None)
+            .await
     }
 
     /// Produce a fresh `Crc` at `self.end_version` by reverse-replaying the commits in

@@ -14,6 +14,7 @@ use crate::actions::CheckpointAction;
 use crate::actions::{
     CheckpointMetadata, DomainMetadata, Metadata, Protocol, SetTransaction, Sidecar,
 };
+use crate::coroutine::kernel::{Channel, ChannelExt as _, run_workflow_with_storage};
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
 use crate::{FileMeta, KernelError, KernelResult, StorageHandler, Version};
@@ -436,6 +437,15 @@ impl LastCheckpointHint {
     /// failing the read. Thus, the semantics of this function are to return `None` if the file is
     /// not found or is invalid JSON. Unexpected/unrecoverable errors are returned as `Err` case and
     /// are assumed to cause failure.
+    pub(crate) fn try_read(
+        storage: &dyn StorageHandler,
+        log_root: &Url,
+    ) -> KernelResult<Option<LastCheckpointHint>> {
+        run_workflow_with_storage!(storage, |channel| {
+            Self::try_read_with_channel(channel, log_root)
+        })
+    }
+
     // TODO(#1047): weird that we propagate FileNotFound as part of the iterator instead of top-
     // level result coming from storage.read_files
     #[instrument(
@@ -444,12 +454,12 @@ impl LastCheckpointHint {
         fields(enable_call_frame),
         err
     )]
-    pub(crate) fn try_read(
-        storage: &dyn StorageHandler,
+    pub(crate) async fn try_read_with_channel(
+        channel: &Channel,
         log_root: &Url,
     ) -> KernelResult<Option<LastCheckpointHint>> {
         let file_path = Self::path(log_root)?;
-        match storage.read_small_file((file_path, None)).transpose() {
+        match channel.read_small_file(file_path, None).await.transpose() {
             Some(Ok(data)) => {
                 let result = Self::from_bytes_with_oversized_fields_dropped(&data)
                     .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
