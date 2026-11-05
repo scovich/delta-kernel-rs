@@ -86,7 +86,6 @@ impl ConnectorRespond for EngineConnector {
 
 /// Drive a workflow using only storage operations.
 #[internal_api]
-#[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
 pub(crate) fn drive_with_storage<O>(
     storage: &dyn StorageHandler,
     workflow: Workflow<'_, O>,
@@ -96,7 +95,6 @@ pub(crate) fn drive_with_storage<O>(
 
 /// Drive `workflow` through `engine`.
 #[internal_api]
-#[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
 pub(crate) fn drive_with_engine<O>(
     engine: &dyn Engine,
     workflow: Workflow<'_, O>,

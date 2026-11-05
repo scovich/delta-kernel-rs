@@ -37,7 +37,6 @@ pub(crate) struct BodyFn<F, P, O> {
 impl<F, P: Send + 'static, O> BodyFn<F, P, O> {
     /// Stores `body` without choosing its call-future proof path.
     #[internal_api]
-    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
     pub(crate) fn new(body: F) -> Self
     where
         F: for<'channel> AsyncFnOnce(&'channel Channel<P>) -> KernelResult<O>,
@@ -51,7 +50,6 @@ impl<F, P: Send + 'static, O> BodyFn<F, P, O> {
 
     /// Creates a scoped workflow using the concrete call-future proof supplied by `witness`.
     #[internal_api]
-    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
     pub(crate) fn into_workflow_with<'workflow, Fut>(
         self,
         witness: impl FnOnce(Self, Arc<Channel<P>>) -> Fut,
@@ -70,7 +68,6 @@ impl<F, P: Send + 'static, O> BodyFn<F, P, O> {
 
     /// Runs the body while exposing its concrete future to [`Self::into_workflow_with`].
     #[internal_api]
-    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
     pub(crate) fn witness(self, channel: Arc<Channel<P>>) -> impl Future<Output = KernelResult<O>>
     where
         F: for<'channel> AsyncFnOnce(&'channel Channel<P>) -> KernelResult<O>,

@@ -30,7 +30,6 @@ pub(crate) type Channel = crate::coroutine::Channel<Request>;
 /// initialization errors surface at the call and callers can compose the stream before
 /// [`Self::bind`].
 #[internal_api]
-#[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
 #[allow(async_fn_in_trait)]
 pub(crate) trait ChannelExt: ChannelExchange<Request> {
     /// Read one small file, or one half-open byte range, completely into memory via
@@ -44,6 +43,7 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
     }
 
     /// Initialize `operation` via [`PageRequest::Prepare`] without fetching its first page.
+    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
     fn prepare_paged<Op>(&self, operation: Op) -> impl KernelFuture<Cursor<Op>>
     where
         Op: PagedOperation,
@@ -53,6 +53,7 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
     }
 
     /// Fetch the next page for `cursor` via [`PageRequest::Next`].
+    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
     fn next_page<Op>(&self, cursor: Cursor<Op>) -> impl KernelFuture<Page<Op>>
     where
         Op: PagedOperation,
@@ -62,6 +63,7 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
     }
 
     /// Bind `generator` so its connector requests post through this channel.
+    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
     fn bind<'a, G>(
         &'a self,
         generator: G,

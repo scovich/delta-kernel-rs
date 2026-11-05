@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use delta_kernel_derive::internal_api;
 use derive_more::From;
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,8 @@ use super::ScanMetadata;
 use super::log_replay::SCAN_ROW_SCHEMA;
 use crate::actions::deletion_vector::{DeletionVectorDescriptor, deletion_treemap_to_bools};
 use crate::actions::visitors::visit_deletion_vector_at;
+use crate::coroutine::AsyncOption as _;
+use crate::coroutine::kernel::{Channel, Workflow, run_workflow_with_engine, workflow};
 use crate::engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData};
 use crate::scan::get_transform_for_row;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};
@@ -60,17 +63,15 @@ impl DvInfo {
         self.deletion_vector.is_some()
     }
 
-    pub(crate) fn get_treemap(
+    pub(crate) async fn get_treemap_with_channel(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         table_root: &url::Url,
     ) -> KernelResult<Option<RoaringTreemap>> {
         self.deletion_vector
             .as_ref()
-            .map(|dv_descriptor| {
-                let storage = engine.storage_handler();
-                dv_descriptor.read(storage, table_root)
-            })
+            .map_async(|dv_descriptor| dv_descriptor.read_with_channel(channel, table_root))
+            .await
             .transpose()
     }
 
@@ -79,7 +80,27 @@ impl DvInfo {
         engine: &dyn Engine,
         table_root: &url::Url,
     ) -> KernelResult<Option<Vec<bool>>> {
-        let dv_treemap = self.get_treemap(engine, table_root)?;
+        run_workflow_with_engine!(engine, |channel| {
+            self.get_selection_vector_with_channel(channel, table_root)
+        })
+    }
+
+    /// Return a lazy workflow that materializes this deletion vector as a selection vector.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
+    pub(crate) fn get_selection_vector_workflow<'a>(
+        &'a self,
+        table_root: &'a url::Url,
+    ) -> Workflow<'a, Option<Vec<bool>>> {
+        workflow!(|channel| self.get_selection_vector_with_channel(channel, table_root))
+    }
+
+    pub(crate) async fn get_selection_vector_with_channel(
+        &self,
+        channel: &Channel,
+        table_root: &url::Url,
+    ) -> KernelResult<Option<Vec<bool>>> {
+        let dv_treemap = self.get_treemap_with_channel(channel, table_root).await?;
         Ok(dv_treemap.map(deletion_treemap_to_bools))
     }
 
@@ -89,12 +110,30 @@ impl DvInfo {
         engine: &dyn Engine,
         table_root: &url::Url,
     ) -> KernelResult<Option<Vec<u64>>> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.get_row_indexes_with_channel(channel, table_root)
+        })
+    }
+
+    /// Return a lazy workflow that materializes this deletion vector's row indexes.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
+    pub(crate) fn get_row_indexes_workflow<'a>(
+        &'a self,
+        table_root: &'a url::Url,
+    ) -> Workflow<'a, Option<Vec<u64>>> {
+        workflow!(|channel| self.get_row_indexes_with_channel(channel, table_root))
+    }
+
+    pub(crate) async fn get_row_indexes_with_channel(
+        &self,
+        channel: &Channel,
+        table_root: &url::Url,
+    ) -> KernelResult<Option<Vec<u64>>> {
         self.deletion_vector
             .as_ref()
-            .map(|dv| {
-                let storage = engine.storage_handler();
-                dv.row_indexes(storage, table_root)
-            })
+            .map_async(|dv| dv.row_indexes_with_channel(channel, table_root))
+            .await
             .transpose()
     }
 }

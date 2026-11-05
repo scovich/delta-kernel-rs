@@ -100,6 +100,7 @@ use std::task::{Context, Poll, Waker};
 
 use delta_kernel_derive::{internal_api, pub_macro};
 
+pub(crate) use self::async_ext::AsyncOption;
 #[doc(inline)]
 #[internal_api]
 #[cfg_attr(not(feature = "internal-api"), expect(unused_imports))]
@@ -280,7 +281,6 @@ impl<'a, P: Send + 'static, Y: Send + 'a, O: Send + 'static>
 ///
 /// The `|channel| future` form forwards one future as the workflow body. Use an explicit async
 /// closure for multi-step control flow.
-#[cfg(feature = "internal-api")]
 #[internal_api]
 macro_rules! workflow {
     ($request:ty, |$channel:ident| $future:expr $(,)?) => {
@@ -411,7 +411,6 @@ pub(crate) use self::pagination::PageGenerator;
 pub use self::pagination::{Cursor, Page, PageRequest, PagedOperation};
 #[doc(hidden)]
 #[internal_api]
-#[cfg_attr(not(feature = "internal-api"), expect(unused_imports))]
 pub(crate) use self::workflow::BodyFn;
 
 mod async_ext;
