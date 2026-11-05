@@ -255,8 +255,7 @@ mod tests {
         fn commit(
             &self,
             _engine: &dyn delta_kernel::Engine,
-            _actions: Box<dyn delta_kernel::KernelResultIterator<FilteredEngineData> + '_>,
-            _commit_metadata: delta_kernel::committer::CommitMetadata,
+            _commit: delta_kernel::committer::Commit,
         ) -> KernelResult<delta_kernel::committer::CommitResponse> {
             Err(delta_kernel::KernelError::IOError(std::io::Error::other(
                 "simulated IO error",
@@ -288,8 +287,7 @@ mod tests {
         fn commit(
             &self,
             _engine: &dyn delta_kernel::Engine,
-            _actions: Box<dyn delta_kernel::KernelResultIterator<FilteredEngineData> + '_>,
-            _commit_metadata: delta_kernel::committer::CommitMetadata,
+            _commit: delta_kernel::committer::Commit,
         ) -> KernelResult<delta_kernel::committer::CommitResponse> {
             Err(delta_kernel::KernelError::generic(
                 "drop-tracking committer must not be called",

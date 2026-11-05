@@ -2,16 +2,16 @@
 
 use tracing::{info, instrument};
 
-use super::Committer;
-use super::commit_types::{CommitMetadata, CommitResponse};
+#[cfg(feature = "declarative-plans")]
+use super::commit_types::CommitMetadata;
+use super::commit_types::CommitResponse;
 use super::publish_types::PublishMetadata;
+use super::{Commit, Committer};
 #[cfg(feature = "declarative-plans")]
 use crate::committer::write_commit_json_declarative;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::{RelationRef, ScopedPlanExecutor};
-use crate::{
-    Engine, FileMeta, FilteredEngineData, KernelError, KernelResult, KernelResultIterator,
-};
+use crate::{Engine, FileMeta, KernelError, KernelResult};
 
 /// The `FileSystemCommitter` is an internal implementation of the `Committer` trait which
 /// commits to a file system directly via `Engine::json_handler().write_json_file` for
@@ -55,21 +55,17 @@ impl Committer for FileSystemCommitter {
     #[instrument(
         name = "fs_committer.commit",
         skip_all,
-        fields(version = commit_metadata.version()),
+        fields(version = commit.version()),
         err
     )]
-    fn commit(
-        &self,
-        engine: &dyn Engine,
-        actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
-        commit_metadata: CommitMetadata,
-    ) -> KernelResult<CommitResponse> {
+    fn commit(&self, engine: &dyn Engine, commit: Commit) -> KernelResult<CommitResponse> {
+        let (commit_metadata, actions) = commit.try_into_parts(false)?;
         let version = commit_metadata.version();
         let published_commit_path = commit_metadata.published_commit_path()?;
 
         let result = engine
             .json_handler()
-            .write_json_file(&published_commit_path, Box::new(actions), false)
+            .write_json_file(&published_commit_path, actions, false)
             .map(|written_size| {
                 FileMeta::new(
                     published_commit_path,
@@ -125,7 +121,7 @@ mod tests {
 
     use super::*;
     use crate::actions::{LOG_METADATA_SCHEMA, Metadata, Protocol};
-    use crate::committer::{CommitProtocolMetadata, CommitType};
+    use crate::committer::{CommitMetadata, CommitProtocolMetadata, CommitType};
     #[cfg(feature = "declarative-plans")]
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
@@ -137,7 +133,7 @@ mod tests {
     use crate::path::LogRoot;
     use crate::schema::schema_ref;
     use crate::transaction::UpdateTableOperation;
-    use crate::{EngineData, create_row};
+    use crate::{EngineData, FilteredEngineData, create_row};
 
     #[derive(Clone, Copy)]
     enum CommitStyle {
@@ -161,7 +157,7 @@ mod tests {
                 let actions = Box::new(std::iter::once(Ok(
                     FilteredEngineData::with_all_rows_selected(action),
                 )));
-                committer.commit(engine, actions, commit_metadata)
+                committer.commit(engine, Commit::new(commit_metadata, actions))
             }
             #[cfg(feature = "declarative-plans")]
             CommitStyle::Declarative => {

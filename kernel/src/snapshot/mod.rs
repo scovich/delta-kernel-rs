@@ -1923,10 +1923,11 @@ mod tests {
     use test_utils::{add_commit, delta_path_for_version};
 
     use super::{commit, *};
+    use crate::Result;
     use crate::actions::{DomainMetadata, Protocol};
     use crate::arrow::array::StringArray;
     use crate::arrow::record_batch::RecordBatch;
-    use crate::committer::{CommitMetadata, CommitResponse, FileSystemCommitter};
+    use crate::committer::{Commit, CommitResponse, FileSystemCommitter};
     use crate::engine::PanicEngine;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
@@ -1949,7 +1950,6 @@ mod tests {
         create_log_path, string_array_to_engine_data,
     };
     use crate::utils::FoldWithOption as _;
-    use crate::{FilteredEngineData, Result};
 
     /// Records versions passed to `publish` and can fail the first call.
     #[derive(Default)]
@@ -1959,12 +1959,7 @@ mod tests {
     }
 
     impl Committer for RecordingPublishCommitter {
-        fn commit(
-            &self,
-            _: &dyn Engine,
-            _: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
-            _: CommitMetadata,
-        ) -> KernelResult<CommitResponse> {
+        fn commit(&self, _: &dyn Engine, _: Commit) -> KernelResult<CommitResponse> {
             panic!("publication must not commit a transaction")
         }
 

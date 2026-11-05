@@ -21,7 +21,7 @@ use crate::actions::{
     LOG_PROTOCOL_SCHEMA, LOG_REMOVE_SCHEMA, LOG_TXN_SCHEMA, Metadata, Protocol, SetTransaction,
     as_log_add_schema,
 };
-use crate::committer::{CommitMetadata, CommitResponse, Committer};
+use crate::committer::{Commit, CommitActions, CommitMetadata, CommitResponse, Committer};
 use crate::crc::FileStatsDelta;
 use crate::engine_data::FilteredEngineData;
 use crate::error::KernelError;
@@ -57,7 +57,7 @@ mod write_validation;
 
 /// The encoded commit actions, plus the state the post-commit CRC and snapshot are built from.
 struct CommitBatches {
-    actions: Box<dyn KernelResultIterator<FilteredEngineData>>,
+    actions: CommitActions,
     dm_changes: Vec<DomainMetadata>,
     /// The `checkpoint` action this commit writes, if any (adaptiveMetadata).
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -143,7 +143,6 @@ impl<STATE: 'static> Transaction<STATE, Imperative> {
 
         // === Commit ===
         let commit_metadata = self.create_commit_metadata(
-            committer,
             commit_version,
             kernel_commit_info.in_commit_timestamp,
             protocol,
@@ -220,11 +219,11 @@ impl<STATE: 'static> Transaction<STATE, Imperative> {
         &self,
         engine: &dyn Engine,
         committer: &dyn Committer,
-        actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
+        actions: CommitActions,
         commit_metadata: CommitMetadata,
     ) -> (KernelResult<CommitResponse>, Duration) {
         let committer_start = Instant::now();
-        let commit_response = committer.commit(engine, actions, commit_metadata);
+        let commit_response = committer.commit(engine, Commit::new(commit_metadata, actions));
         (commit_response, committer_start.elapsed())
     }
 
