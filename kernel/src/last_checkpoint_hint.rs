@@ -449,7 +449,7 @@ impl LastCheckpointHint {
         log_root: &Url,
     ) -> KernelResult<Option<LastCheckpointHint>> {
         let file_path = Self::path(log_root)?;
-        match storage.read_files(vec![(file_path, None)])?.next() {
+        match storage.read_small_file((file_path, None)).transpose() {
             Some(Ok(data)) => {
                 let result = Self::from_bytes_with_oversized_fields_dropped(&data)
                     .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
