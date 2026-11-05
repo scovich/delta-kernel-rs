@@ -30,6 +30,7 @@ use self::filesystem::ObjectStoreStorageHandler;
 use self::json::DefaultJsonHandler;
 use self::parquet::DefaultParquetHandler;
 
+pub mod coroutine;
 pub mod executor;
 pub mod file_stream;
 pub mod filesystem;
@@ -41,6 +42,8 @@ pub mod storage;
 
 #[cfg(test)]
 mod stats_verifier_tests;
+
+pub use self::coroutine::AsyncEngineConnector;
 
 /// Converts a Stream-producing future to a synchronous iterator, each blocking poll raced against
 /// the cancellation token. When the token fires, the iterator yields a single
@@ -346,6 +349,14 @@ impl<E: TaskExecutor> DefaultEngine<E> {
 
     pub fn get_object_store_for_url(&self, _url: &Url) -> Option<Arc<DynObjectStore>> {
         Some(self.object_store.clone())
+    }
+
+    /// Return a native async connector with this engine's object store and read tuning.
+    ///
+    /// The returned connector bypasses the [`Engine`] trait hierarchy and does not use this
+    /// engine's [`TaskExecutor`].
+    pub fn async_connector(&self) -> AsyncEngineConnector {
+        AsyncEngineConnector::new(self.object_store.clone())
     }
 
     /// Returns the concrete [`DefaultParquetHandler`] for callers that need the inherent
