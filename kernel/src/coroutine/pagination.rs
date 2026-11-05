@@ -111,7 +111,6 @@ where
     }
 }
 
-#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 struct BoundPages<'a, P: Send + 'static, Op: PagedOperation> {
     channel: ChannelBinding<'a, P>,
     state: PageGenerator<Op>,

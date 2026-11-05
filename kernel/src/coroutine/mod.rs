@@ -406,7 +406,6 @@ pub(crate) use self::generator::{
 };
 #[doc(inline)]
 #[internal_api]
-#[cfg_attr(not(feature = "internal-api"), expect(unused_imports))]
 pub(crate) use self::pagination::PageGenerator;
 pub use self::pagination::{Cursor, Page, PageRequest, PagedOperation};
 #[doc(hidden)]
