@@ -29,7 +29,7 @@ static CLUSTERING_PROVIDER_COLUMNS: LazyLock<ColumnNamesAndTypes> =
 /// actions already in `uniqueness_validator`, and records `adds` into it.
 /// For example, this can be used to detect duplicates between addFile and removeFile actions.
 pub(crate) fn validate_add_files(
-    adds: &[Box<dyn EngineData>],
+    adds: &[impl AsRef<dyn EngineData>],
     physical_partition_columns: impl IntoIterator<Item = String>,
     uniqueness_validator: Option<&mut FileActionUniquenessValidator>,
 ) -> KernelResult<()> {
@@ -40,14 +40,17 @@ pub(crate) fn validate_add_files(
 // TODO(#3757): Merge this validation into StagedDataValidator::for_add_files.
 /// Rejects batches with non-null clustering providers.
 pub(crate) fn validate_no_clustering_providers_set(
-    batches: &[Box<dyn EngineData>],
+    batches: &[impl AsRef<dyn EngineData>],
 ) -> KernelResult<()> {
     let mut validator = StagedDataValidator::new(
         &CLUSTERING_PROVIDER_COLUMNS,
         vec![Box::new(UnclusteredFile)],
     );
     for batch in batches {
-        if batch.has_field(&column_name!(CLUSTERING_PROVIDER_NAME)) {
+        if batch
+            .as_ref()
+            .has_field(&column_name!(CLUSTERING_PROVIDER_NAME))
+        {
             RowVisitor::visit_rows_of(&mut validator, batch.as_ref())?;
         }
     }

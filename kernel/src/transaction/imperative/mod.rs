@@ -182,7 +182,7 @@ impl<STATE> Transaction<STATE, Imperative> {
         engine_commit_info: Box<dyn EngineData>,
         commit_info_schema: SchemaRef,
     ) -> Self {
-        self.engine_commit_info = Some((engine_commit_info, commit_info_schema));
+        self.engine_commit_info = Some((engine_commit_info.into(), commit_info_schema));
         self
     }
 
@@ -195,7 +195,7 @@ impl<STATE> Transaction<STATE, Imperative> {
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
         self.staged_data_changes
             .add_files_metadata
-            .push(add_metadata);
+            .push(add_metadata.into());
     }
 }
 
@@ -290,7 +290,7 @@ impl<STATE> Transaction<STATE, Imperative> {
             .remove_files_metadata
             .iter()
             .chain(&self.staged_data_changes.dv_matched_files)
-            .any(HasSelectionVector::has_selected_rows);
+            .any(|batch| batch.has_selected_rows());
         require!(
             !removes_data,
             KernelError::invalid_transaction_state(
@@ -445,7 +445,10 @@ impl<STATE> Transaction<STATE, Imperative> {
     /// Only add files are validated(remove files do not carry statistics).
     ///
     /// [`requires_stats_num_records`]: crate::table_configuration::TableConfiguration::requires_stats_num_records
-    fn validate_add_files_stats(&self, add_files: &[Box<dyn EngineData>]) -> KernelResult<()> {
+    fn validate_add_files_stats(
+        &self,
+        add_files: &[impl AsRef<dyn EngineData>],
+    ) -> KernelResult<()> {
         if add_files.is_empty() {
             return Ok(());
         }
@@ -615,7 +618,7 @@ impl<STATE> Transaction<STATE, Imperative> {
         has_dv_update_columns: bool,
     ) -> KernelResult<impl KernelResultIterator<FilteredEngineData> + use<'a, STATE, T>>
     where
-        T: Iterator<Item = &'a FilteredEngineData> + Send + 'a,
+        T: Iterator<Item = &'a Arc<FilteredEngineData>> + Send + 'a,
     {
         // Create-table transactions should not have any remove actions.
         // Only error if there are actually files queued for removal.
@@ -1172,7 +1175,7 @@ mod tests {
         match removal {
             DataRemoval::RemoveFile => txn.remove_files(data),
             DataRemoval::DeletionVectorUpdate => {
-                txn.staged_data_changes.dv_matched_files.push(data)
+                txn.staged_data_changes.dv_matched_files.push(data.into())
             }
         }
     }

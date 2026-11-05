@@ -302,7 +302,7 @@ pub struct Transaction<STATE = UpdateTable, MODE: ExecutionMode = Imperative> {
     operation_parameters: Option<HashMap<String, Option<String>>>,
     operation_metrics: Option<HashMap<String, Option<String>>>,
     engine_info: String,
-    engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
+    engine_commit_info: Option<(Arc<dyn EngineData>, SchemaRef)>,
     staged_data_changes: MODE,
     skip_dedup_validation: bool,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
@@ -1778,7 +1778,8 @@ mod tests {
         let expected_metrics = HashMap::from([("numFiles".into(), Some("3".into()))]);
         let expected_domains = vec![DomainMetadata::new("app.domain".into(), "{}".into())];
         let expected_commit_info_schema = schema_ref! { nullable "tag": STRING };
-        let commit_info = string_array_to_engine_data(StringArray::from(vec!["connector-tag"]));
+        let commit_info: Arc<dyn EngineData> =
+            string_array_to_engine_data(StringArray::from(vec!["connector-tag"])).into();
         let expected_commit_info = std::ptr::from_ref(commit_info.as_ref());
         let expected_commit_timestamp = 5678;
 
@@ -2753,11 +2754,12 @@ mod tests {
     fn test_update_deletion_vectors_iter_error_does_not_mutate_transaction() -> KernelResult<()> {
         let (engine, snapshot) = setup_dv_enabled_table();
         let mut txn = create_dv_transaction(snapshot.clone(), &engine)?;
-        txn.staged_data_changes
-            .dv_matched_files
-            .push(FilteredEngineData::with_all_rows_selected(
-                string_array_to_engine_data(StringArray::from(vec!["sentinel"])),
-            ));
+        txn.staged_data_changes.dv_matched_files.push(
+            FilteredEngineData::with_all_rows_selected(string_array_to_engine_data(
+                StringArray::from(vec!["sentinel"]),
+            ))
+            .into(),
+        );
         let staged_len_before = txn.staged_data_changes.dv_matched_files.len();
         let scan = snapshot.scan_builder().build()?;
         let scan_metadata = scan
@@ -3042,7 +3044,9 @@ mod tests {
         let dv_data = FilteredEngineData::with_all_rows_selected(string_array_to_engine_data(
             StringArray::from(vec!["dv"]),
         ));
-        txn.staged_data_changes.dv_matched_files.push(dv_data);
+        txn.staged_data_changes
+            .dv_matched_files
+            .push(dv_data.into());
         let result = txn.validate_blind_append_semantics();
         assert!(matches!(
             result,
