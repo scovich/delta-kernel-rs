@@ -240,8 +240,8 @@ use delta_kernel::transaction::{
 use delta_kernel::{
     CancellationToken, CancellationTokenRef, CancelledFuture, Engine, EngineData,
     FileDataReadResultIterator, FileMeta, FileSize, FilteredEngineData, JsonHandler, KernelError,
-    KernelResult, KernelResultIterator, LogPath, ParquetFooter, ParquetHandler, PredicateRef,
-    Snapshot, try_parse_uri,
+    KernelResult, KernelResultIterator, LogPath, ParquetFooter, ParquetHandler,
+    ParquetMultiFileWrite, PredicateRef, Snapshot, try_parse_uri,
 };
 // Re-export `delta_kernel_default_engine` so kernel's integration tests can access it without
 // taking a direct dev-dep on the new crate (which would create a cycle via this crate).
@@ -2018,6 +2018,14 @@ impl ParquetHandler for CapturingParquetHandler {
         data: FileDataReadResultIterator,
     ) -> KernelResult<FileSize> {
         self.inner.write_parquet_file(location, data)
+    }
+
+    fn write_parquet_files(
+        &self,
+        write: ParquetMultiFileWrite,
+        data: FileDataReadResultIterator,
+    ) -> KernelResult<Vec<(Url, FileSize)>> {
+        self.inner.write_parquet_files(write, data)
     }
 
     fn read_parquet_footer(&self, file: &FileMeta) -> KernelResult<ParquetFooter> {
