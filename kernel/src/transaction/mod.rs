@@ -96,8 +96,7 @@ use root_manifest_file::RootManifestFile;
 pub use write_state::{BoundWriteContextBuilder, RowTrackingMetadataColumns, WriteState};
 
 /// Type alias for an iterator of [`EngineData`] results.
-pub(crate) type EngineDataResultIterator<'a> =
-    Box<dyn KernelResultIterator<Box<dyn EngineData>> + 'a>;
+pub(crate) type EngineDataResultIterator = Box<dyn KernelResultIterator<Box<dyn EngineData>>>;
 
 /// The static instance referenced by [`add_files_schema`] that doesn't contain the dataChange
 /// column.
@@ -2790,7 +2789,7 @@ mod tests {
     // ============================================================================
     // validate_blind_append tests
     // ============================================================================
-    fn add_dummy_file<STATE>(txn: &mut Transaction<STATE>) {
+    fn add_dummy_file<STATE: 'static>(txn: &mut Transaction<STATE>) {
         let batch = create_valid_add_file_batch(false /* all_nullable */);
         txn.add_files(Box::new(ArrowEngineData::new(batch)));
     }
