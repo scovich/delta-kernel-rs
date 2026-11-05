@@ -34,7 +34,7 @@ use tracing::{Instrument as _, Span, error};
 
 #[cfg_attr(not(feature = "internal-api"), expect(unused_imports))]
 pub use self::adapters::{
-    AsyncIntoIterator, Enumerate, FilterMap, Flatten, Iter, MapAsync, MapAsyncWitness, MapOk,
+    AsyncIntoIterator, Enumerate, FilterMap, Flatten, Iter, Map, MapAsync, MapAsyncWitness, MapOk,
     Peekable, Unfold, empty, map_async_witness, unfold,
 };
 pub(crate) use self::adapters::{unfold_mut_with, unfold_mut_witness};
@@ -59,6 +59,14 @@ pub enum GeneratorStep<Y, O> {
 /// type `P`, and naming `P` on a combinator would force it to be inferred before
 /// [`Generator::bind`]. Bound consume helpers live on [`BoundGenerator`].
 pub trait GeneratorExt {
+    /// Counterpart of [`Iterator::map`]: transforms each yielded item.
+    fn map<F>(self, map: F) -> FilterMap<Self, Map<F>>
+    where
+        Self: Sized,
+    {
+        FilterMap::new(self, Map::new(map))
+    }
+
     /// Counterpart of [`itertools::Itertools::map_ok`]: transforms each successful yielded item.
     fn map_ok<F>(self, map: F) -> FilterMap<Self, MapOk<F>>
     where
@@ -173,6 +181,23 @@ pub trait BoundGenerator: Send {
                 GeneratorStep::Done(()) => None,
             }))
         })
+    }
+
+    /// Counterpart of [`itertools::Itertools::try_collect`]: collects successful yielded items,
+    /// stopping at the first item or generator error.
+    fn try_collect<T, C>(mut self) -> impl KernelFuture<C>
+    where
+        Self: Sized + Unpin + BoundGenerator<Item = KernelResult<T>, Output = ()>,
+        T: Send + 'static,
+        C: Default + Extend<T> + Send,
+    {
+        async move {
+            let mut output = C::default();
+            while let Some(item) = self.next().await? {
+                output.extend([item?]);
+            }
+            Ok(output)
+        }
     }
 
     /// Counterpart of [`Iterator::peekable`]: allows inspecting the next item without consuming it.
