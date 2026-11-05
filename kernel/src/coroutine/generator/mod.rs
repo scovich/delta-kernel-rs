@@ -34,8 +34,8 @@ use tracing::{Instrument as _, Span, error};
 
 #[cfg_attr(not(feature = "internal-api"), expect(unused_imports))]
 pub use self::adapters::{
-    AsyncIntoIterator, Enumerate, FilterMap, Flatten, Iter, Map, MapAsync, MapAsyncWitness, MapOk,
-    Peekable, Unfold, empty, map_async_witness, unfold,
+    AsyncIntoIterator, Enumerate, FilterMap, FilterOk, Flatten, Iter, Map, MapAsync,
+    MapAsyncWitness, MapOk, Peekable, Unfold, empty, map_async_witness, unfold,
 };
 pub(crate) use self::adapters::{unfold_mut_with, unfold_mut_witness};
 use super::witness::invoke_witness;
@@ -73,6 +73,15 @@ pub trait GeneratorExt {
         Self: Sized,
     {
         FilterMap::new(self, MapOk::new(map))
+    }
+
+    /// Counterpart of [`itertools::Itertools::filter_ok`]: retains successful items matching
+    /// `predicate` and preserves errors.
+    fn filter_ok<P>(self, predicate: P) -> FilterMap<Self, FilterOk<P>>
+    where
+        Self: Sized,
+    {
+        FilterMap::new(self, FilterOk::new(predicate))
     }
 
     /// Maps items asynchronously through the bound request channel.

@@ -179,7 +179,6 @@ impl<'a> SnapshotReader<'a> {
     /// Gets this version's timestamp through `channel`, in milliseconds since the Unix epoch.
     ///
     /// Cancellation is the connector's.
-    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
     pub(crate) async fn get_timestamp_with_channel(&self, channel: &Channel) -> KernelResult<i64> {
         self.snapshot.get_timestamp_with_channel(channel).await
