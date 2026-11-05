@@ -9,12 +9,12 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 use derive_more::Constructor;
 
-use super::request::ReadJsonFiles;
+use super::request::{ForwardListing, ReadJsonFiles};
 use super::{Coroutine, CoroutineStep, KernelResultGenerator, Request, Workflow};
 use crate::coroutine::{Cursor, Page, PageRequest, PagedOperation, Reply, drive_workflow};
 use crate::{
-    Engine, EngineData, FileDataReadResultIterator, JsonHandler, KernelError, KernelResult,
-    KernelResultIterator, StorageHandler,
+    Engine, EngineData, FileDataReadResultIterator, FileMeta, JsonHandler, KernelError,
+    KernelResult, KernelResultIterator, StorageHandler,
 };
 
 /// Maps a paged request onto synchronous Engine state stored in an opaque cursor.
@@ -110,6 +110,7 @@ impl EngineConnector {
 impl ConnectorRespond for EngineConnector {
     fn respond(&self, request: Request) -> KernelResult<()> {
         match request {
+            Request::ListForward(request) => respond_paged(&self.storage_connector(), request)?,
             Request::ReadSmallFile(..) => self.storage_connector().respond(request)?,
             Request::ReadJson(request) => respond_paged(self, request)?,
         }
@@ -124,6 +125,23 @@ pub(crate) fn drive_with_storage<O>(
     workflow: Workflow<'_, O>,
 ) -> KernelResult<O> {
     drive_connector(&StorageConnector::new(storage), workflow)
+}
+
+/// Prepare and iterate a fallible result coroutine through a storage handler.
+#[internal_api]
+pub(crate) fn iterate_prepared_result_coroutine_with_storage<'a, G, Item>(
+    storage: &'a dyn StorageHandler,
+    workflow: Workflow<'_, G>,
+) -> KernelResult<impl KernelResultIterator<Item> + 'a>
+where
+    G: KernelResultGenerator<Item> + 'a,
+    Item: Send + 'static,
+{
+    let coroutine = Coroutine::from_generator(drive_with_storage(storage, workflow)?);
+    Ok(EngineResultCoroutineIterator(EngineCoroutineIterator {
+        connector: StorageConnector::new(storage),
+        state: CoroutineState::Active(coroutine),
+    }))
 }
 
 /// Drive `workflow` through `engine`.
@@ -247,6 +265,7 @@ struct StorageConnector<'a> {
 impl ConnectorRespond for StorageConnector<'_> {
     fn respond(&self, request: Request) -> KernelResult<()> {
         match request {
+            Request::ListForward(request) => respond_paged(self, request),
             Request::ReadSmallFile(file, reply) => {
                 complete(reply, self.storage.read_small_file(file))
             }
@@ -271,6 +290,19 @@ fn drive_connector<O>(
         cancellation.record(connector.respond(request))?
     });
     cancellation.finish(output)
+}
+
+impl EnginePagination<ForwardListing> for StorageConnector<'_> {
+    type State = Box<dyn KernelResultIterator<FileMeta>>;
+
+    fn prepare(&self, ForwardListing(bounds): ForwardListing) -> KernelResult<Self::State> {
+        let listing = self.storage.list_from(&bounds.low, Some(&bounds.high))?;
+        Ok(Box::new(listing))
+    }
+
+    fn next(&self, listing: Self::State) -> KernelResult<Page<ForwardListing>> {
+        next_page(listing, ForwardListing::DEFAULT_PAGE_SIZE)
+    }
 }
 
 impl EnginePagination<ReadJsonFiles> for EngineConnector {

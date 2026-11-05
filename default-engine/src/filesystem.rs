@@ -62,7 +62,7 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
 /// after `end` before sorting.
 ///
 /// [`MeteredStorageHandler`]: delta_kernel::metrics::MeteredStorageHandler
-async fn list_from_impl(
+pub(crate) async fn list_from_impl(
     store: Arc<DynObjectStore>,
     path: Url,
     end: Option<Url>,

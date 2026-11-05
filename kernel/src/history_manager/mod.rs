@@ -770,8 +770,8 @@ fn get_earliest_recreatable_commit(
 
     // Listing inherits any token bound to the engine's storage handler.
     // TODO(#3188): accept cancellation tokens on the history-manager entry points.
-    let listing =
-        list_delta_log_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?;
+    let storage = engine.storage_handler();
+    let listing = list_delta_log_from_storage(storage.as_ref(), log_root, 0, Version::MAX)?;
     for parsed_result in listing {
         let parsed_log_path = parsed_result?;
         if !should_process_log_file(&parsed_log_path) {

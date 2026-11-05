@@ -4,6 +4,7 @@
 
 use bytes::Bytes;
 use derive_more::From;
+use url::Url;
 
 use crate::coroutine::{PageRequest, PagedOperation, Reply};
 use crate::expressions::PredicateRef;
@@ -13,6 +14,8 @@ use crate::{EngineData, FileMeta, FileSlice, KernelResult};
 /// Operations Kernel can request from a connector.
 #[derive(From)]
 pub enum Request {
+    /// List a bounded path range in ascending order.
+    ListForward(PageRequest<ForwardListing>),
     /// Read a whole file when the range is `None`, or exactly the half-open range otherwise.
     ///
     /// Missing-object failures remain connector errors. `Ok(None)` means the connector returned no
@@ -21,6 +24,31 @@ pub enum Request {
     /// Read JSON files as ordered [`EngineData`] batches. Each file may produce multiple batches,
     /// but batches may not span files.
     ReadJson(PageRequest<ReadJsonFiles>),
+}
+
+/// URL bounds for a forward listing.
+pub struct ListingBounds {
+    /// Exclusive lower URL bound.
+    pub low: Url,
+    /// Exclusive upper URL bound.
+    pub high: Url,
+}
+
+/// A bounded listing whose pages and entries are in ascending lexicographic order.
+pub struct ForwardListing(pub Box<ListingBounds>);
+
+impl ForwardListing {
+    /// Creates a forward listing over `bounds`.
+    pub fn new(bounds: ListingBounds) -> Self {
+        Self(Box::new(bounds))
+    }
+
+    /// Default number of entries in one listing page.
+    pub const DEFAULT_PAGE_SIZE: usize = 1000;
+}
+
+impl PagedOperation for ForwardListing {
+    type Page = Vec<KernelResult<FileMeta>>;
 }
 
 /// Paginated JSON file read.

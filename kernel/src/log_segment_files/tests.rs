@@ -5,6 +5,7 @@ use rstest::rstest;
 use url::Url;
 
 use super::*;
+use crate::coroutine::kernel::request::ForwardListing;
 use crate::engine::CancellableEngine;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
@@ -1867,22 +1868,19 @@ fn precancelled_token_stops_listing_before_any_storage_call() {
     let engine =
         DelegatingEngine::new(Arc::new(SyncEngine::new())).with_storage_handler(Arc::new(storage));
     let engine = CancellableEngine::new(&engine, Arc::new(TestCancellationToken::cancelled()));
+    let storage = engine.storage_handler();
 
-    let result = list_delta_log_from_storage(
-        engine.storage_handler().as_ref(),
-        &log_root,
-        0,
-        Version::MAX,
-    );
+    let result = list_delta_log_from_storage(storage.as_ref(), &log_root, 0, Version::MAX);
     assert!(matches!(result, Err(KernelError::Cancelled)));
     assert_eq!(pulled.load(Ordering::Relaxed), 0);
 }
 
-// The default `list_from_with_cancellation` adapter surfaces cancellation through the log-file
-// filters instead of making a truncated listing look complete.
+// Cancellation after the first page is returned stops the listing instead of fetching the next
+// page. One page is pulled eagerly (`ForwardListing::DEFAULT_PAGE_SIZE`).
 #[test]
 fn mid_listing_cancellation_yields_terminal_error_not_silent_truncation() {
-    let (log_root, pulled, storage) = finite_listing_handler(100);
+    let page = ForwardListing::DEFAULT_PAGE_SIZE;
+    let (log_root, pulled, storage) = finite_listing_handler(page + 500);
 
     let token = Arc::new(TestCancellationToken::default());
     let engine =
@@ -1897,9 +1895,11 @@ fn mid_listing_cancellation_yields_terminal_error_not_silent_truncation() {
 
     token.cancel();
 
+    for _ in 2..page {
+        assert!(matches!(iter.next(), Some(Ok(_))));
+    }
     assert!(matches!(iter.next(), Some(Err(KernelError::Cancelled))));
-    // The listing stopped early rather than draining all 100 entries.
-    assert!(pulled.load(Ordering::Relaxed) < 100);
+    assert_eq!(pulled.load(Ordering::Relaxed), page as u32);
 }
 
 #[rstest]

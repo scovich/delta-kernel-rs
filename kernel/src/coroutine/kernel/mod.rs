@@ -30,7 +30,8 @@ pub(crate) use self::channel::{
 #[cfg_attr(not(feature = "internal-api"), expect(unused_imports))]
 pub(crate) use self::engine::{
     drive_with_engine, drive_with_storage, iterate_prepared_result_coroutine_with_engine,
-    iterate_result_coroutine_with_engine, run_workflow_with_engine, run_workflow_with_storage,
+    iterate_prepared_result_coroutine_with_storage, iterate_result_coroutine_with_engine,
+    run_workflow_with_engine, run_workflow_with_storage,
 };
 pub use self::request::Request;
 use crate::KernelResult;

@@ -32,6 +32,26 @@ pub trait Step<I> {
     fn step(&mut self, item: I) -> Option<Self::Out>;
 }
 
+/// Mapping policy used by [`GeneratorExt::map`].
+pub struct Map<F>(F);
+
+impl<F> Map<F> {
+    pub(super) fn new(map: F) -> Self {
+        Self(map)
+    }
+}
+
+impl<F, T, U> Step<T> for Map<F>
+where
+    F: FnMut(T) -> U,
+{
+    type Out = U;
+
+    fn step(&mut self, item: T) -> Option<U> {
+        Some((self.0)(item))
+    }
+}
+
 /// Mapping policy used by [`GeneratorExt::map_ok`].
 pub struct MapOk<F>(F);
 
@@ -52,7 +72,7 @@ where
     }
 }
 
-/// Generator returned by [`GeneratorExt::map_ok`].
+/// Generator returned by [`GeneratorExt::map`] and [`GeneratorExt::map_ok`].
 // This struct's manual `impl Unpin` is conditional on `G: Unpin` and valid because it does not use
 // structural field pinning.
 pub struct FilterMap<G, S>(G, S);
