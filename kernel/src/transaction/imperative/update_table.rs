@@ -360,17 +360,17 @@ pub(super) fn new_dv_column_schema() -> &'static SchemaRef {
 
 // DV updates can only be staged on update-table transactions. The create-table guard protects
 // action generation, which is shared by all imperative transaction states.
-impl<STATE> Transaction<STATE, Imperative> {
+impl<STATE: 'static> Transaction<STATE, Imperative> {
     /// Generate remove/add action pairs for files with DV updates.
     ///
     /// This method processes the cached matched files, generating the necessary Remove and Add
     /// actions. For each file:
     /// 1. A Remove action is generated for the old file
     /// 2. An Add action is generated with the new DV descriptor
-    pub(super) fn generate_dv_update_actions<'a>(
-        &'a self,
-        engine: &'a dyn Engine,
-    ) -> KernelResult<impl KernelResultIterator<FilteredEngineData> + 'a> {
+    pub(super) fn generate_dv_update_actions(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<impl KernelResultIterator<FilteredEngineData> + use<STATE>> {
         // Create-table transactions should not have any DV update actions
         if self.is_create_table() && !self.staged_data_changes.dv_matched_files.is_empty() {
             return Err(crate::error::KernelError::internal_error(
@@ -378,15 +378,22 @@ impl<STATE> Transaction<STATE, Imperative> {
             ));
         }
 
+        let remove_files_metadata = self
+            .staged_data_changes
+            .dv_matched_files
+            .clone()
+            .into_iter();
         let remove_actions = self.generate_remove_actions(
             engine,
-            self.staged_data_changes.dv_matched_files.iter(),
+            remove_files_metadata,
             true, /* has_dv_update_columns */
         )?;
-        let add_actions = self.generate_adds_for_dv_update(
-            engine,
-            self.staged_data_changes.dv_matched_files.iter(),
-        )?;
+        let file_metadata_batch = self
+            .staged_data_changes
+            .dv_matched_files
+            .clone()
+            .into_iter();
+        let add_actions = self.generate_adds_for_dv_update(engine, file_metadata_batch)?;
         Ok(remove_actions.chain(add_actions))
     }
 
@@ -394,11 +401,14 @@ impl<STATE> Transaction<STATE, Imperative> {
     ///
     /// This transforms scan file metadata with new DV descriptors (appended as a temporary column)
     /// into Add actions for the Delta log.
-    fn generate_adds_for_dv_update<'a>(
-        &'a self,
-        engine: &'a dyn Engine,
-        file_metadata_batch: impl Iterator<Item = &'a Arc<FilteredEngineData>> + Send + 'a,
-    ) -> KernelResult<impl KernelResultIterator<FilteredEngineData> + 'a> {
+    fn generate_adds_for_dv_update<T>(
+        &self,
+        engine: &dyn Engine,
+        file_metadata_batch: T,
+    ) -> KernelResult<impl KernelResultIterator<FilteredEngineData> + use<STATE, T>>
+    where
+        T: Iterator<Item = Arc<FilteredEngineData>> + Send + 'static,
+    {
         let evaluation_handler = engine.evaluation_handler();
         // Struct patch to replace the deletionVector field with the new DV/stats from
         // NEW_DELETION_VECTOR_NAME/NEW_STATS_NAME, then drop the
