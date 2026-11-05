@@ -178,6 +178,7 @@ pub(crate) const DEFAULT_READ_BATCH_SIZE: NonZero<usize> =
 pub struct DefaultEngine<E: TaskExecutor> {
     object_store: Arc<DynObjectStore>,
     task_executor: Arc<E>,
+    io_config: ReadIoConfig,
     storage: Arc<MeteredStorageHandler>,
     json: Arc<MeteredJsonHandler>,
     parquet: Arc<MeteredParquetHandler>,
@@ -332,6 +333,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             raw_parquet,
             object_store,
             task_executor,
+            io_config,
             evaluation: Arc::new(ArrowEvaluationHandler {}),
         }
     }
@@ -356,7 +358,14 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     /// The returned connector bypasses the [`Engine`] trait hierarchy and does not use this
     /// engine's [`TaskExecutor`].
     pub fn async_connector(&self) -> AsyncEngineConnector {
-        AsyncEngineConnector::new(self.object_store.clone())
+        let mut connector = AsyncEngineConnector::new(self.object_store.clone());
+        if let Some(buffer_size) = self.io_config.buffer_size {
+            connector = connector.with_buffer_size(buffer_size);
+        }
+        if let Some(batch_size) = self.io_config.batch_size {
+            connector = connector.with_batch_size(batch_size);
+        }
+        connector
     }
 
     /// Returns the concrete [`DefaultParquetHandler`] for callers that need the inherent

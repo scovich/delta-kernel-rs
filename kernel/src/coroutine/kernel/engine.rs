@@ -3,14 +3,44 @@
 //! This adapter backs Engine-compatible entry points and coroutine iterators. It handles requests
 //! synchronously through Engine handlers; connector-native async execution uses its own driver.
 
+use std::any::Any;
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 use derive_more::Constructor;
 
+use super::request::ReadJsonFiles;
 use super::{Coroutine, CoroutineStep, KernelResultGenerator, Request, Workflow};
-use crate::coroutine::{Reply, drive_workflow};
-use crate::{Engine, KernelError, KernelResult, StorageHandler};
+use crate::coroutine::{Cursor, Page, PageRequest, PagedOperation, Reply, drive_workflow};
+use crate::{
+    Engine, EngineData, FileDataReadResultIterator, JsonHandler, KernelError, KernelResult,
+    KernelResultIterator, StorageHandler,
+};
+
+/// Maps a paged request onto synchronous Engine state stored in an opaque cursor.
+trait EnginePagination<Op: PagedOperation> {
+    type State: Any + Send;
+
+    fn prepare(&self, operation: Op) -> KernelResult<Self::State>;
+
+    fn next(&self, state: Self::State) -> KernelResult<Page<Op>>;
+}
+
+fn respond_paged<C, Op>(connector: &C, request: PageRequest<Op>) -> KernelResult<()>
+where
+    C: EnginePagination<Op>,
+    Op: PagedOperation,
+{
+    match request {
+        PageRequest::Prepare(operation, reply) => {
+            complete(reply, connector.prepare(operation).map(Cursor::new))
+        }
+        PageRequest::Next(cursor, reply) => complete(
+            reply,
+            cursor.into_inner().and_then(|state| connector.next(state)),
+        ),
+    }
+}
 
 /// Serves coroutine requests through handlers captured from an [`Engine`].
 ///
@@ -22,6 +52,7 @@ use crate::{Engine, KernelError, KernelResult, StorageHandler};
 #[derive(Clone)]
 pub(crate) struct EngineConnector {
     storage: Arc<dyn StorageHandler>,
+    json: Arc<dyn JsonHandler>,
 }
 
 impl EngineConnector {
@@ -29,6 +60,7 @@ impl EngineConnector {
     pub(crate) fn new(engine: &dyn Engine) -> Self {
         Self {
             storage: engine.storage_handler(),
+            json: engine.json_handler(),
         }
     }
 
@@ -79,6 +111,7 @@ impl ConnectorRespond for EngineConnector {
     fn respond(&self, request: Request) -> KernelResult<()> {
         match request {
             Request::ReadSmallFile(..) => self.storage_connector().respond(request)?,
+            Request::ReadJson(request) => respond_paged(self, request)?,
         }
         Ok(())
     }
@@ -218,6 +251,9 @@ impl ConnectorRespond for StorageConnector<'_> {
             Request::ReadSmallFile(file, reply) => {
                 complete(reply, self.storage.read_small_file(file))
             }
+            Request::ReadJson(_) => Err(KernelError::internal_error(
+                "JSON reads require an Engine connector",
+            )),
         }
     }
 }
@@ -236,6 +272,19 @@ fn drive_connector<O>(
         cancellation.record(connector.respond(request))?
     });
     cancellation.finish(output)
+}
+
+impl EnginePagination<ReadJsonFiles> for EngineConnector {
+    type State = FileDataReadResultIterator;
+
+    fn prepare(&self, read: ReadJsonFiles) -> KernelResult<Self::State> {
+        self.json
+            .read_json_files(&read.files, read.physical_schema, read.predicate)
+    }
+
+    fn next(&self, state: Self::State) -> KernelResult<Page<ReadJsonFiles>> {
+        next_engine_data(state)
+    }
 }
 
 #[derive(Default)]
@@ -271,6 +320,38 @@ fn complete<In: Send + 'static>(reply: Reply<In>, result: KernelResult<In>) -> K
     }
 }
 
+/// Data reads return one batch per page, which keeps pulls lazy.
+fn next_engine_data<Op>(reads: FileDataReadResultIterator) -> KernelResult<Page<Op>>
+where
+    Op: PagedOperation<Page = Vec<KernelResult<Box<dyn EngineData>>>>,
+{
+    next_page(reads, 1)
+}
+
+/// Pulls up to `size` (which must be positive) items from `items` into one page.
+///
+/// A full page carries a cursor for the remaining items; a short page ends the stream. An
+/// item-level [`KernelError::Cancelled`] becomes a page error so the drive aborts like it does for
+/// every other cancelled request.
+fn next_page<Op, T>(
+    mut items: impl KernelResultIterator<T> + 'static,
+    size: usize,
+) -> KernelResult<Page<Op>>
+where
+    Op: PagedOperation<Page = Vec<KernelResult<T>>>,
+    T: Send + 'static,
+{
+    let mut data = Vec::new();
+    for item in items.by_ref().take(size) {
+        if matches!(item, Err(KernelError::Cancelled)) {
+            return Err(KernelError::Cancelled);
+        }
+        data.push(item);
+    }
+    let next = (data.len() == size).then(|| Cursor::new(items));
+    Ok(Page { data, next })
+}
+
 fn next_coroutine<C: ConnectorRespond, Item: Send + 'static, O: Send + 'static>(
     connector: &C,
     state: &mut CoroutineState<'_, Item, O>,
@@ -302,6 +383,7 @@ fn next_coroutine<C: ConnectorRespond, Item: Send + 'static, O: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use rstest::rstest;
     use url::Url;
 
     use super::*;
@@ -371,5 +453,40 @@ mod tests {
         let result = drive_with_engine(&engine, workflow);
 
         assert!(matches!(result, Err(KernelError::Cancelled)));
+    }
+
+    struct Numbers;
+
+    impl PagedOperation for Numbers {
+        type Page = Vec<KernelResult<usize>>;
+    }
+
+    #[rstest]
+    #[case::many_single_item_pages(5, 1, &[1, 1, 1, 1, 1, 0])]
+    #[case::one_many_item_page(5, 100, &[5])]
+    #[case::many_many_item_pages(10, 3, &[3, 3, 3, 1])]
+    #[case::exact_multiple_of_page_size(9, 3, &[3, 3, 3, 0])]
+    #[case::exactly_one_full_page(3, 3, &[3, 0])]
+    #[case::empty(0, 3, &[0])]
+    fn next_page_splits_items_into_pages(
+        #[case] count: usize,
+        #[case] size: usize,
+        #[case] page_lens: &[usize],
+    ) {
+        let mut items: Box<dyn KernelResultIterator<usize>> = Box::new((0..count).map(Ok));
+        let mut lens = Vec::new();
+        let mut seen = Vec::new();
+        loop {
+            let page: Page<Numbers> = next_page(items, size).unwrap();
+            lens.push(page.data.len());
+            seen.extend(page.data.into_iter().map(Result::unwrap));
+            let Some(cursor) = page.next else {
+                break;
+            };
+            items = cursor.into_inner().unwrap();
+        }
+
+        assert_eq!(lens, page_lens);
+        assert_eq!(seen, Vec::from_iter(0..count));
     }
 }
