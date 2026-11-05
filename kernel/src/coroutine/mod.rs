@@ -296,7 +296,6 @@ macro_rules! workflow {
 ///
 /// The `|channel| future` form forwards one future as the workflow body. Use an explicit async
 /// closure for multi-step control flow.
-#[cfg(feature = "internal-api")]
 #[internal_api]
 macro_rules! static_workflow {
     ($request:ty, |$channel:ident| $future:expr $(,)?) => {

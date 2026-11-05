@@ -23,14 +23,17 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
 
+use delta_kernel_derive::internal_api;
 use error::{LogHistoryError, NearestTimestamp};
-use itertools::Itertools;
 use search::{Bound, SearchError, binary_search_by_key_with_bounds};
 use tracing::{info, trace, warn};
 use url::Url;
 
+use crate::coroutine::AsyncOption as _;
+use crate::coroutine::generator::{BoundGenerator as _, Generator as _, GeneratorExt as _};
+use crate::coroutine::kernel::{Channel, Workflow, run_workflow_with_engine, workflow};
 use crate::log_segment::LogSegment;
-use crate::log_segment_files::{list_delta_log_from_storage, should_process_log_file};
+use crate::log_segment_files::{list_delta_log_generator, should_process_log_file};
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::InCommitTimestampEnablement;
@@ -280,11 +283,24 @@ fn linear_search_file_mod_timestamps(
 /// Binary search over commits with In-Commit Timestamps (ICT).
 ///
 /// ICT timestamps are guaranteed monotonic by protocol, so binary search is safe.
+#[cfg(test)]
 fn binary_search_ict_timestamps(
     commits: &[ParsedLogPath],
     timestamp: Timestamp,
     bound: Bound,
     engine: &dyn Engine,
+) -> KernelResult<CommitAt, LogHistoryError> {
+    run_workflow_with_engine!(engine, async move |channel| {
+        Ok(binary_search_ict_timestamps_with_channel(commits, timestamp, bound, channel).await)
+    })
+    .map_err(|error| LogHistoryError::internal("ICT binary search workflow failed", error))?
+}
+
+async fn binary_search_ict_timestamps_with_channel(
+    commits: &[ParsedLogPath],
+    timestamp: Timestamp,
+    bound: Bound,
+    channel: &Channel,
 ) -> KernelResult<CommitAt, LogHistoryError> {
     if commits.is_empty() {
         return Err(LogHistoryError::out_of_range(
@@ -301,19 +317,22 @@ fn binary_search_ict_timestamps(
         hi_version, "ICT binary search over version range"
     );
 
-    let commit_to_ict = |commit: &ParsedLogPath| -> KernelResult<Timestamp, LogHistoryError> {
+    let commit_to_ict = async |commit: &ParsedLogPath, channel: &Channel| {
         commit
-            .read_in_commit_timestamp(engine)
+            .read_in_commit_timestamp_with_channel(channel)
+            .await
             .map_err(|e| LogHistoryError::internal("failed to read in-commit timestamp", e))
     };
 
-    match binary_search_by_key_with_bounds(commits, timestamp, commit_to_ict, bound) {
+    let search =
+        binary_search_by_key_with_bounds(commits, timestamp, commit_to_ict, bound, channel);
+    match search.await {
         Ok(idx) => {
             let version = commits[idx].version;
             // TODO(#2687): reading in_commit_timestamp is an expensive operation since it require
             // an engine I/O. An optimization is to have the `binary_search_by_key_with_bounds`
             // return the search result's index and key value to avoid calling commit_to_ict
-            let timestamp = commit_to_ict(&commits[idx])?;
+            let timestamp = commit_to_ict(&commits[idx], channel).await?;
             Ok(CommitAt::new(version, timestamp))
         }
         Err(SearchError::KeyFunctionError(error)) => Err(error),
@@ -323,7 +342,7 @@ fn binary_search_ict_timestamps(
             // ICT. Preserve cancellation from the boundary read; other failures
             // degrade to `Unknown` so the original out-of-range error survives.
             let nearest = match bound.boundary_of(commits) {
-                Some(boundary) => match commit_to_ict(boundary) {
+                Some(boundary) => match commit_to_ict(boundary, channel).await {
                     Ok(timestamp) => NearestTimestamp::from_boundary(bound, timestamp),
                     Err(error) if error.is_cancelled() => return Err(error),
                     Err(error) => {
@@ -375,9 +394,30 @@ fn binary_search_ict_timestamps(
 ///
 /// Propagates a [`LogHistoryError`] from getting the earliest recreatable commit when
 /// `resolved_commit_type` is [`HistoryCommitType::Recreatable`].
+#[cfg(test)]
 pub(crate) fn timestamp_to_version(
     snapshot: &Snapshot,
     engine: &dyn Engine,
+    timestamp: Timestamp,
+    bound: Bound,
+    resolved_commit_type: HistoryCommitType,
+) -> KernelResult<CommitAt, LogHistoryError> {
+    run_workflow_with_engine!(engine, async move |channel| {
+        let result = timestamp_to_version_with_channel(
+            snapshot,
+            channel,
+            timestamp,
+            bound,
+            resolved_commit_type,
+        );
+        Ok(result.await)
+    })
+    .map_err(|error| LogHistoryError::internal("timestamp conversion workflow failed", error))?
+}
+
+async fn timestamp_to_version_with_channel(
+    snapshot: &Snapshot,
+    channel: &Channel,
     timestamp: Timestamp,
     bound: Bound,
     resolved_commit_type: HistoryCommitType,
@@ -386,7 +426,8 @@ pub(crate) fn timestamp_to_version(
     // This optimization mirrors Delta Spark and Java Kernel behavior.
     let snap_ts = snapshot
         .reader()
-        .get_timestamp(engine)
+        .get_timestamp_with_channel(channel)
+        .await
         .map_err(|e| LogHistoryError::internal("failed to get snapshot timestamp", e))?;
     match (timestamp.cmp(&snap_ts), bound) {
         // Exact match: snapshot version satisfies both bounds
@@ -420,12 +461,13 @@ pub(crate) fn timestamp_to_version(
     let listing_limit = match resolved_commit_type {
         HistoryCommitType::Published => None,
         HistoryCommitType::Recreatable => {
-            let earliest = get_earliest_commit(
-                engine,
+            let earliest = get_earliest_commit_with_channel(
+                channel,
                 &snapshot.log_segment().log_root,
                 None,
                 HistoryCommitType::Recreatable,
             )
+            .await
             .map_err(|e| match e {
                 DeltaError::LogHistory(inner) => *inner,
                 _ => LogHistoryError::internal("failed to get earliest commit", e),
@@ -452,13 +494,14 @@ pub(crate) fn timestamp_to_version(
     // snapshot.log_segment() because it may include a checkpoint prefix with gaps in
     // the commit sequence. for_timestamp_conversion returns only contiguous commits,
     // which is required for correct timestamp-to-version mapping.
-    let log_segment = LogSegment::for_timestamp_conversion(
-        engine.storage_handler().as_ref(),
+    let log_segment = LogSegment::for_timestamp_conversion_with_channel(
+        channel,
         snapshot.log_segment().log_root.clone(),
         snapshot.version(),
         listing_limit,
         staged_log_tail,
     )
+    .await
     .map_err(|e| {
         LogHistoryError::internal("failed to build log segment for timestamp conversion", e)
     })?;
@@ -476,7 +519,8 @@ pub(crate) fn timestamp_to_version(
     match search_bounds {
         TimestampSearchBounds::ExactMatch(version) => Ok(CommitAt::new(version, timestamp)),
         TimestampSearchBounds::ICTSearchStartingFrom(lo) => {
-            binary_search_ict_timestamps(&commits[lo..], timestamp, bound, engine)
+            binary_search_ict_timestamps_with_channel(&commits[lo..], timestamp, bound, channel)
+                .await
         }
         TimestampSearchBounds::FileModificationSearch => {
             linear_search_file_mod_timestamps(commits, timestamp, bound)
@@ -525,20 +569,45 @@ pub(crate) fn timestamp_to_version(
 /// let timestamp = 1672531200000; // Milliseconds since epoch for 2023-01-01
 /// let commit = latest_version_as_of(&snapshot, &engine, timestamp, HistoryCommitType::Recreatable)?;
 /// ```
-#[tracing::instrument(skip(snapshot, engine), ret, fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
 pub fn latest_version_as_of(
     snapshot: &Snapshot,
     engine: &dyn Engine,
     timestamp: Timestamp,
     resolved_commit_type: HistoryCommitType,
 ) -> KernelResult<CommitAt> {
-    timestamp_to_version(
+    run_workflow_with_engine!(engine, |channel| {
+        latest_version_as_of_with_channel(snapshot, channel, timestamp, resolved_commit_type)
+    })
+}
+
+/// Returns a lazy workflow for [`latest_version_as_of`].
+#[internal_api]
+#[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
+pub(crate) fn latest_version_as_of_workflow<'a>(
+    snapshot: &'a Snapshot,
+    timestamp: Timestamp,
+    resolved_commit_type: HistoryCommitType,
+) -> Workflow<'a, CommitAt> {
+    workflow!(|channel| {
+        latest_version_as_of_with_channel(snapshot, channel, timestamp, resolved_commit_type)
+    })
+}
+
+#[tracing::instrument(name = "latest_version_as_of", skip(snapshot, channel), ret, fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
+async fn latest_version_as_of_with_channel(
+    snapshot: &Snapshot,
+    channel: &Channel,
+    timestamp: Timestamp,
+    resolved_commit_type: HistoryCommitType,
+) -> KernelResult<CommitAt> {
+    timestamp_to_version_with_channel(
         snapshot,
-        engine,
+        channel,
         timestamp,
         Bound::GreatestLower,
         resolved_commit_type,
     )
+    .await
     .map_err(Into::into)
 }
 
@@ -566,20 +635,45 @@ pub fn latest_version_as_of(
 /// let timestamp = 1672531200000; // Milliseconds since epoch for 2023-01-01
 /// let commit = first_version_after(&snapshot, &engine, timestamp, HistoryCommitType::Recreatable)?;
 /// ```
-#[tracing::instrument(skip(snapshot, engine), ret, fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
 pub fn first_version_after(
     snapshot: &Snapshot,
     engine: &dyn Engine,
     timestamp: Timestamp,
     resolved_commit_type: HistoryCommitType,
 ) -> KernelResult<CommitAt> {
-    timestamp_to_version(
+    run_workflow_with_engine!(engine, |channel| {
+        first_version_after_with_channel(snapshot, channel, timestamp, resolved_commit_type)
+    })
+}
+
+/// Returns a lazy workflow for [`first_version_after`].
+#[internal_api]
+#[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
+pub(crate) fn first_version_after_workflow<'a>(
+    snapshot: &'a Snapshot,
+    timestamp: Timestamp,
+    resolved_commit_type: HistoryCommitType,
+) -> Workflow<'a, CommitAt> {
+    workflow!(|channel| {
+        first_version_after_with_channel(snapshot, channel, timestamp, resolved_commit_type)
+    })
+}
+
+#[tracing::instrument(name = "first_version_after", skip(snapshot, channel), ret, fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
+async fn first_version_after_with_channel(
+    snapshot: &Snapshot,
+    channel: &Channel,
+    timestamp: Timestamp,
+    resolved_commit_type: HistoryCommitType,
+) -> KernelResult<CommitAt> {
+    timestamp_to_version_with_channel(
         snapshot,
-        engine,
+        channel,
         timestamp,
         Bound::LeastUpper,
         resolved_commit_type,
     )
+    .await
     .map_err(Into::into)
 }
 
@@ -626,10 +720,34 @@ pub fn first_version_after(
 /// let (start_version, end_version) =
 ///     timestamp_range_to_versions(&snapshot, &engine, start_timestamp, Some(end_timestamp))?;
 /// ```
-#[tracing::instrument(skip(snapshot, engine), ret, fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
 pub fn timestamp_range_to_versions(
     snapshot: &Snapshot,
     engine: &dyn Engine,
+    start_timestamp: Timestamp,
+    end_timestamp: Option<Timestamp>,
+) -> KernelResult<(Version, Option<Version>)> {
+    run_workflow_with_engine!(engine, |channel| {
+        timestamp_range_to_versions_with_channel(snapshot, channel, start_timestamp, end_timestamp)
+    })
+}
+
+/// Returns a lazy workflow for [`timestamp_range_to_versions`].
+#[internal_api]
+#[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
+pub(crate) fn timestamp_range_to_versions_workflow<'a>(
+    snapshot: &'a Snapshot,
+    start_timestamp: Timestamp,
+    end_timestamp: Option<Timestamp>,
+) -> Workflow<'a, (Version, Option<Version>)> {
+    workflow!(|channel| {
+        timestamp_range_to_versions_with_channel(snapshot, channel, start_timestamp, end_timestamp)
+    })
+}
+
+#[tracing::instrument(name = "timestamp_range_to_versions", skip(snapshot, channel), ret, fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
+async fn timestamp_range_to_versions_with_channel(
+    snapshot: &Snapshot,
+    channel: &Channel,
     start_timestamp: Timestamp,
     end_timestamp: Option<Timestamp>,
 ) -> KernelResult<(Version, Option<Version>)> {
@@ -651,19 +769,26 @@ pub fn timestamp_range_to_versions(
     // helper (e.g., timestamp_to_version_in_segment) to cut listing time in half.
 
     // Convert the start timestamp to version
-    let start_version = first_version_after(
+    let start_version = first_version_after_with_channel(
         snapshot,
-        engine,
+        channel,
         start_timestamp,
         HistoryCommitType::Published,
-    )?
+    )
+    .await?
     .version;
 
     // If the end timestamp is present, convert it to an end version
     let end_version = end_timestamp
-        .map(|end| {
-            let end_version =
-                latest_version_as_of(snapshot, engine, end, HistoryCommitType::Published)?.version;
+        .map_async(async |end| {
+            let end_version = latest_version_as_of_with_channel(
+                snapshot,
+                channel,
+                end,
+                HistoryCommitType::Published,
+            )
+            .await?
+            .version;
 
             // Verify that the start version is no greater than the end version. This can
             // happen in the case that the entire timestamp range falls between two commits.
@@ -685,6 +810,7 @@ pub fn timestamp_range_to_versions(
 
             Ok(end_version)
         })
+        .await
         .transpose()?;
 
     Ok((start_version, end_version))
@@ -710,17 +836,40 @@ pub fn timestamp_range_to_versions(
 ///   before the catalog exposes the table. Otherwise a filesystem-only client could list an empty
 ///   `_delta_log/` and "create" a table at the same location. An empty listing here therefore
 ///   indicates a broken invariant rather than a normal missing version.
-#[tracing::instrument(skip(engine), ret, err)]
+#[cfg(test)]
 fn get_earliest_published_commit_version(
     engine: &dyn Engine,
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
 ) -> KernelResult<Version> {
+    run_workflow_with_engine!(engine, |channel| {
+        get_earliest_published_commit_version_with_channel(
+            channel,
+            log_root,
+            earliest_ratified_commit_version,
+        )
+    })
+}
+
+#[tracing::instrument(
+    name = "get_earliest_published_commit_version",
+    skip(channel),
+    ret,
+    err
+)]
+async fn get_earliest_published_commit_version_with_channel(
+    channel: &Channel,
+    log_root: &Url,
+    earliest_ratified_commit_version: Option<Version>,
+) -> KernelResult<Version> {
     // Listing inherits any token bound to the engine's storage handler.
     // TODO(#3188): accept cancellation tokens on the history-manager entry points.
-    list_delta_log_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?
-        .filter_ok(|f| f.file_type == LogPathFileType::Commit)
+    list_delta_log_generator(channel, log_root, 0, Version::MAX)
+        .await?
+        .filter_ok(|f: &ParsedLogPath| f.file_type == LogPathFileType::Commit)
+        .bind(channel)
         .next()
+        .await?
         .transpose()?
         .map(|f| f.version)
         .ok_or_else(|| {
@@ -750,15 +899,30 @@ fn get_earliest_published_commit_version(
 ///
 /// # Errors
 /// - Propagate any error from listing the log directory.
-/// - [`LogHistoryError::NoCommitsFound`] if the log contains no commit files at all
-/// (empty directory, or only checkpoint files) -- unless `earliest_ratified_commit_version`
-/// is `Some(0)`, in which case it returns a generic [`KernelError`](crate::KernelError) flagging
-/// the broken CCv2 invariant (ratified commit 0 with no published filesystem commit).
-/// - [`LogHistoryError::NoRecreatableCommit`] if commits exist but neither
-/// `00...00.json` nor a complete checkpoint that anchors the smallest commit is present.
-#[tracing::instrument(skip(engine), err, ret)]
+/// - [`LogHistoryError::NoCommitsFound`] if the log contains no commit files at all (empty
+///   directory, or only checkpoint files) -- unless `earliest_ratified_commit_version` is
+///   `Some(0)`, in which case it returns a generic [`KernelError`](crate::KernelError) flagging the
+///   broken CCv2 invariant (ratified commit 0 with no published filesystem commit).
+/// - [`LogHistoryError::NoRecreatableCommit`] if commits exist but neither `00...00.json` nor a
+///   complete checkpoint that anchors the smallest commit is present.
+#[cfg(test)]
 fn get_earliest_recreatable_commit(
     engine: &dyn Engine,
+    log_root: &Url,
+    earliest_ratified_commit_version: Option<Version>,
+) -> KernelResult<Version> {
+    run_workflow_with_engine!(engine, |channel| {
+        get_earliest_recreatable_commit_with_channel(
+            channel,
+            log_root,
+            earliest_ratified_commit_version,
+        )
+    })
+}
+
+#[tracing::instrument(name = "get_earliest_recreatable_commit", skip(channel), err, ret)]
+async fn get_earliest_recreatable_commit_with_channel(
+    channel: &Channel,
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
 ) -> KernelResult<Version> {
@@ -770,9 +934,10 @@ fn get_earliest_recreatable_commit(
 
     // Listing inherits any token bound to the engine's storage handler.
     // TODO(#3188): accept cancellation tokens on the history-manager entry points.
-    let storage = engine.storage_handler();
-    let listing = list_delta_log_from_storage(storage.as_ref(), log_root, 0, Version::MAX)?;
-    for parsed_result in listing {
+    let mut listing = list_delta_log_generator(channel, log_root, 0, Version::MAX)
+        .await?
+        .bind(channel);
+    while let Some(parsed_result) = listing.next().await? {
         let parsed_log_path = parsed_result?;
         if !should_process_log_file(&parsed_log_path) {
             continue;
@@ -874,24 +1039,66 @@ pub enum HistoryCommitType {
 /// - [`DeltaError::Generic`] when the listing yields no commits and
 ///   `earliest_ratified_commit_version` is `Some(0)`, flagging a broken catalog-managed invariant
 ///   (ratified commit 0 with no published filesystem commit).
-#[tracing::instrument(skip(engine), err, ret)]
 pub fn get_earliest_commit(
     engine: &dyn Engine,
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
     commit_type: HistoryCommitType,
 ) -> KernelResult<Version> {
-    match commit_type {
-        HistoryCommitType::Published => get_earliest_published_commit_version(
-            engine,
+    run_workflow_with_engine!(engine, |channel| {
+        get_earliest_commit_with_channel(
+            channel,
             log_root,
             earliest_ratified_commit_version,
-        ),
+            commit_type,
+        )
+    })
+}
+
+#[tracing::instrument(name = "get_earliest_commit", skip(channel), err, ret)]
+async fn get_earliest_commit_with_channel(
+    channel: &Channel,
+    log_root: &Url,
+    earliest_ratified_commit_version: Option<Version>,
+    commit_type: HistoryCommitType,
+) -> KernelResult<Version> {
+    match commit_type {
+        HistoryCommitType::Published => {
+            get_earliest_published_commit_version_with_channel(
+                channel,
+                log_root,
+                earliest_ratified_commit_version,
+            )
+            .await
+        }
 
         HistoryCommitType::Recreatable => {
-            get_earliest_recreatable_commit(engine, log_root, earliest_ratified_commit_version)
+            get_earliest_recreatable_commit_with_channel(
+                channel,
+                log_root,
+                earliest_ratified_commit_version,
+            )
+            .await
         }
     }
+}
+
+/// Returns a lazy workflow for [`get_earliest_commit`].
+#[internal_api]
+#[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
+pub(crate) fn get_earliest_commit_workflow<'a>(
+    log_root: &'a Url,
+    earliest_ratified_commit_version: Option<Version>,
+    commit_type: HistoryCommitType,
+) -> Workflow<'a, Version> {
+    workflow!(|channel| {
+        get_earliest_commit_with_channel(
+            channel,
+            log_root,
+            earliest_ratified_commit_version,
+            commit_type,
+        )
+    })
 }
 
 #[cfg(test)]

@@ -2,6 +2,9 @@ use delta_kernel_derive::internal_api;
 use url::Url;
 
 use crate::commit_range::CommitRange;
+use crate::coroutine::kernel::{
+    Channel, StaticWorkflow, run_workflow_with_engine, static_workflow,
+};
 use crate::log_segment::{
     validate_catalog_managed_log_tail, validate_commit_file_types,
     validate_commit_files_contiguous, validate_commit_files_sorted,
@@ -133,6 +136,15 @@ impl CommitRangeBuilder {
     /// all, and [`KernelError::CommitRange`] if the resolved version range is invalid
     /// (start > end).
     pub fn build(self, engine: &dyn Engine) -> KernelResult<CommitRange> {
+        run_workflow_with_engine!(engine, |channel| self.build_with_channel(channel))
+    }
+
+    /// Returns a lazy workflow for [`Self::build`].
+    pub fn build_workflow(self) -> StaticWorkflow<CommitRange> {
+        static_workflow!(|channel| self.build_with_channel(channel))
+    }
+
+    async fn build_with_channel(self, channel: &Channel) -> KernelResult<CommitRange> {
         self.validate_supported_modes()?;
 
         let table_root = Self::parse_table_root(&self.table_root)?;
@@ -157,13 +169,16 @@ impl CommitRangeBuilder {
                 start_version,
                 configured_end_version,
             )?,
-            None => Self::list_commit_files(
-                engine,
-                &log_root,
-                log_tail,
-                start_version,
-                configured_end_version,
-            )?,
+            None => {
+                Self::list_commit_files_with_channel(
+                    channel,
+                    &log_root,
+                    log_tail,
+                    start_version,
+                    configured_end_version,
+                )
+                .await?
+            }
         };
 
         validate_commit_file_types(&commit_files)?;
@@ -232,20 +247,21 @@ impl CommitRangeBuilder {
         Ok((commit_files, end_version))
     }
 
-    fn list_commit_files(
-        engine: &dyn Engine,
+    async fn list_commit_files_with_channel(
+        channel: &Channel,
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         start_version: Version,
         configured_end_version: Option<Version>,
     ) -> KernelResult<(Vec<ParsedLogPath>, Version)> {
-        let commit_files = LogSegmentFiles::list_commits(
-            engine.storage_handler().as_ref(),
+        let commit_files = LogSegmentFiles::list_commits_with_channel(
+            channel,
             log_root,
             log_tail,
             Some(start_version),
             configured_end_version,
-        )?
+        )
+        .await?
         .ascending_commit_files;
         let last_version = commit_files.last().ok_or(KernelError::EmptyLog)?.version;
         let end_version = configured_end_version.unwrap_or(last_version);

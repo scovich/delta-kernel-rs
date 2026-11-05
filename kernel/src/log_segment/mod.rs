@@ -32,6 +32,7 @@ use crate::coroutine::generator::{BoundGenerator, GeneratorExt as _};
 use crate::coroutine::kernel::run_workflow_with_engine;
 use crate::coroutine::kernel::{
     Channel, ChannelExt as _, KernelResultGenerator, iterate_prepared_result_coroutine_with_engine,
+    run_workflow_with_storage,
 };
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
@@ -546,12 +547,6 @@ impl LogSegment {
     ///
     /// Reports metrics: `LogSegmentLoadSuccess` or `LogSegmentLoadFailure`.
     #[internal_api]
-    #[tracing::instrument(
-        name = "log_segment.for_snapshot",
-        skip_all,
-        fields(enable_call_frame),
-        err
-    )]
     pub(crate) fn for_snapshot(
         storage: &dyn StorageHandler,
         log_root: Url,
@@ -560,19 +555,49 @@ impl LogSegment {
         metric_context: SnapshotLoadMetricContext,
     ) -> KernelResult<Self> {
         let time_travel_version = time_travel_version.into();
+        run_workflow_with_storage!(storage, |channel| {
+            Self::for_snapshot_with_channel(
+                channel,
+                log_root,
+                log_tail,
+                time_travel_version,
+                metric_context,
+            )
+        })
+    }
+
+    /// Constructs a snapshot log segment through `channel`.
+    #[internal_api]
+    #[tracing::instrument(
+        name = "log_segment.for_snapshot",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
+    pub(crate) async fn for_snapshot_with_channel(
+        channel: &Channel,
+        log_root: Url,
+        log_tail: Vec<ParsedLogPath>,
+        time_travel_version: impl Into<Option<Version>>,
+        metric_context: SnapshotLoadMetricContext,
+    ) -> KernelResult<Self> {
+        let time_travel_version = time_travel_version.into();
         let start = std::time::Instant::now();
-        let build = || {
-            let checkpoint_hint = LastCheckpointHint::try_read(storage, &log_root)?;
-            Self::for_snapshot_impl(
-                storage,
+        let build = async {
+            let checkpoint_hint =
+                LastCheckpointHint::try_read_with_channel(channel, &log_root).await?;
+            Self::for_snapshot_impl_with_channel(
+                channel,
                 log_root,
                 log_tail,
                 checkpoint_hint,
                 time_travel_version,
             )
+            .await
         };
-        let log_segment =
-            build().inspect_err(|_| emit_log_segment_load_failure(&metric_context))?;
+        let log_segment = build
+            .await
+            .inspect_err(|_| emit_log_segment_load_failure(&metric_context))?;
 
         emit_log_segment_load(&metric_context, &log_segment, start.elapsed());
         Ok(log_segment)
@@ -590,8 +615,27 @@ impl LogSegment {
     }
 
     // factored out for testing
+    #[cfg(test)]
     pub(crate) fn for_snapshot_impl(
         storage: &dyn StorageHandler,
+        log_root: Url,
+        log_tail: Vec<ParsedLogPath>,
+        checkpoint_hint: Option<LastCheckpointHint>,
+        time_travel_version: Option<Version>,
+    ) -> KernelResult<Self> {
+        run_workflow_with_storage!(storage, |channel| {
+            Self::for_snapshot_impl_with_channel(
+                channel,
+                log_root,
+                log_tail,
+                checkpoint_hint,
+                time_travel_version,
+            )
+        })
+    }
+
+    pub(crate) async fn for_snapshot_impl_with_channel(
+        channel: &Channel,
         log_root: Url,
         log_tail: Vec<ParsedLogPath>,
         checkpoint_hint: Option<LastCheckpointHint>,
@@ -621,19 +665,27 @@ impl LogSegment {
 
         let listed_files = match (usable_hint, end_version) {
             // Cases 1 and 2
-            (Some(cp), end_version) => LogSegmentFiles::list_with_checkpoint_hint(
-                cp,
-                storage,
-                &log_root,
-                log_tail,
-                end_version,
-            )?,
+            (Some(cp), end_version) => {
+                LogSegmentFiles::list_with_checkpoint_hint_with_channel(
+                    cp,
+                    channel,
+                    &log_root,
+                    log_tail,
+                    end_version,
+                )
+                .await?
+            }
             // Case 3
-            (None, Some(end)) => LogSegmentFiles::list_with_backward_checkpoint_scan(
-                storage, &log_root, log_tail, end,
-            )?,
+            (None, Some(end)) => {
+                LogSegmentFiles::list_with_backward_checkpoint_scan_with_channel(
+                    channel, &log_root, log_tail, end,
+                )
+                .await?
+            }
             // Case 4
-            (None, None) => LogSegmentFiles::list(storage, &log_root, log_tail, None, None)?,
+            (None, None) => {
+                LogSegmentFiles::list_with_channel(channel, &log_root, log_tail, None, None).await?
+            }
         };
 
         LogSegment::try_new(listed_files, log_root, time_travel_version, checkpoint_hint)
@@ -651,12 +703,34 @@ impl LogSegment {
         start_version: Version,
         end_version: impl Into<Option<Version>>,
     ) -> KernelResult<Self> {
-        Self::for_table_changes_with_log_tail(storage, log_root, start_version, end_version, vec![])
+        let end_version = end_version.into();
+        // Inherit any cancellation token bound to `storage`.
+        run_workflow_with_storage!(storage, |channel| {
+            Self::for_table_changes_with_channel(channel, log_root, start_version, end_version)
+        })
+    }
+
+    /// Constructs a table-changes log segment through `channel`.
+    #[internal_api]
+    pub(crate) async fn for_table_changes_with_channel(
+        channel: &Channel,
+        log_root: Url,
+        start_version: Version,
+        end_version: impl Into<Option<Version>>,
+    ) -> KernelResult<Self> {
+        Self::for_table_changes_with_log_tail_with_channel(
+            channel,
+            log_root,
+            start_version,
+            end_version,
+            vec![],
+        )
+        .await
     }
 
     /// Constructs a table-changes log segment with a caller-provided authoritative commit tail.
-    pub(crate) fn for_table_changes_with_log_tail(
-        storage: &dyn StorageHandler,
+    pub(crate) async fn for_table_changes_with_log_tail_with_channel(
+        channel: &Channel,
         log_root: Url,
         start_version: Version,
         end_version: impl Into<Option<Version>>,
@@ -672,14 +746,14 @@ impl LogSegment {
         }
 
         // TODO: compactions?
-        // Inherit any cancellation token bound to `storage`.
-        let listed_files = LogSegmentFiles::list_commits(
-            storage,
+        let listed_files = LogSegmentFiles::list_commits_with_channel(
+            channel,
             &log_root,
             log_tail,
             Some(start_version),
             end_version,
-        )?;
+        )
+        .await?;
         // - Here check that the start version is correct.
         // - [`LogSegment::try_new`] will verify that the `end_version` is correct if present.
         // - [`LogSegment::try_new`] also checks that there are no gaps between commits.
@@ -707,6 +781,25 @@ impl LogSegment {
         limit: Option<NonZero<usize>>,
         log_tail: Vec<ParsedLogPath>,
     ) -> KernelResult<Self> {
+        // Inherit any cancellation token bound to `storage`.
+        run_workflow_with_storage!(storage, |channel| {
+            Self::for_timestamp_conversion_with_channel(
+                channel,
+                log_root,
+                end_version,
+                limit,
+                log_tail,
+            )
+        })
+    }
+
+    pub(crate) async fn for_timestamp_conversion_with_channel(
+        channel: &Channel,
+        log_root: Url,
+        end_version: Version,
+        limit: Option<NonZero<usize>>,
+        log_tail: Vec<ParsedLogPath>,
+    ) -> KernelResult<Self> {
         // Compute the version to start listing from.
         let start_from = limit
             .map(|limit| match NonZero::<Version>::try_from(limit) {
@@ -719,14 +812,14 @@ impl LogSegment {
 
         // this is a list of commits with possible gaps, we want to take the latest contiguous
         // chunk of commits
-        // Inherit any cancellation token bound to `storage`.
-        let mut listed_commits = LogSegmentFiles::list_commits(
-            storage,
+        let mut listed_commits = LogSegmentFiles::list_commits_with_channel(
+            channel,
             &log_root,
             log_tail,
             start_from,
             Some(end_version),
-        )?;
+        )
+        .await?;
         if listed_commits.ascending_commit_files().is_empty() {
             return Err(KernelError::EmptyLog);
         }

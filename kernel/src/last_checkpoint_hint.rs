@@ -9,15 +9,19 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 
+#[cfg(test)]
+use crate::StorageHandler;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::CheckpointAction;
 use crate::actions::{
     CheckpointMetadata, DomainMetadata, Metadata, Protocol, SetTransaction, Sidecar,
 };
-use crate::coroutine::kernel::{Channel, ChannelExt as _, run_workflow_with_storage};
+#[cfg(test)]
+use crate::coroutine::kernel::run_workflow_with_storage;
+use crate::coroutine::kernel::{Channel, ChannelExt as _};
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
-use crate::{FileMeta, KernelError, KernelResult, StorageHandler, Version};
+use crate::{FileMeta, KernelError, KernelResult, Version};
 
 /// Name of the _last_checkpoint file that provides metadata about the last checkpoint
 /// created for the table. This file is used as a hint for the engine to quickly locate
@@ -437,6 +441,7 @@ impl LastCheckpointHint {
     /// failing the read. Thus, the semantics of this function are to return `None` if the file is
     /// not found or is invalid JSON. Unexpected/unrecoverable errors are returned as `Err` case and
     /// are assumed to cause failure.
+    #[cfg(test)]
     pub(crate) fn try_read(
         storage: &dyn StorageHandler,
         log_root: &Url,

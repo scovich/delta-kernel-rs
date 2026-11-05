@@ -3,6 +3,7 @@
 use std::cmp::Ordering;
 use std::error::Error;
 use std::fmt::Debug;
+use std::ops::AsyncFn;
 
 /// Defines the type of bound to return from a binary search operation.
 ///
@@ -70,6 +71,7 @@ pub(crate) enum SearchError<T: Error> {
 /// * key - The key value to search for
 /// * key_fn - A fallible function that extracts a comparable key from slice elements
 /// * bound - The type of bound to search for (least upper bound or greatest lower bound)
+/// * context - Passed through to each `key_fn` invocation
 ///
 /// # Returns
 ///
@@ -90,15 +92,16 @@ pub(crate) enum SearchError<T: Error> {
 /// # use delta_kernel::KernelResult;
 /// let values = [10, 20, 30, 40, 50];
 /// // Simple key function that just returns the value
-/// let key_fn = |&val| -> KernelResult<_> { Ok(val) };
+/// let key_fn = async |&val, &()| -> KernelResult<_> { Ok(val) };
 ///
 /// // Find the least upper bound for 25 (element that is ≥ 25)
 /// let result = binary_search_by_key_with_bounds(
 ///     &values,
 ///     25,
 ///     key_fn,
-///     Bound::LeastUpper
-/// );
+///     Bound::LeastUpper,
+///     &(),
+/// ).await;
 /// assert_eq!(result.unwrap(), 2); // Index of 30
 /// ```
 ///
@@ -107,15 +110,16 @@ pub(crate) enum SearchError<T: Error> {
 /// # use delta_kernel::history_manager::search::*;
 /// # use delta_kernel::KernelResult;
 /// let values = [10, 20, 30, 40, 50];
-/// let key_fn = |&val| -> KernelResult<_> { Ok(val) };
+/// let key_fn = async |&val, &()| -> KernelResult<_> { Ok(val) };
 ///
 /// // Find the greatest lower bound for 25 (element that is ≤ 25)
 /// let result = binary_search_by_key_with_bounds(
 ///     &values,
 ///     25,
 ///     key_fn,
-///     Bound::GreatestLower
-/// );
+///     Bound::GreatestLower,
+///     &(),
+/// ).await;
 /// assert_eq!(result.unwrap(), 1); // Index of 20
 /// ```
 ///
@@ -124,15 +128,16 @@ pub(crate) enum SearchError<T: Error> {
 /// # use delta_kernel::history_manager::search::*;
 /// # use delta_kernel::KernelResult;
 /// let values = [10, 20, 30, 40, 50];
-/// let key_fn = |&val| -> KernelResult<_> { Ok(val) };
+/// let key_fn = async |&val, &()| -> KernelResult<_> { Ok(val) };
 ///
 /// // Finding a bound that's out of range
 /// let result = binary_search_by_key_with_bounds(
 ///     &values,
 ///     5,
 ///     key_fn,
-///     Bound::GreatestLower
-/// );
+///     Bound::GreatestLower,
+///     &(),
+/// ).await;
 /// assert!(matches!(result, Err(SearchError::OutOfRange)));
 /// ```
 ///
@@ -145,16 +150,18 @@ pub(crate) enum SearchError<T: Error> {
 /// let result = binary_search_by_key_with_bounds(
 ///     &values,
 ///     25,
-///     |&s| s.parse::<i32>(),
-///     Bound::LeastUpper
-/// );
+///     async |&s, &()| s.parse::<i32>(),
+///     Bound::LeastUpper,
+///     &(),
+/// ).await;
 /// assert!(matches!(result, Err(SearchError::KeyFunctionError(_))));
 /// ```
-pub(crate) fn binary_search_by_key_with_bounds<'a, T, K: Ord + Debug, E: Error>(
+pub(crate) async fn binary_search_by_key_with_bounds<'a, T, K: Ord + Debug, E: Error, C>(
     values: &'a [T],
     key: K,
-    key_fn: impl Fn(&'a T) -> Result<K, E>,
+    key_fn: impl AsyncFn(&'a T, &'a C) -> Result<K, E>,
     bound: Bound,
+    context: &'a C,
 ) -> Result<usize, SearchError<E>> {
     let (mut lo, mut hi) = (0, values.len());
     while lo != hi {
@@ -162,7 +169,9 @@ pub(crate) fn binary_search_by_key_with_bounds<'a, T, K: Ord + Debug, E: Error>(
         debug_assert!(lo <= mid && mid < hi);
 
         // Use the key function to get a key. Return an error otherwise.
-        let mid_key = key_fn(&values[mid]).map_err(SearchError::KeyFunctionError)?;
+        let mid_key = key_fn(&values[mid], context)
+            .await
+            .map_err(SearchError::KeyFunctionError)?;
         match (key.cmp(&mid_key), bound) {
             (Ordering::Less, _) => hi = mid,
             (Ordering::Equal, Bound::LeastUpper) => hi = mid,
@@ -186,7 +195,7 @@ mod tests {
     use crate::{KernelError, KernelResult};
 
     // Simple key extraction function
-    fn get_val(x: &i32) -> KernelResult<i32> {
+    async fn get_val(x: &i32, _: &()) -> KernelResult<i32> {
         Ok(*x)
     }
 
@@ -195,60 +204,72 @@ mod tests {
     #[case::exact_greatest_lower(5, Bound::GreatestLower, 2)]
     #[case::no_match_least_upper(4, Bound::LeastUpper, 2)]
     #[case::no_match_greatest_lower(6, Bound::GreatestLower, 2)]
-    fn test_binary_search(
+    #[tokio::test]
+    async fn test_binary_search(
         #[case] search_key: i32,
         #[case] bound: Bound,
         #[case] expected_index: usize,
     ) {
         let values = vec![1, 3, 5, 7, 9];
-        let result = binary_search_by_key_with_bounds(&values, search_key, get_val, bound).unwrap();
+        let result = binary_search_by_key_with_bounds(&values, search_key, get_val, bound, &())
+            .await
+            .unwrap();
         assert_eq!(result, expected_index);
     }
 
     #[rstest::rstest]
     #[case::least_upper_first_occurrence(5, Bound::LeastUpper, 2)]
     #[case::greatest_lower_last_occurrence(5, Bound::GreatestLower, 4)]
-    fn test_duplicate_values(
+    #[tokio::test]
+    async fn test_duplicate_values(
         #[case] search_key: i32,
         #[case] bound: Bound,
         #[case] expected_index: usize,
     ) {
         let values = vec![1, 3, 5, 5, 5, 7, 9];
-        let result = binary_search_by_key_with_bounds(&values, search_key, get_val, bound).unwrap();
+        let result = binary_search_by_key_with_bounds(&values, search_key, get_val, bound, &())
+            .await
+            .unwrap();
         assert_eq!(result, expected_index);
     }
 
-    #[test]
-    fn test_edge_cases() {
+    #[tokio::test]
+    async fn test_edge_cases() {
         // Empty array
         let empty: Vec<i32> = vec![];
-        let result = binary_search_by_key_with_bounds(&empty, 5, get_val, Bound::LeastUpper);
+        let result =
+            binary_search_by_key_with_bounds(&empty, 5, get_val, Bound::LeastUpper, &()).await;
         assert!(result.is_err());
 
         // Value less than all elements (LeastUpper)
         let values = vec![5, 7, 9];
-        let result =
-            binary_search_by_key_with_bounds(&values, 3, get_val, Bound::LeastUpper).unwrap();
+        let result = binary_search_by_key_with_bounds(&values, 3, get_val, Bound::LeastUpper, &())
+            .await
+            .unwrap();
         assert_eq!(result, 0); // Should return index of first element
 
         // Value less than all elements (GreatestLower)
-        let result = binary_search_by_key_with_bounds(&values, 3, get_val, Bound::GreatestLower);
+        let result =
+            binary_search_by_key_with_bounds(&values, 3, get_val, Bound::GreatestLower, &()).await;
         assert!(matches!(result, Err(SearchError::OutOfRange))); // No lower bound exists
 
         // Value greater than all elements (LeastUpper)
-        let result = binary_search_by_key_with_bounds(&values, 10, get_val, Bound::LeastUpper);
+        let result =
+            binary_search_by_key_with_bounds(&values, 10, get_val, Bound::LeastUpper, &()).await;
         assert!(matches!(result, Err(SearchError::OutOfRange))); // No upper bound exists
 
         // Value greater than all elements (GreatestLower)
         let result =
-            binary_search_by_key_with_bounds(&values, 10, get_val, Bound::GreatestLower).unwrap();
+            binary_search_by_key_with_bounds(&values, 10, get_val, Bound::GreatestLower, &())
+                .await
+                .unwrap();
         assert_eq!(result, 2); // Should return index of last element
     }
-    #[test]
-    fn test_error_propagation() {
+    #[tokio::test]
+    async fn test_error_propagation() {
         let values = vec![1, 3, 5, 7, 9];
 
-        let failing_key_fn = |x: &i32| -> KernelResult<i32> {
+        let failing_key_fn = async |x: &i32, _: &()| -> KernelResult<i32> {
             if *x == 5 {
                 Err(KernelError::generic("Error extracting key"))
             } else {
@@ -257,7 +278,8 @@ mod tests {
         };
 
         let result =
-            binary_search_by_key_with_bounds(&values, 7, failing_key_fn, Bound::LeastUpper);
+            binary_search_by_key_with_bounds(&values, 7, failing_key_fn, Bound::LeastUpper, &())
+                .await;
         assert!(matches!(
             result,
             Err(SearchError::KeyFunctionError(crate::KernelError::Generic(msg))) if msg.contains("Error extracting key")

@@ -10,21 +10,23 @@ use delta_kernel_derive::internal_api;
 use url::Url;
 use uuid::Uuid;
 
+#[cfg(test)]
+use crate::Engine;
 use crate::actions::visitors::InCommitTimestampVisitor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::visitors::LastManifestCommitVisitor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{COMMIT_INFO_NAME, LAST_MANIFEST_COMMIT_FIELD, LastManifestCommit};
 use crate::coroutine::generator::BoundGenerator as _;
-use crate::coroutine::kernel::{Channel, ChannelExt as _, run_workflow_with_engine};
+#[cfg(test)]
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::{Channel, ChannelExt as _};
 use crate::engine_data::RowVisitor;
 use crate::schema::SchemaRef;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::schema::lazy_schema_ref;
 use crate::utils::require;
-use crate::{
-    Engine, EngineData, FileMeta, KernelError, KernelResult, ParquetMultiFileWrite, Version,
-};
+use crate::{EngineData, FileMeta, KernelError, KernelResult, ParquetMultiFileWrite, Version};
 
 /// The delta log subdirectory with a trailing slash for directory URL joins.
 pub(crate) const DELTA_LOG_DIR_WITH_SLASH: &str = "_delta_log/";
@@ -385,6 +387,7 @@ impl ParsedLogPath<FileMeta> {
     ///
     /// Returns the inCommitTimestamp value, or an error if ICT is not found or cannot be read.
     /// Callers should handle enablement version checks before calling this method.
+    #[cfg(test)]
     pub(crate) fn read_in_commit_timestamp(&self, engine: &dyn Engine) -> KernelResult<i64> {
         run_workflow_with_engine!(engine, |channel| {
             self.read_in_commit_timestamp_with_channel(channel)
