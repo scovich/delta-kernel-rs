@@ -11,15 +11,17 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 use self::data_skipping::as_checkpoint_skipping_predicate;
-use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
+use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter_with_channel};
 use crate::actions::deletion_vector::{
     DeletionVectorDescriptor, deletion_treemap_to_bools, split_vector,
 };
 use crate::actions::{ADD_FIELD, ADD_NAME, Add, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
+use crate::coroutine::generator::{AsyncIntoIterator as _, GeneratorExt as _};
 use crate::coroutine::kernel::engine::EngineConnector;
 use crate::coroutine::kernel::{
-    Channel, KernelResultGenerator, Workflow, run_workflow_with_storage, workflow,
+    Channel, KernelResultGenerator, Workflow, iterate_prepared_result_coroutine_with_engine,
+    run_workflow_with_storage, workflow,
 };
 use crate::engine::CancellableEngine;
 use crate::engine_data::FilteredEngineData;
@@ -34,6 +36,7 @@ use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegme
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
+use crate::parallel::parallel_scan_metadata::{sequential_scan_metadata, sequential_scan_span};
 use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::plan::Plan;
@@ -50,7 +53,7 @@ use crate::schema::{
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{ExpressionTransform, SchemaTransform, transform_output_type};
-use crate::utils::{FoldWithOption as _, IteratorExt, require};
+use crate::utils::{FoldWithOption as _, require};
 use crate::{
     Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator, SnapshotRef,
     Version,
@@ -109,8 +112,8 @@ static PARALLEL_CHECKPOINT_READ_SCHEMA_NO_JSON_STATS: LazyLock<SchemaRef> = Lazy
 });
 #[allow(unused)]
 pub use crate::parallel::parallel_scan_metadata::{
-    AfterSequentialScanMetadata, ParallelScanMetadataIterator, ParallelState,
-    SequentialScanMetadataIterator,
+    AfterSequentialScanMetadata, ParallelScanMetadata, ParallelScanMetadataIterator, ParallelState,
+    SequentialScanMetadata, SequentialScanMetadataIterator,
 };
 
 /// Configures structured-stats output and JSON synthesis in scan metadata.
@@ -1291,7 +1294,24 @@ impl Scan {
         actions_with_checkpoint_info: ActionsWithCheckpointInfo<I>,
     ) -> KernelResult<impl KernelResultIterator<ScanMetadata> + use<I>>
     where
-        I: KernelResultIterator<ActionsBatch>,
+        I: KernelResultIterator<ActionsBatch> + 'static,
+    {
+        let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
+            actions: actions_with_checkpoint_info.actions.into_generator(),
+            checkpoint_info: actions_with_checkpoint_info.checkpoint_info,
+        };
+        iterate_prepared_result_coroutine_with_engine!(engine, |channel| {
+            self.scan_metadata_inner_with_channel(channel, actions_with_checkpoint_info)
+        })
+    }
+
+    async fn scan_metadata_inner_with_channel<'a, G>(
+        &self,
+        channel: &Channel,
+        actions_with_checkpoint_info: ActionsWithCheckpointInfo<G>,
+    ) -> KernelResult<impl KernelResultGenerator<ScanMetadata> + 'a + use<'a, G>>
+    where
+        G: KernelResultGenerator<ActionsBatch> + 'a,
     {
         let start = Instant::now();
         let operation_id = MetricId::new();
@@ -1304,14 +1324,15 @@ impl Scan {
                 (None, Arc::new(ScanMetrics::default()))
             }
             _ => {
-                let (it, m) = scan_action_iter(
-                    engine,
+                let (it, m) = scan_action_iter_with_channel(
+                    channel,
                     actions_with_checkpoint_info.actions,
                     self.state_info.clone(),
                     actions_with_checkpoint_info.checkpoint_info,
                     self.stats_options(),
                     self.partition_values_options(),
-                )?;
+                )
+                .await?;
                 (Some(it), m)
             }
         };
@@ -1327,7 +1348,8 @@ impl Scan {
             info!(%event);
             emit_scan_metadata_completed(&event);
         };
-        Ok(iter.into_iter().flatten().on_complete(on_complete))
+        let iter = iter.into_generator().flatten_async();
+        Ok(iter.on_complete(on_complete))
     }
 
     #[cfg(feature = "declarative-plans")]
@@ -1541,6 +1563,42 @@ impl Scan {
     ) -> KernelResult<SequentialScanMetadataIterator> {
         // There is no cancellable variant: distributed cancellation belongs to the engine or
         // connector that owns the remote work.
+        let connector = EngineConnector::new(engine.as_ref());
+        let span = sequential_scan_span();
+        let workflow = span.in_scope(|| {
+            workflow!(|channel| { self.parallel_scan_metadata_with_channel(channel) })
+        });
+        let sequential = connector.drive(workflow)?;
+        Ok(SequentialScanMetadataIterator::new(
+            connector,
+            sequential,
+            self.correlation_id.clone(),
+            span,
+        ))
+    }
+
+    /// Returns a lazy workflow for [`Self::parallel_scan_metadata`].
+    pub fn parallel_scan_metadata_workflow(&self) -> Workflow<'_, SequentialScanMetadata> {
+        let span = sequential_scan_span();
+        let body_span = span.clone();
+        span.in_scope(|| {
+            workflow!(async move |channel| {
+                let sequential = self.parallel_scan_metadata_with_channel(channel).await?;
+                Ok(sequential_scan_metadata(
+                    sequential,
+                    self.correlation_id.clone(),
+                    body_span,
+                ))
+            })
+        })
+    }
+
+    async fn parallel_scan_metadata_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<
+        impl KernelResultGenerator<ScanMetadata, KernelResult<AfterSequential>> + 'static + use<>,
+    > {
         // TODO(#3609): Support connector-supplied timezone in parallel metadata scans.
         require!(
             !table_requires_timestamp_timezone_support(
@@ -1565,33 +1623,14 @@ impl Scan {
             has_partition_values_parsed: false,
             checkpoint_read_schema: checkpoint_read_schema.clone(),
         };
-        let processor = ScanLogReplayProcessor::new(
-            engine.as_ref(),
+        let processor = ScanLogReplayProcessor::new_with_channel(
+            channel,
             self.state_info.clone(),
             checkpoint_info,
             self.stats_options(),
             self.partition_values_options(),
-        )?;
-        let connector = EngineConnector::new(engine.as_ref());
-        let sequential = connector.drive(workflow!(|channel| {
-            self.parallel_scan_metadata_with_channel(channel, processor, checkpoint_read_schema)
-        }))?;
-
-        Ok(SequentialScanMetadataIterator::new(
-            connector,
-            sequential,
-            self.correlation_id.clone(),
-        ))
-    }
-
-    async fn parallel_scan_metadata_with_channel(
-        &self,
-        channel: &Channel,
-        processor: ScanLogReplayProcessor,
-        checkpoint_read_schema: SchemaRef,
-    ) -> KernelResult<
-        impl KernelResultGenerator<ScanMetadata, KernelResult<AfterSequential>> + 'static + use<>,
-    > {
+        )
+        .await?;
         SequentialPhase::try_new_with_channel(
             channel,
             processor,

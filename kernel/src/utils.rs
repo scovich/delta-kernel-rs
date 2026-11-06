@@ -198,62 +198,6 @@ pub(crate) trait FoldWithOption: Sized {
 // Blanket impl -- every type can fold_with an Option.
 impl<T: Sized> FoldWithOption for T {}
 
-/// Extension trait for adding completion callbacks to iterators.
-pub(crate) trait IteratorExt: Iterator + Sized {
-    /// Wraps this iterator to call a closure when fully exhausted.
-    ///
-    /// The closure is called only when `next()` returns `None`. If the iterator
-    /// is dropped before exhaustion, a warning is logged but the closure is not called.
-    fn on_complete<F: FnOnce()>(self, f: F) -> OnComplete<Self, F> {
-        OnComplete {
-            inner: self,
-            on_complete: Some(f),
-        }
-    }
-}
-
-impl<I: Iterator> IteratorExt for I {}
-
-/// Iterator adaptor that executes a closure when fully exhausted.
-pub(crate) struct OnComplete<I, F: FnOnce()> {
-    inner: I,
-    on_complete: Option<F>,
-}
-
-impl<I, F: FnOnce()> Drop for OnComplete<I, F> {
-    fn drop(&mut self) {
-        if self.on_complete.is_some() {
-            tracing::debug!(
-                "OnComplete iterator dropped before exhaustion; completion callback not called"
-            );
-        }
-    }
-}
-
-impl<I, F> Iterator for OnComplete<I, F>
-where
-    I: Iterator,
-    F: FnOnce(),
-{
-    type Item = I::Item;
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.inner.next() {
-            Some(item) => Some(item),
-            None => {
-                if let Some(f) = self.on_complete.take() {
-                    f();
-                }
-                None
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,55 +252,5 @@ mod tests {
             url.to_string(),
             "s3://foo/__unitystorage/catalogs/cid/tables/tid/"
         );
-    }
-
-    mod on_complete_tests {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-
-        use super::*;
-
-        #[test]
-        fn test_calls_on_exhaustion() {
-            let called = Arc::new(AtomicBool::new(false));
-            let called_clone = called.clone();
-            let mut iter = vec![1, 2].into_iter().on_complete(move || {
-                called_clone.store(true, Ordering::SeqCst);
-            });
-            assert_eq!(iter.next(), Some(1));
-            assert!(!called.load(Ordering::SeqCst));
-            assert_eq!(iter.next(), Some(2));
-            assert_eq!(iter.next(), None);
-            assert!(called.load(Ordering::SeqCst));
-        }
-
-        #[test]
-        fn test_does_not_call_on_early_drop() {
-            let called = Arc::new(AtomicBool::new(false));
-            let called_clone = called.clone();
-            {
-                let mut iter = vec![1, 2].into_iter().on_complete(move || {
-                    called_clone.store(true, Ordering::SeqCst);
-                });
-                assert_eq!(iter.next(), Some(1));
-                // Drop without exhausting - callback should NOT be called
-            }
-            assert!(!called.load(Ordering::SeqCst));
-        }
-
-        #[test]
-        fn test_calls_only_once() {
-            let count = Arc::new(AtomicU32::new(0));
-            let count_clone = count.clone();
-            {
-                let mut iter = vec![1].into_iter().on_complete(move || {
-                    count_clone.fetch_add(1, Ordering::SeqCst);
-                });
-                assert_eq!(iter.next(), Some(1));
-                assert_eq!(iter.next(), None); // triggers callback
-                assert_eq!(iter.next(), None); // should not trigger again
-            } // drop should not trigger again
-            assert_eq!(count.load(Ordering::SeqCst), 1);
-        }
     }
 }

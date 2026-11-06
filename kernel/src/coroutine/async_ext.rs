@@ -14,6 +14,11 @@ pub(crate) trait AsyncOption<T> {
     async fn map_async<U, Fut>(self, f: impl FnOnce(T) -> Fut) -> Option<U>
     where
         Fut: Future<Output = U>;
+
+    /// Async counterpart of [`Option::and_then`].
+    async fn and_then_async<U, Fut>(self, f: impl FnOnce(T) -> Fut) -> Option<U>
+    where
+        Fut: Future<Output = Option<U>>;
 }
 
 impl<T> AsyncOption<T> for Option<T> {
@@ -23,11 +28,17 @@ impl<T> AsyncOption<T> for Option<T> {
     {
         Some(f(self?).await)
     }
+
+    async fn and_then_async<U, Fut>(self, f: impl FnOnce(T) -> Fut) -> Option<U>
+    where
+        Fut: Future<Output = Option<U>>,
+    {
+        f(self?).await
+    }
 }
 
 /// Async counterparts of [`Result`] combinators.
 #[internal_api]
-#[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
 #[allow(async_fn_in_trait)]
 pub(crate) trait AsyncResult<T, E> {
     /// Async counterpart of [`Result::and_then`].

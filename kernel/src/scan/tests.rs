@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use ::test_utils::table_builder::{DataLayoutConfig, LogState, TestTableBuilder};
 use ::test_utils::{assert_result_error_with_message, get_column, load_test_data};
 use bytes::Bytes;
 use rstest::rstest;
@@ -761,6 +762,30 @@ fn scan_metadata_from_requires_timezone_support_only_for_timestamp_partitions(
         let metadata: Vec<_> = result.unwrap().try_collect().unwrap();
         assert!(metadata.is_empty());
     }
+}
+
+#[test]
+fn scan_metadata_from_checks_timezone_before_checkpoint_fallback() {
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_latest_version(1).with_checkpoint_at([1]))
+        .with_data_layout(DataLayoutConfig::PartitionedAllTypes)
+        .build()
+        .unwrap();
+    let engine = SyncEngine::new_with_store(table.store().clone());
+    let snapshot = Snapshot::builder_for(table.table_root())
+        .build(&engine)
+        .unwrap();
+    assert_eq!(snapshot.log_segment().checkpoint_version, Some(1));
+
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(
+            PartitionValuesOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+        )
+        .build()
+        .unwrap();
+    let result = scan.scan_metadata_from(&engine, 0, Vec::new(), None);
+    assert_result_error_with_message(result, "with_timestamp_timezone in scan_metadata_from");
 }
 
 #[test_log::test]

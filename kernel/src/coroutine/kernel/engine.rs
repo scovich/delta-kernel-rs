@@ -91,6 +91,23 @@ impl EngineConnector {
         Ok(self.iterate_result_coroutine(coroutine))
     }
 
+    /// Prepare a fallible result coroutine and split its result with `into_parts` into a generator
+    /// and a companion value; return an iterator that drives the generator, plus the companion.
+    #[cfg(test)]
+    pub(crate) fn iterate_prepared_result_coroutine_with_companion<'a, R, G, Item, Companion>(
+        self,
+        workflow: Workflow<'_, R>,
+        into_parts: impl FnOnce(R) -> (G, Companion),
+    ) -> KernelResult<(EngineResultCoroutineIterator<'a, Item>, Companion)>
+    where
+        G: KernelResultGenerator<Item> + 'a,
+        Item: Send + 'static,
+    {
+        let (generator, companion) = into_parts(self.drive(workflow)?);
+        let coroutine = Coroutine::from_generator(generator);
+        Ok((self.iterate_result_coroutine(coroutine), companion))
+    }
+
     /// Return an iterator that drives `coroutine` and its connector requests.
     pub(crate) fn iterate_coroutine<'a, Item: Send + 'static, O: Send + 'static>(
         self,
