@@ -1,11 +1,15 @@
 use url::Url;
 
 use super::scan_file::CdfScanFileType;
+#[cfg(test)]
+use crate::Engine;
 use crate::actions::deletion_vector::{deletion_treemap_to_bools, selection_treemap_to_bools};
 use crate::coroutine::AsyncOption as _;
-use crate::coroutine::kernel::{Channel, run_workflow_with_engine};
+use crate::coroutine::kernel::Channel;
+#[cfg(test)]
+use crate::coroutine::kernel::run_workflow_with_engine;
 use crate::table_changes::scan_file::CdfScanFile;
-use crate::{Engine, KernelError, KernelResult};
+use crate::{KernelError, KernelResult};
 
 /// A [`CdfScanFile`] with its associated `selection_vector`. The `scan_type` is resolved to
 /// match the `_change_type` that its rows will have in the change data feed.
@@ -35,6 +39,7 @@ pub(crate) struct ResolvedCdfScanFile {
 /// 2. The second case handles all other add, remove, and cdc [`CdfScanFile`]s. These will simply
 ///    read the deletion vector (if present), and each is converted into a [`ResolvedCdfScanFile`].
 ///    No changes are made to the `scan_type`.
+#[cfg(test)]
 pub(crate) fn resolve_scan_file_dv(
     engine: &dyn Engine,
     table_root: &Url,
