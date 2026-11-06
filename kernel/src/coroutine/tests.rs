@@ -2,12 +2,12 @@ use std::borrow::Borrow;
 use std::future::{Future as _, poll_fn};
 use std::ops::Deref;
 use std::pin::pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::Poll;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Wake, Waker};
 
 use bytes::Bytes;
-use futures::future::join;
+use futures::future::{Either, join, ready, select};
 use futures::stream::{FuturesUnordered, StreamExt as _};
 use rstest::rstest;
 use tempfile::tempdir;
@@ -24,6 +24,7 @@ use super::kernel::{
     Channel, ChannelExt as _, CoroutineStep, GeneratorBody, Request, StaticCoroutine, workflow,
 };
 use super::{static_coroutine, *};
+use crate::engine::RelaxedCounter;
 use crate::engine::sync::SyncEngine;
 use crate::metrics::MetricEvent;
 use crate::unit_test_utils::{
@@ -36,6 +37,25 @@ enum ReplyOutcome {
     Ok,
     Err,
     Drop,
+}
+
+#[derive(Default)]
+struct WakeCounter(RelaxedCounter);
+
+impl Wake for WakeCounter {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.inc();
+    }
+}
+
+impl WakeCounter {
+    fn count(&self) -> u64 {
+        self.0.get()
+    }
 }
 
 #[test]
@@ -441,6 +461,255 @@ fn generator_fn_erasure_preserves_requests_and_items() {
         CoroutineStep::Done(())
     ));
     assert_result_error_with_message(generator.try_advance(), "advanced after completion");
+}
+
+fn memory_url(name: &str) -> Url {
+    Url::parse(&format!("memory:///{name}")).unwrap()
+}
+
+fn read_target(request: Request) -> (String, Reply<Option<Bytes>>) {
+    let Request::ReadSmallFile((url, _), reply) = request else {
+        panic!("unexpected request");
+    };
+    (url.to_string(), reply)
+}
+
+fn two_outstanding_requests_source() -> Box<dyn Generator<Request, Item = usize, Output = ()>> {
+    generator_fn!(async move |channel| {
+        let first = channel.read_small_file(memory_url("first"), None);
+        let second = channel.read_small_file(memory_url("second"), None);
+        let (first, second) = join(first, second).await;
+        first?;
+        second?;
+        channel.yield_item(0).await?;
+        channel.yield_item(1).await
+    })
+}
+
+fn drive_holding_replies<O>(workflow: &mut Workflow<'_, Request, O>) -> (Vec<Vec<String>>, O) {
+    let mut rounds = vec![Vec::new()];
+    let mut held = Vec::new();
+    loop {
+        match workflow.try_advance() {
+            Ok(WorkflowStep::Done(output)) => return (rounds, output),
+            Ok(WorkflowStep::Request(request)) => {
+                let (url, reply) = read_target(request);
+                rounds.last_mut().unwrap().push(url);
+                held.push(reply);
+            }
+            Err(KernelError::WouldBlock) => {
+                for reply in held.drain(..) {
+                    reply.send(Ok(Some(Bytes::new())));
+                }
+                rounds.push(Vec::new());
+            }
+            Err(err) => panic!("unexpected workflow error: {err}"),
+        }
+    }
+}
+
+fn drive_coroutine_replying(
+    stream: &mut Coroutine<'static, Request, usize>,
+) -> (Vec<String>, Vec<usize>, ()) {
+    let mut served = Vec::new();
+    let mut items = Vec::new();
+    loop {
+        match stream.try_advance().unwrap() {
+            CoroutineStep::Yield(item) => items.push(item),
+            CoroutineStep::Request(request) => {
+                let (url, reply) = read_target(request);
+                served.push(url);
+                reply.send(Ok(Some(Bytes::new())));
+            }
+            CoroutineStep::Done(()) => return (served, items, ()),
+        }
+    }
+}
+
+#[test]
+fn accepting_forwarded_request_wakes_driver() {
+    let source = generator_fn!(async move |channel| {
+        channel.read_small_file(memory_url("wake"), None).await?;
+        channel.yield_item(7).await
+    });
+    let mut workflow = workflow!(async move |channel| {
+        let mut view = source.attach_to(channel);
+        view.next().await
+    });
+
+    let accept_wakes = Arc::new(WakeCounter::default());
+    let accept_waker = Waker::from(Arc::clone(&accept_wakes));
+    let reply = {
+        let mut context = Context::from_waker(&accept_waker);
+        let mut advance = pin!(workflow.advance());
+        let Poll::Ready(Ok(WorkflowStep::Request(request))) = advance.as_mut().poll(&mut context)
+        else {
+            panic!("workflow did not forward the nested request");
+        };
+        read_target(request).1
+    };
+    assert_eq!(accept_wakes.count(), 1);
+
+    let late_wakes = Arc::new(WakeCounter::default());
+    let late_waker = Waker::from(Arc::clone(&late_wakes));
+    let mut context = Context::from_waker(&late_waker);
+    let mut advance = pin!(workflow.advance());
+    assert!(advance.as_mut().poll(&mut context).is_pending());
+    assert_eq!(late_wakes.count(), 0);
+    reply.send(Ok(Some(Bytes::new())));
+    assert_eq!((accept_wakes.count(), late_wakes.count()), (1, 1));
+    let Poll::Ready(Ok(WorkflowStep::Done(Some(item)))) = advance.as_mut().poll(&mut context)
+    else {
+        panic!("workflow did not finish after the late reply");
+    };
+    assert_eq!(item, 7);
+}
+
+#[rstest]
+fn join_style_inner_requests_surface_before_any_reply(#[values(false, true)] forwarded: bool) {
+    let mut workflow = workflow!(async move |channel| {
+        let mut items = Vec::new();
+        if forwarded {
+            let mut view = two_outstanding_requests_source().attach_to(channel);
+            while let Some(item) = view.next().await? {
+                items.push(item);
+            }
+        } else {
+            let mut view = two_outstanding_requests_source().bind(channel);
+            while let Some(item) = view.next().await? {
+                items.push(item);
+            }
+        }
+        Ok(items)
+    });
+    let (rounds, items) = drive_holding_replies(&mut workflow);
+    assert_eq!(rounds[0], ["memory:///first", "memory:///second"]);
+    assert_eq!(items, [0, 1]);
+}
+
+#[test]
+fn detach_with_forward_awaiting_acceptance_hands_off_cleanly() {
+    let mut workflow = workflow!(async move |channel| {
+        let mut attached = two_outstanding_requests_source().attach_to(channel);
+        {
+            let next = Box::pin(attached.next());
+            match select(next, ready(())).await {
+                Either::Right(((), _next)) => {}
+                Either::Left((result, _)) => {
+                    panic!("attached generator completed unexpectedly: {result:?}");
+                }
+            }
+        }
+        attached.detach().await
+    });
+
+    let WorkflowStep::Request(request) = workflow.try_advance().unwrap() else {
+        panic!("workflow completed without a request");
+    };
+    let (first, reply) = read_target(request);
+    assert_eq!(first, "memory:///first");
+
+    let WorkflowStep::Done(remainder) = workflow.try_advance().unwrap() else {
+        panic!("detach did not complete after request acceptance");
+    };
+    reply.send(Ok(Some(Bytes::new())));
+    let mut stream = Coroutine::from_generator(remainder);
+    let (served, items, ()) = drive_coroutine_replying(&mut stream);
+    assert_eq!(served, ["memory:///second"]);
+    assert_eq!(items, [0, 1]);
+}
+
+#[test]
+fn detach_after_completion_returns_completed_remainder() {
+    let mut workflow = workflow!(async move |channel| {
+        let source = generator_fn!(async move |channel| channel.yield_item(1).await);
+        let mut attached = source.attach_to(channel);
+        let mut sampled = Vec::new();
+        while let Some(item) = attached.next().await? {
+            sampled.push(item);
+        }
+        let remainder = attached.detach().await?;
+        Ok((remainder, sampled))
+    });
+    let (_, (remainder, sampled)) = drive_holding_replies(&mut workflow);
+    assert_eq!(sampled, [1]);
+
+    let mut stream = Coroutine::from_generator(remainder);
+    assert!(matches!(
+        stream.try_advance().unwrap(),
+        CoroutineStep::Done(())
+    ));
+}
+
+#[test]
+fn nested_attachment_keeps_inner_requests_outstanding() {
+    let middle = generator_fn!(async move |channel| {
+        let mut inner = two_outstanding_requests_source().attach_to(&channel);
+        while let Some(item) = inner.next().await? {
+            channel.yield_item(item).await?;
+        }
+        Ok(())
+    });
+    let mut workflow = workflow!(async move |channel| {
+        let mut view = middle.attach_to(channel);
+        let mut items = Vec::new();
+        while let Some(item) = view.next().await? {
+            items.push(item);
+        }
+        Ok(items)
+    });
+    let (rounds, items) = drive_holding_replies(&mut workflow);
+    assert_eq!(rounds[0], ["memory:///first", "memory:///second"]);
+    assert_eq!(items, [0, 1]);
+}
+
+struct PoppingWaker {
+    channel: Arc<Channel>,
+    popped: Mutex<Vec<Request>>,
+}
+
+impl Wake for PoppingWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        if let Some(request) = self.channel.pop() {
+            self.popped.lock().unwrap().push(request);
+        }
+    }
+}
+
+#[test]
+fn waker_that_pops_the_outer_channel_synchronously_does_not_deadlock() {
+    let source = two_outstanding_requests_source();
+    let mut workflow = workflow!(async move |channel| {
+        let sample = async {
+            let mut view = source.attach_to(channel);
+            view.next().await
+        };
+        let unrelated = channel.read_small_file(memory_url("unrelated"), None);
+        let (sampled, unrelated) = join(sample, unrelated).await;
+        unrelated?;
+        sampled
+    });
+    let waker = Arc::new(PoppingWaker {
+        channel: Arc::clone(&workflow.requests),
+        popped: Mutex::default(),
+    });
+    let task_waker = Waker::from(Arc::clone(&waker));
+    let mut context = Context::from_waker(&task_waker);
+    let mut advance = pin!(workflow.advance());
+
+    let Poll::Ready(Ok(WorkflowStep::Request(request))) = advance.as_mut().poll(&mut context)
+    else {
+        panic!("workflow did not forward the nested request");
+    };
+
+    assert_eq!(read_target(request).0, "memory:///first");
+    let mut popped = std::mem::take(&mut *waker.popped.lock().unwrap());
+    assert_eq!(popped.len(), 1);
+    assert_eq!(read_target(popped.pop().unwrap()).0, "memory:///unrelated");
 }
 
 #[test]

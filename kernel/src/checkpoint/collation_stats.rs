@@ -7,10 +7,15 @@
 use std::borrow::Cow;
 use std::sync::{Arc, LazyLock};
 
+#[cfg(test)]
+use futures::FutureExt as _;
 use serde_json::Value;
 
 use crate::action_reconciliation::log_replay::ActionReconciliationBatch;
 use crate::actions::{NUM_RECORDS, TIGHT_BOUNDS};
+#[cfg(test)]
+use crate::coroutine::generator::AsyncIntoIterator as _;
+use crate::coroutine::generator::BoundGenerator;
 use crate::engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData};
 use crate::expressions::{
     ColumnName, Expression, ExpressionRef, UnaryExpressionOp, col, column_name,
@@ -104,6 +109,19 @@ pub(crate) fn build_collation_stats_read_transform(
     }))
 }
 
+/// Synchronous test adapter for `checkpoint_stats_schema_with_channel`.
+#[cfg(test)]
+pub(super) fn checkpoint_stats_schema(
+    snapshot: &Snapshot,
+    binary_stats: SchemaRef,
+    batches: &mut (impl Iterator<Item = KernelResult<ActionReconciliationBatch>> + Send),
+) -> KernelResult<(SchemaRef, Vec<ActionReconciliationBatch>)> {
+    let mut batches = batches.into_generator();
+    checkpoint_stats_schema_with_channel(snapshot, binary_stats, &mut batches)
+        .now_or_never()
+        .expect("iterator-backed collation stats sampling never suspends")
+}
+
 /// Extends `binary_stats` with identifiers sampled from the first active Add.
 ///
 /// Consumes reconciled `batches` through the first active Add and returns them for writing before
@@ -113,11 +131,14 @@ pub(crate) fn build_collation_stats_read_transform(
 /// Unsampled identifiers are omitted from structured stats; bounds are never relabeled with a
 /// sampled identifier. JSON stats retain all source identifiers when enabled.
 /// Returns an error if replay, visiting selected rows, or building the derived schema returns one.
-pub(super) fn checkpoint_stats_schema(
+pub(super) async fn checkpoint_stats_schema_with_channel<G>(
     snapshot: &Snapshot,
     binary_stats: SchemaRef,
-    batches: &mut impl Iterator<Item = KernelResult<ActionReconciliationBatch>>,
-) -> KernelResult<(SchemaRef, Vec<ActionReconciliationBatch>)> {
+    batches: &mut G,
+) -> KernelResult<(SchemaRef, Vec<ActionReconciliationBatch>)>
+where
+    G: BoundGenerator<Item = KernelResult<ActionReconciliationBatch>, Output = ()> + Unpin,
+{
     let data_schema = snapshot
         .table_configuration()
         .physical_data_schema_without_partition_columns();
@@ -127,7 +148,7 @@ pub(super) fn checkpoint_stats_schema(
     let bound_schema = bound_schema.into_owned();
     let mut visitor = CollationStatsVisitor::default();
     let mut buffered = Vec::new();
-    for batch in batches {
+    while let Some(batch) = batches.next().await? {
         let batch = batch?;
         visitor.visit_rows_of(&batch.filtered_data)?;
         buffered.push(batch);

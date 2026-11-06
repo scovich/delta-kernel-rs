@@ -29,12 +29,15 @@
 //!   3. Tracks state for deduplication across batches
 //!   4. Produces a [`ActionReconciliationBatch`] result which includes both the filtered data and
 //!      counts of actions selected
+use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use url::Url;
 
+use crate::coroutine::generator::{BoundGenerator, generator_fn};
+use crate::coroutine::kernel::KernelResultGenerator;
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::deduplicator::{Deduplicator as _, FileActionInfo};
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, HasSelectionVector};
@@ -140,22 +143,62 @@ impl ActionReconciliationIteratorState {
 /// This iterator yields a stream of [`FilteredEngineData`] items while, tracking action
 /// counts. Used by both checkpoint and log compaction workflows.
 pub struct ActionReconciliationIterator {
-    inner: Box<dyn KernelResultIterator<ActionReconciliationBatch>>,
+    inner: Box<dyn KernelResultIterator<FilteredEngineData>>,
     state: Arc<ActionReconciliationIteratorState>,
 }
 
+/// Couples an action stream with its reconciliation counters.
+pub(crate) struct ActionReconciliationState<A, S> {
+    actions: A,
+    state: S,
+}
+
 impl ActionReconciliationIterator {
-    /// Create a new iterator with counters initialized to 0
-    pub(crate) fn new(inner: Box<dyn KernelResultIterator<ActionReconciliationBatch>>) -> Self {
-        Self {
-            inner,
-            state: Arc::new(ActionReconciliationIteratorState::default()),
-        }
+    /// Creates an iterator over filtered data with shared reconciliation counters.
+    pub(crate) fn new(
+        inner: Box<dyn KernelResultIterator<FilteredEngineData>>,
+        state: Arc<ActionReconciliationIteratorState>,
+    ) -> Self {
+        Self { inner, state }
     }
 
     /// Get the shared state. This allows sharing of stats.
     pub fn state(&self) -> Arc<ActionReconciliationIteratorState> {
         Arc::clone(&self.state)
+    }
+}
+
+impl<A, S> ActionReconciliationState<A, S>
+where
+    S: Borrow<ActionReconciliationIteratorState>,
+{
+    /// Couples `actions` with the counters stored in `state`.
+    pub(crate) fn new(actions: A, state: S) -> Self {
+        Self { actions, state }
+    }
+
+    /// Converts the state into a generator and maps its terminal counter state.
+    pub(crate) fn into_generator<O, F>(
+        self,
+        map_output: F,
+    ) -> impl KernelResultGenerator<FilteredEngineData, O>
+    where
+        A: KernelResultGenerator<ActionReconciliationBatch> + 'static,
+        S: Send + 'static,
+        O: Send + 'static,
+        F: FnOnce(S) -> O + Send + 'static,
+    {
+        generator_fn!(async move |channel| {
+            let mut state = ActionReconciliationState {
+                actions: self.actions.bind(&channel),
+                state: self.state,
+            };
+            // Drain manually: `map_output` needs the state after its actions are exhausted.
+            while let Some(item) = state.advance().await? {
+                channel.yield_item(item).await?;
+            }
+            Ok(map_output(state.state))
+        })
     }
 
     /// Helper to transform a batch: update metrics and extract filtered data
@@ -164,21 +207,52 @@ impl ActionReconciliationIterator {
         batch: Option<KernelResult<ActionReconciliationBatch>>,
     ) -> Option<KernelResult<FilteredEngineData>> {
         let Some(batch) = batch else {
-            self.state.is_exhausted.store(true, Ordering::Release);
+            self.state
+                .borrow()
+                .is_exhausted
+                .store(true, Ordering::Release);
             return None;
         };
         Some(batch.map(|batch| {
             self.state
+                .borrow()
                 .actions_count
                 .fetch_add(batch.actions_count, Ordering::Release);
             self.state
+                .borrow()
                 .add_actions_count
                 .fetch_add(batch.add_actions_count, Ordering::Release);
             self.state
+                .borrow()
                 .remove_actions_count
                 .fetch_add(batch.remove_actions_count, Ordering::Release);
             batch.filtered_data
         }))
+    }
+
+    async fn advance(&mut self) -> KernelResult<Option<KernelResult<FilteredEngineData>>>
+    where
+        A: BoundGenerator<Item = KernelResult<ActionReconciliationBatch>, Output = ()> + Unpin,
+    {
+        let batch = self.actions.next().await?;
+        Ok(self.transform_batch(batch))
+    }
+}
+
+impl<A> ActionReconciliationState<A, Arc<ActionReconciliationIteratorState>>
+where
+    A: KernelResultGenerator<ActionReconciliationBatch> + 'static,
+{
+    /// Converts `actions` into a generator and returns its shared reconciliation counters.
+    pub(crate) fn with_shared_state(
+        actions: A,
+    ) -> (
+        impl KernelResultGenerator<FilteredEngineData>,
+        Arc<ActionReconciliationIteratorState>,
+    ) {
+        let state = Arc::new(ActionReconciliationIteratorState::default());
+        let generator = Self::new(actions, Arc::clone(&state)).into_generator(drop);
+        (generator, state)
     }
 }
 
@@ -194,8 +268,7 @@ impl Iterator for ActionReconciliationIterator {
     type Item = KernelResult<FilteredEngineData>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let batch = self.inner.next();
-        self.transform_batch(batch)
+        self.inner.next()
     }
 }
 
@@ -715,6 +788,9 @@ mod tests {
     use super::*;
     use crate::KernelError;
     use crate::arrow::array::StringArray;
+    use crate::coroutine::generator::AsyncIntoIterator as _;
+    use crate::coroutine::kernel::iterate_prepared_result_coroutine_with_engine;
+    use crate::engine::sync::SyncEngine;
     use crate::unit_test_utils::{action_batch, parse_json_batch};
 
     /// Helper function to create test batches from JSON strings
@@ -866,12 +942,15 @@ mod tests {
         ];
         let mut processor =
             ActionReconciliationProcessor::new(minimum_file_retention_timestamp, None, None);
-        let iterator = ActionReconciliationIterator::new(Box::new(
-            input_batches
-                .into_iter()
-                .map(move |batch| processor.process_actions_batch(batch)),
-        ));
-        let state = iterator.state();
+        let actions = input_batches
+            .into_iter()
+            .map(move |batch| processor.process_actions_batch(batch))
+            .into_generator();
+        let (data, state) = ActionReconciliationState::with_shared_state(actions);
+        let engine = SyncEngine::new();
+        let iterator = iterate_prepared_result_coroutine_with_engine!(&engine, |_channel| {
+            std::future::ready(KernelResult::Ok(data))
+        })?;
         assert!(!state.is_exhausted());
 
         let batches: Vec<_> = iterator.try_collect()?;

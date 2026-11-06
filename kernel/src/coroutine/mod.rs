@@ -56,6 +56,11 @@
 //! step. In both cases the connector's executor polls Kernel's futures and the connector remains
 //! responsible for scheduling and executing every request.
 //!
+//! A workflow can output a generator it already started, and that generator may await replies to
+//! requests the workflow previously surfaced. A driver that rejects outstanding requests merely
+//! because the workflow completed can make the generator fail later. Cancelling the operation
+//! should still tear down everything it launched, including outstanding requests.
+//!
 //! Engine-compatible entry points use a synchronous driver that translates each request into calls
 //! to [`crate::Engine`] handlers. Connectors that choose these entry points intentionally opt into
 //! the legacy Kernel-to-Engine callback model.
@@ -108,10 +113,10 @@ use std::task::{Context, Poll, Waker};
 use delta_kernel_derive::{internal_api, pub_macro};
 use tracing::{Instrument as _, Span};
 
-pub(crate) use self::async_ext::AsyncOption;
 #[doc(inline)]
 #[internal_api]
 pub(crate) use self::async_ext::AsyncResult;
+pub(crate) use self::async_ext::{AsyncBool, AsyncOption};
 use crate::{KernelError, KernelResult};
 
 /// Independently driven operation that may request connector work before producing a final output.
