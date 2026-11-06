@@ -120,6 +120,7 @@ use crate::actions::{
     DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD, SET_TRANSACTION_FIELD,
     SIDECAR_FIELD,
 };
+use crate::coroutine::kernel::{Channel, ChannelExt as _, run_workflow_with_engine};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::Scalar;
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -724,6 +725,16 @@ impl CheckpointWriter {
         engine: &dyn Engine,
         schema: &SchemaRef,
     ) -> KernelResult<ActionReconciliationBatch> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.create_checkpoint_metadata_batch_with_channel(channel, schema)
+        })
+    }
+
+    async fn create_checkpoint_metadata_batch_with_channel(
+        &self,
+        channel: &Channel,
+        schema: &SchemaRef,
+    ) -> KernelResult<ActionReconciliationBatch> {
         // Build the checkpointMetadata struct value. `tags` is left unset (null) since kernel
         // does not currently emit checkpoint tags.
         let checkpoint_metadata_value: Scalar = CheckpointMetadata {
@@ -743,9 +754,7 @@ impl CheckpointWriter {
                 }
             })
             .collect();
-        let checkpoint_metadata_batch = engine
-            .evaluation_handler()
-            .create_many(schema.clone(), vec![row])?;
+        let checkpoint_metadata_batch = channel.create_many(schema.clone(), vec![row]).await?;
 
         let filtered_data = FilteredEngineData::with_all_rows_selected(checkpoint_metadata_batch);
 
@@ -839,7 +848,24 @@ pub(crate) fn create_last_checkpoint_data(
     add_actions_counter: i64,
     size_in_bytes: i64,
 ) -> KernelResult<Box<dyn EngineData>> {
-    engine.evaluation_handler().create_many(
+    run_workflow_with_engine!(engine, |channel| create_last_checkpoint_data_with_channel(
+        channel,
+        version,
+        actions_counter,
+        add_actions_counter,
+        size_in_bytes,
+    ))
+}
+
+/// Creates `_last_checkpoint` data through `channel`.
+pub(crate) async fn create_last_checkpoint_data_with_channel(
+    channel: &Channel,
+    version: i64,
+    actions_counter: i64,
+    add_actions_counter: i64,
+    size_in_bytes: i64,
+) -> KernelResult<Box<dyn EngineData>> {
+    let data = channel.create_many(
         LAST_CHECKPOINT_SCHEMA.clone(),
         vec![vec![
             version.into(),
@@ -848,7 +874,8 @@ pub(crate) fn create_last_checkpoint_data(
             size_in_bytes.into(),
             add_actions_counter.into(),
         ]],
-    )
+    );
+    data.await
 }
 
 /// Verifies that the size the parquet writer reported matches the size the storage layer reports

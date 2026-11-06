@@ -9,12 +9,16 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 use derive_more::Constructor;
 
-use super::request::{ForwardListing, ReadJsonFiles, ReadParquetFiles};
+use super::request::{
+    ExpressionEvaluatorHandle, ForwardListing, PredicateEvaluatorHandle, ReadJsonFiles,
+    ReadParquetFiles,
+};
 use super::{Coroutine, CoroutineStep, KernelResultGenerator, Request, Workflow};
 use crate::coroutine::{Cursor, Page, PageRequest, PagedOperation, Reply, drive_workflow};
 use crate::{
-    Engine, EngineData, FileDataReadResultIterator, FileMeta, JsonHandler, KernelError,
-    KernelResult, KernelResultIterator, ParquetHandler, StorageHandler,
+    Engine, EngineData, EvaluationHandler, ExpressionEvaluator, FileDataReadResultIterator,
+    FileMeta, JsonHandler, KernelError, KernelResult, KernelResultIterator, ParquetHandler,
+    PredicateEvaluator, StorageHandler,
 };
 
 /// Maps a paged request onto synchronous Engine state stored in an opaque cursor.
@@ -54,6 +58,7 @@ pub(crate) struct EngineConnector {
     storage: Arc<dyn StorageHandler>,
     json: Arc<dyn JsonHandler>,
     parquet: Arc<dyn ParquetHandler>,
+    evaluation: Arc<dyn EvaluationHandler>,
 }
 
 impl EngineConnector {
@@ -63,6 +68,7 @@ impl EngineConnector {
             storage: engine.storage_handler(),
             json: engine.json_handler(),
             parquet: engine.parquet_handler(),
+            evaluation: engine.evaluation_handler(),
         }
     }
 
@@ -120,6 +126,37 @@ impl ConnectorRespond for EngineConnector {
             }
             Request::ReadJson(request) => respond_paged(self, request)?,
             Request::ReadParquet(request) => respond_paged(self, request)?,
+            Request::CreateEngineData(operation, reply) => complete(
+                reply,
+                self.evaluation
+                    .create_many(operation.schema, operation.rows),
+            )?,
+            Request::CreateExpressionEvaluator(operation, reply) => complete(
+                reply,
+                self.evaluation
+                    .new_expression_evaluator(
+                        operation.input_schema,
+                        operation.expression,
+                        operation.output_type,
+                    )
+                    .map(|evaluator| Arc::new(evaluator) as _),
+            )?,
+            Request::CreatePredicateEvaluator(operation, reply) => complete(
+                reply,
+                self.evaluation
+                    .new_predicate_evaluator(operation.input_schema, operation.predicate)
+                    .map(|evaluator| Arc::new(evaluator) as _),
+            )?,
+            Request::EvaluateExpression(operation, reply) => complete(
+                reply,
+                expression_evaluator(&operation.evaluator)
+                    .and_then(|evaluator| evaluator.evaluate(operation.input.as_ref())),
+            )?,
+            Request::EvaluatePredicate(operation, reply) => complete(
+                reply,
+                predicate_evaluator(&operation.evaluator)
+                    .and_then(|evaluator| evaluator.evaluate(operation.input.as_ref())),
+            )?,
         }
         Ok(())
     }
@@ -302,6 +339,13 @@ impl ConnectorRespond for StorageConnector<'_> {
             Request::ReadParquetFooter(..) | Request::ReadParquet(_) => Err(
                 KernelError::internal_error("Parquet reads require an Engine connector"),
             ),
+            Request::CreateEngineData(..)
+            | Request::CreateExpressionEvaluator(..)
+            | Request::CreatePredicateEvaluator(..)
+            | Request::EvaluateExpression(..)
+            | Request::EvaluatePredicate(..) => Err(KernelError::internal_error(
+                "evaluation requires an Engine connector",
+            )),
         }
     }
 }
@@ -382,6 +426,22 @@ impl CancellationLatch {
             Ok(output)
         }
     }
+}
+
+fn expression_evaluator(
+    handle: &ExpressionEvaluatorHandle,
+) -> KernelResult<&Arc<dyn ExpressionEvaluator>> {
+    handle
+        .downcast_ref()
+        .ok_or_else(|| KernelError::internal_error("invalid Engine expression evaluator handle"))
+}
+
+fn predicate_evaluator(
+    handle: &PredicateEvaluatorHandle,
+) -> KernelResult<&Arc<dyn PredicateEvaluator>> {
+    handle
+        .downcast_ref()
+        .ok_or_else(|| KernelError::internal_error("invalid Engine predicate evaluator handle"))
 }
 
 fn complete<In: Send + 'static>(reply: Reply<In>, result: KernelResult<In>) -> KernelResult<()> {

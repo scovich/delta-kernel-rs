@@ -22,17 +22,24 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use delta_kernel::coroutine::kernel::request::{ForwardListing, ReadJsonFiles, ReadParquetFiles};
+use delta_kernel::coroutine::kernel::request::{
+    ExpressionEvaluatorHandle, ForwardListing, PredicateEvaluatorHandle, ReadJsonFiles,
+    ReadParquetFiles,
+};
 use delta_kernel::coroutine::kernel::{Request, Workflow};
 use delta_kernel::coroutine::{
     AsyncResult as _, Cursor, Page, PageRequest, PagedOperation, drive_workflow_async,
 };
+use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
 use delta_kernel::metrics::{
     emit_json_read_completed, emit_parquet_read_completed, emit_storage_list_completed,
     emit_storage_read_completed,
 };
 use delta_kernel::object_store::DynObjectStore;
-use delta_kernel::{EngineData, FileMeta, FileSlice, KernelError, KernelResult};
+use delta_kernel::{
+    EngineData, EvaluationHandler, ExpressionEvaluator, FileMeta, FileSlice, KernelError,
+    KernelResult, PredicateEvaluator,
+};
 use futures::stream::BoxStream;
 use futures::{Stream, StreamExt as _};
 use tokio_util::sync::CancellationToken;
@@ -148,6 +155,31 @@ impl AsyncEngineConnector {
             }
             Request::ReadJson(request) => respond_paged(self, request).await?,
             Request::ReadParquet(request) => respond_paged(self, request).await?,
+            Request::CreateEngineData(operation, reply) => {
+                reply.send(ArrowEvaluationHandler.create_many(operation.schema, operation.rows))
+            }
+            Request::CreateExpressionEvaluator(operation, reply) => reply.send(
+                ArrowEvaluationHandler
+                    .new_expression_evaluator(
+                        operation.input_schema,
+                        operation.expression,
+                        operation.output_type,
+                    )
+                    .map(|evaluator| Arc::new(evaluator) as _),
+            ),
+            Request::CreatePredicateEvaluator(operation, reply) => reply.send(
+                ArrowEvaluationHandler
+                    .new_predicate_evaluator(operation.input_schema, operation.predicate)
+                    .map(|evaluator| Arc::new(evaluator) as _),
+            ),
+            Request::EvaluateExpression(operation, reply) => reply.send(
+                expression_evaluator(&operation.evaluator)
+                    .and_then(|evaluator| evaluator.evaluate(operation.input.as_ref())),
+            ),
+            Request::EvaluatePredicate(operation, reply) => reply.send(
+                predicate_evaluator(&operation.evaluator)
+                    .and_then(|evaluator| evaluator.evaluate(operation.input.as_ref())),
+            ),
         }
         Ok(())
     }
@@ -181,6 +213,22 @@ impl AsyncEngineConnector {
     {
         next_page(stream, 1).await
     }
+}
+
+fn expression_evaluator(
+    handle: &ExpressionEvaluatorHandle,
+) -> KernelResult<&Arc<dyn ExpressionEvaluator>> {
+    handle.downcast_ref().ok_or_else(|| {
+        KernelError::internal_error("invalid async engine expression evaluator handle")
+    })
+}
+
+fn predicate_evaluator(
+    handle: &PredicateEvaluatorHandle,
+) -> KernelResult<&Arc<dyn PredicateEvaluator>> {
+    handle.downcast_ref().ok_or_else(|| {
+        KernelError::internal_error("invalid async engine predicate evaluator handle")
+    })
 }
 
 const STORAGE_READAHEAD: usize = 10;
@@ -370,11 +418,12 @@ mod tests {
     use delta_kernel::coroutine::generator::{BoundGenerator as _, GeneratorExt as _};
     use delta_kernel::coroutine::kernel::request::{ForwardListing, ListingBounds};
     use delta_kernel::coroutine::kernel::{ChannelExt as _, WorkflowStep, static_workflow};
+    use delta_kernel::expressions::{col, lit};
     use delta_kernel::object_store::ObjectStoreExt as _;
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
-    use delta_kernel::schema::schema_ref;
+    use delta_kernel::schema::{DataType, schema_ref};
     use url::Url;
 
     use super::*;
@@ -515,6 +564,35 @@ mod tests {
             locations,
             [prefix.join("00000000000000000000.json").unwrap()]
         );
+    }
+
+    #[tokio::test]
+    async fn evaluates_through_native_async_connector() {
+        let connector = AsyncEngineConnector::new(Arc::new(InMemory::new()));
+        let workflow = static_workflow!(async move |channel| {
+            let input_schema = schema_ref! { nullable "value": LONG };
+            let rows = vec![vec![1_i64.into()]];
+            let input = channel.create_many(input_schema.clone(), rows).await?;
+            let expression = channel
+                .create_expression_evaluator(
+                    input_schema,
+                    Arc::new(col!("value") + lit(1_i64)),
+                    DataType::LONG,
+                )
+                .await?;
+            let output = channel.evaluate_expression(&expression, input).await?;
+            let predicate = channel
+                .create_predicate_evaluator(
+                    schema_ref! { nullable "output": LONG },
+                    Arc::new(col!("output").gt(lit(1_i64))),
+                )
+                .await?;
+            channel.evaluate_predicate(&predicate, output).await
+        });
+
+        let data = connector.run(workflow).await.unwrap();
+
+        assert_eq!(data.len(), 1);
     }
 
     #[tokio::test]

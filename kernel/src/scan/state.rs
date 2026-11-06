@@ -14,7 +14,10 @@ use super::log_replay::SCAN_ROW_SCHEMA;
 use crate::actions::deletion_vector::{DeletionVectorDescriptor, deletion_treemap_to_bools};
 use crate::actions::visitors::visit_deletion_vector_at;
 use crate::coroutine::AsyncOption as _;
-use crate::coroutine::kernel::{Channel, Workflow, run_workflow_with_engine, workflow};
+use crate::coroutine::kernel::{
+    Channel, ChannelExt as _, StaticWorkflow, Workflow, run_workflow_with_engine, static_workflow,
+    workflow,
+};
 use crate::engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData};
 use crate::scan::get_transform_for_row;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};
@@ -147,15 +150,49 @@ pub fn transform_to_logical(
     logical_schema: &Schema,
     transform: Option<ExpressionRef>,
 ) -> KernelResult<Box<dyn EngineData>> {
+    run_workflow_with_engine!(engine, |channel| transform_to_logical_with_channel(
+        channel,
+        physical_data,
+        physical_schema,
+        logical_schema,
+        transform,
+    ))
+}
+
+/// Returns a lazy workflow that applies a physical-to-logical transform.
+pub fn transform_to_logical_workflow(
+    physical_data: Box<dyn EngineData>,
+    physical_schema: SchemaRef,
+    logical_schema: SchemaRef,
+    transform: Option<ExpressionRef>,
+) -> StaticWorkflow<Box<dyn EngineData>> {
+    static_workflow!(|channel| transform_to_logical_with_channel(
+        channel,
+        physical_data,
+        &physical_schema,
+        logical_schema.as_ref(),
+        transform,
+    ))
+}
+
+/// Applies a physical-to-logical transform through `channel`.
+pub(crate) async fn transform_to_logical_with_channel(
+    channel: &Channel,
+    physical_data: Box<dyn EngineData>,
+    physical_schema: &SchemaRef,
+    logical_schema: &Schema,
+    transform: Option<ExpressionRef>,
+) -> KernelResult<Box<dyn EngineData>> {
     match transform {
-        Some(transform) => engine
-            .evaluation_handler()
-            .new_expression_evaluator(
+        Some(transform) => {
+            let evaluator = channel.create_expression_evaluator(
                 physical_schema.clone(),
                 transform,
                 logical_schema.clone().into(), // TODO: expensive deep clone!
-            )?
-            .evaluate(physical_data.as_ref()),
+            );
+            let evaluator = evaluator.await?;
+            channel.evaluate_expression(&evaluator, physical_data).await
+        }
         None => Ok(physical_data),
     }
 }
