@@ -9,12 +9,12 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 use derive_more::Constructor;
 
-use super::request::{ForwardListing, ReadJsonFiles};
+use super::request::{ForwardListing, ReadJsonFiles, ReadParquetFiles};
 use super::{Coroutine, CoroutineStep, KernelResultGenerator, Request, Workflow};
 use crate::coroutine::{Cursor, Page, PageRequest, PagedOperation, Reply, drive_workflow};
 use crate::{
     Engine, EngineData, FileDataReadResultIterator, FileMeta, JsonHandler, KernelError,
-    KernelResult, KernelResultIterator, StorageHandler,
+    KernelResult, KernelResultIterator, ParquetHandler, StorageHandler,
 };
 
 /// Maps a paged request onto synchronous Engine state stored in an opaque cursor.
@@ -53,6 +53,7 @@ where
 pub(crate) struct EngineConnector {
     storage: Arc<dyn StorageHandler>,
     json: Arc<dyn JsonHandler>,
+    parquet: Arc<dyn ParquetHandler>,
 }
 
 impl EngineConnector {
@@ -61,6 +62,7 @@ impl EngineConnector {
         Self {
             storage: engine.storage_handler(),
             json: engine.json_handler(),
+            parquet: engine.parquet_handler(),
         }
     }
 
@@ -112,7 +114,11 @@ impl ConnectorRespond for EngineConnector {
         match request {
             Request::ListForward(request) => respond_paged(&self.storage_connector(), request)?,
             Request::ReadSmallFile(..) => self.storage_connector().respond(request)?,
+            Request::ReadParquetFooter(file, reply) => {
+                complete(reply, self.parquet.read_parquet_footer(&file))?
+            }
             Request::ReadJson(request) => respond_paged(self, request)?,
+            Request::ReadParquet(request) => respond_paged(self, request)?,
         }
         Ok(())
     }
@@ -272,6 +278,9 @@ impl ConnectorRespond for StorageConnector<'_> {
             Request::ReadJson(_) => Err(KernelError::internal_error(
                 "JSON reads require an Engine connector",
             )),
+            Request::ReadParquetFooter(..) | Request::ReadParquet(_) => Err(
+                KernelError::internal_error("Parquet reads require an Engine connector"),
+            ),
         }
     }
 }
@@ -314,6 +323,19 @@ impl EnginePagination<ReadJsonFiles> for EngineConnector {
     }
 
     fn next(&self, state: Self::State) -> KernelResult<Page<ReadJsonFiles>> {
+        next_engine_data(state)
+    }
+}
+
+impl EnginePagination<ReadParquetFiles> for EngineConnector {
+    type State = FileDataReadResultIterator;
+
+    fn prepare(&self, read: ReadParquetFiles) -> KernelResult<Self::State> {
+        self.parquet
+            .read_parquet_files(&read.files, read.physical_schema, read.predicate)
+    }
+
+    fn next(&self, state: Self::State) -> KernelResult<Page<ReadParquetFiles>> {
         next_engine_data(state)
     }
 }

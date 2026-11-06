@@ -13,14 +13,14 @@ use delta_kernel_derive::internal_api;
 use url::Url;
 
 use super::Request;
-use super::request::ReadJsonFiles;
+use super::request::{ReadJsonFiles, ReadParquetFiles};
 use crate::coroutine::generator::{self, BoundGenerator, Flatten, Generator, GeneratorExt as _};
 use crate::coroutine::{
     ChannelExchange, Cursor, KernelFuture, Page, PageGenerator, PageRequest, PagedOperation,
 };
 use crate::expressions::PredicateRef;
 use crate::schema::SchemaRef;
-use crate::{EngineData, FileIndex, FileMeta, KernelResult};
+use crate::{EngineData, FileIndex, FileMeta, KernelResult, ParquetFooter};
 
 /// Kernel's [`crate::coroutine::Channel`] specialized to [`Request`].
 ///
@@ -50,6 +50,11 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
         self.exchange((url, range), Request::ReadSmallFile)
     }
 
+    /// Reads one Parquet file footer via [`Request::ReadParquetFooter`].
+    fn read_parquet_footer(&self, file: &FileMeta) -> impl KernelFuture<ParquetFooter> {
+        self.exchange(file.clone(), Request::ReadParquetFooter)
+    }
+
     /// Reads JSON files via [`Request::ReadJson`] as a stream of result batches.
     async fn read_json_files<'a>(
         &'a self,
@@ -71,6 +76,18 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
         predicate: Option<PredicateRef>,
     ) -> KernelResult<FlattenedPages<ReadJsonFiles>> {
         let operation = ReadJsonFiles::new(files, physical_schema, predicate);
+        let cursor = self.prepare_paged(operation).await?;
+        Ok(PageGenerator::Next(cursor).flatten())
+    }
+
+    /// Prepares a Parquet read as an unbound stream of result batches.
+    async fn prepare_parquet_files(
+        &self,
+        files: impl Into<Vec<FileMeta>>,
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> KernelResult<FlattenedPages<ReadParquetFiles>> {
+        let operation = ReadParquetFiles::new(files, physical_schema, predicate);
         let cursor = self.prepare_paged(operation).await?;
         Ok(PageGenerator::Next(cursor).flatten())
     }
