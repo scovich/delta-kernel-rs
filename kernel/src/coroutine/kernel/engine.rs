@@ -11,14 +11,14 @@ use derive_more::Constructor;
 
 use super::request::{
     ExpressionEvaluatorHandle, ForwardListing, PredicateEvaluatorHandle, ReadJsonFiles,
-    ReadParquetFiles,
+    ReadParquetFiles, WriteJsonFile,
 };
 use super::{Coroutine, CoroutineStep, KernelResultGenerator, Request, Workflow};
 use crate::coroutine::{Cursor, Page, PageRequest, PagedOperation, Reply, drive_workflow};
 use crate::{
     Engine, EngineData, EvaluationHandler, ExpressionEvaluator, FileDataReadResultIterator,
-    FileMeta, JsonHandler, KernelError, KernelResult, KernelResultIterator, ParquetHandler,
-    PredicateEvaluator, StorageHandler,
+    FileMeta, FileSize, JsonHandler, KernelError, KernelResult, KernelResultIterator,
+    ParquetHandler, PredicateEvaluator, StorageHandler,
 };
 
 /// Maps a paged request onto synchronous Engine state stored in an opaque cursor.
@@ -130,6 +130,12 @@ impl EngineConnector {
     fn storage_connector(&self) -> StorageConnector<'_> {
         StorageConnector::new(self.storage.as_ref())
     }
+
+    fn write_json_file(&self, operation: WriteJsonFile) -> KernelResult<FileSize> {
+        let iterator = self.clone().iterate_result_coroutine(operation.input);
+        self.json
+            .write_json_file(&operation.url, Box::new(iterator), operation.overwrite)
+    }
 }
 
 impl ConnectorRespond for EngineConnector {
@@ -173,6 +179,9 @@ impl ConnectorRespond for EngineConnector {
                 predicate_evaluator(&operation.evaluator)
                     .and_then(|evaluator| evaluator.evaluate(operation.input.as_ref())),
             )?,
+            Request::WriteJson(operation, reply) => {
+                complete(reply, self.write_json_file(*operation))?
+            }
         }
         Ok(())
     }
@@ -361,6 +370,9 @@ impl ConnectorRespond for StorageConnector<'_> {
             | Request::EvaluateExpression(..)
             | Request::EvaluatePredicate(..) => Err(KernelError::internal_error(
                 "evaluation requires an Engine connector",
+            )),
+            Request::WriteJson(..) => Err(KernelError::internal_error(
+                "file writes require an Engine connector",
             )),
         }
     }

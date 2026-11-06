@@ -120,7 +120,10 @@ use crate::actions::{
     DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD, SET_TRANSACTION_FIELD,
     SIDECAR_FIELD,
 };
-use crate::coroutine::kernel::{Channel, ChannelExt as _, run_workflow_with_engine};
+use crate::coroutine::generator::AsyncIntoIterator as _;
+use crate::coroutine::kernel::{
+    Channel, ChannelExt as _, StaticCoroutine, Workflow, run_workflow_with_engine, workflow,
+};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::Scalar;
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -548,11 +551,30 @@ impl CheckpointWriter {
     ///
     /// # Returns: `Ok` if the checkpoint was successfully finalized
     // Internally, this method:
-    // 1. Creates the `_last_checkpoint` data with `create_last_checkpoint_data`
+    // 1. Creates the `_last_checkpoint` data with `create_last_checkpoint_data_with_channel`
     // 2. Writes the `_last_checkpoint` data to the `_last_checkpoint` file in the delta log
     pub fn finalize(
         self,
         engine: &dyn Engine,
+        last_checkpoint_stats: &LastCheckpointHintStats,
+    ) -> KernelResult<()> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.finalize_with_channel(channel, last_checkpoint_stats)
+        })
+    }
+
+    /// Returns a lazy workflow that finalizes this checkpoint. See [`Self::finalize`] for when to
+    /// run it.
+    pub fn finalize_workflow(
+        self,
+        last_checkpoint_stats: &LastCheckpointHintStats,
+    ) -> Workflow<'_, ()> {
+        workflow!(|channel| self.finalize_with_channel(channel, last_checkpoint_stats))
+    }
+
+    async fn finalize_with_channel(
+        self,
+        channel: &Channel,
         last_checkpoint_stats: &LastCheckpointHintStats,
     ) -> KernelResult<()> {
         // Skip writing `_last_checkpoint` if the existing hint already points to a newer
@@ -569,23 +591,25 @@ impl CheckpointWriter {
             return Ok(());
         }
 
-        let data = create_last_checkpoint_data(
-            engine,
+        let data = create_last_checkpoint_data_with_channel(
+            channel,
             self.version,
             last_checkpoint_stats.num_actions,
             last_checkpoint_stats.num_of_add_files,
             last_checkpoint_stats.size_in_bytes,
         );
+        let data = data.await;
 
         let last_checkpoint_path = LastCheckpointHint::path(&self.snapshot.log_segment().log_root)?;
 
         // Write the `_last_checkpoint` file to `table/_delta_log/_last_checkpoint`
         let filtered_data = FilteredEngineData::with_all_rows_selected(data?);
-        engine.json_handler().write_json_file(
+        let result = channel.write_json_file(
             &last_checkpoint_path,
-            Box::new(std::iter::once(Ok(filtered_data))),
+            StaticCoroutine::from_generator(std::iter::once(Ok(filtered_data)).into_generator()),
             true,
-        )?;
+        );
+        result.await?;
 
         Ok(())
     }
@@ -841,6 +865,7 @@ pub(crate) fn ensure_standalone_checkpoint_supported(
 /// TODO(#839): Add `checkpoint_schema` field to `_last_checkpoint` file
 /// TODO(#1054): Add `tags` field to `_last_checkpoint` file
 /// TODO(#1052): Add `v2Checkpoint` field to `_last_checkpoint` file
+#[cfg(test)]
 pub(crate) fn create_last_checkpoint_data(
     engine: &dyn Engine,
     version: i64,

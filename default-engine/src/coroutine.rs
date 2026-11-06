@@ -16,6 +16,7 @@ use std::any::Any;
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::future::Future;
 use std::num::NonZero;
+use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -24,20 +25,21 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use delta_kernel::coroutine::kernel::request::{
     ExpressionEvaluatorHandle, ForwardListing, PredicateEvaluatorHandle, ReadJsonFiles,
-    ReadParquetFiles,
+    ReadParquetFiles, WriteJsonFile,
 };
-use delta_kernel::coroutine::kernel::{Request, Workflow};
+use delta_kernel::coroutine::kernel::{Coroutine, CoroutineStep, Request, Workflow};
 use delta_kernel::coroutine::{
     AsyncResult as _, Cursor, Page, PageRequest, PagedOperation, drive_workflow_async,
 };
 use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
+use delta_kernel::engine::arrow_utils::to_json_bytes;
 use delta_kernel::metrics::{
     emit_json_read_completed, emit_parquet_read_completed, emit_storage_list_completed,
     emit_storage_read_completed,
 };
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::{
-    EngineData, EvaluationHandler, ExpressionEvaluator, FileMeta, FileSlice, KernelError,
+    EngineData, EvaluationHandler, ExpressionEvaluator, FileMeta, FileSize, FileSlice, KernelError,
     KernelResult, PredicateEvaluator,
 };
 use futures::stream::BoxStream;
@@ -45,7 +47,7 @@ use futures::{Stream, StreamExt as _};
 use tokio_util::sync::CancellationToken;
 
 use crate::filesystem::{list_from_impl, read_files_impl};
-use crate::json::read_json_files_impl;
+use crate::json::{read_json_files_impl, write_json_file_impl};
 use crate::parquet::{read_parquet_files_impl, read_parquet_footer_impl};
 use crate::{DEFAULT_READ_BATCH_SIZE, DEFAULT_READ_BUFFER_SIZE};
 
@@ -180,8 +182,46 @@ impl AsyncEngineConnector {
                 predicate_evaluator(&operation.evaluator)
                     .and_then(|evaluator| evaluator.evaluate(operation.input.as_ref())),
             ),
+            Request::WriteJson(operation, reply) => {
+                reply.send(Box::pin(self.write_json_file(*operation)).await)
+            }
         }
         Ok(())
+    }
+
+    /// Advances `input` through connector requests until it yields or completes.
+    pub async fn advance<Y: Send + 'static, O: Send + 'static>(
+        &self,
+        input: &mut Coroutine<'_, Y, O>,
+    ) -> KernelResult<ControlFlow<O, Y>> {
+        self.race_cancellation(self.advance_inner(input)).await
+    }
+
+    async fn advance_inner<Y, O>(
+        &self,
+        input: &mut Coroutine<'_, Y, O>,
+    ) -> KernelResult<ControlFlow<O, Y>>
+    where
+        Y: Send + 'static,
+        O: Send + 'static,
+    {
+        loop {
+            match input.advance().await? {
+                CoroutineStep::Done(output) => return Ok(ControlFlow::Break(output)),
+                CoroutineStep::Yield(item) => return Ok(ControlFlow::Continue(item)),
+                CoroutineStep::Request(request) => self.respond_inner(request).await?,
+            }
+        }
+    }
+
+    async fn write_json_file(&self, operation: WriteJsonFile) -> KernelResult<FileSize> {
+        let mut input = operation.input;
+        let mut buffer = Vec::new();
+        while let ControlFlow::Continue(data) = self.advance_inner(&mut input).await? {
+            buffer.extend(to_json_bytes(std::iter::once(data))?);
+        }
+        let store = Arc::clone(&self.object_store);
+        write_json_file_impl(store, operation.url, buffer, operation.overwrite).await
     }
 
     async fn read_small_file(&self, file: FileSlice) -> KernelResult<Option<Bytes>> {
