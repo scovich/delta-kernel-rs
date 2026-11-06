@@ -383,9 +383,15 @@ mod tests {
         });
         let callstacks = entered_callstacks(&events);
 
+        // TODO: The `CheckpointShape` `PlanExecutor` shim captures the current span and re-enters
+        // it while that same span remains active. This is legal tracing recursion, but not the
+        // intended logical call stack. Drop the duplicate frame once
+        // `declarative_metadata_scan_plan` drives `CheckpointShape` through its channel instead of
+        // the shim.
         assert_contains_callstack(
             &callstacks,
             &[
+                "scan.declarative_metadata_scan_plan",
                 "scan.declarative_metadata_scan_plan",
                 "checkpoint_shape.try_new_with_leaf_schema",
                 "checkpoint_shape.from_v2_checkpoint_hint",

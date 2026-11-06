@@ -13,6 +13,8 @@ use super::StaticCoroutine;
 use crate::coroutine::{PageRequest, PagedOperation, Reply};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ExpressionRef, PredicateRef};
+#[cfg(feature = "declarative-plans")]
+pub use crate::plans::Operation as PlanOperation;
 use crate::schema::{DataType, SchemaRef};
 use crate::{EngineData, FileMeta, FileSize, FileSlice, KernelResult, ParquetFooter, Scalar};
 
@@ -34,6 +36,8 @@ pub enum Request {
     /// Read Parquet files as ordered [`EngineData`] batches. Each file may produce multiple
     /// batches, but batches may not span files.
     ReadParquet(PageRequest<ReadParquetFiles>),
+    /// Execute a declarative plan operation.
+    ExecutePlan(PlanRequest),
     /// Materialize scalar rows as one [`EngineData`] batch.
     CreateEngineData(CreateEngineData, Reply<Box<dyn EngineData>>),
     /// Prepare an expression evaluator for repeated use.
@@ -47,6 +51,28 @@ pub enum Request {
     /// Write one newline-delimited JSON file from streamed row batches.
     WriteJson(Box<WriteJsonFile>, Reply<FileSize>),
 }
+
+/// Declarative plan operations with result-specific reply types.
+pub enum PlanRequest {
+    /// Executes a query plan in connector-selected pages.
+    Query(PageRequest<PlanOperation>),
+    /// Reads a Parquet footer through the plan-execution path.
+    ParquetFooter(FileMeta, Reply<ParquetFooter>),
+}
+
+impl From<PageRequest<PlanOperation>> for Request {
+    fn from(request: PageRequest<PlanOperation>) -> Self {
+        Self::ExecutePlan(PlanRequest::Query(request))
+    }
+}
+
+impl PagedOperation for PlanOperation {
+    type Page = Vec<KernelResult<Box<dyn EngineData>>>;
+}
+
+/// Uninhabited plan operation used when declarative plans are disabled.
+#[cfg(not(feature = "declarative-plans"))]
+pub enum PlanOperation {}
 
 /// URL bounds for a forward listing.
 pub struct ListingBounds {

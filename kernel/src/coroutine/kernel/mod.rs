@@ -25,6 +25,9 @@ use delta_kernel_derive::internal_api;
 pub(crate) use self::channel::{
     Channel, ChannelExt, GeneratorBody, coroutine, static_coroutine, static_workflow, workflow,
 };
+#[cfg(feature = "declarative-plans")]
+#[internal_api]
+pub(crate) use self::engine::drive_with_plan_executor;
 #[doc(inline)]
 #[internal_api]
 #[cfg_attr(not(feature = "internal-api"), expect(unused_imports))]
@@ -33,7 +36,7 @@ pub(crate) use self::engine::{
     iterate_prepared_result_coroutine_with_storage, iterate_result_coroutine_with_engine,
     run_workflow_with_engine, run_workflow_with_storage,
 };
-pub use self::request::Request;
+pub use self::request::{PlanRequest, Request};
 use crate::KernelResult;
 
 #[cfg(feature = "internal-api")]
