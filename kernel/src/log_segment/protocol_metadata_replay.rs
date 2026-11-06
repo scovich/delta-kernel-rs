@@ -16,10 +16,15 @@ use crate::actions::{CHECKPOINT_ACTION_FIELD, CheckpointAction, LastManifestComm
 use crate::actions::{METADATA_FIELD, Metadata, PROTOCOL_FIELD, Protocol};
 #[cfg(feature = "declarative-plans")]
 use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
+use crate::coroutine::generator::GeneratorExt as _;
+use crate::coroutine::kernel::{
+    Channel, KernelResultGenerator, iterate_prepared_result_coroutine_with_engine,
+};
 use crate::crc::Crc;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 #[cfg(feature = "declarative-plans")]
 use crate::expressions::{Predicate, col};
+use crate::log_replay::ActionsBatch;
 use crate::metrics::ProtocolMetadataSource;
 use crate::path::ParsedLogPath;
 #[cfg(feature = "declarative-plans")]
@@ -223,6 +228,15 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<impl KernelResultIterator<VersionedBatch> + use<>> {
+        iterate_prepared_result_coroutine_with_engine!(engine, |channel| {
+            self.read_pm_batches_generator(channel)
+        })
+    }
+
+    async fn read_pm_batches_generator(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<impl KernelResultGenerator<VersionedBatch> + 'static + use<>> {
         let (commit_schema, checkpoint_schema) = pm_replay_schemas();
         // Commit schema only: `_file` in the checkpoint schema would break its skipping predicate.
         let file_column =
@@ -232,17 +246,18 @@ impl LogSegment {
         )?);
         let checkpoint_version = self.checkpoint_version.map(|v| v as i64);
         let batches = self
-            .read_actions_with_projected_checkpoint_actions(
-                engine,
+            .read_actions_with_projected_checkpoint_actions_with_channel(
+                channel,
                 commit_schema,
                 checkpoint_schema,
                 None,
                 None,
                 None,
-            )?
+            )
+            .await?
             .actions;
         Ok(batches.map(move |batch| {
-            let batch = batch?;
+            let batch: ActionsBatch = batch?;
             // A commit's version is parsed from its `_file`; a checkpoint batch uses the constant.
             let version = if batch.is_log_batch {
                 batch_version(batch.actions.as_ref())? as i64

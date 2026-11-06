@@ -17,11 +17,13 @@ use crate::actions::deletion_vector::{
 };
 use crate::actions::{ADD_FIELD, ADD_NAME, Add, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
-use crate::coroutine::generator::{AsyncIntoIterator as _, GeneratorExt as _};
+use crate::coroutine::generator::{
+    AsyncIntoIterator as _, Generator, GeneratorExt as _, map_async,
+};
 use crate::coroutine::kernel::engine::EngineConnector;
 use crate::coroutine::kernel::{
-    Channel, KernelResultGenerator, Workflow, iterate_prepared_result_coroutine_with_engine,
-    run_workflow_with_storage, workflow,
+    Channel, ChannelExt as _, KernelResultGenerator, Request, Workflow, run_workflow_with_storage,
+    workflow,
 };
 use crate::engine::CancellableEngine;
 use crate::engine_data::FilteredEngineData;
@@ -904,6 +906,9 @@ pub struct Scan {
     partition_values_options: PartitionValuesOptions,
 }
 
+type ScanMetadataGenerator<'a> =
+    Box<dyn Generator<Request, Item = KernelResult<ScanMetadata>, Output = ()> + 'a>;
+
 /// Builds the consumer-visible stats schemas without predicate-only fields.
 fn build_stats_output_schemas(
     table_configuration: &TableConfiguration,
@@ -1068,8 +1073,25 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<impl KernelResultIterator<ScanMetadata> + use<>> {
-        let actions_with_checkpoint_info = self.replay_for_scan_metadata(engine)?;
-        self.scan_metadata_inner(engine, actions_with_checkpoint_info)
+        EngineConnector::new(engine)
+            .iterate_prepared_result_coroutine(self.scan_metadata_workflow())
+    }
+
+    /// Returns a lazy workflow for [`Self::scan_metadata`].
+    pub fn scan_metadata_workflow(
+        &self,
+    ) -> Workflow<'_, impl KernelResultGenerator<ScanMetadata> + 'static> {
+        workflow!(|channel| self.scan_metadata_with_channel(channel))
+    }
+
+    async fn scan_metadata_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<impl KernelResultGenerator<ScanMetadata> + 'static + use<>> {
+        let actions_with_checkpoint_info =
+            self.replay_for_scan_metadata_with_channel(channel).await?;
+        self.scan_metadata_inner_with_channel(channel, actions_with_checkpoint_info)
+            .await
     }
 
     /// Get scan metadata with a cancellation token for handler-backed reads.
@@ -1148,6 +1170,43 @@ impl Scan {
         >,
         existing_predicate: Option<PredicateRef>,
     ) -> KernelResult<Box<dyn KernelResultIterator<ScanMetadata>>> {
+        let connector = EngineConnector::new(engine);
+        let workflow =
+            self.scan_metadata_from_workflow(existing_version, existing_data, existing_predicate);
+        let result = connector.iterate_prepared_result_coroutine(workflow)?;
+        Ok(Box::new(result) as Box<dyn KernelResultIterator<ScanMetadata>>)
+    }
+
+    /// Returns a lazy workflow for [`Self::scan_metadata_from`].
+    #[internal_api]
+    pub(crate) fn scan_metadata_from_workflow(
+        &self,
+        existing_version: Version,
+        existing_data: impl IntoIterator<
+            Item = KernelResult<Box<dyn EngineData>>,
+            IntoIter: Send + 'static,
+        >,
+        existing_predicate: Option<PredicateRef>,
+    ) -> Workflow<'_, ScanMetadataGenerator<'static>> {
+        let existing_data = existing_data.into_iter();
+        workflow!(|channel| self.scan_metadata_from_with_channel(
+            channel,
+            existing_version,
+            existing_data,
+            existing_predicate
+        ))
+    }
+
+    async fn scan_metadata_from_with_channel(
+        &self,
+        channel: &Channel,
+        existing_version: Version,
+        existing_data: impl IntoIterator<
+            Item = KernelResult<Box<dyn EngineData>>,
+            IntoIter: Send + 'static,
+        >,
+        _existing_predicate: Option<PredicateRef>,
+    ) -> KernelResult<ScanMetadataGenerator<'static>> {
         // TODO(#3609): scan_metadata_from does not reuse existing partitionValues_parsed
         // from compatible checkpoints. Support reusing those values and enable connector-supplied
         // timezone support.
@@ -1163,7 +1222,6 @@ impl Scan {
         );
         // TODO(#966): validate that the current predicate is compatible with the hint predicate.
         let existing_data = existing_data.into_iter();
-        let _ = existing_predicate;
 
         if existing_version > self.snapshot.version() {
             return Err(KernelError::Generic(format!(
@@ -1178,14 +1236,15 @@ impl Scan {
         // we treat it as if it originated from a checkpoint.
         // TODO(#3263): Existing data may contain `stats_parsed` and `partitionValues_parsed`;
         // provide its full schema to the evaluator.
-        let transform = engine.evaluation_handler().new_expression_evaluator(
+        let transform = channel.create_expression_evaluator(
             scan_row_schema(),
             get_scan_metadata_transform_expr(),
             restored_add_schema().clone().into(),
-        )?;
-        let apply_transform = move |data: KernelResult<Box<dyn EngineData>>| {
+        );
+        let transform = transform.await?;
+        let apply_transform = async move |channel: &Channel, data| {
             let data = data?;
-            let data = transform.evaluate(data.as_ref())?;
+            let data = channel.evaluate_expression(&transform, data).await?;
             Ok(ActionsBatch::new(data, false))
         };
 
@@ -1196,7 +1255,7 @@ impl Scan {
         // Since we're only processing existing data (no checkpoint), we use the base schema
         // and no stats_parsed optimization.
         if existing_version == self.snapshot.version() {
-            let actions = existing_data.map(apply_transform);
+            let actions = map_async!(existing_data.into_generator(), apply_transform);
             let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
                 actions,
                 checkpoint_info: CheckpointReadInfo {
@@ -1206,7 +1265,8 @@ impl Scan {
                 },
             };
             return Ok(Box::new(
-                self.scan_metadata_inner(engine, actions_with_checkpoint_info)?,
+                self.scan_metadata_inner_with_channel(channel, actions_with_checkpoint_info)
+                    .await?,
             ));
         }
 
@@ -1216,7 +1276,7 @@ impl Scan {
         // TODO: we may be able to apply heuristics or other logic to try and fetch missing deltas
         // from the log.
         if matches!(log_segment.checkpoint_version, Some(v) if v > existing_version) {
-            return Ok(Box::new(self.scan_metadata(engine)?));
+            return Ok(Box::new(self.scan_metadata_with_channel(channel).await?));
         }
 
         // create a new log segment containing only the commits added after the version hint.
@@ -1238,17 +1298,18 @@ impl Scan {
         // checkpoint schema returned by the function for consistency.
         let (checkpoint_schema, meta_predicate, physical_stats_read_schema) =
             self.checkpoint_read_options();
-        let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
-            engine,
+        let result = new_log_segment.read_actions_with_projected_checkpoint_actions_with_channel(
+            channel,
             COMMIT_READ_SCHEMA.clone(),
             checkpoint_schema,
             meta_predicate,
             physical_stats_read_schema,
             None,
-        )?;
+        );
+        let result = result.await?;
         // Only the cached suffix needs a kernel-side check. The engine owns cancellation for the
         // newly read action prefix.
-        let existing_actions = existing_data.map(apply_transform);
+        let existing_actions = map_async!(existing_data.into_generator(), apply_transform);
         let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
             actions: result.actions.chain(existing_actions),
             checkpoint_info: CheckpointReadInfo {
@@ -1258,10 +1319,10 @@ impl Scan {
             },
         };
 
-        Ok(Box::new(self.scan_metadata_inner(
-            engine,
-            actions_with_checkpoint_info,
-        )?))
+        Ok(Box::new(
+            self.scan_metadata_inner_with_channel(channel, actions_with_checkpoint_info)
+                .await?,
+        ))
     }
 
     #[allow(unused)]
@@ -1286,23 +1347,6 @@ impl Scan {
         let existing_data =
             CancellableIterator::new(existing_data.into_iter().map(Ok), cancellation_token);
         self.scan_metadata_from(engine, existing_version, existing_data, existing_predicate)
-    }
-
-    fn scan_metadata_inner<I>(
-        &self,
-        engine: &dyn Engine,
-        actions_with_checkpoint_info: ActionsWithCheckpointInfo<I>,
-    ) -> KernelResult<impl KernelResultIterator<ScanMetadata> + use<I>>
-    where
-        I: KernelResultIterator<ActionsBatch> + 'static,
-    {
-        let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
-            actions: actions_with_checkpoint_info.actions.into_generator(),
-            checkpoint_info: actions_with_checkpoint_info.checkpoint_info,
-        };
-        iterate_prepared_result_coroutine_with_engine!(engine, |channel| {
-            self.scan_metadata_inner_with_channel(channel, actions_with_checkpoint_info)
-        })
     }
 
     async fn scan_metadata_inner_with_channel<'a, G>(
@@ -1411,19 +1455,38 @@ impl Scan {
     }
 
     // Factored out to facilitate testing
+    #[cfg(test)]
     fn replay_for_scan_metadata(
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch> + use<>>>
     {
+        let connector = EngineConnector::new(engine);
+        let workflow = workflow!(|channel| self.replay_for_scan_metadata_with_channel(channel));
+        let (actions, checkpoint_info) = connector
+            .iterate_prepared_result_coroutine_with_companion(workflow, |result| {
+                (result.actions, result.checkpoint_info)
+            })?;
+        Ok(ActionsWithCheckpointInfo {
+            actions,
+            checkpoint_info,
+        })
+    }
+
+    async fn replay_for_scan_metadata_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<
+        ActionsWithCheckpointInfo<impl KernelResultGenerator<ActionsBatch> + 'static + use<>>,
+    > {
         let (checkpoint_schema, meta_predicate, physical_stats_read_schema) =
             self.checkpoint_read_options();
         // Checkpoints already represent reconciled state, so scans project only Add actions. This
         // derives `add.path IS NOT NULL` and allows readers to skip non-Add row groups.
         self.snapshot
             .log_segment()
-            .read_actions_with_projected_checkpoint_actions(
-                engine,
+            .read_actions_with_projected_checkpoint_actions_with_channel(
+                channel,
                 COMMIT_READ_SCHEMA.clone(),
                 checkpoint_schema,
                 meta_predicate,
@@ -1433,6 +1496,7 @@ impl Scan {
                     .as_ref()
                     .map(|s| s.as_ref()),
             )
+            .await
     }
 
     /// Builds a predicate for row group skipping in checkpoint and sidecar parquet files.
