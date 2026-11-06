@@ -72,13 +72,14 @@ impl EngineConnector {
     }
 
     /// Prepare a fallible result coroutine and return an iterator that drives it and its requests.
-    pub(crate) fn iterate_prepared_result_coroutine<'a, G, Item>(
+    pub(crate) fn iterate_prepared_result_coroutine<'a, G, Item, O>(
         self,
         workflow: Workflow<'_, G>,
-    ) -> KernelResult<EngineResultCoroutineIterator<'a, Item>>
+    ) -> KernelResult<EngineResultCoroutineIterator<'a, Item, O>>
     where
-        G: KernelResultGenerator<Item> + 'a,
+        G: KernelResultGenerator<Item, O> + 'a,
         Item: Send + 'static,
+        O: Send + 'static,
     {
         let coroutine = Coroutine::from_generator(self.drive(workflow)?);
         Ok(self.iterate_result_coroutine(coroutine))
@@ -253,6 +254,26 @@ impl<C: ConnectorRespond, Item: Send + 'static, O: Send + 'static> Iterator
 
     fn next(&mut self) -> Option<Self::Item> {
         self.0.next().map(|result| result?)
+    }
+}
+
+impl<Item: Send + 'static, O: Send + 'static, C> EngineResultCoroutineIterator<'_, Item, O, C> {
+    /// Returns whether the coroutine completed and stored its terminal output.
+    pub(crate) fn is_complete(&self) -> bool {
+        matches!(self.0.state, CoroutineState::Complete(_))
+    }
+
+    /// Returns the terminal output after this iterator has been exhausted.
+    pub(crate) fn into_output(self) -> KernelResult<O> {
+        match self.0.state {
+            CoroutineState::Complete(output) => Ok(output),
+            CoroutineState::Active(_) => Err(KernelError::internal_error(
+                "coroutine iterator must be exhausted before taking its output",
+            )),
+            CoroutineState::Failed => Err(KernelError::internal_error(
+                "coroutine iterator failed before producing its output",
+            )),
+        }
     }
 }
 

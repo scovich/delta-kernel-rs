@@ -1218,7 +1218,7 @@ impl LogSegment {
     /// # Errors
     /// Returns an error if the commit cannot be read, or if this segment does not list the commit,
     /// the commit carries no checkpoint action, or that action disagrees with `pointer`.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
     pub(crate) fn read_last_checkpoint_action_from_pointer(
         &self,
         engine: &dyn Engine,
@@ -1230,7 +1230,7 @@ impl LogSegment {
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    async fn read_last_checkpoint_action_from_pointer_with_channel(
+    pub(crate) async fn read_last_checkpoint_action_from_pointer_with_channel(
         &self,
         channel: &Channel,
         pointer: &LastManifestCommit,

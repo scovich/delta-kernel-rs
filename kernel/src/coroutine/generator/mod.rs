@@ -366,7 +366,6 @@ impl<'a, Y: Send + 'a, O: Send + 'static> BoundGenerator for GeneratorBody<'a, Y
 // === Construction macros ===
 
 /// Creates a bound generator using an existing request channel.
-#[cfg(feature = "internal-api")]
 #[internal_api]
 macro_rules! generator {
     ($channel:expr, $body:expr) => {
@@ -378,7 +377,6 @@ macro_rules! generator {
 /// Creates a [`Generator`] from an async closure.
 ///
 /// The request channel is supplied later by [`Generator::bind`].
-#[cfg(feature = "internal-api")]
 #[internal_api]
 macro_rules! generator_fn {
     ($body:expr) => {
@@ -462,7 +460,6 @@ impl<F, P, Y, O> GeneratorFn<F, P, Y, O> {
 
 /// Erase a channel binder as `Box<dyn Generator<...>>`.
 #[internal_api]
-#[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
 pub(crate) fn box_generator<P, Y, O, F>(bind: F) -> Box<dyn Generator<P, Item = Y, Output = O>>
 where
     F: for<'a> FnOnce(ChannelBinding<'a, P>) -> GeneratorBody<'a, Y, O> + Send + 'static,
@@ -593,7 +590,6 @@ pub(crate) struct BodyFn<F, P, Y, O> {
 impl<F, P: Send + 'static, Y: Send, O> BodyFn<F, P, Y, O> {
     /// Store `body` without choosing its call-future proof path.
     #[internal_api]
-    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
     pub(crate) fn new(body: F) -> Self
     where
         F: for<'channel> AsyncFnOnce(GeneratorChannel<'channel, P, Y>) -> KernelResult<O>,
@@ -607,7 +603,6 @@ impl<F, P: Send + 'static, Y: Send, O> BodyFn<F, P, Y, O> {
 
     /// Create a generator using the concrete call-future proof supplied by `witness`.
     #[internal_api]
-    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
     pub(crate) fn into_generator_with<'generator, C, Fut>(
         self,
         channel: C,
@@ -625,7 +620,6 @@ impl<F, P: Send + 'static, Y: Send, O> BodyFn<F, P, Y, O> {
 
     /// Run the body while exposing its concrete future to [`Self::into_generator_with`].
     #[internal_api]
-    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
     pub(crate) fn witness(
         self,
         channel: impl Deref<Target = Channel<P>> + Send,
