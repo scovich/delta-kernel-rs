@@ -13,8 +13,12 @@ use super::request::{
     ExpressionEvaluatorHandle, ForwardListing, PredicateEvaluatorHandle, ReadJsonFiles,
     ReadParquetFiles, WriteJsonFile,
 };
+#[cfg(feature = "declarative-plans")]
+use super::request::{PlanOperation, PlanRequest};
 use super::{Coroutine, CoroutineStep, KernelResultGenerator, Request, Workflow};
 use crate::coroutine::{Cursor, Page, PageRequest, PagedOperation, Reply, drive_workflow};
+#[cfg(feature = "declarative-plans")]
+use crate::plans::PlanExecutor;
 use crate::{
     Engine, EngineData, EvaluationHandler, ExpressionEvaluator, FileDataReadResultIterator,
     FileMeta, FileSize, JsonHandler, KernelError, KernelResult, KernelResultIterator,
@@ -148,6 +152,11 @@ impl ConnectorRespond for EngineConnector {
             }
             Request::ReadJson(request) => respond_paged(self, request)?,
             Request::ReadParquet(request) => respond_paged(self, request)?,
+            Request::ExecutePlan(..) => {
+                return Err(KernelError::internal_error(
+                    "Engine connector does not execute declarative plans",
+                ));
+            }
             Request::CreateEngineData(operation, reply) => complete(
                 reply,
                 self.evaluation
@@ -194,6 +203,16 @@ pub(crate) fn drive_with_storage<O>(
     workflow: Workflow<'_, O>,
 ) -> KernelResult<O> {
     drive_connector(&StorageConnector::new(storage), workflow)
+}
+
+/// Drives a workflow using only declarative plan operations.
+#[cfg(feature = "declarative-plans")]
+#[internal_api]
+pub(crate) fn drive_with_plan_executor<O>(
+    executor: &dyn PlanExecutor,
+    workflow: Workflow<'_, O>,
+) -> KernelResult<O> {
+    drive_connector(&PlanExecutorConnector(executor), workflow)
 }
 
 /// Prepare and iterate a fallible result coroutine through a storage handler.
@@ -345,6 +364,35 @@ enum CoroutineState<'a, Item: Send + 'static, O: Send + 'static> {
     Failed,
 }
 
+/// Serves workflows that require only declarative plan execution.
+#[cfg(feature = "declarative-plans")]
+struct PlanExecutorConnector<'a>(&'a dyn PlanExecutor);
+
+#[cfg(feature = "declarative-plans")]
+impl ConnectorRespond for PlanExecutorConnector<'_> {
+    fn respond(&self, request: Request) -> KernelResult<()> {
+        match request {
+            Request::ExecutePlan(PlanRequest::Query(request)) => respond_paged(self, request),
+            Request::ExecutePlan(PlanRequest::ParquetFooter(file, reply)) => {
+                complete(reply, self.0.read_parquet_footer(file))
+            }
+            Request::ListForward(_)
+            | Request::ReadSmallFile(..)
+            | Request::ReadParquetFooter(..)
+            | Request::ReadJson(_)
+            | Request::ReadParquet(_)
+            | Request::CreateEngineData(..)
+            | Request::CreateExpressionEvaluator(..)
+            | Request::CreatePredicateEvaluator(..)
+            | Request::EvaluateExpression(..)
+            | Request::EvaluatePredicate(..)
+            | Request::WriteJson(..) => Err(KernelError::internal_error(
+                "plan-executor workflow requested a non-plan operation",
+            )),
+        }
+    }
+}
+
 /// Serves entry points that intentionally require only storage access.
 #[derive(Constructor)]
 struct StorageConnector<'a> {
@@ -364,6 +412,9 @@ impl ConnectorRespond for StorageConnector<'_> {
             Request::ReadParquetFooter(..) | Request::ReadParquet(_) => Err(
                 KernelError::internal_error("Parquet reads require an Engine connector"),
             ),
+            Request::ExecutePlan(..) => Err(KernelError::internal_error(
+                "declarative plans require a connector with a plan executor",
+            )),
             Request::CreateEngineData(..)
             | Request::CreateExpressionEvaluator(..)
             | Request::CreatePredicateEvaluator(..)
@@ -404,6 +455,19 @@ impl EnginePagination<ForwardListing> for StorageConnector<'_> {
 
     fn next(&self, listing: Self::State) -> KernelResult<Page<ForwardListing>> {
         next_page(listing, ForwardListing::DEFAULT_PAGE_SIZE)
+    }
+}
+
+#[cfg(feature = "declarative-plans")]
+impl EnginePagination<PlanOperation> for PlanExecutorConnector<'_> {
+    type State = FileDataReadResultIterator;
+
+    fn prepare(&self, operation: PlanOperation) -> KernelResult<Self::State> {
+        self.0.execute_op(operation)?.into_data()
+    }
+
+    fn next(&self, state: Self::State) -> KernelResult<Page<PlanOperation>> {
+        next_engine_data(state)
     }
 }
 

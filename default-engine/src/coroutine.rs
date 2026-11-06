@@ -27,7 +27,7 @@ use delta_kernel::coroutine::kernel::request::{
     ExpressionEvaluatorHandle, ForwardListing, PredicateEvaluatorHandle, ReadJsonFiles,
     ReadParquetFiles, WriteJsonFile,
 };
-use delta_kernel::coroutine::kernel::{Coroutine, CoroutineStep, Request, Workflow};
+use delta_kernel::coroutine::kernel::{Coroutine, CoroutineStep, PlanRequest, Request, Workflow};
 use delta_kernel::coroutine::{
     AsyncResult as _, Cursor, Page, PageRequest, PagedOperation, drive_workflow_async,
 };
@@ -157,6 +157,11 @@ impl AsyncEngineConnector {
             }
             Request::ReadJson(request) => respond_paged(self, request).await?,
             Request::ReadParquet(request) => respond_paged(self, request).await?,
+            Request::ExecutePlan(PlanRequest::Query(_) | PlanRequest::ParquetFooter(..)) => {
+                return Err(KernelError::unsupported(
+                    "Default async connector does not execute plans",
+                ));
+            }
             Request::CreateEngineData(operation, reply) => {
                 reply.send(ArrowEvaluationHandler.create_many(operation.schema, operation.rows))
             }
