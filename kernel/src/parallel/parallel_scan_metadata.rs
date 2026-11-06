@@ -4,19 +4,22 @@ use std::time::Instant;
 use delta_kernel_derive::internal_api;
 use tracing::{Span, info_span};
 
-use crate::log_reader::checkpoint_manifest::CheckpointManifestReader;
+use crate::coroutine::kernel::engine::{EngineConnector, EngineResultCoroutineIterator};
+use crate::coroutine::kernel::{KernelResultGenerator, StaticCoroutine};
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
 use crate::parallel::parallel_phase::ParallelPhase;
-use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
+use crate::parallel::sequential_phase::AfterSequential;
 use crate::scan::ScanMetadata;
 use crate::scan::log_replay::{ScanLogReplayProcessor, SerializableScanState};
 use crate::schema::SchemaRef;
 use crate::{Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator};
 
-type EngineSequentialPhase =
-    SequentialPhase<Box<dyn KernelResultIterator<ActionsBatch>>, CheckpointManifestReader>;
+type RawSequentialScanCoroutine =
+    StaticCoroutine<KernelResult<ScanMetadata>, KernelResult<AfterSequential>>;
+type SequentialScanEngineIterator =
+    EngineResultCoroutineIterator<'static, ScanMetadata, KernelResult<AfterSequential>>;
 
 /// Result of sequential scan metadata processing.
 ///
@@ -37,15 +40,20 @@ pub enum AfterSequentialScanMetadata {
 /// After exhaustion, call `finish()` to get the result which indicates whether
 /// a distributed phase is needed.
 pub struct SequentialScanMetadataIterator {
-    pub(crate) sequential: EngineSequentialPhase,
+    pub(crate) sequential: SequentialScanEngineIterator,
     completion: SequentialScanCompletion,
     span: Span,
 }
 
 impl SequentialScanMetadataIterator {
-    pub(crate) fn new(sequential: EngineSequentialPhase, correlation_id: Option<Arc<str>>) -> Self {
+    pub(crate) fn new(
+        connector: EngineConnector,
+        sequential: impl KernelResultGenerator<ScanMetadata, KernelResult<AfterSequential>> + 'static,
+        correlation_id: Option<Arc<str>>,
+    ) -> Self {
+        let raw: RawSequentialScanCoroutine = StaticCoroutine::from_generator(sequential);
         Self {
-            sequential,
+            sequential: connector.iterate_result_coroutine(raw),
             completion: SequentialScanCompletion::new(correlation_id),
             // TODO: Associate a unique scan ID with this span to correlate sequential and parallel
             // phases
@@ -55,7 +63,13 @@ impl SequentialScanMetadataIterator {
 
     pub fn finish(self) -> KernelResult<AfterSequentialScanMetadata> {
         let _guard = self.span.enter();
-        Ok(self.completion.finish(self.sequential.finish()?))
+        if !self.sequential.is_complete() {
+            return Err(KernelError::generic(
+                "Must exhaust iterator before calling finish()",
+            ));
+        }
+        let after = self.sequential.into_output()??;
+        Ok(self.completion.finish(after))
     }
 }
 

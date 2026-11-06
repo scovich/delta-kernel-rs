@@ -17,7 +17,10 @@ use crate::actions::deletion_vector::{
 };
 use crate::actions::{ADD_FIELD, ADD_NAME, Add, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
-use crate::coroutine::kernel::{Channel, Workflow, run_workflow_with_storage, workflow};
+use crate::coroutine::kernel::engine::EngineConnector;
+use crate::coroutine::kernel::{
+    Channel, KernelResultGenerator, Workflow, run_workflow_with_storage, workflow,
+};
 use crate::engine::CancellableEngine;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{
@@ -31,7 +34,7 @@ use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegme
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
-use crate::parallel::sequential_phase::SequentialPhase;
+use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::plan::Plan;
 use crate::scan::log_replay::{
@@ -1569,17 +1572,33 @@ impl Scan {
             self.stats_options(),
             self.partition_values_options(),
         )?;
-        let sequential = SequentialPhase::try_new(
-            processor,
-            self.snapshot.log_segment(),
-            engine.clone(),
-            checkpoint_read_schema,
-        )?;
+        let connector = EngineConnector::new(engine.as_ref());
+        let sequential = connector.drive(workflow!(|channel| {
+            self.parallel_scan_metadata_with_channel(channel, processor, checkpoint_read_schema)
+        }))?;
 
         Ok(SequentialScanMetadataIterator::new(
+            connector,
             sequential,
             self.correlation_id.clone(),
         ))
+    }
+
+    async fn parallel_scan_metadata_with_channel(
+        &self,
+        channel: &Channel,
+        processor: ScanLogReplayProcessor,
+        checkpoint_read_schema: SchemaRef,
+    ) -> KernelResult<
+        impl KernelResultGenerator<ScanMetadata, KernelResult<AfterSequential>> + 'static + use<>,
+    > {
+        SequentialPhase::try_new_with_channel(
+            channel,
+            processor,
+            self.snapshot.log_segment(),
+            checkpoint_read_schema,
+        )
+        .await
     }
 
     /// Perform an "all in one" scan. This will use the provided `engine` to read and process all
