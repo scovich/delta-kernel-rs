@@ -16,9 +16,8 @@ use delta_kernel::actions::Protocol;
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::coroutine::kernel::{Workflow, drive_with_engine};
 use delta_kernel::history_manager::{
-    CommitAt, HistoryCommitType, first_version_after as kernel_first_version_after,
-    get_earliest_commit as kernel_get_earliest_commit,
-    latest_version_as_of as kernel_latest_version_as_of,
+    CommitAt, HistoryCommitType, first_version_after_workflow, get_earliest_commit_workflow,
+    latest_version_as_of_workflow,
 };
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::object_store::ObjectStore;
@@ -1402,9 +1401,8 @@ pub unsafe extern "C" fn snapshot_timestamp(
 ) -> ExternResult<i64> {
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot = unsafe { snapshot.as_ref() };
-    let result = snapshot
-        .reader()
-        .get_timestamp(engine_ref.engine().as_ref());
+    let workflow = snapshot.reader().get_timestamp_workflow();
+    let result = drive_kernel(engine_ref, workflow);
     unsafe { result.into_extern_result(&engine_ref) }
 }
 
@@ -1606,12 +1604,13 @@ fn get_earliest_commit_impl(
     earliest_ratified_commit_version: OptionalValue<Version>,
     commit_type: FfiHistoryCommitType,
 ) -> KernelResult<Version> {
-    kernel_get_earliest_commit(
-        extern_engine.engine().as_ref(),
-        &log_root?,
+    let log_root = log_root?;
+    let workflow = get_earliest_commit_workflow(
+        &log_root,
         earliest_ratified_commit_version.into(),
         commit_type.into(),
-    )
+    );
+    drive_kernel(extern_engine, workflow)
 }
 
 /// A commit located by a timestamp query: a commit version paired with its timestamp. FFI-safe
@@ -1655,13 +1654,8 @@ pub unsafe extern "C" fn latest_version_as_of(
 ) -> ExternResult<FfiCommitAt> {
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot = unsafe { snapshot.as_ref() };
-    let result = kernel_latest_version_as_of(
-        snapshot,
-        engine_ref.engine().as_ref(),
-        timestamp,
-        commit_type.into(),
-    )
-    .map(FfiCommitAt::from);
+    let workflow = latest_version_as_of_workflow(snapshot, timestamp, commit_type.into());
+    let result = drive_kernel(engine_ref, workflow).map(FfiCommitAt::from);
     unsafe { result.into_extern_result(&engine_ref) }
 }
 
@@ -1685,13 +1679,8 @@ pub unsafe extern "C" fn first_version_after(
 ) -> ExternResult<FfiCommitAt> {
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot = unsafe { snapshot.as_ref() };
-    let result = kernel_first_version_after(
-        snapshot,
-        engine_ref.engine().as_ref(),
-        timestamp,
-        commit_type.into(),
-    )
-    .map(FfiCommitAt::from);
+    let workflow = first_version_after_workflow(snapshot, timestamp, commit_type.into());
+    let result = drive_kernel(engine_ref, workflow).map(FfiCommitAt::from);
     unsafe { result.into_extern_result(&engine_ref) }
 }
 

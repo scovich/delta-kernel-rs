@@ -46,7 +46,7 @@ use url::Url;
 
 use crate::coroutine::generator::{BoundGenerator as _, Generator as _, GeneratorExt as _};
 use crate::coroutine::kernel::{
-    Channel, StaticWorkflow, run_workflow_with_engine, static_workflow,
+    Channel, StaticWorkflow, Workflow, run_workflow_with_engine, static_workflow, workflow,
 };
 use crate::log_segment::LogSegment;
 use crate::path::AsUrl;
@@ -59,7 +59,7 @@ use crate::table_properties::{
     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
 };
 use crate::utils::{require, try_parse_uri};
-use crate::{Engine, KernelError, KernelResult, KernelResultIterator, Result, Version};
+use crate::{Engine, Error, KernelError, KernelResult, KernelResultIterator, Result, Version};
 
 mod log_replay;
 mod net_changes;
@@ -259,19 +259,48 @@ impl TableChanges {
     /// - `end_version`: The end version (inclusive) of the change data feed. If this is none, this
     ///   defaults to the newest table version.
     pub fn try_new(
-        table_root: impl AsRef<str>,
+        table_root: impl AsRef<str> + Send,
         engine: &dyn Engine,
         start_version: Version,
         end_version: Option<Version>,
     ) -> Result<Self> {
-        let table_root = try_parse_uri(table_root)?;
-        Self::try_new_internal(
+        run_workflow_with_engine!(engine, |channel| Self::try_new_with_channel(
             table_root,
-            engine,
+            channel,
+            start_version,
+            end_version,
+        ))
+    }
+
+    /// Returns a lazy workflow that constructs a change data feed over the requested range.
+    pub fn try_new_workflow<'a>(
+        table_root: impl AsRef<str> + Send + 'a,
+        start_version: Version,
+        end_version: Option<Version>,
+    ) -> Workflow<'a, Self, Error> {
+        workflow!(|channel| Self::try_new_with_channel(
+            table_root,
+            channel,
+            start_version,
+            end_version,
+        ))
+    }
+
+    async fn try_new_with_channel(
+        table_root: impl AsRef<str>,
+        channel: &Channel,
+        start_version: Version,
+        end_version: Option<Version>,
+    ) -> Result<Self> {
+        let table_root = try_parse_uri(table_root)?;
+        Self::try_new_internal_with_channel(
+            table_root,
+            channel,
             start_version,
             end_version,
             CdfMode::ChangeDataFeed,
         )
+        .await
     }
 
     /// Creates a listing-only change feed from row-tracking metadata.
@@ -306,33 +335,52 @@ impl TableChanges {
         start_version: Version,
         end_version: Option<Version>,
     ) -> Result<Self> {
-        Self::try_new_internal(
+        run_workflow_with_engine!(engine, |channel| Self::try_new_internal_with_channel(
             table_root,
-            engine,
+            channel,
             start_version,
             end_version,
             CdfMode::RowTracking,
-        )
+        ))
     }
 
-    fn try_new_internal(
+    /// Returns a lazy workflow for [`Self::try_new_row_tracking_cdf_listing`].
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
+    pub(crate) fn try_new_row_tracking_cdf_listing_workflow(
         table_root: Url,
-        engine: &dyn Engine,
+        start_version: Version,
+        end_version: Option<Version>,
+    ) -> StaticWorkflow<Self, Error> {
+        static_workflow!(|channel| Self::try_new_internal_with_channel(
+            table_root,
+            channel,
+            start_version,
+            end_version,
+            CdfMode::RowTracking,
+        ))
+    }
+
+    async fn try_new_internal_with_channel(
+        table_root: Url,
+        channel: &Channel,
         start_version: Version,
         end_version: Option<Version>,
         mode: CdfMode,
     ) -> Result<Self> {
         let log_root = table_root.join("_delta_log/").map_err(KernelError::from)?;
-        let log_segment = LogSegment::for_table_changes(
-            engine.storage_handler().as_ref(),
+        let log_segment = LogSegment::for_table_changes_with_channel(
+            channel,
             log_root,
             start_version,
             end_version,
-        )?;
+        )
+        .await?;
 
         let start_snapshot = Snapshot::builder_for(table_root.as_url().clone())
             .at_version(start_version)
-            .build(engine)?;
+            .build_with_channel(channel)
+            .await?;
         start_snapshot
             .table_configuration()
             .ensure_operation_supported(Operation::Cdf)?;
@@ -340,9 +388,10 @@ impl TableChanges {
         let end_snapshot = match end_version {
             Some(version) => Snapshot::builder_from(start_snapshot.clone())
                 .at_version(version)
-                .build(engine)?,
-            None => Snapshot::builder_from(start_snapshot.clone()).build(engine)?,
+                .build_with_channel(channel),
+            None => Snapshot::builder_from(start_snapshot.clone()).build_with_channel(channel),
         };
+        let end_snapshot = end_snapshot.await?;
         end_snapshot
             .table_configuration()
             .ensure_operation_supported(Operation::Cdf)?;
@@ -683,7 +732,7 @@ mod tests {
             .trim_end_matches('/')
             .to_owned()
     )]
-    fn table_changes_accepts_urls_and_paths(#[case] table_root: impl AsRef<str>) {
+    fn table_changes_accepts_urls_and_paths(#[case] table_root: impl AsRef<str> + Send) {
         let engine = SyncEngine::new();
         let expected_schema = [
             StructField::nullable("part", DataType::INTEGER),
