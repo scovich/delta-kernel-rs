@@ -443,15 +443,29 @@ pub(crate) async fn read_parquet_footer_impl(
     Ok(ParquetFooter { schema })
 }
 
+/// Yields the next engine-data batch, or `Ok(None)` when the input is exhausted.
+pub(crate) trait ParquetBatchSource {
+    async fn next_batch(&mut self) -> KernelResult<Option<Box<dyn EngineData>>>;
+}
+
+impl<S> ParquetBatchSource for S
+where
+    S: Stream<Item = KernelResult<Box<dyn EngineData>>> + Unpin,
+{
+    async fn next_batch(&mut self) -> KernelResult<Option<Box<dyn EngineData>>> {
+        self.next().await.transpose()
+    }
+}
+
 /// Writes every batch from `batches` into one Parquet file at `location`.
 pub(crate) async fn write_parquet_file_impl(
     store: Arc<DynObjectStore>,
     location: url::Url,
-    mut batches: impl Stream<Item = KernelResult<Box<dyn EngineData>>> + Unpin,
+    mut batches: impl ParquetBatchSource,
 ) -> KernelResult<FileSize> {
-    let first = batches.next().await.ok_or_else(|| {
+    let first = batches.next_batch().await?.ok_or_else(|| {
         KernelError::generic("Cannot write parquet file with empty data iterator")
-    })??;
+    })?;
     let path = Path::from_url_path(location.path())?;
     write_one_parquet_file(store, path, first, &mut batches, usize::MAX).await
 }
@@ -495,7 +509,7 @@ async fn write_one_parquet_file(
     store: Arc<DynObjectStore>,
     path: Path,
     first: Box<dyn EngineData>,
-    batches: &mut (impl Stream<Item = KernelResult<Box<dyn EngineData>>> + Unpin),
+    batches: &mut impl ParquetBatchSource,
     rowcount_limit: usize,
 ) -> KernelResult<FileSize> {
     let first = engine_data_to_record_batch(first)?;
@@ -506,10 +520,10 @@ async fn write_one_parquet_file(
     writer.write(&first).await?;
     let mut rows = first.num_rows();
     while rows <= rowcount_limit {
-        let Some(engine_data) = batches.next().await else {
+        let Some(engine_data) = batches.next_batch().await? else {
             break;
         };
-        let batch = engine_data_to_record_batch(engine_data?)?;
+        let batch = engine_data_to_record_batch(engine_data)?;
         writer.write(&batch).await?;
         rows = rows.saturating_add(batch.num_rows());
     }

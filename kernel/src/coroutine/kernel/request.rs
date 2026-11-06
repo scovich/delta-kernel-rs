@@ -9,10 +9,12 @@ use bytes::Bytes;
 use derive_more::{Constructor, From};
 use url::Url;
 
+use super::StaticCoroutine;
 use crate::coroutine::{PageRequest, PagedOperation, Reply};
+use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ExpressionRef, PredicateRef};
 use crate::schema::{DataType, SchemaRef};
-use crate::{EngineData, FileMeta, FileSlice, KernelResult, ParquetFooter, Scalar};
+use crate::{EngineData, FileMeta, FileSize, FileSlice, KernelResult, ParquetFooter, Scalar};
 
 /// Operations Kernel can request from a connector.
 #[derive(From)]
@@ -42,6 +44,8 @@ pub enum Request {
     EvaluateExpression(EvaluateExpression, Reply<Box<dyn EngineData>>),
     /// Evaluate a prepared predicate against one [`EngineData`] batch.
     EvaluatePredicate(EvaluatePredicate, Reply<Box<dyn EngineData>>),
+    /// Write one newline-delimited JSON file from streamed row batches.
+    WriteJson(Box<WriteJsonFile>, Reply<FileSize>),
 }
 
 /// URL bounds for a forward listing.
@@ -173,4 +177,15 @@ pub struct EvaluateExpression {
 pub struct EvaluatePredicate {
     pub evaluator: PredicateEvaluatorHandle,
     pub input: Box<dyn EngineData>,
+}
+
+/// Writes newline-delimited JSON rows to one file.
+#[derive(Constructor)]
+pub struct WriteJsonFile {
+    /// Destination URL.
+    pub url: Url,
+    /// Row batches to serialize in yield order.
+    pub input: StaticCoroutine<KernelResult<FilteredEngineData>>,
+    /// Whether an existing destination may be overwritten.
+    pub overwrite: bool,
 }

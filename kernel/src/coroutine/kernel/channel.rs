@@ -13,19 +13,20 @@ use bytes::Bytes;
 use delta_kernel_derive::internal_api;
 use url::Url;
 
-use super::Request;
 use super::request::{
     CreateEngineData, CreateExpressionEvaluator, CreatePredicateEvaluator, EvaluateExpression,
     EvaluatePredicate, ExpressionEvaluatorHandle, PredicateEvaluatorHandle, ReadJsonFiles,
-    ReadParquetFiles,
+    ReadParquetFiles, WriteJsonFile,
 };
+use super::{Request, StaticCoroutine};
 use crate::coroutine::generator::{self, BoundGenerator, Flatten, Generator, GeneratorExt as _};
 use crate::coroutine::{
     ChannelExchange, Cursor, KernelFuture, Page, PageGenerator, PageRequest, PagedOperation,
 };
+use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ExpressionRef, PredicateRef};
 use crate::schema::{DataType, SchemaRef};
-use crate::{EngineData, FileIndex, FileMeta, KernelResult, ParquetFooter, Scalar};
+use crate::{EngineData, FileIndex, FileMeta, FileSize, KernelResult, ParquetFooter, Scalar};
 
 /// Kernel's [`crate::coroutine::Channel`] specialized to [`Request`].
 ///
@@ -146,6 +147,17 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
     ) -> impl KernelFuture<Box<dyn EngineData>> {
         let evaluation = EvaluatePredicate::new(Arc::clone(evaluator), input);
         self.exchange(evaluation, Request::EvaluatePredicate)
+    }
+
+    /// Writes generated row batches to one newline-delimited JSON file.
+    fn write_json_file(
+        &self,
+        url: &Url,
+        input: StaticCoroutine<KernelResult<FilteredEngineData>>,
+        overwrite: bool,
+    ) -> impl KernelFuture<FileSize> {
+        let operation = WriteJsonFile::new(url.clone(), input, overwrite);
+        self.exchange(Box::new(operation), Request::WriteJson)
     }
 
     /// Initialize `operation` via [`PageRequest::Prepare`] without fetching its first page.
