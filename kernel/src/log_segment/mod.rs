@@ -146,7 +146,7 @@ pub(crate) struct ActionsWithCheckpointInfo<A> {
 ///
 /// [`LogSegment`] is used in [`Snapshot`] when built with
 /// [`LogSegment::for_snapshot_with_channel`], and in `TableChanges` when built with
-/// [`LogSegment::for_table_changes`].
+/// [`LogSegment::for_table_changes_with_channel`].
 ///
 /// [`Snapshot`]: crate::snapshot::Snapshot
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -698,7 +698,7 @@ impl LogSegment {
     /// and all commits between versions `start_version` (inclusive) and `end_version`
     /// (inclusive). If no `end_version` is specified it will be the most recent version by
     /// default.
-    #[internal_api]
+    #[cfg(test)]
     pub(crate) fn for_table_changes(
         storage: &dyn StorageHandler,
         log_root: Url,
@@ -1092,6 +1092,7 @@ impl LogSegment {
     /// for reading checkpoints and commits. IS NOT NULL predicates are automatically derived from
     /// the schema, so callers do not need to supply them.
     #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
     pub(crate) fn read_actions(
         &self,
         engine: &dyn Engine,

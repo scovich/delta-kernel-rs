@@ -620,6 +620,33 @@ async fn collation_domain_hints_survive_append_alter_checkpoint_and_crc(
     Ok(())
 }
 
+#[rstest]
+#[case::v1(CheckpointSpec::V1, false)]
+#[case::v2_inline(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar), true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_of_collation_table_without_active_adds_writes_struct_stats(
+    #[case] spec: CheckpointSpec,
+    #[case] v2: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, path, engine) = test_table_setup_mt()?;
+    let fixture = generated_table(false, &["name"]);
+    let mut properties = vec![("delta.checkpoint.writeStatsAsStruct", "true")];
+    if v2 {
+        properties.push(("delta.feature.v2Checkpoint", "supported"));
+    }
+    let snapshot = create_table(&path, fixture.schema.clone(), "test", false)
+        .with_table_properties(properties)
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?
+        .unwrap_post_commit_snapshot();
+
+    assert_eq!(
+        snapshot.checkpoint(engine.as_ref(), Some(&spec))?.0,
+        CheckpointWriteResult::Written
+    );
+    Ok(())
+}
+
 /// Rejects invalid CREATE/ALTER annotations (RFC: "Specifying collations in the table schema").
 #[rstest]
 #[case::text(json!("test.ASCII_CI"), "JSON object")]

@@ -279,7 +279,6 @@ impl<'a> SnapshotReader<'a> {
     /// Gets physical clustering column names in domain order through `channel`.
     ///
     /// Cancellation is the connector's.
-    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
     #[internal_api]
     pub(crate) async fn get_physical_clustering_columns_with_channel(
         &self,

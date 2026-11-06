@@ -96,10 +96,31 @@ impl<P: 'static> Channel<P> {
     }
 }
 
+impl<P: Send + 'static> Channel<P> {
+    /// Offers an already-accepted `request` to this channel's driver.
+    ///
+    /// The returned future resolves once the driver accepts the request. The request's response
+    /// remains tied to its original requester.
+    pub(super) fn forward(&self, request: P) -> Forward<'_, P> {
+        Wait {
+            channel: self,
+            exchange: Arc::new(Mutex::new(Exchange::new(request, |request, accepted| {
+                accepted.send(Ok(()));
+                request
+            }))),
+        }
+    }
+}
+
+/// Future returned by [`Channel::forward`].
+pub(super) type Forward<'a, P> = Wait<'a, P, P, (), fn(P, Reply<()>) -> P>;
+
 /// Single-use capability to complete a connector request.
 ///
 /// Sending or dropping this capability wakes the executor task that last polled the request
-/// future. Dropping it without sending rejects the request.
+/// future. Dropping delivers [`KernelError::RequestRejected`] to the waiting Kernel operation.
+/// See [driver policies](crate::coroutine#driver-policies) for replies that outlive their
+/// workflow.
 #[must_use = "dropping a reply rejects its connector request"]
 pub struct Reply<In: Send + 'static>(Weak<dyn Complete<In>>);
 
@@ -251,7 +272,7 @@ where
 
 /// A custom [`Future`] that propagates a kernel request through a channel for its driver to
 /// retrieve.
-struct Wait<'a, P: 'static, Out, In, Make> {
+pub(super) struct Wait<'a, P: 'static, Out, In, Make> {
     channel: &'a Channel<P>,
     exchange: Arc<Mutex<Exchange<Out, In, Make, P>>>,
 }

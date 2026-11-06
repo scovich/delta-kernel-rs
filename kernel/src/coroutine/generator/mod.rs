@@ -39,6 +39,7 @@ pub use self::adapters::{
     empty, map_async_witness, unfold,
 };
 pub(crate) use self::adapters::{unfold_mut_with, unfold_mut_witness};
+pub use self::attach::Attached;
 use super::witness::invoke_witness;
 use super::{Channel, KernelFuture};
 use crate::utils::PhantomType;
@@ -139,6 +140,20 @@ pub trait GeneratorExt {
         Self: Sized,
     {
         Flatten::new(self)
+    }
+
+    /// Temporarily binds this generator to `channel`, which receives its connector requests until
+    /// [`Attached::detach`] releases it.
+    fn attach_to<P>(
+        self,
+        channel: &Channel<P>,
+    ) -> Attached<'_, P, <Self as Generator<P>>::Item, <Self as Generator<P>>::Output>
+    where
+        P: Send + 'static,
+        Self: Generator<P> + Sized + 'static,
+        <Self as Generator<P>>::Item: 'static,
+    {
+        Attached::new(self, channel)
     }
 }
 
@@ -670,3 +685,4 @@ impl<F, P: Send + 'static, Y: Send, O> BodyFn<F, P, Y, O> {
 }
 
 mod adapters;
+mod attach;

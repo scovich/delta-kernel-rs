@@ -23,7 +23,9 @@ use crate::checkpoint::{
 };
 use crate::clustering::{CLUSTERING_DOMAIN_NAME, ClusteringColumnInfo, parse_clustering_columns};
 use crate::committer::{Committer, PublishMetadata};
-use crate::coroutine::kernel::{Channel, run_workflow_with_engine};
+use crate::coroutine::kernel::{
+    Channel, StaticWorkflow, run_workflow_with_engine, static_workflow,
+};
 use crate::crc::{
     Crc, CrcDelta, DomainMetadataState, FileSizeHistogram, FileStats, SetTransactionState,
     try_write_crc_file,
@@ -1486,7 +1488,21 @@ impl Snapshot {
         self: Arc<Self>,
         engine: &dyn Engine,
     ) -> KernelResult<CheckpointWriter> {
-        CheckpointWriter::try_new(self, engine)
+        run_workflow_with_engine!(engine, |channel| {
+            self.create_checkpoint_writer_with_channel(channel)
+        })
+    }
+
+    /// Returns a lazy workflow that creates a checkpoint writer for this snapshot.
+    pub fn create_checkpoint_writer_workflow(self: Arc<Self>) -> StaticWorkflow<CheckpointWriter> {
+        static_workflow!(|channel| self.create_checkpoint_writer_with_channel(channel))
+    }
+
+    async fn create_checkpoint_writer_with_channel(
+        self: Arc<Self>,
+        channel: &Channel,
+    ) -> KernelResult<CheckpointWriter> {
+        CheckpointWriter::try_new_with_channel(self, channel).await
     }
 
     /// Creates a [`LogCompactionWriter`] for generating a log compaction file.
