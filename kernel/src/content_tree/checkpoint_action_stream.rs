@@ -3,12 +3,19 @@
 use std::iter;
 
 use super::action_projector::ActionProjector;
-use super::checkpoint_sidecar::read_sidecar_actions;
-use super::reader::{ReadContext, read_add_actions_from_amt};
+use super::checkpoint_sidecar::read_sidecar_actions_generator;
+use super::reader::{ReadContext, read_add_actions_from_amt_generator};
 use crate::actions::{
     ADD_NAME, CheckpointAction, DOMAIN_METADATA_NAME, LOG_ADD_SCHEMA, LOG_DOMAIN_METADATA_SCHEMA,
     LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_TXN_SCHEMA, METADATA_NAME, PROTOCOL_NAME,
     REMOVE_NAME, SET_TRANSACTION_NAME, Sidecar,
+};
+use crate::coroutine::generator::{
+    self, AsyncIntoIterator as _, Generator, GeneratorExt as _, map_async,
+};
+use crate::coroutine::kernel::{
+    Channel, ChannelExt as _, KernelResultGenerator, Request,
+    iterate_prepared_result_coroutine_with_engine,
 };
 use crate::expressions::Scalar;
 use crate::log_replay::ActionsBatch;
@@ -27,6 +34,12 @@ const CHECKPOINT_ACTION_KINDS: &[&str] = &[
     REMOVE_NAME,
 ];
 
+/// A type-erased generator of checkpoint batches. The per-kind readers return it so that they share
+/// one type, and so that those with `impl IntoIterator` row arguments need not capture them in a
+/// `use<..>` list.
+type ActionBatchGenerator =
+    Box<dyn Generator<Request, Item = KernelResult<ActionsBatch>, Output = ()>>;
+
 /// Reads the actions `read_schema` asks for from `checkpoint`, as checkpoint batches
 /// (`is_log_batch = false`) matching `read_schema`. `log_root` resolves the action's file
 /// references.
@@ -40,6 +53,18 @@ pub(crate) fn read_checkpoint_action(
     log_root: &LogRoot,
     read_schema: SchemaRef,
 ) -> KernelResult<Box<dyn KernelResultIterator<ActionsBatch>>> {
+    let actions = iterate_prepared_result_coroutine_with_engine!(engine, |channel| {
+        read_checkpoint_action_generator(channel, checkpoint, log_root, read_schema)
+    });
+    Ok(Box::new(actions?))
+}
+
+pub(crate) async fn read_checkpoint_action_generator(
+    channel: &Channel,
+    checkpoint: &CheckpointAction,
+    log_root: &LogRoot,
+    read_schema: SchemaRef,
+) -> KernelResult<impl KernelResultGenerator<ActionsBatch> + 'static + use<>> {
     if let Some(other) = read_schema
         .fields()
         .map(|field| field.name().as_str())
@@ -53,39 +78,53 @@ pub(crate) fn read_checkpoint_action(
     let mut streams = Vec::new();
     for field in read_schema.fields() {
         let stream = match field.name().as_str() {
-            ADD_NAME => read_tree_adds(engine, checkpoint, log_root, read_schema.clone())?,
-            PROTOCOL_NAME => inline_actions(
-                engine,
-                PROTOCOL_NAME,
-                LOG_PROTOCOL_SCHEMA.clone(),
-                iter::once(checkpoint.protocol().clone()),
-                read_schema.clone(),
-            )?,
-            METADATA_NAME => inline_actions(
-                engine,
-                METADATA_NAME,
-                LOG_METADATA_SCHEMA.clone(),
-                iter::once(checkpoint.metadata().clone()),
-                read_schema.clone(),
-            )?,
-            SET_TRANSACTION_NAME => inline_and_sidecar_actions(
-                engine,
-                log_root,
-                SET_TRANSACTION_NAME,
-                LOG_TXN_SCHEMA.clone(),
-                checkpoint.transactions.iter().cloned(),
-                &checkpoint.txn_sidecars,
-                read_schema.clone(),
-            )?,
-            DOMAIN_METADATA_NAME => inline_and_sidecar_actions(
-                engine,
-                log_root,
-                DOMAIN_METADATA_NAME,
-                LOG_DOMAIN_METADATA_SCHEMA.clone(),
-                checkpoint.domain_metadata.iter().cloned(),
-                &checkpoint.domain_metadata_sidecars,
-                read_schema.clone(),
-            )?,
+            ADD_NAME => {
+                read_tree_adds_generator(channel, checkpoint, log_root, read_schema.clone()).await?
+            }
+            PROTOCOL_NAME => {
+                inline_actions_generator(
+                    channel,
+                    PROTOCOL_NAME,
+                    LOG_PROTOCOL_SCHEMA.clone(),
+                    iter::once(checkpoint.protocol().clone()),
+                    read_schema.clone(),
+                )
+                .await?
+            }
+            METADATA_NAME => {
+                inline_actions_generator(
+                    channel,
+                    METADATA_NAME,
+                    LOG_METADATA_SCHEMA.clone(),
+                    iter::once(checkpoint.metadata().clone()),
+                    read_schema.clone(),
+                )
+                .await?
+            }
+            SET_TRANSACTION_NAME => {
+                inline_and_sidecar_actions_generator(
+                    channel,
+                    log_root,
+                    SET_TRANSACTION_NAME,
+                    LOG_TXN_SCHEMA.clone(),
+                    checkpoint.transactions.iter().cloned(),
+                    &checkpoint.txn_sidecars,
+                    read_schema.clone(),
+                )
+                .await?
+            }
+            DOMAIN_METADATA_NAME => {
+                inline_and_sidecar_actions_generator(
+                    channel,
+                    log_root,
+                    DOMAIN_METADATA_NAME,
+                    LOG_DOMAIN_METADATA_SCHEMA.clone(),
+                    checkpoint.domain_metadata.iter().cloned(),
+                    &checkpoint.domain_metadata_sidecars,
+                    read_schema.clone(),
+                )
+                .await?
+            }
             // `remove`: with adaptiveMetadata, a remove is applied during replay and then dropped,
             // so no checkpoint or reconciled state holds one. Change data feed reads removes from
             // the log commits instead.
@@ -93,16 +132,16 @@ pub(crate) fn read_checkpoint_action(
         };
         streams.push(stream);
     }
-    Ok(Box::new(streams.into_iter().flatten()))
+    Ok(streams.into_generator().flatten_async())
 }
 
 /// The `add` actions of `checkpoint`'s content tree, projected onto `read_schema`.
-fn read_tree_adds(
-    engine: &dyn Engine,
+async fn read_tree_adds_generator(
+    channel: &Channel,
     checkpoint: &CheckpointAction,
     log_root: &LogRoot,
     read_schema: SchemaRef,
-) -> KernelResult<Box<dyn KernelResultIterator<ActionsBatch>>> {
+) -> KernelResult<ActionBatchGenerator> {
     // TODO(#3320): the content tree does not yet carry partition values, so its adds would read
     // with empty `partitionValues`.
     let partition_columns = checkpoint.metadata().partition_columns();
@@ -119,54 +158,65 @@ fn read_tree_adds(
         modification_time: 1,
         data_change: false,
     };
-    let projector =
-        ActionProjector::try_new(engine, ADD_NAME, LOG_ADD_SCHEMA.clone(), read_schema)?;
-    // The engine's handlers carry any cancellation token bound to this read.
-    let adds = read_add_actions_from_amt(engine, checkpoint, &ctx, None)?;
-    Ok(Box::new(adds.map(move |batch| {
+    let projector = ActionProjector::try_new_with_channel(
+        channel,
+        ADD_NAME,
+        LOG_ADD_SCHEMA.clone(),
+        read_schema,
+    )
+    .await?;
+    // The connector's handlers carry any cancellation token bound to this read.
+    let adds = read_add_actions_from_amt_generator(channel, checkpoint, &ctx).await?;
+    Ok(map_async!(adds, async move |channel, batch| {
         // `ActionsBatch` does not take a `FilteredEngineData` yet, so drop the deselected rows
         // here; otherwise replay would read them as live adds.
         let selected = batch?.apply_selection_vector()?;
         Ok(ActionsBatch::new(
-            projector.project(selected.as_ref())?,
+            projector.project_with_channel(channel, selected).await?,
             false,
         ))
-    })))
+    })
+    .into_boxed())
 }
 
 /// One batch of the `action` rows `rows` (each a value of `source`'s single `action` field),
 /// projected onto `read_schema`, or no batch when there are no rows.
-fn inline_actions(
-    engine: &dyn Engine,
+async fn inline_actions_generator(
+    channel: &Channel,
     action: &str,
     source: SchemaRef,
     rows: impl IntoIterator<Item = impl Into<Scalar>>,
     read_schema: SchemaRef,
-) -> KernelResult<Box<dyn KernelResultIterator<ActionsBatch>>> {
+) -> KernelResult<ActionBatchGenerator> {
     let rows: Vec<_> = rows.into_iter().map(|row| vec![row.into()]).collect();
     if rows.is_empty() {
-        return Ok(Box::new(iter::empty()));
+        return Ok(generator::empty().into_boxed());
     }
-    let projector = ActionProjector::try_new(engine, action, source.clone(), read_schema)?;
-    let data = engine.evaluation_handler().create_many(source, rows)?;
-    let batch = ActionsBatch::new(projector.project(data.as_ref())?, false);
-    Ok(Box::new(iter::once(Ok(batch))))
+    let projector =
+        ActionProjector::try_new_with_channel(channel, action, source.clone(), read_schema).await?;
+    let data = channel.create_many(source, rows).await?;
+    let batch = ActionsBatch::new(projector.project_with_channel(channel, data).await?, false);
+    Ok(iter::once(Ok(batch)).into_generator().into_boxed())
 }
 
 /// The `action` rows held inline (`rows`, each a value of `source`'s single `action` field) and in
 /// `sidecars`, projected onto `read_schema`.
-fn inline_and_sidecar_actions(
-    engine: &dyn Engine,
+async fn inline_and_sidecar_actions_generator(
+    channel: &Channel,
     log_root: &LogRoot,
     action: &str,
     source: SchemaRef,
     rows: impl IntoIterator<Item = impl Into<Scalar>>,
     sidecars: &[Sidecar],
     read_schema: SchemaRef,
-) -> KernelResult<Box<dyn KernelResultIterator<ActionsBatch>>> {
-    let inline = inline_actions(engine, action, source.clone(), rows, read_schema.clone())?;
-    let spilled = read_sidecar_actions(engine, log_root, sidecars, action, source, read_schema)?;
-    Ok(Box::new(inline.chain(spilled)))
+) -> KernelResult<ActionBatchGenerator> {
+    let inline =
+        inline_actions_generator(channel, action, source.clone(), rows, read_schema.clone())
+            .await?;
+    let spilled =
+        read_sidecar_actions_generator(channel, log_root, sidecars, action, source, read_schema)
+            .await?;
+    Ok(inline.chain(spilled).into_boxed())
 }
 
 #[cfg(test)]

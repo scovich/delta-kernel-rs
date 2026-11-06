@@ -3,9 +3,15 @@
 use std::sync::Arc;
 
 use super::struct_expr_from_schema;
+#[cfg(test)]
+use crate::Engine;
+use crate::coroutine::kernel::request::ExpressionEvaluatorHandle;
+#[cfg(test)]
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::{Channel, ChannelExt as _};
 use crate::expressions::{Expression, expr, null_lit};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
-use crate::{Engine, EngineData, ExpressionEvaluator, KernelError, KernelResult};
+use crate::{EngineData, KernelError, KernelResult};
 
 /// Pads batches holding one top-level action out to a log-replay read schema, with every other
 /// top-level action null. Each source an adaptiveMetadata `checkpoint` action reads from yields
@@ -14,7 +20,7 @@ use crate::{Engine, EngineData, ExpressionEvaluator, KernelError, KernelResult};
 /// For example, projecting `add` batches onto a read schema of `{add, remove}` keeps each row's
 /// `add` and makes its `remove` null.
 pub(super) struct ActionProjector {
-    evaluator: Arc<dyn ExpressionEvaluator>,
+    evaluator: ExpressionEvaluatorHandle,
 }
 
 impl ActionProjector {
@@ -29,8 +35,8 @@ impl ActionProjector {
     /// # Errors
     /// Returns an error if `action` is not a struct in both schemas, if a field both have differs
     /// in type, or if `read_schema` has a non-nullable field `source` cannot supply.
-    pub(super) fn try_new(
-        engine: &dyn Engine,
+    pub(super) async fn try_new_with_channel(
+        channel: &Channel,
         action: &str,
         source: SchemaRef,
         read_schema: SchemaRef,
@@ -61,17 +67,43 @@ impl ActionProjector {
         let expr = struct_expr_from_schema(&read_schema, |name| {
             (name == action).then(|| action_expr.clone())
         })?;
-        let evaluator = engine.evaluation_handler().new_expression_evaluator(
+        let evaluator = channel.create_expression_evaluator(
             source,
             Arc::new(expr),
             read_schema.as_ref().clone().into(),
-        )?;
+        );
+        let evaluator = evaluator.await?;
         Ok(ActionProjector { evaluator })
     }
 
+    #[cfg(test)]
+    pub(super) fn try_new(
+        engine: &dyn Engine,
+        action: &str,
+        source: SchemaRef,
+        read_schema: SchemaRef,
+    ) -> KernelResult<Self> {
+        run_workflow_with_engine!(engine, |channel| {
+            Self::try_new_with_channel(channel, action, source, read_schema)
+        })
+    }
+
     /// Projects `data`, a batch matching the projector's source schema, onto its read schema.
-    pub(super) fn project(&self, data: &dyn EngineData) -> KernelResult<Box<dyn EngineData>> {
-        self.evaluator.evaluate(data)
+    pub(super) async fn project_with_channel(
+        &self,
+        channel: &Channel,
+        data: Box<dyn EngineData>,
+    ) -> KernelResult<Box<dyn EngineData>> {
+        channel.evaluate_expression(&self.evaluator, data).await
+    }
+
+    #[cfg(test)]
+    pub(super) fn project(
+        &self,
+        engine: &dyn Engine,
+        data: Box<dyn EngineData>,
+    ) -> KernelResult<Box<dyn EngineData>> {
+        run_workflow_with_engine!(engine, |channel| self.project_with_channel(channel, data))
     }
 }
 
@@ -154,7 +186,10 @@ mod tests {
         .unwrap();
 
         let batch = projector
-            .project(adds(&engine, &[Some("a.parquet"), None, Some("b.parquet")]).as_ref())
+            .project(
+                &engine,
+                adds(&engine, &[Some("a.parquet"), None, Some("b.parquet")]),
+            )
             .unwrap()
             .try_into_record_batch()
             .unwrap();

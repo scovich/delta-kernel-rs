@@ -12,12 +12,14 @@
 //! [`ReadContext`].
 
 use std::collections::{HashSet, VecDeque};
+use std::iter;
 use std::sync::{Arc, LazyLock};
-use std::{iter, slice};
 
 use bytes::Bytes;
 use url::Url;
 
+#[cfg(test)]
+use crate::FileDataReadResultIterator;
 use crate::actions::{ADD_NAME, ADD_SCHEMA, CheckpointAction, LOG_ADD_SCHEMA};
 use crate::amt_path_util::amt_manifest_filemeta;
 use crate::cancellation::CancellationTokenRef;
@@ -32,6 +34,17 @@ use crate::content_tree::{
     PARTITION_SPEC_ID, RECORD_COUNT, SEQUENCE_NUMBER, TRACKING, TRACKING_COLUMNS, TRACKING_STATUS,
     TrackingInfo, TrackingStatus, struct_expr_from_schema,
 };
+use crate::coroutine::generator::{
+    AsyncIntoIterator as _, BoundGenerator, Generator, GeneratorExt as _, generator_fn,
+};
+use crate::coroutine::kernel::request::ExpressionEvaluatorHandle;
+#[cfg(test)]
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::{
+    Channel, ChannelExt as _, KernelResultGenerator, Request,
+    iterate_prepared_result_coroutine_with_engine,
+};
+use crate::engine::CancellableEngine;
 use crate::engine_data::{
     EngineData, FilteredEngineData, GetData, RowVisitor, StructList, TypedGetData as _,
 };
@@ -44,10 +57,7 @@ use crate::schema::{
     ArrayType, ColumnNamesAndTypes, DataType, MapType, MetadataColumnSpec, SchemaRef, StructField,
     StructType, ToSchema as _,
 };
-use crate::{
-    Engine, ExpressionEvaluator, FileDataReadResultIterator, FileMeta, KernelError, KernelResult,
-    KernelResultIterator,
-};
+use crate::{Engine, FileMeta, KernelError, KernelResult, KernelResultIterator};
 
 /// Reads the `Add` actions for every live data file in an AMT checkpoint's content tree.
 ///
@@ -75,30 +85,44 @@ pub(crate) fn read_add_actions_from_amt(
     ctx: &ReadContext,
     cancellation_token: Option<&CancellationTokenRef>,
 ) -> KernelResult<Box<dyn KernelResultIterator<FilteredEngineData>>> {
+    let scoped_engine =
+        cancellation_token.map(|token| CancellableEngine::new(engine, token.clone()));
+    let engine = scoped_engine
+        .as_ref()
+        .map_or(engine, |engine| engine as &dyn Engine);
+    let actions = iterate_prepared_result_coroutine_with_engine!(engine, |channel| {
+        read_add_actions_from_amt_generator(channel, checkpoint, ctx)
+    });
+    Ok(Box::new(actions?))
+}
+
+pub(crate) async fn read_add_actions_from_amt_generator(
+    channel: &Channel,
+    checkpoint: &CheckpointAction,
+    ctx: &ReadContext,
+) -> KernelResult<impl KernelResultGenerator<FilteredEngineData> + 'static + use<>> {
     let table_root = &ctx.table_root;
     let root = checkpoint.root_filemeta(table_root)?;
     let schemas = ManifestReadSchema::new();
-    let converter = make_root_entry_converter(engine, ctx)?;
+    let converter = make_root_entry_converter_with_channel(channel, ctx).await?;
     let mut root_actions = Vec::new();
     let mut leaves = LeafRefVisitor::new(table_root);
-    let batches = engine
-        .parquet_handler()
-        .read_parquet_files_with_cancellation(
-            slice::from_ref(&root),
-            schemas.root.clone(),
-            None,
-            cancellation_token.cloned(),
-        )?;
-    for batch in batches {
+    let mut batches = channel
+        .prepare_parquet_files([root], schemas.root.clone(), None)
+        .await?
+        .bind(channel);
+    while let Some(batch) = batches.next().await? {
         let batch = batch?;
         leaves.visit_rows_of(batch.as_ref())?;
-        root_actions.push(converter.convert(batch.as_ref(), RemovedEntries::default())?);
+        let actions = converter
+            .convert_with_channel(channel, batch.as_ref(), RemovedEntries::default())
+            .await?;
+        root_actions.push(actions);
     }
     let leaf_actions =
-        LeafToAddActions::try_new(engine, leaves.leaves, schemas.leaf, ctx, cancellation_token)?;
-    Ok(Box::new(
-        root_actions.into_iter().map(Ok).chain(leaf_actions),
-    ))
+        LeafToAddActions::try_new_with_channel(channel, leaves.leaves, schemas.leaf, ctx).await?;
+    let leaf_actions = leaf_actions.into_generator();
+    Ok(root_actions.into_generator().map(Ok).chain(leaf_actions))
 }
 
 /// Values the read path needs but cannot derive from an AMT entry, so the caller must supply them.
@@ -297,7 +321,7 @@ static LEAF_INPUT_SCHEMA: LazyLock<SchemaRef> =
 struct EntryConverter {
     /// Evaluates a batch plus the [`ADD_DV_HELPER_SCHEMA`] columns `Add.deletionVector` is built
     /// from (see [`add_deletion_vector_expression`]).
-    evaluator: Arc<dyn ExpressionEvaluator>,
+    evaluator: ExpressionEvaluatorHandle,
 }
 
 impl EntryConverter {
@@ -327,8 +351,9 @@ impl EntryConverter {
     /// non-zero partition spec id, carries column files, a `modifiedSnapshotId`, or a deletion
     /// vector with no `Add` equivalent, if the evaluator fails to evaluate, or if the selection
     /// vector length exceeds the batch.
-    fn convert(
+    async fn convert_with_channel(
         &self,
+        channel: &Channel,
         entries: &dyn EngineData,
         removed: RemovedEntries<'_>,
     ) -> KernelResult<FilteredEngineData> {
@@ -342,29 +367,54 @@ impl EntryConverter {
             ADD_DV_HELPER_SCHEMA.clone(),
             visitor.deletion_vectors.into_columns()?,
         )?;
-        let actions = self.evaluator.evaluate(augmented.as_ref())?;
+        let actions = channel
+            .evaluate_expression(&self.evaluator, augmented)
+            .await?;
         FilteredEngineData::try_new(actions, visitor.selection)
+    }
+
+    #[cfg(test)]
+    fn convert(
+        &self,
+        engine: &dyn Engine,
+        entries: &dyn EngineData,
+        removed: RemovedEntries<'_>,
+    ) -> KernelResult<FilteredEngineData> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.convert_with_channel(channel, entries, removed)
+        })
     }
 }
 
 /// Builds an [`EntryConverter`] for an AMT root manifest's content-tree entries.
 ///
 /// # Parameters
-/// - `engine`: provides the [`crate::EvaluationHandler`] used to build the evaluator.
+/// - `channel`: provides the expression evaluator.
 /// - `ctx`: the per-read values the entry cannot supply (see [`ReadContext`]).
 ///
 /// # Errors
 /// Returns an error if the evaluator cannot be constructed.
-fn make_root_entry_converter(
-    engine: &dyn Engine,
+async fn make_root_entry_converter_with_channel(
+    channel: &Channel,
     ctx: &ReadContext,
 ) -> KernelResult<EntryConverter> {
-    make_entry_converter(
-        engine,
+    make_entry_converter_with_channel(
+        channel,
         ctx,
         &AddFieldSources::root(),
         Arc::new(ContentTreeNodeEntry::to_schema()),
     )
+    .await
+}
+
+#[cfg(test)]
+fn make_root_entry_converter(
+    engine: &dyn Engine,
+    ctx: &ReadContext,
+) -> KernelResult<EntryConverter> {
+    run_workflow_with_engine!(engine, |channel| {
+        make_root_entry_converter_with_channel(channel, ctx)
+    })
 }
 
 /// Converts the entry batches of one leaf manifest into `Add` actions, filling null tracking
@@ -384,7 +434,7 @@ impl LeafReadContext {
     /// Creates a context for the leaf referenced by a root `DataManifest` entry.
     ///
     /// # Parameters
-    /// - `engine`: provides the evaluation handler for the entry->`Add` transform.
+    /// - `channel`: provides the entry->`Add` evaluator.
     /// - `parent`: tracking info of the root `DataManifest` entry referencing the leaf.
     /// - `manifest_dv`: the parent's manifest deletion vector, if any.
     /// - `ctx`: the per-read values the entry cannot supply (see [`ReadContext`]).
@@ -392,8 +442,8 @@ impl LeafReadContext {
     /// # Errors
     /// Returns an error if `parent` has a null `sequenceNumber` or `firstRowId`, or if the
     /// evaluator cannot be constructed.
-    fn new(
-        engine: &dyn Engine,
+    async fn new_with_channel(
+        channel: &Channel,
         parent: &TrackingInfo,
         manifest_dv: Option<MumblingBitmap>,
         ctx: &ReadContext,
@@ -417,15 +467,33 @@ impl LeafReadContext {
         };
         Ok(Self {
             next_first_row_id: require(parent.first_row_id, FIRST_ROW_ID)?,
-            converter: make_entry_converter(engine, ctx, &sources, LEAF_INPUT_SCHEMA.clone())?,
+            converter: make_entry_converter_with_channel(
+                channel,
+                ctx,
+                &sources,
+                LEAF_INPUT_SCHEMA.clone(),
+            )
+            .await?,
             manifest_dv,
             next_position: 0,
         })
     }
 
+    #[cfg(test)]
+    fn new(
+        engine: &dyn Engine,
+        parent: &TrackingInfo,
+        manifest_dv: Option<MumblingBitmap>,
+        ctx: &ReadContext,
+    ) -> KernelResult<Self> {
+        run_workflow_with_engine!(engine, |channel| {
+            Self::new_with_channel(channel, parent, manifest_dv, ctx)
+        })
+    }
+
     /// Converts one batch of leaf entries into an `Add`-action batch, like
-    /// [`EntryConverter::convert`]. Batches must be passed in manifest order, since null
-    /// `firstRowId`s are assigned, and entry positions counted, sequentially across them.
+    /// [`EntryConverter::convert_with_channel`]. Batches must be passed in manifest order, since
+    /// null `firstRowId`s are assigned, and entry positions counted, sequentially across them.
     ///
     /// Entries the manifest deletion vector removes are dropped, but they still take part in
     /// `firstRowId` assignment, so a surviving entry's row IDs do not change when an earlier entry
@@ -434,9 +502,10 @@ impl LeafReadContext {
     ///
     /// # Errors
     /// Returns an error if an entry is malformed for a leaf (see [`LeafEntryVisitor`]), or any
-    /// error from [`EntryConverter::convert`].
-    fn convert_leaf_entries_to_add_actions(
+    /// error from [`EntryConverter::convert_with_channel`].
+    async fn convert_leaf_entries_to_add_actions_with_channel(
         &mut self,
+        channel: &Channel,
         entries: &dyn EngineData,
     ) -> KernelResult<FilteredEngineData> {
         let mask = removed_mask(self.manifest_dv.as_ref(), self.next_position, entries.len());
@@ -451,10 +520,24 @@ impl LeafReadContext {
         let augmented =
             entries.append_columns(FIRST_ROW_ID_HELPER_SCHEMA.clone(), vec![helper_column])?;
 
-        let filtered = self.converter.convert(augmented.as_ref(), removed)?;
+        let filtered = self
+            .converter
+            .convert_with_channel(channel, augmented.as_ref(), removed)
+            .await?;
         self.next_first_row_id = next_first_row_id;
         self.next_position += entries.len();
         Ok(filtered)
+    }
+
+    #[cfg(test)]
+    fn convert_leaf_entries_to_add_actions(
+        &mut self,
+        engine: &dyn Engine,
+        entries: &dyn EngineData,
+    ) -> KernelResult<FilteredEngineData> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.convert_leaf_entries_to_add_actions_with_channel(channel, entries)
+        })
     }
 
     /// Checks, once all of the leaf's batches are converted, that the manifest deletion vector
@@ -500,32 +583,34 @@ fn tracking_start(getters: &[&dyn GetData<'_>]) -> usize {
         .saturating_sub(TRACKING_COLUMNS.as_ref().0.len())
 }
 
-/// Iterator of `Add`-action batches for all live leaf manifests, read in a single request. The
+type LeafBatchGenerator =
+    Box<dyn Generator<Request, Item = KernelResult<Box<dyn EngineData>>, Output = ()>>;
+
+/// Generator of `Add`-action batches for all live leaf manifests, read in a single request. The
 /// engine is expected to return each leaf's batches together and in request order, each tagged
 /// with the leaf's requested location in `_file`.
-struct LeafToAddActions {
+struct LeafToAddActions<G = LeafBatchGenerator> {
     /// Leaves whose reads are still in progress, in request order, each with its location and
     /// context. The front is the leaf currently being read.
     pending: VecDeque<(String, LeafReadContext)>,
     /// Batches of all leaves; `None` when there are no leaves.
-    batches: Option<FileDataReadResultIterator>,
+    batches: Option<G>,
 }
 
 impl LeafToAddActions {
     /// Validates and reads all the leaves, with `read_schema` (see [`ManifestReadSchema::leaf`]),
-    /// stopping when `cancellation_token` is cancelled.
+    /// through `channel`.
     ///
     /// # Errors
     /// Returns an error if two leaves share a location (their batches could not be told apart), if
     /// a leaf cannot yet be read (see [`LeafRef::check_readable`]), if a leaf's
-    /// context cannot be built (see [`LeafReadContext::new`]), or if the engine fails to start the
-    /// read.
-    fn try_new(
-        engine: &dyn Engine,
+    /// context cannot be built (see [`LeafReadContext::new_with_channel`]), or if the connector
+    /// fails to start the read.
+    async fn try_new_with_channel(
+        channel: &Channel,
         leaves: Vec<LeafRef>,
         read_schema: SchemaRef,
         ctx: &ReadContext,
-        cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<Self> {
         let mut seen = HashSet::new();
         if let Some(dup) = leaves.iter().find(|l| !seen.insert(&l.file_meta.location)) {
@@ -534,43 +619,75 @@ impl LeafToAddActions {
                 dup.file_meta.location
             )));
         }
-        let (pending, files): (VecDeque<_>, Vec<_>) = leaves
-            .into_iter()
-            .map(|leaf| {
-                leaf.check_readable()?;
-                let location = leaf.file_meta.location.to_string();
-                let context =
-                    LeafReadContext::new(engine, &leaf.parent_info, leaf.manifest_dv, ctx)
-                        .map_err(|e| match e {
-                            KernelError::MissingData(msg) => KernelError::missing_data(format!(
-                                "{msg} (leaf manifest '{location}')"
-                            )),
-                            e => e,
-                        })?;
-                Ok(((location, context), leaf.file_meta))
-            })
-            .collect::<KernelResult<_>>()?;
-        let batches = if files.is_empty() {
+        let mut pending = VecDeque::with_capacity(leaves.len());
+        let mut files = Vec::with_capacity(leaves.len());
+        // `map_async` needs a `'static` mapper, but building contexts borrows `ctx`.
+        for leaf in leaves {
+            leaf.check_readable()?;
+            let location = leaf.file_meta.location.to_string();
+            let context = LeafReadContext::new_with_channel(
+                channel,
+                &leaf.parent_info,
+                leaf.manifest_dv,
+                ctx,
+            )
+            .await
+            .map_err(|e| match e {
+                KernelError::MissingData(msg) => {
+                    KernelError::missing_data(format!("{msg} (leaf manifest '{location}')"))
+                }
+                e => e,
+            })?;
+            pending.push_back((location, context));
+            files.push(leaf.file_meta);
+        }
+        let batches: Option<LeafBatchGenerator> = if files.is_empty() {
             None
         } else {
             Some(
-                engine
-                    .parquet_handler()
-                    .read_parquet_files_with_cancellation(
-                        &files,
-                        read_schema,
-                        None,
-                        cancellation_token.cloned(),
-                    )?,
+                channel
+                    .prepare_parquet_files(files, read_schema, None)
+                    .await?
+                    .into_boxed(),
             )
         };
         Ok(Self { pending, batches })
     }
 
+    fn into_generator(self) -> impl KernelResultGenerator<FilteredEngineData> + 'static {
+        generator_fn!(async move |channel| {
+            let mut state = self.bind(&channel);
+            while let Some(item) = state.next_with_channel(&channel).await? {
+                channel.yield_item(item).await?;
+            }
+            Ok(())
+        })
+    }
+}
+
+impl<G: KernelResultGenerator<Box<dyn EngineData>>> LeafToAddActions<G> {
+    fn bind<'a>(
+        self,
+        channel: &'a Channel,
+    ) -> LeafToAddActions<
+        impl BoundGenerator<Item = KernelResult<Box<dyn EngineData>>, Output = ()> + Unpin + 'a,
+    >
+    where
+        G: 'a,
+    {
+        LeafToAddActions {
+            pending: self.pending,
+            batches: self.batches.map(|batches| batches.bind(channel)),
+        }
+    }
+}
+
+impl<G> LeafToAddActions<G> {
     /// Converts one leaf batch with the context of the leaf named by its `_file` value. Leaves
     /// before that one produced no further batches, so they are finished and dropped.
-    fn convert_to_add_actions(
+    async fn convert_to_add_actions_with_channel(
         &mut self,
+        channel: &Channel,
         batch: &dyn EngineData,
     ) -> KernelResult<FilteredEngineData> {
         let file = file_path_of(batch)?;
@@ -592,36 +709,61 @@ impl LeafToAddActions {
         };
         // TODO(#3263): leaf batches also carry the `_file` and `_row_index` metadata columns, which
         // the leaf converter's input schema does not declare.
-        context.convert_leaf_entries_to_add_actions(batch)
+        context
+            .convert_leaf_entries_to_add_actions_with_channel(channel, batch)
+            .await
     }
 }
 
-impl Iterator for LeafToAddActions {
-    type Item = KernelResult<FilteredEngineData>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+impl<G> LeafToAddActions<G>
+where
+    G: BoundGenerator<Item = KernelResult<Box<dyn EngineData>>, Output = ()> + Unpin,
+{
+    async fn next_with_channel(
+        &mut self,
+        channel: &Channel,
+    ) -> KernelResult<Option<KernelResult<FilteredEngineData>>> {
         loop {
-            let Some(next) = self.batches.as_mut()?.next() else {
+            let Some(batches) = self.batches.as_mut() else {
+                return Ok(None);
+            };
+            let Some(batch) = batches.next().await? else {
                 // Every remaining leaf is finished. Dropping the batches fuses the iterator.
                 self.batches = None;
                 let result = self
                     .pending
                     .drain(..)
                     .try_for_each(|(location, context)| context.finish(&location));
-                return result.err().map(Err);
+                return Ok(result.err().map(Err));
             };
-            let result = match next {
+            let result = match batch {
                 // An empty batch carries no `_file` to group by, and no actions.
                 Ok(batch) if batch.is_empty() => continue,
-                Ok(batch) => self.convert_to_add_actions(batch.as_ref()),
+                Ok(batch) => {
+                    self.convert_to_add_actions_with_channel(channel, batch.as_ref())
+                        .await
+                }
                 Err(e) => Err(e),
             };
             // Fail every later batch rather than convert it with stale `firstRowId`s.
             if result.is_err() {
                 self.pending.clear();
             }
-            return Some(result);
+            return Ok(Some(result));
         }
+    }
+}
+
+#[cfg(test)]
+impl<G: Send> LeafToAddActions<G> {
+    fn convert_to_add_actions(
+        &mut self,
+        engine: &dyn Engine,
+        batch: &dyn EngineData,
+    ) -> KernelResult<FilteredEngineData> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.convert_to_add_actions_with_channel(channel, batch)
+        })
     }
 }
 
@@ -667,11 +809,12 @@ impl RowVisitor for FilePathVisitor {
 /// Shared constructor for [`EntryConverter`]: builds the entry->`Add` transform (with the caller's
 /// [`AddFieldSources`]) and its evaluator.
 ///
-/// `input_schema` is the schema of the batches passed to [`EntryConverter::convert`] -- the entry
-/// schema for a root batch, or an augmented schema when a caller appends helper columns. The
-/// transform evaluates against it plus the [`ADD_DV_HELPER_SCHEMA`] columns `convert` appends.
-fn make_entry_converter(
-    engine: &dyn Engine,
+/// `input_schema` is the schema of the batches passed to [`EntryConverter::convert_with_channel`]
+/// -- the entry schema for a root batch, or an augmented schema when a caller appends helper
+/// columns. The transform evaluates against it plus the [`ADD_DV_HELPER_SCHEMA`] columns `convert`
+/// appends.
+async fn make_entry_converter_with_channel(
+    channel: &Channel,
     ctx: &ReadContext,
     sources: &AddFieldSources,
     input_schema: SchemaRef,
@@ -684,11 +827,9 @@ fn make_entry_converter(
             .chain(ADD_DV_HELPER_SCHEMA.fields())
             .cloned(),
     );
-    let evaluator = engine.evaluation_handler().new_expression_evaluator(
-        Arc::new(evaluated_schema),
-        Arc::new(expr),
-        output_type,
-    )?;
+    let evaluator = channel
+        .create_expression_evaluator(Arc::new(evaluated_schema), Arc::new(expr), output_type)
+        .await?;
     Ok(EntryConverter { evaluator })
 }
 
@@ -1194,7 +1335,7 @@ mod tests {
         entries: &dyn EngineData,
         ctx: &ReadContext,
     ) -> KernelResult<FilteredEngineData> {
-        make_root_entry_converter(engine, ctx)?.convert(entries, RemovedEntries::default())
+        make_root_entry_converter(engine, ctx)?.convert(engine, entries, RemovedEntries::default())
     }
 
     /// Runs the read path over `entries`.
@@ -1783,7 +1924,7 @@ mod tests {
     ) {
         let engine = SyncEngine::new();
         let leaf = "memory:///table/leaf.parquet".to_string();
-        let mut actions = LeafToAddActions {
+        let mut actions: LeafToAddActions = LeafToAddActions {
             pending: VecDeque::from([(
                 leaf,
                 LeafReadContext::new(&engine, &valid_parent(), None, &read_ctx()).unwrap(),
@@ -1798,7 +1939,10 @@ mod tests {
             .evaluation_handler()
             .create_many(schema, vec![vec![file]])
             .unwrap();
-        assert_result_error_with_message(actions.convert_to_add_actions(batch.as_ref()), message);
+        assert_result_error_with_message(
+            actions.convert_to_add_actions(&engine, batch.as_ref()),
+            message,
+        );
     }
 
     #[rstest]
@@ -2179,6 +2323,7 @@ mod tests {
         for (entries, (selection, row)) in batches.iter().zip(expected) {
             let filtered = converter
                 .convert(
+                    &engine,
                     entry_batch(&engine, entries).as_ref(),
                     RemovedEntries::default(),
                 )
@@ -2449,8 +2594,11 @@ mod tests {
         ];
         let mut ctx = LeafReadContext::new(&engine, &valid_parent(), None, &read_ctx()).unwrap();
         let out = filtered_to_batch(
-            ctx.convert_leaf_entries_to_add_actions(entry_batch(&engine, &entries).as_ref())
-                .unwrap(),
+            ctx.convert_leaf_entries_to_add_actions(
+                &engine,
+                entry_batch(&engine, &entries).as_ref(),
+            )
+            .unwrap(),
         );
         // baseRowId is prefix-summed from the parent's 100 by recordCount; defaultRowCommitVersion
         // inherits the parent's sequence number 5.
@@ -2481,8 +2629,11 @@ mod tests {
         )];
         let mut ctx = LeafReadContext::new(&engine, &valid_parent(), None, &read_ctx()).unwrap();
         let out = filtered_to_batch(
-            ctx.convert_leaf_entries_to_add_actions(entry_batch(&engine, &entries).as_ref())
-                .unwrap(),
+            ctx.convert_leaf_entries_to_add_actions(
+                &engine,
+                entry_batch(&engine, &entries).as_ref(),
+            )
+            .unwrap(),
         );
         let expected = expected_batch(&engine, &[expected_add_row("a.parquet", 100, 500, 99)]);
         assert_eq!(
@@ -2535,8 +2686,11 @@ mod tests {
         entries.push(leaf_entry("a.parquet", 1, 10, None, None, None));
         let mut ctx = LeafReadContext::new(&engine, &valid_parent(), None, &read_ctx()).unwrap();
         let out = filtered_to_batch(
-            ctx.convert_leaf_entries_to_add_actions(entry_batch(&engine, &entries).as_ref())
-                .unwrap(),
+            ctx.convert_leaf_entries_to_add_actions(
+                &engine,
+                entry_batch(&engine, &entries).as_ref(),
+            )
+            .unwrap(),
         );
         let expected_rows: Vec<_> = expected_preceding
             .into_iter()
@@ -2560,8 +2714,11 @@ mod tests {
             leaf_entry("b.parquet", 1, 20, None, None, None),
         ];
         let out1 = filtered_to_batch(
-            ctx.convert_leaf_entries_to_add_actions(entry_batch(&engine, &batch1).as_ref())
-                .unwrap(),
+            ctx.convert_leaf_entries_to_add_actions(
+                &engine,
+                entry_batch(&engine, &batch1).as_ref(),
+            )
+            .unwrap(),
         );
         let expected1 = expected_batch(
             &engine,
@@ -2578,8 +2735,11 @@ mod tests {
         // Assignment continues from the previous batch: 100 + 10 + 20 = 130.
         let batch2 = [leaf_entry("c.parquet", 1, 5, None, None, None)];
         let out2 = filtered_to_batch(
-            ctx.convert_leaf_entries_to_add_actions(entry_batch(&engine, &batch2).as_ref())
-                .unwrap(),
+            ctx.convert_leaf_entries_to_add_actions(
+                &engine,
+                entry_batch(&engine, &batch2).as_ref(),
+            )
+            .unwrap(),
         );
         let expected2 = expected_batch(&engine, &[expected_add_row("c.parquet", 1, 130, 5)]);
         assert_eq!(
@@ -2612,7 +2772,7 @@ mod tests {
         let mut ctx =
             LeafReadContext::new(&engine, &valid_parent(), Some(dv), &read_ctx()).unwrap();
         let mut convert = |entries: &[ContentTreeNodeEntry]| {
-            ctx.convert_leaf_entries_to_add_actions(entry_batch(&engine, entries).as_ref())
+            ctx.convert_leaf_entries_to_add_actions(&engine, entry_batch(&engine, entries).as_ref())
                 .map(|out| filtered_to_batch(out).try_into_record_batch().unwrap())
         };
         let expected = |rows: &[(&str, i64)]| {
@@ -2659,8 +2819,8 @@ mod tests {
             status,
         );
         let mut ctx = LeafReadContext::new(&engine, &valid_parent(), None, &read_ctx()).unwrap();
-        let result =
-            ctx.convert_leaf_entries_to_add_actions(entry_batch(&engine, &[entry]).as_ref());
+        let result = ctx
+            .convert_leaf_entries_to_add_actions(&engine, entry_batch(&engine, &[entry]).as_ref());
         assert_result_error_with_message(result, expected_field);
     }
 
@@ -2676,8 +2836,8 @@ mod tests {
         let engine = SyncEngine::new();
         let entry = leaf_entry("a.parquet", 1, record_count, None, None, None);
         let mut ctx = LeafReadContext::new(&engine, &valid_parent(), None, &read_ctx()).unwrap();
-        let result =
-            ctx.convert_leaf_entries_to_add_actions(entry_batch(&engine, &[entry]).as_ref());
+        let result = ctx
+            .convert_leaf_entries_to_add_actions(&engine, entry_batch(&engine, &[entry]).as_ref());
         assert_result_error_with_message(result, expected_message);
     }
 
@@ -2710,8 +2870,8 @@ mod tests {
         let mut entry = leaf_entry("f.parquet", 10, 5, None, None, None);
         entry.content_type = content_type;
         let mut ctx = LeafReadContext::new(&engine, &valid_parent(), None, &read_ctx()).unwrap();
-        let result =
-            ctx.convert_leaf_entries_to_add_actions(entry_batch(&engine, &[entry]).as_ref());
+        let result = ctx
+            .convert_leaf_entries_to_add_actions(&engine, entry_batch(&engine, &[entry]).as_ref());
         assert_result_error_with_message(result, &format!("content type {content_type:?}"));
     }
 
@@ -2720,7 +2880,7 @@ mod tests {
         let engine = SyncEngine::new();
         let mut ctx = LeafReadContext::new(&engine, &valid_parent(), None, &read_ctx()).unwrap();
         let empty = filtered_to_batch(
-            ctx.convert_leaf_entries_to_add_actions(entry_batch(&engine, &[]).as_ref())
+            ctx.convert_leaf_entries_to_add_actions(&engine, entry_batch(&engine, &[]).as_ref())
                 .unwrap(),
         );
         assert_eq!(empty.len(), 0);
@@ -2728,6 +2888,7 @@ mod tests {
         // The empty batch consumes no row IDs, so the next entry still starts at 100.
         let out = filtered_to_batch(
             ctx.convert_leaf_entries_to_add_actions(
+                &engine,
                 entry_batch(&engine, &[leaf_entry("a.parquet", 1, 10, None, None, None)]).as_ref(),
             )
             .unwrap(),

@@ -34,7 +34,7 @@ use tracing::{Instrument as _, Span, error};
 
 #[cfg_attr(not(feature = "internal-api"), expect(unused_imports))]
 pub use self::adapters::{
-    AsyncIntoIterator, Enumerate, FilterMap, FilterOk, Flatten, FlattenBy, FlattenIdent,
+    AsyncIntoIterator, Chain, Enumerate, FilterMap, FilterOk, Flatten, FlattenBy, FlattenIdent,
     FlattenResult, Iter, Map, MapAsync, MapAsyncWitness, MapOk, OnComplete, Peekable, Unfold,
     empty, map_async_witness, unfold,
 };
@@ -120,6 +120,14 @@ pub trait GeneratorExt {
         Self: Sized,
     {
         FlattenBy::new(self)
+    }
+
+    /// Counterpart of [`Iterator::chain`]: yields every item of `self`, then every item of `other`.
+    fn chain<B>(self, other: B) -> Chain<Self, B>
+    where
+        Self: Sized,
+    {
+        Chain::new(self, other)
     }
 
     /// Counterpart of [`Iterator::flatten`]: yields the elements of each collection-valued item.
