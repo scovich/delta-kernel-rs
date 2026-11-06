@@ -1,33 +1,56 @@
 //! Domain metadata replay logic for [`LogSegment`].
 //!
-//! Two entry points: [`LogSegment::scan_domain_metadatas`] replays the whole log for the latest
-//! domain metadata, and [`LogSegment::scan_domain_metadatas_rooted_in_crc`] scans only the commits
-//! after an authoritative stale CRC and reconciles them against its active-domain map.
+//! Two entry points: [`LogSegment::scan_domain_metadatas_with_channel`] replays the whole log for
+//! the latest domain metadata, and [`LogSegment::scan_domain_metadatas_rooted_in_crc_with_channel`]
+//! scans only the commits after an authoritative stale CRC and reconciles them against its
+//! active-domain map.
 
 use std::collections::{HashMap, HashSet};
 
 use tracing::instrument;
 
 use super::LogSegment;
+#[cfg(test)]
+use crate::Engine;
+#[cfg(test)]
+use crate::KernelResultIterator;
 use crate::actions::visitors::DomainMetadataVisitor;
 use crate::actions::{DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA};
-use crate::coroutine::kernel::{
-    Channel, KernelResultGenerator, iterate_prepared_result_coroutine_with_engine,
-};
+use crate::coroutine::generator::{BoundGenerator, Generator as _};
+#[cfg(test)]
+use crate::coroutine::kernel::iterate_prepared_result_coroutine_with_engine;
+#[cfg(test)]
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::{Channel, KernelResultGenerator};
 use crate::crc::merge_domain_metadata;
 use crate::log_replay::ActionsBatch;
-use crate::{Engine, KernelResult, KernelResultIterator, RowVisitor as _, Version};
+use crate::{KernelResult, RowVisitor as _, Version};
 
 pub(crate) type DomainMetadataMap = HashMap<String, DomainMetadata>;
 
 impl LogSegment {
     /// [`scan_domain_metadata_actions`] over this segment's whole log.
+    #[cfg(test)]
     pub(crate) fn scan_domain_metadatas(
         &self,
         domains: Option<&HashSet<&str>>,
         engine: &dyn Engine,
     ) -> KernelResult<DomainMetadataMap> {
-        scan_domain_metadata_actions(self.read_domain_metadata_batches(engine)?, domains)
+        run_workflow_with_engine!(engine, |channel| {
+            self.scan_domain_metadatas_with_channel(domains, channel)
+        })
+    }
+
+    pub(crate) async fn scan_domain_metadatas_with_channel(
+        &self,
+        domains: Option<&HashSet<&str>>,
+        channel: &Channel,
+    ) -> KernelResult<DomainMetadataMap> {
+        let batches = self
+            .read_domain_metadata_batches_generator(channel)
+            .await?
+            .bind(channel);
+        scan_domain_metadata_actions(batches, domains).await
     }
 
     /// Answer a domain-metadata query rooted in an authoritative (`Complete`) but stale CRC's
@@ -40,16 +63,17 @@ impl LogSegment {
     /// A domain the tail never mentions falls back to `base_active`. `domains == None` answers all
     /// active domains; `Some(filter)` answers only the requested ones. Returned maps never contain
     /// tombstones.
-    pub(crate) fn scan_domain_metadatas_rooted_in_crc(
+    pub(crate) async fn scan_domain_metadatas_rooted_in_crc_with_channel(
         &self,
         base_version: Version,
         base_active: &HashMap<String, DomainMetadata>,
         domains: Option<&HashSet<&str>>,
-        engine: &dyn Engine,
+        channel: &Channel,
     ) -> KernelResult<DomainMetadataMap> {
         let tail = self
             .segment_after_version(base_version)
-            .scan_tail_including_tombstones(domains, engine)?;
+            .scan_tail_including_tombstones_with_channel(domains, channel)
+            .await?;
         let reconciled = match domains {
             // Filtered: the newest tail action per requested domain wins; a tombstone settles the
             // answer as absent. Fall back to `base_active` only when the tail never mentions it.
@@ -74,27 +98,44 @@ impl LogSegment {
     /// Reverse-replay this segment for domain metadata, keeping tombstones. Terminates early once
     /// every requested domain is decided (a tombstone counts as decided). The CRC-rooted path keeps
     /// tombstones so a removal in a newer commit can suppress a domain the base holds.
+    #[cfg(test)]
     fn scan_tail_including_tombstones(
         &self,
         domains: Option<&HashSet<&str>>,
         engine: &dyn Engine,
     ) -> KernelResult<DomainMetadataMap> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.scan_tail_including_tombstones_with_channel(domains, channel)
+        })
+    }
+
+    async fn scan_tail_including_tombstones_with_channel(
+        &self,
+        domains: Option<&HashSet<&str>>,
+        channel: &Channel,
+    ) -> KernelResult<DomainMetadataMap> {
         Ok(self
-            .visit_domain_metadatas(domains, engine)?
+            .visit_domain_metadatas_with_channel(domains, channel)
+            .await?
             .into_domain_metadatas_including_tombstones())
     }
 
     /// Reverse-replay this segment, folding domain metadata actions into a
     /// [`DomainMetadataVisitor`] (see [`visit_domain_metadata_actions`]).
-    fn visit_domain_metadatas(
+    async fn visit_domain_metadatas_with_channel(
         &self,
         domains: Option<&HashSet<&str>>,
-        engine: &dyn Engine,
+        channel: &Channel,
     ) -> KernelResult<DomainMetadataVisitor> {
-        visit_domain_metadata_actions(self.read_domain_metadata_batches(engine)?, domains)
+        let batches = self
+            .read_domain_metadata_batches_generator(channel)
+            .await?
+            .bind(channel);
+        visit_domain_metadata_actions(batches, domains).await
     }
 
     /// Read action batches from the log, projecting rows to only contain domain metadata columns.
+    #[cfg(test)]
     fn read_domain_metadata_batches(
         &self,
         engine: &dyn Engine,
@@ -120,18 +161,19 @@ impl LogSegment {
 /// Returns the latest domain metadata for each domain, accounting for tombstones
 /// (`removed=true`) — removed domain metadatas will _never_ be present in the returned map.
 #[instrument(name = "domain_metadata.scan", skip_all, fields(domains = ?domains.map(|d| d.iter().collect::<Vec<_>>())), err)]
-fn scan_domain_metadata_actions(
-    actions: impl Iterator<Item = KernelResult<ActionsBatch>>,
+async fn scan_domain_metadata_actions(
+    actions: impl BoundGenerator<Item = KernelResult<ActionsBatch>, Output = ()> + Unpin,
     domains: Option<&HashSet<&str>>,
 ) -> KernelResult<DomainMetadataMap> {
-    Ok(visit_domain_metadata_actions(actions, domains)?.into_domain_metadatas())
+    let visitor = visit_domain_metadata_actions(actions, domains);
+    Ok(visitor.await?.into_domain_metadatas())
 }
 
 /// Folds `actions` into a [`DomainMetadataVisitor`] (newest-first, first-seen-wins). A domain
 /// filter stops reading once every requested domain is found. The caller chooses whether to keep
 /// or strip tombstones from the returned visitor.
-fn visit_domain_metadata_actions(
-    actions: impl Iterator<Item = KernelResult<ActionsBatch>>,
+async fn visit_domain_metadata_actions(
+    mut actions: impl BoundGenerator<Item = KernelResult<ActionsBatch>, Output = ()> + Unpin,
     domains: Option<&HashSet<&str>>,
 ) -> KernelResult<DomainMetadataVisitor> {
     let domain_filter = domains.map(|set| {
@@ -143,7 +185,7 @@ fn visit_domain_metadata_actions(
     // If a specific set of domains is requested then we can terminate log replay early as
     // soon as all requested domains have been found. If all domains are requested then we
     // are forced to replay the entire log.
-    for actions in actions {
+    while let Some(actions) = actions.next().await? {
         let domain_metadatas = actions?.actions;
         visitor.visit_rows_of(domain_metadatas.as_ref())?;
         // if all requested domains have been found, terminate early

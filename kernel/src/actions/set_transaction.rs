@@ -1,9 +1,19 @@
+#[cfg(test)]
+use crate::Engine;
+#[cfg(test)]
+use crate::KernelResultIterator;
 pub(crate) use crate::actions::visitors::SetTransactionMap;
 use crate::actions::visitors::SetTransactionVisitor;
 use crate::actions::{LOG_TXN_SCHEMA, SetTransaction};
+use crate::coroutine::generator::{BoundGenerator, Generator as _};
+#[cfg(test)]
+use crate::coroutine::kernel::iterate_prepared_result_coroutine_with_engine;
+#[cfg(test)]
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::{Channel, KernelResultGenerator};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
-use crate::{Engine, KernelResult, KernelResultIterator, RowVisitor as _, Version};
+use crate::{KernelResult, RowVisitor as _, Version};
 
 /// Resolves the latest `txn` action per application id via log replay, where the newest action in
 /// log order wins.
@@ -18,24 +28,51 @@ impl SetTransactionScanner {
     ///
     /// Note that each call to this function repeats log replay. Thus, if callers are interested
     /// in multiple app ids, use `get_all` (once) instead and probe the map returned.
+    #[cfg(test)]
     pub(crate) fn get_one(
         log_segment: &LogSegment,
         application_id: &str,
         engine: &dyn Engine,
     ) -> KernelResult<Option<SetTransaction>> {
-        let actions = replay_for_app_ids(log_segment, engine)?;
-        let mut transactions = scan_application_transactions(actions, Some(application_id))?;
+        run_workflow_with_engine!(engine, |channel| {
+            Self::get_one_with_channel(log_segment, application_id, channel)
+        })
+    }
+
+    /// Channel-driven counterpart to [`Self::get_one`].
+    pub(crate) async fn get_one_with_channel(
+        log_segment: &LogSegment,
+        application_id: &str,
+        channel: &Channel,
+    ) -> KernelResult<Option<SetTransaction>> {
+        let actions = replay_for_app_ids_generator(log_segment, channel)
+            .await?
+            .bind(channel);
+        let mut transactions = scan_application_transactions(actions, Some(application_id)).await?;
         Ok(transactions.remove(application_id))
     }
 
     /// Scan the Delta Log for the latest `txn` action of every application id.
-    #[allow(unused)]
+    #[cfg(test)]
     pub(crate) fn get_all(
         log_segment: &LogSegment,
         engine: &dyn Engine,
     ) -> KernelResult<SetTransactionMap> {
-        let actions = replay_for_app_ids(log_segment, engine)?;
-        scan_application_transactions(actions, None)
+        run_workflow_with_engine!(engine, |channel| {
+            Self::get_all_with_channel(log_segment, channel)
+        })
+    }
+
+    /// Channel-driven counterpart to [`Self::get_all`].
+    #[cfg(any(test, feature = "adaptive-metadata-in-dev"))]
+    pub(crate) async fn get_all_with_channel(
+        log_segment: &LogSegment,
+        channel: &Channel,
+    ) -> KernelResult<SetTransactionMap> {
+        let actions = replay_for_app_ids_generator(log_segment, channel)
+            .await?
+            .bind(channel);
+        scan_application_transactions(actions, None).await
     }
 
     /// Fetch the latest `txn` action for `application_id`, rooted in an authoritative (`Complete`)
@@ -46,17 +83,19 @@ impl SetTransactionScanner {
     /// [`LogSegment::segment_after_version`]. When the tail holds a `txn` for `application_id`, its
     /// newest wins; otherwise the result is that id's entry in `base_active`, the value the CRC
     /// recorded at `base_version`.
-    pub(crate) fn get_one_rooted_in_crc(
+    pub(crate) async fn get_one_rooted_in_crc_with_channel(
         log_segment: &LogSegment,
         application_id: &str,
         base_active: &SetTransactionMap,
         base_version: Version,
-        engine: &dyn Engine,
+        channel: &Channel,
     ) -> KernelResult<Option<SetTransaction>> {
         let actions = log_segment
             .segment_after_version(base_version)
-            .read_actions(engine, LOG_TXN_SCHEMA.clone())?;
-        let mut tail = scan_application_transactions(actions, Some(application_id))?;
+            .read_actions_generator(channel, LOG_TXN_SCHEMA.clone())
+            .await?
+            .bind(channel);
+        let mut tail = scan_application_transactions(actions, Some(application_id)).await?;
         Ok(tail
             .remove(application_id)
             .or_else(|| base_active.get(application_id).cloned()))
@@ -66,14 +105,14 @@ impl SetTransactionScanner {
 /// Folds `actions`, a newest-first read with [`LOG_TXN_SCHEMA`], into the latest `txn` per
 /// application id, stopping early once `application_id` (if given) is found.
 // TODO: we could have this track _multiple_ application ids instead of only up to one.
-fn scan_application_transactions(
-    actions: impl Iterator<Item = KernelResult<ActionsBatch>>,
+async fn scan_application_transactions(
+    mut actions: impl BoundGenerator<Item = KernelResult<ActionsBatch>, Output = ()> + Unpin,
     application_id: Option<&str>,
 ) -> KernelResult<SetTransactionMap> {
     let mut visitor = SetTransactionVisitor::new(application_id.map(|s| s.to_owned()));
     // If a specific id is requested then we can terminate log replay early as soon as it was
     // found. If all ids are requested then we are forced to replay the entire log.
-    for maybe_data in actions {
+    while let Some(maybe_data) = actions.next().await? {
         let txns = maybe_data?.actions;
         visitor.visit_rows_of(txns.as_ref())?;
         // if a specific id is requested and a transaction was found, then return
@@ -86,11 +125,23 @@ fn scan_application_transactions(
 }
 
 // The full-log `txn` read that `get_one` and `get_all` fold; factored out to facilitate testing.
+#[cfg(test)]
 fn replay_for_app_ids(
     log_segment: &LogSegment,
     engine: &dyn Engine,
 ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
-    log_segment.read_actions(engine, LOG_TXN_SCHEMA.clone())
+    iterate_prepared_result_coroutine_with_engine!(engine, |channel| {
+        replay_for_app_ids_generator(log_segment, channel)
+    })
+}
+
+async fn replay_for_app_ids_generator(
+    log_segment: &LogSegment,
+    channel: &Channel,
+) -> KernelResult<impl KernelResultGenerator<ActionsBatch> + 'static + use<>> {
+    log_segment
+        .read_actions_generator(channel, LOG_TXN_SCHEMA.clone())
+        .await
 }
 
 #[cfg(test)]

@@ -88,6 +88,19 @@ impl<'a> SnapshotReader<'a> {
         }
     }
 
+    /// Returns a lazy workflow that gets the latest non-expired transaction version for
+    /// `application_id`.
+    ///
+    /// Cancellation is the connector's.
+    pub fn get_app_id_version_workflow(
+        &self,
+        application_id: impl Into<String>,
+    ) -> Workflow<'a, Option<i64>> {
+        let snapshot = self.snapshot;
+        let application_id = application_id.into();
+        workflow!(|channel| snapshot.get_app_id_version_with_channel(&application_id, channel))
+    }
+
     /// Returns the latest configuration for the user-controlled `domain`, or `None` if absent.
     ///
     /// Uses `engine` to replay the log when needed. Returns an error for system-controlled
@@ -116,6 +129,19 @@ impl<'a> SnapshotReader<'a> {
         }
     }
 
+    /// Returns a lazy workflow that gets the latest configuration for the user-controlled
+    /// `domain`, or `None` if absent.
+    ///
+    /// Cancellation is the connector's.
+    pub fn get_domain_metadata_workflow(
+        &self,
+        domain: impl Into<String>,
+    ) -> Workflow<'a, Option<String>> {
+        let snapshot = self.snapshot;
+        let domain = domain.into();
+        workflow!(|channel| snapshot.get_domain_metadata_with_channel(&domain, channel))
+    }
+
     /// Returns the row-tracking high-water mark, or `None` if no active row-tracking domain exists.
     ///
     /// Uses `engine` to load domain metadata when needed. Returns read, malformed-configuration,
@@ -142,6 +168,30 @@ impl<'a> SnapshotReader<'a> {
         } else {
             self.get_row_tracking_high_water_mark(engine)
         }
+    }
+
+    /// Returns a lazy workflow that gets the row-tracking high-water mark, or `None` if no active
+    /// row-tracking domain exists.
+    ///
+    /// Cancellation is the connector's.
+    pub fn get_row_tracking_high_water_mark_workflow(&self) -> Workflow<'a, Option<i64>> {
+        let snapshot = self.snapshot;
+        workflow!(|channel| snapshot.get_row_tracking_high_water_mark_with_channel(channel))
+    }
+
+    /// Gets the row-tracking high-water mark through `channel`, or `None` if no active
+    /// row-tracking domain exists.
+    ///
+    /// Cancellation is the connector's.
+    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
+    #[internal_api]
+    pub(crate) async fn get_row_tracking_high_water_mark_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<Option<i64>> {
+        self.snapshot
+            .get_row_tracking_high_water_mark_with_channel(channel)
+            .await
     }
 
     /// Returns this version's timestamp in milliseconds since the Unix epoch.
@@ -199,6 +249,18 @@ impl<'a> SnapshotReader<'a> {
         self.snapshot.get_clustering_column_infos(engine)
     }
 
+    /// Returns a lazy workflow that gets clustering descriptors in domain order.
+    ///
+    /// Cancellation is the connector's.
+    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
+    #[internal_api]
+    pub(crate) fn get_clustering_column_infos_workflow(
+        &self,
+    ) -> Workflow<'a, Option<Vec<ClusteringColumnInfo>>> {
+        let snapshot = self.snapshot;
+        workflow!(|channel| snapshot.get_clustering_column_infos_with_channel(channel))
+    }
+
     /// Returns physical clustering column names in domain order.
     ///
     /// Returns `None` when the clustering feature is absent or `delta.clustering` has no active
@@ -212,6 +274,20 @@ impl<'a> SnapshotReader<'a> {
         engine: &dyn Engine,
     ) -> KernelResult<Option<Vec<ColumnName>>> {
         self.snapshot.get_physical_clustering_columns(engine)
+    }
+
+    /// Gets physical clustering column names in domain order through `channel`.
+    ///
+    /// Cancellation is the connector's.
+    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
+    #[internal_api]
+    pub(crate) async fn get_physical_clustering_columns_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<Option<Vec<ColumnName>>> {
+        self.snapshot
+            .get_physical_clustering_columns_with_channel(channel)
+            .await
     }
 
     /// Returns current metadata for `domains`, or all domains when the filter is `None`.
@@ -234,6 +310,22 @@ impl<'a> SnapshotReader<'a> {
         self.snapshot.get_domain_metadatas_internal(engine, domains)
     }
 
+    /// Gets current metadata for `domains` through `channel`, or all domains when the filter is
+    /// `None`.
+    ///
+    /// Cancellation is the connector's.
+    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
+    #[internal_api]
+    pub(crate) async fn get_domain_metadatas_internal_with_channel(
+        &self,
+        channel: &Channel,
+        domains: Option<&HashSet<&str>>,
+    ) -> KernelResult<DomainMetadataMap> {
+        self.snapshot
+            .get_domain_metadatas_internal_with_channel(channel, domains)
+            .await
+    }
+
     /// Returns the latest configuration for a user or system `domain`, or `None` if absent.
     ///
     /// Unlike [`Self::get_domain_metadata`], accepts `delta.*` domains. Uses `engine` to replay
@@ -248,6 +340,22 @@ impl<'a> SnapshotReader<'a> {
         self.snapshot.get_domain_metadata_internal(domain, engine)
     }
 
+    /// Gets the latest configuration for a user or system `domain` through `channel`, or `None` if
+    /// absent.
+    ///
+    /// Cancellation is the connector's.
+    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
+    #[internal_api]
+    pub(crate) async fn get_domain_metadata_internal_with_channel(
+        &self,
+        domain: &str,
+        channel: &Channel,
+    ) -> KernelResult<Option<String>> {
+        self.snapshot
+            .get_domain_metadata_internal_with_channel(domain, channel)
+            .await
+    }
+
     /// Returns all active user-controlled domain metadata, excluding `delta.*` domains.
     ///
     /// Uses `engine` to replay the log when needed and returns read or cancellation errors.
@@ -258,6 +366,32 @@ impl<'a> SnapshotReader<'a> {
         engine: &dyn Engine,
     ) -> KernelResult<Vec<DomainMetadata>> {
         self.snapshot.get_all_domain_metadata(engine)
+    }
+
+    /// Returns a lazy workflow that gets all active user-controlled domain metadata, excluding
+    /// `delta.*` domains.
+    ///
+    /// Cancellation is the connector's.
+    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
+    #[internal_api]
+    pub(crate) fn get_all_domain_metadata_workflow(&self) -> Workflow<'a, Vec<DomainMetadata>> {
+        let snapshot = self.snapshot;
+        workflow!(|channel| snapshot.get_all_domain_metadata_with_channel(channel))
+    }
+
+    /// Gets all active user-controlled domain metadata through `channel`, excluding `delta.*`
+    /// domains.
+    ///
+    /// Cancellation is the connector's.
+    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
+    #[internal_api]
+    pub(crate) async fn get_all_domain_metadata_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<Vec<DomainMetadata>> {
+        self.snapshot
+            .get_all_domain_metadata_with_channel(channel)
+            .await
     }
 
     /// Returns this version's In-Commit Timestamp (ICT), or `None` when ICT is disabled.
