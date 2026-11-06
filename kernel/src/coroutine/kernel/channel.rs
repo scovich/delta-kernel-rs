@@ -158,7 +158,6 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
     }
 
     /// Fetch the next page for `cursor` via [`PageRequest::Next`].
-    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
     fn next_page<Op>(&self, cursor: Cursor<Op>) -> impl KernelFuture<Page<Op>>
     where
         Op: PagedOperation,
