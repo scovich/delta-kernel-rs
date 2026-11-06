@@ -54,6 +54,8 @@ pub enum Request {
 
 /// Declarative plan operations with result-specific reply types.
 pub enum PlanRequest {
+    /// Reports whether the connector executes declarative plans. Every connector must reply.
+    Available(Reply<bool>),
     /// Executes a query plan in connector-selected pages.
     Query(PageRequest<PlanOperation>),
     /// Reads a Parquet footer through the plan-execution path.

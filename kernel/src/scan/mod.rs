@@ -58,7 +58,7 @@ use crate::coroutine::generator::{
 };
 use crate::coroutine::kernel::engine::EngineConnector;
 use crate::coroutine::kernel::request::ReadParquetFiles;
-#[cfg(feature = "adaptive-metadata-in-dev")]
+#[cfg(feature = "declarative-plans")]
 use crate::coroutine::kernel::run_workflow_with_engine;
 use crate::coroutine::kernel::{
     Channel, ChannelExt as _, KernelResultGenerator, Request, Workflow, run_workflow_with_storage,
@@ -1494,15 +1494,32 @@ impl Scan {
     /// with `TIMESTAMP` partition columns, if planning requires a
     /// [`PlanExecutor`](crate::plans::PlanExecutor) that the engine does not provide, or if log
     /// discovery, checkpoint inspection, or plan construction fails.
+    pub fn declarative_metadata_scan_plan(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<Plan>> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.declarative_metadata_scan_plan_with_channel(channel)
+        })
+    }
+
+    /// Returns a lazy workflow that builds this scan's declarative metadata plan.
+    #[cfg(feature = "declarative-plans")]
+    #[internal_api]
+    pub(crate) fn declarative_metadata_scan_plan_workflow(&self) -> Workflow<'_, Option<Plan>> {
+        workflow!(|channel| self.declarative_metadata_scan_plan_with_channel(channel))
+    }
+
+    #[cfg(feature = "declarative-plans")]
     #[tracing::instrument(
         name = "scan.declarative_metadata_scan_plan",
         skip_all,
         fields(enable_call_frame),
         err
     )]
-    pub fn declarative_metadata_scan_plan(
+    async fn declarative_metadata_scan_plan_with_channel(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
     ) -> KernelResult<Option<Plan>> {
         // TODO(#3609): Support connector-supplied timezone in declarative metadata scans.
         require!(
@@ -1517,7 +1534,8 @@ impl Scan {
             )
         );
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        self.require_no_checkpoint_action(engine, "declarative_metadata_scan_plan")?;
+        self.require_no_checkpoint_action_with_channel(channel, "declarative_metadata_scan_plan")
+            .await?;
 
         // A statically-unsatisfiable predicate (e.g. `x > 10 AND FALSE`) skips the whole table.
         if self.state_info.physical_predicate == PhysicalPredicate::StaticSkipAll {
@@ -1525,7 +1543,9 @@ impl Scan {
         }
 
         let planner = scan_plan::MetadataPlanner::try_from_scan(self)?;
-        let base = scan_plan::MetadataReplayBase::try_new(&self.snapshot, engine, &planner)?;
+        let base =
+            scan_plan::MetadataReplayBase::try_new_with_channel(&self.snapshot, channel, &planner)
+                .await?;
         self.build_metadata_scan_plan_with(base, &planner)
     }
 
@@ -1600,17 +1620,6 @@ impl Scan {
 
     /// Errors when the snapshot has an AMT `checkpoint` action, which `entry_point` does not yet
     /// read.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn require_no_checkpoint_action(
-        &self,
-        engine: &dyn Engine,
-        entry_point: &str,
-    ) -> KernelResult<()> {
-        run_workflow_with_engine!(engine, |channel| {
-            self.require_no_checkpoint_action_with_channel(channel, entry_point)
-        })
-    }
-
     #[cfg(feature = "adaptive-metadata-in-dev")]
     async fn require_no_checkpoint_action_with_channel(
         &self,

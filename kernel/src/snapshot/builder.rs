@@ -6,6 +6,9 @@ use delta_kernel_derive::internal_api;
 use tracing::{info, instrument};
 
 use crate::cancellation::CancellationTokenRef;
+use crate::coroutine::kernel::{
+    Channel, StaticWorkflow, run_workflow_with_engine, static_workflow,
+};
 use crate::engine::CancellableEngine;
 use crate::log_path::LogPath;
 use crate::log_segment::{LogSegment, validate_catalog_managed_log_tail};
@@ -325,6 +328,18 @@ impl<Mode> SnapshotBuilder<Mode> {
     /// [`MetricEvent::SnapshotBuildFailure`]: crate::metrics::MetricEvent::SnapshotBuildFailure
     ///
     /// Use [`Self::build_with_cancellation`] to add a per-call cancellation token.
+    pub fn build(self, engine: &dyn Engine) -> Result<SnapshotRef> {
+        run_workflow_with_engine!(engine, |channel| self.build_with_channel(channel))
+    }
+
+    /// Returns a lazy workflow that builds this snapshot.
+    pub fn build_workflow(self) -> StaticWorkflow<SnapshotRef, Error>
+    where
+        Mode: 'static,
+    {
+        static_workflow!(|channel| self.build_with_channel(channel))
+    }
+
     // `is_catalog_managed` is the requested load mode, not the confirmed protocol
     // (see `IS_CATALOG_MANAGED_FIELD`).
     #[instrument(
@@ -333,7 +348,7 @@ impl<Mode> SnapshotBuilder<Mode> {
         fields(path = %self.table_path(), report, enable_call_frame, version = tracing::field::Empty, operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some(), correlation_id = self.correlation_id.as_deref().unwrap_or(""), load_type = self.load_type().as_ref()),
         err
     )]
-    pub fn build(self, engine: &dyn Engine) -> Result<SnapshotRef> {
+    pub(crate) async fn build_with_channel(self, channel: &Channel) -> Result<SnapshotRef> {
         // Fold the context into the message string rather than passing structured fields: this
         // `info!` fires inside the `snap.build` metrics span, where any field the
         // `SnapshotBuildSuccess` event doesn't recognize would trip a spurious "Invalid field"
@@ -386,8 +401,9 @@ impl<Mode> SnapshotBuilder<Mode> {
             Self::validate_catalog_managed_build_inputs(version, max_catalog_version, &log_tail)?;
 
             // Use time-travel version if set, otherwise fall back to max_catalog_version. Passing
-            // this as the version to LogSegment::for_snapshot does NOT skip the _last_checkpoint
-            // hint -- the hint is still used when its version <= effective_version.
+            // this as the version to LogSegment::for_snapshot_with_channel does NOT skip the
+            // _last_checkpoint hint -- the hint is still used when its version <=
+            // effective_version.
             let effective_version = version.or(max_catalog_version);
 
             // A snapshot is latest when no explicit time-travel version is requested, or when the
@@ -397,8 +413,8 @@ impl<Mode> SnapshotBuilder<Mode> {
             if let Some(table_root) = table_root {
                 let table_url = try_parse_uri(&table_root)
                     .map_err(|error| classify_table_root_error(&table_root, error))?;
-                let log_segment = LogSegment::for_snapshot(
-                    engine.storage_handler().as_ref(),
+                let log_segment = LogSegment::for_snapshot_with_channel(
+                    channel,
                     table_url
                         .join(DELTA_LOG_DIR_WITH_SLASH)
                         .map_err(KernelError::from)?,
@@ -406,17 +422,19 @@ impl<Mode> SnapshotBuilder<Mode> {
                     effective_version,
                     metric_context.clone(),
                 )
+                .await
                 .map_err(|error| {
                     classify_log_segment_error(&table_root, effective_version, error)
                 })?;
-                Snapshot::try_new_from_log_segment(
+                Snapshot::try_new_from_log_segment_with_channel(
                     table_url,
                     log_segment,
-                    engine,
+                    channel,
                     metric_context,
                     incremental_replay,
                     built_as_latest,
                 )
+                .await
                 .map(Into::into)?
             } else {
                 let Some(existing_snapshot) = existing_snapshot else {
@@ -425,17 +443,18 @@ impl<Mode> SnapshotBuilder<Mode> {
                     )
                     .into());
                 };
-                Snapshot::try_new_from(
+                Snapshot::try_new_from_with_channel(
                     existing_snapshot,
                     log_tail,
-                    engine,
+                    channel,
                     effective_version,
                     max_catalog_version,
                     metric_context,
                     incremental_replay,
                     checkpoint_handling,
                     built_as_latest,
-                )?
+                )
+                .await?
             }
         };
 
