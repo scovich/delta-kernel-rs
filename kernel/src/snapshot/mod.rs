@@ -24,7 +24,8 @@ use crate::checkpoint::{
 };
 use crate::clustering::{CLUSTERING_DOMAIN_NAME, ClusteringColumnInfo, parse_clustering_columns};
 use crate::committer::{Committer, PublishMetadata};
-use crate::coroutine::kernel::{Channel, run_workflow_with_engine};
+use crate::coroutine::generator::Generator as _;
+use crate::coroutine::kernel::{Channel, KernelResultGenerator, run_workflow_with_engine};
 use crate::crc::{
     Crc, CrcDelta, DomainMetadataState, FileSizeHistogram, FileStats, SetTransactionState,
     try_write_crc_file,
@@ -55,9 +56,7 @@ use crate::table_properties::CheckConstraint;
 use crate::table_properties::TableProperties;
 use crate::transaction::{UpdateTableOperation, UpdateTableTransactionBuilder};
 use crate::utils::require;
-use crate::{
-    Engine, KernelError, KernelResult, KernelResultIterator, LogCompactionWriter, Version,
-};
+use crate::{Engine, KernelError, KernelResult, LogCompactionWriter, Version};
 
 #[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
 mod adaptive_metadata_tests;
@@ -373,24 +372,31 @@ impl Snapshot {
     /// Reads this snapshot's log with `schema`, newest first, for log replay. For a table with an
     /// AMT `checkpoint` action (see [`Self::latest_checkpoint_action`]), that action stands in for
     /// the checkpoint and the commits at or below its version.
-    pub(crate) fn read_log_actions(
+    pub(crate) async fn read_log_actions_generator(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         schema: SchemaRef,
-    ) -> KernelResult<Box<dyn KernelResultIterator<ActionsBatch>>> {
+    ) -> KernelResult<impl KernelResultGenerator<ActionsBatch> + 'static + use<>> {
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        if let Some(checkpoint) = self.latest_checkpoint_action(engine)? {
-            let result = self.log_segment.read_actions_with_checkpoint_action(
-                engine,
-                &checkpoint,
-                self.table_root(),
-                schema.clone(),
-                schema,
-                None,
-            )?;
+        if let Some(checkpoint) = self.latest_checkpoint_action_with_channel(channel).await? {
+            let result = self
+                .log_segment
+                .read_actions_with_checkpoint_action_with_channel(
+                    channel,
+                    &checkpoint,
+                    self.table_root(),
+                    schema.clone(),
+                    schema,
+                    None,
+                )
+                .await?;
             return Ok(result.actions);
         }
-        Ok(Box::new(self.log_segment.read_actions(engine, schema)?))
+        Ok(self
+            .log_segment
+            .read_actions_generator(channel, schema)
+            .await?
+            .into_boxed())
     }
 
     /// Create a new [`Snapshot`] from a freshly-listed [`LogSegment`]. Takes Protocol and Metadata
@@ -676,18 +682,28 @@ impl Snapshot {
     /// The stale CRC a tail-only replay can start from: [`Self::base_crc`], unless an AMT
     /// `checkpoint` action is newer. That action stands in for the commits at or below its
     /// version, which may no longer be listed, so replay must read it instead.
+    #[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
     fn tail_replay_base_crc(&self, engine: &dyn Engine) -> KernelResult<Option<&Arc<Crc>>> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.tail_replay_base_crc_with_channel(channel)
+        })
+    }
+
+    async fn tail_replay_base_crc_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<Option<&Arc<Crc>>> {
         let Some(base) = self.base_crc() else {
             return Ok(None);
         };
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        if let Some(checkpoint) = self.latest_checkpoint_action(engine)?
+        if let Some(checkpoint) = self.latest_checkpoint_action_with_channel(channel).await?
             && !Version::try_from(checkpoint.version()).is_ok_and(|v| v <= base.version)
         {
             return Ok(None);
         }
         #[cfg(not(feature = "adaptive-metadata-in-dev"))]
-        let _ = engine;
+        let _ = channel;
         Ok(Some(base))
     }
 
@@ -849,6 +865,16 @@ impl Snapshot {
     /// replay.
     ///
     /// Reports metrics: `SetTransactionLoadSuccess` or `SetTransactionLoadFailure`.
+    fn get_app_id_version(
+        &self,
+        application_id: &str,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<i64>> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.get_app_id_version_with_channel(application_id, channel)
+        })
+    }
+
     #[instrument(
         parent = &self.span,
         name = SET_TRANSACTION_LOADED_SPAN,
@@ -856,10 +882,10 @@ impl Snapshot {
         err,
         fields(report, from_cache, found)
     )]
-    fn get_app_id_version(
+    async fn get_app_id_version_with_channel(
         &self,
         application_id: &str,
-        engine: &dyn Engine,
+        channel: &Channel,
     ) -> KernelResult<Option<i64>> {
         fn record_metric(from_cache: bool, found: bool) {
             let span = tracing::Span::current();
@@ -896,16 +922,17 @@ impl Snapshot {
         // it, skipping the checkpoint. A stale `Partial` CRC (one whose file lacked the
         // `setTransactions` field) has no authoritative transaction set, so it cannot root the
         // scan and falls through to the full replay below.
-        if let Some(base) = self.tail_replay_base_crc(engine)?
+        if let Some(base) = self.tail_replay_base_crc_with_channel(channel).await?
             && let SetTransactionState::Complete(base_active) = &base.set_transaction_state
         {
-            let txn = SetTransactionScanner::get_one_rooted_in_crc(
+            let txn = SetTransactionScanner::get_one_rooted_in_crc_with_channel(
                 self.log_segment(),
                 application_id,
                 base_active,
                 base.version,
-                engine,
-            )?;
+                channel,
+            )
+            .await?;
             let version = txn.and_then(|txn| txn.non_expired_version(expiration_timestamp));
             // TODO: report a distinct metric source here. A rooted tail scan is neither a
             //       cache hit nor a full replay, yet `from_cache = false` buckets it with
@@ -917,24 +944,35 @@ impl Snapshot {
 
         // Fallback: full log replay. Scan for the newest txn and apply expiration to it, like the
         // CRC paths above.
-        let txn = SetTransactionScanner::get_one(self, application_id, engine)?;
+        let txn =
+            SetTransactionScanner::get_one_with_channel(self, application_id, channel).await?;
         let version = txn.and_then(|txn| txn.non_expired_version(expiration_timestamp));
         record_metric(false, version.is_some());
         Ok(version)
     }
 
     /// Fetch the latest transaction version for every application id in this snapshot.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
     pub(crate) fn get_app_id_versions(
         &self,
         engine: &dyn Engine,
+    ) -> KernelResult<SetTransactionMap> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.get_app_id_versions_with_channel(channel)
+        })
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) async fn get_app_id_versions_with_channel(
+        &self,
+        channel: &Channel,
     ) -> KernelResult<SetTransactionMap> {
         if let Some(crc) = self.crc_at_version()
             && let SetTransactionState::Complete(map) = &crc.set_transaction_state
         {
             return Ok(map.clone());
         }
-        SetTransactionScanner::get_all(self, engine)
+        SetTransactionScanner::get_all_with_channel(self, channel).await
     }
 
     /// Fetch the domainMetadata for a specific domain in this snapshot. This returns the latest
@@ -946,13 +984,24 @@ impl Snapshot {
         domain: &str,
         engine: &dyn Engine,
     ) -> KernelResult<Option<String>> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.get_domain_metadata_with_channel(domain, channel)
+        })
+    }
+
+    async fn get_domain_metadata_with_channel(
+        &self,
+        domain: &str,
+        channel: &Channel,
+    ) -> KernelResult<Option<String>> {
         if domain.starts_with(INTERNAL_DOMAIN_PREFIX) {
             return Err(KernelError::generic(
                 "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain",
             ));
         }
 
-        self.get_domain_metadata_internal(domain, engine)
+        self.get_domain_metadata_internal_with_channel(domain, channel)
+            .await
     }
 
     /// Get the row-tracking high-water mark for this snapshot.
@@ -964,7 +1013,18 @@ impl Snapshot {
     /// Reads domain metadata, potentially replaying the log, and returns an error if the metadata
     /// cannot be read or its JSON configuration is malformed.
     fn get_row_tracking_high_water_mark(&self, engine: &dyn Engine) -> KernelResult<Option<i64>> {
-        self.get_domain_metadata_internal(ROW_TRACKING_DOMAIN_NAME, engine)?
+        run_workflow_with_engine!(engine, |channel| {
+            self.get_row_tracking_high_water_mark_with_channel(channel)
+        })
+    }
+
+    /// Gets the row-tracking high-water mark through `channel`.
+    async fn get_row_tracking_high_water_mark_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<Option<i64>> {
+        self.get_domain_metadata_internal_with_channel(ROW_TRACKING_DOMAIN_NAME, channel)
+            .await?
             .map(|config| parse_row_tracking_high_water_mark(&config))
             .transpose()
     }
@@ -991,7 +1051,17 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<Vec<ClusteringColumnInfo>>> {
-        let Some(physical_columns) = self.get_physical_clustering_columns(engine)? else {
+        run_workflow_with_engine!(engine, |channel| {
+            self.get_clustering_column_infos_with_channel(channel)
+        })
+    }
+
+    async fn get_clustering_column_infos_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<Option<Vec<ClusteringColumnInfo>>> {
+        let physical_columns = self.get_physical_clustering_columns_with_channel(channel);
+        let Some(physical_columns) = physical_columns.await? else {
             return Ok(None);
         };
         let column_mapping_mode = self.table_configuration.column_mapping_mode();
@@ -1027,7 +1097,18 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<Vec<ColumnName>>> {
-        match self.get_clustering_domain_metadata(engine)? {
+        run_workflow_with_engine!(engine, |channel| {
+            self.get_physical_clustering_columns_with_channel(channel)
+        })
+    }
+
+    /// Gets physical clustering columns through `channel`.
+    async fn get_physical_clustering_columns_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<Option<Vec<ColumnName>>> {
+        let config = self.get_clustering_domain_metadata_with_channel(channel);
+        match config.await? {
             Some(config) => Ok(Some(parse_clustering_columns(&config)?)),
             None => Ok(None),
         }
@@ -1038,7 +1119,10 @@ impl Snapshot {
     /// Returns `Ok(None)` when the `ClusteredTable` feature is absent on the protocol, or when
     /// the domain has no current entry. The JSON has the shape
     /// `{"clusteringColumns":[["col1"],["addr","city"], ...]}` with physical column names.
-    fn get_clustering_domain_metadata(&self, engine: &dyn Engine) -> KernelResult<Option<String>> {
+    async fn get_clustering_domain_metadata_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<Option<String>> {
         if !self
             .table_configuration
             .protocol()
@@ -1046,7 +1130,8 @@ impl Snapshot {
         {
             return Ok(None);
         }
-        self.get_domain_metadata_internal(CLUSTERING_DOMAIN_NAME, engine)
+        self.get_domain_metadata_internal_with_channel(CLUSTERING_DOMAIN_NAME, channel)
+            .await
     }
 
     /// Load domain metadata: if Complete in the CRC, answer from the cache; else if every
@@ -1055,6 +1140,17 @@ impl Snapshot {
     /// reconcile against its map; else full log replay. `domains == None` means load all.
     ///
     /// Reports metrics: `DomainMetadataLoadSuccess` or `DomainMetadataLoadFailure`.
+    fn get_domain_metadatas_internal(
+        &self,
+        engine: &dyn Engine,
+        domains: Option<&HashSet<&str>>,
+    ) -> KernelResult<DomainMetadataMap> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.get_domain_metadatas_internal_with_channel(channel, domains)
+        })
+    }
+
+    /// Loads domain metadata through `channel`.
     #[instrument(
         parent = &self.span,
         name = DOMAIN_METADATA_LOADED_SPAN,
@@ -1062,9 +1158,9 @@ impl Snapshot {
         err,
         fields(report, from_cache, num_domains_returned)
     )]
-    fn get_domain_metadatas_internal(
+    async fn get_domain_metadatas_internal_with_channel(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         domains: Option<&HashSet<&str>>,
     ) -> KernelResult<DomainMetadataMap> {
         fn record_metric(from_cache: bool, num_domains_returned: usize) {
@@ -1114,15 +1210,17 @@ impl Snapshot {
         // it, skipping the checkpoint. A stale `Partial` CRC (one whose file lacked the
         // `domainMetadata` field) has no authoritative active-domain set, so it cannot root the
         // scan and falls through to the full replay below.
-        if let Some(base) = self.tail_replay_base_crc(engine)?
+        if let Some(base) = self.tail_replay_base_crc_with_channel(channel).await?
             && let DomainMetadataState::Complete(base_active) = &base.domain_metadata_state
         {
-            let rooted = self.log_segment().scan_domain_metadatas_rooted_in_crc(
+            let log_segment = self.log_segment();
+            let rooted = log_segment.scan_domain_metadatas_rooted_in_crc_with_channel(
                 base.version,
                 base_active,
                 domains,
-                engine,
-            )?;
+                channel,
+            );
+            let rooted = rooted.await?;
             // TODO: report a distinct metric source here. A rooted tail scan is neither a
             //       cache hit nor a full replay, yet `from_cache = false` buckets it with
             //       full replay, hiding the checkpoint-skipping win. A 3-variant source enum
@@ -1136,10 +1234,11 @@ impl Snapshot {
         //       miss search could skip that range and only scan the older commits, then
         //       union those results with the Partial cache's entries to produce the final
         //       answer.
-        let replayed = scan_domain_metadata_actions(
-            self.read_log_actions(engine, LOG_DOMAIN_METADATA_SCHEMA.clone())?,
-            domains,
-        )?;
+        let batches = self
+            .read_log_actions_generator(channel, LOG_DOMAIN_METADATA_SCHEMA.clone())
+            .await?
+            .bind(channel);
+        let replayed = scan_domain_metadata_actions(batches, domains).await?;
         record_metric(false, replayed.len());
         Ok(replayed)
     }
@@ -1156,7 +1255,20 @@ impl Snapshot {
         domain: &str,
         engine: &dyn Engine,
     ) -> KernelResult<Option<String>> {
-        let mut map = self.get_domain_metadatas_internal(engine, Some(&HashSet::from([domain])))?;
+        run_workflow_with_engine!(engine, |channel| {
+            self.get_domain_metadata_internal_with_channel(domain, channel)
+        })
+    }
+
+    /// Fetches domain metadata for `domain` through `channel`.
+    async fn get_domain_metadata_internal_with_channel(
+        &self,
+        domain: &str,
+        channel: &Channel,
+    ) -> KernelResult<Option<String>> {
+        let mut map = self
+            .get_domain_metadatas_internal_with_channel(channel, Some(&HashSet::from([domain])))
+            .await?;
         Ok(map.remove(domain).map(|dm| dm.configuration().to_owned()))
     }
 
@@ -1165,7 +1277,19 @@ impl Snapshot {
     /// Internal (`delta.*`) domains are filtered out.
     #[allow(unused)]
     fn get_all_domain_metadata(&self, engine: &dyn Engine) -> KernelResult<Vec<DomainMetadata>> {
-        let all_metadata = self.get_domain_metadatas_internal(engine, None)?;
+        run_workflow_with_engine!(engine, |channel| {
+            self.get_all_domain_metadata_with_channel(channel)
+        })
+    }
+
+    /// Fetches all non-internal domain metadata through `channel`.
+    async fn get_all_domain_metadata_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<Vec<DomainMetadata>> {
+        let all_metadata = self
+            .get_domain_metadatas_internal_with_channel(channel, None)
+            .await?;
         Ok(all_metadata
             .into_values()
             .filter(|domain| !domain.is_internal())
@@ -1189,6 +1313,7 @@ impl Snapshot {
     /// - `Ok(Some(timestamp))` - ICT is enabled and available for this version
     /// - `Ok(None)` - ICT is not enabled
     /// - `Err(...)` - ICT is enabled but cannot be read, or enablement version is invalid
+    #[cfg(test)]
     fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> KernelResult<Option<i64>> {
         run_workflow_with_engine!(engine, |channel| {
             self.get_in_commit_timestamp_with_channel(channel)
@@ -1293,16 +1418,6 @@ impl Snapshot {
 
     /// Reads the In-Commit Timestamp and `lastManifestCommit` from this version's commit file,
     /// caching the `lastManifestCommit`.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn read_ict_and_last_manifest_commit(
-        &self,
-        engine: &dyn Engine,
-    ) -> KernelResult<(i64, Option<LastManifestCommit>)> {
-        run_workflow_with_engine!(engine, |channel| {
-            self.read_ict_and_last_manifest_commit_with_channel(channel)
-        })
-    }
-
     #[cfg(feature = "adaptive-metadata-in-dev")]
     async fn read_ict_and_last_manifest_commit_with_channel(
         &self,
@@ -1593,10 +1708,20 @@ impl Snapshot {
     /// stats).
     ///
     /// The `root` span field records the selected root. `write_span` records its resolution mode.
-    #[instrument(parent = &self.span, name = "snap.resolve_crc_for_write", skip_all, err, fields(root))]
     fn resolve_crc_for_write(
         &self,
         engine: &dyn Engine,
+        write_span: &tracing::Span,
+    ) -> KernelResult<Arc<Crc>> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.resolve_crc_for_write_with_channel(channel, write_span)
+        })
+    }
+
+    #[instrument(parent = &self.span, name = "snap.resolve_crc_for_write", skip_all, err, fields(root))]
+    async fn resolve_crc_for_write_with_channel(
+        &self,
+        channel: &Channel,
         write_span: &tracing::Span,
     ) -> KernelResult<Arc<Crc>> {
         let span = tracing::Span::current();
@@ -1621,7 +1746,9 @@ impl Snapshot {
         // tail commits (a held base is always at or above the checkpoint, so a tail exists).
         if let Some(base) = self.base_crc() {
             record_root("stale_crc", ChecksumWriteResolutionMode::Incremental);
-            let crc = log_segment.build_crc_from_base(engine, base)?;
+            let crc = log_segment
+                .build_crc_from_base_with_channel(channel, base)
+                .await?;
             return Ok(Arc::new(crc));
         }
 
@@ -1633,29 +1760,32 @@ impl Snapshot {
                 // there's no tail delta to carry them either, read them from the commit at the
                 // checkpoint version. adaptiveMetadata requires ICT, so one read yields both.
                 let mut crc = log_segment
-                    .build_crc_from_checkpoint(engine)?
+                    .build_crc_from_checkpoint_with_channel(channel)
+                    .await?
                     .ok_or_else(|| unresolved_crc("checkpoint is missing protocol or metadata"))?;
                 #[cfg(feature = "adaptive-metadata-in-dev")]
                 if self
                     .table_configuration()
                     .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
                 {
-                    let (in_commit_timestamp, last_manifest_commit) =
-                        self.read_ict_and_last_manifest_commit(engine)?;
+                    let pair = self.read_ict_and_last_manifest_commit_with_channel(channel);
+                    let (in_commit_timestamp, last_manifest_commit) = pair.await?;
                     crc.in_commit_timestamp_opt = Some(in_commit_timestamp);
                     crc.last_manifest_commit_opt = last_manifest_commit;
                     return Ok(Arc::new(crc));
                 }
-                crc.in_commit_timestamp_opt = self.get_in_commit_timestamp(engine)?;
+                crc.in_commit_timestamp_opt =
+                    self.get_in_commit_timestamp_with_channel(channel).await?;
                 return Ok(Arc::new(crc));
             }
             // Replay the tail commits first: a non-incremental tail dooms file stats no matter
             // what the checkpoint holds, so skip the larger checkpoint read in that case.
-            let delta = log_segment.build_crc_delta_from_base(
-                engine,
+            let delta = log_segment.build_crc_delta_from_base_with_channel(
+                channel,
                 checkpoint_version,
                 Some(FileSizeHistogram::create_default()),
-            )?;
+            );
+            let delta = delta.await?;
             require!(
                 delta.is_incremental_safe,
                 unresolved_crc(&match &delta.unsupported_operation {
@@ -1664,7 +1794,8 @@ impl Snapshot {
                 })
             );
             let base = log_segment
-                .build_crc_from_checkpoint(engine)?
+                .build_crc_from_checkpoint_with_channel(channel)
+                .await?
                 .ok_or_else(|| unresolved_crc("checkpoint is missing protocol or metadata"))?;
             // The tail delta carries v_end's ICT, which `apply` sets on the result.
             return Ok(Arc::new(base.apply(delta, end)));
@@ -1673,7 +1804,8 @@ impl Snapshot {
         // Case 4: neither CRC nor checkpoint, so reverse-replay the full commit history.
         record_root("version_zero", ChecksumWriteResolutionMode::Full);
         let crc = log_segment
-            .build_crc_from_version_zero(engine)?
+            .build_crc_from_version_zero_with_channel(channel)
+            .await?
             .ok_or_else(|| unresolved_crc("commit history is missing protocol or metadata"))?;
         Ok(Arc::new(crc))
     }

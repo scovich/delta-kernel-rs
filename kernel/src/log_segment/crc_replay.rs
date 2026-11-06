@@ -4,9 +4,10 @@
 //! commits `(X, Y]`. Per the incremental equation `Crc[X] + CrcDelta = Crc[Y]`, that
 //! delta is applied to a stale base via [`Crc::apply`].
 //!
-//! The base `Crc[X]` itself can also be built here: [`LogSegment::build_crc_from_checkpoint`]
-//! reads a checkpoint into a Complete CRC, and [`LogSegment::build_crc_from_version_zero`] builds
-//! one from a full reverse replay when there is neither a CRC nor a checkpoint to root at.
+//! The base `Crc[X]` itself can also be built here:
+//! [`LogSegment::build_crc_from_checkpoint_with_channel`] reads a checkpoint into a Complete CRC,
+//! and [`LogSegment::build_crc_from_version_zero`] builds one from a full reverse replay when
+//! there is neither a CRC nor a checkpoint to root at.
 //
 // TODO(#2615): support log compaction files.
 
@@ -170,6 +171,7 @@ impl LogSegment {
     /// Produce a fresh `Crc` at `self.end_version` by reverse-replaying the commits in
     /// `(base_crc.version, self.end_version]` and applying the resulting delta to
     /// `base_crc` via [`Crc::apply`].
+    #[cfg(test)]
     pub(crate) fn build_crc_from_base(
         &self,
         engine: &dyn Engine,
@@ -214,15 +216,6 @@ impl LogSegment {
     /// [`Complete`](DomainMetadataState::Complete) since a checkpoint is authoritative.
     /// `in_commit_timestamp_opt` is left `None`: a checkpoint carries no `commitInfo`, so the
     /// caller sets the ICT on the returned CRC afterward.
-    pub(crate) fn build_crc_from_checkpoint(
-        &self,
-        engine: &dyn Engine,
-    ) -> KernelResult<Option<Crc>> {
-        run_workflow_with_engine!(engine, |channel| {
-            self.build_crc_from_checkpoint_with_channel(channel)
-        })
-    }
-
     pub(crate) async fn build_crc_from_checkpoint_with_channel(
         &self,
         channel: &Channel,
@@ -260,6 +253,7 @@ impl LogSegment {
     ///
     /// Returns `None` if protocol or metadata could not be recovered. File stats degrade to
     /// [`Indeterminate`](FileStatsState::Indeterminate) if the replay is not incremental-safe.
+    #[cfg(test)]
     pub(crate) fn build_crc_from_version_zero(
         &self,
         engine: &dyn Engine,
@@ -300,6 +294,7 @@ impl LogSegment {
     ///
     /// Errors if `base_version >= self.end_version` or if the segment is missing the
     /// commit at `base_version + 1` (i.e. has a gap above `base_version`).
+    #[cfg(test)]
     pub(crate) fn build_crc_delta_from_base(
         &self,
         engine: &dyn Engine,

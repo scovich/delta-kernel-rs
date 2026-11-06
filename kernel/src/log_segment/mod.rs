@@ -1167,7 +1167,7 @@ impl LogSegment {
     /// not read.
     ///
     /// `table_root` resolves the action's manifest locations.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_actions_with_checkpoint_action(
         &self,

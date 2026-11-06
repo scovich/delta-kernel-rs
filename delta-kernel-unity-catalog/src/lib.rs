@@ -11,7 +11,8 @@ use delta_kernel::{KernelError, KernelResult, LogPath, Snapshot};
 use unity_catalog_delta_client_api::{Commit, LoadTableResponse};
 use url::Url;
 pub use utils::{
-    aws_object_store_options, build_uc_create_table_request, get_required_properties_for_disk,
+    aws_object_store_options, build_uc_create_table_request,
+    build_uc_create_table_request_workflow, get_required_properties_for_disk,
 };
 
 /// Convert the inline `Commit`s returned by a UC `load_table` response into
