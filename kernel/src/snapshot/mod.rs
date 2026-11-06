@@ -347,7 +347,7 @@ impl Snapshot {
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    async fn latest_checkpoint_action_with_channel(
+    pub(crate) async fn latest_checkpoint_action_with_channel(
         &self,
         channel: &Channel,
     ) -> KernelResult<Option<Arc<CheckpointAction>>> {
