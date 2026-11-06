@@ -1,13 +1,17 @@
 //! Reads the actions an adaptiveMetadata (AMT) `checkpoint` action spills into sidecar files.
 
-use std::iter;
-
 use super::action_projector::ActionProjector;
+use crate::KernelResult;
 use crate::actions::Sidecar;
+use crate::coroutine::generator::{self, Generator as _, GeneratorExt as _, map_async};
+#[cfg(test)]
+use crate::coroutine::kernel::iterate_prepared_result_coroutine_with_engine;
+use crate::coroutine::kernel::{Channel, ChannelExt as _, KernelResultGenerator};
 use crate::log_replay::ActionsBatch;
 use crate::path::LogRoot;
 use crate::schema::SchemaRef;
-use crate::{Engine, KernelResult, KernelResultIterator};
+#[cfg(test)]
+use crate::{Engine, KernelResultIterator};
 
 /// Reads the `action` rows of `sidecars` as checkpoint batches (`is_log_batch = false`) matching
 /// `read_schema`.
@@ -16,6 +20,37 @@ use crate::{Engine, KernelResult, KernelResultIterator};
 /// a top-level `action` column described by `source_schema`, and whose path is relative to the
 /// `_delta_log/_sidecars/` directory under `log_root` (see [`Sidecar::to_filemeta`]).
 #[cfg_attr(not(test), allow(dead_code))]
+pub(super) async fn read_sidecar_actions_generator(
+    channel: &Channel,
+    log_root: &LogRoot,
+    sidecars: &[Sidecar],
+    action: &str,
+    source_schema: SchemaRef,
+    read_schema: SchemaRef,
+) -> KernelResult<impl KernelResultGenerator<ActionsBatch> + 'static + use<>> {
+    if sidecars.is_empty() {
+        return Ok(generator::empty().into_boxed());
+    }
+    let files = sidecars
+        .iter()
+        .map(|sidecar| sidecar.to_filemeta(log_root.log_root()))
+        .collect::<KernelResult<Vec<_>>>()?;
+    let projector =
+        ActionProjector::try_new_with_channel(channel, action, source_schema.clone(), read_schema)
+            .await?;
+    let batches = channel
+        .prepare_parquet_files(files, source_schema, None)
+        .await?;
+    Ok(map_async!(batches, async move |channel, batch| {
+        Ok(ActionsBatch::new(
+            projector.project_with_channel(channel, batch?).await?,
+            false,
+        ))
+    })
+    .into_boxed())
+}
+
+#[cfg(test)]
 pub(super) fn read_sidecar_actions(
     engine: &dyn Engine,
     log_root: &LogRoot,
@@ -24,23 +59,17 @@ pub(super) fn read_sidecar_actions(
     source_schema: SchemaRef,
     read_schema: SchemaRef,
 ) -> KernelResult<Box<dyn KernelResultIterator<ActionsBatch>>> {
-    if sidecars.is_empty() {
-        return Ok(Box::new(iter::empty()));
-    }
-    let files = sidecars
-        .iter()
-        .map(|sidecar| sidecar.to_filemeta(log_root.log_root()))
-        .collect::<KernelResult<Vec<_>>>()?;
-    let projector = ActionProjector::try_new(engine, action, source_schema.clone(), read_schema)?;
-    let batches = engine
-        .parquet_handler()
-        .read_parquet_files(&files, source_schema, None)?;
-    Ok(Box::new(batches.map(move |batch| {
-        Ok(ActionsBatch::new(
-            projector.project(batch?.as_ref())?,
-            false,
-        ))
-    })))
+    let actions = iterate_prepared_result_coroutine_with_engine!(engine, |channel| {
+        read_sidecar_actions_generator(
+            channel,
+            log_root,
+            sidecars,
+            action,
+            source_schema,
+            read_schema,
+        )
+    });
+    Ok(Box::new(actions?))
 }
 
 #[cfg(test)]
