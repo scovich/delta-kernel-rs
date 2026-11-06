@@ -11,21 +11,25 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 
+use crate::coroutine::generator::{GeneratorExt as _, map_async};
+use crate::coroutine::kernel::{
+    Channel, ChannelExt as _, KernelResultGenerator, iterate_prepared_result_coroutine_with_engine,
+};
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::scan::CHECKPOINT_READ_SCHEMA;
 use crate::schema::SchemaRef;
 use crate::{Engine, EngineData, FileMeta, KernelResult, KernelResultIterator};
 
-/// Creates iterators that process checkpoint leaf files in parallel using a shared processor.
+/// Creates generators that process checkpoint leaf files in parallel using a shared processor.
 ///
-/// Checkpoint leaf files may be partitioned across multiple executors. Each executor creates an
-/// iterator with a subset of files, but all iterators share the same processor to coordinate
+/// Checkpoint leaf files may be partitioned across multiple executors. Each executor creates a
+/// generator with a subset of files, but all generators share the same processor to coordinate
 /// deduplication.
 ///
 /// # Example workflow
 /// - Partition leaf files across N executors
-/// - Create one iterator per executor with its file subset
-/// - Each iterator processes its files independently while sharing deduplication state
+/// - Create one generator per executor with its file subset
+/// - Each generator processes its files independently while sharing deduplication state
 /// cbindgen:ignore
 #[internal_api]
 pub(crate) struct ParallelPhase;
@@ -47,12 +51,28 @@ impl ParallelPhase {
         read_schema: SchemaRef,
     ) -> KernelResult<impl KernelResultIterator<P::Output>>
     where
-        P: ParallelLogReplayProcessor + Send,
+        P: ParallelLogReplayProcessor + Send + Sync + 'static,
+        P::Output: Send + 'static,
     {
-        let batches =
-            engine
-                .parquet_handler()
-                .read_parquet_files(&leaf_files, read_schema, None)?;
+        iterate_prepared_result_coroutine_with_engine!(engine.as_ref(), |channel| {
+            Self::try_new_with_channel(channel, processor, leaf_files, read_schema)
+        })
+    }
+
+    /// Prepares the Parquet read of `leaf_files`, yielding each batch processed by `processor`.
+    pub(crate) async fn try_new_with_channel<P>(
+        channel: &Channel,
+        processor: P,
+        leaf_files: Vec<FileMeta>,
+        read_schema: SchemaRef,
+    ) -> KernelResult<impl KernelResultGenerator<P::Output> + 'static + use<P>>
+    where
+        P: ParallelLogReplayProcessor + Send + Sync + 'static,
+        P::Output: Send + 'static,
+    {
+        let batches = channel
+            .prepare_parquet_files(leaf_files, read_schema, None)
+            .await?;
         Ok(Self::process_batches(processor, batches))
     }
 
@@ -62,14 +82,17 @@ impl ParallelPhase {
     /// finer-grained parallelism. Shared processors coordinate deduplication across partitions.
     pub(crate) fn process_batches<P>(
         processor: P,
-        batches: impl KernelResultIterator<Box<dyn EngineData>>,
-    ) -> impl KernelResultIterator<P::Output>
+        batches: impl KernelResultGenerator<Box<dyn EngineData>> + 'static,
+    ) -> impl KernelResultGenerator<P::Output> + 'static
     where
-        P: ParallelLogReplayProcessor + Send,
+        P: ParallelLogReplayProcessor + Send + Sync + 'static,
+        P::Output: Send + 'static,
     {
-        batches.map(move |batch| {
+        map_async!(batches, async move |channel, batch| {
             let batch = ActionsBatch::new(batch?, false);
-            processor.process_actions_batch_parallel(batch)
+            processor
+                .process_actions_batch_parallel(channel, batch)
+                .await
         })
     }
 

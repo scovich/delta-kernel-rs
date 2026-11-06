@@ -119,7 +119,6 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
     }
 
     /// Prepares `predicate` for repeated evaluation.
-    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
     fn create_predicate_evaluator(
         &self,
         input_schema: SchemaRef,
@@ -140,7 +139,6 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
     }
 
     /// Evaluates a prepared predicate against `input`.
-    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
     fn evaluate_predicate(
         &self,
         evaluator: &PredicateEvaluatorHandle,

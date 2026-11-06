@@ -15,6 +15,7 @@ use std::pin::Pin;
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 
+use crate::coroutine::AsyncResult as _;
 use crate::coroutine::generator::{BoundGenerator, GeneratorStep, generator_fn};
 use crate::coroutine::kernel::{Channel, ChannelExt as _, KernelResultGenerator};
 use crate::log_reader::checkpoint_manifest::CheckpointManifestReader;
@@ -148,7 +149,7 @@ impl SequentialPhase {
         Ok(generator_fn!(async move |channel| {
             let mut state = state.bind(&channel);
             // Drain manually: `finish` needs the state after its actions are exhausted.
-            while let Some(item) = state.advance().await? {
+            while let Some(item) = state.advance(&channel).await? {
                 channel.yield_item(item).await?;
             }
             Ok(state.finish())
@@ -262,13 +263,18 @@ where
     M: BoundGenerator<Item = KernelResult<ActionsBatch>, Output = KernelResult<Vec<FileMeta>>>
         + Unpin,
 {
-    async fn advance(&mut self) -> KernelResult<Option<KernelResult<ScanMetadata>>> {
+    async fn advance(
+        &mut self,
+        channel: &Channel,
+    ) -> KernelResult<Option<KernelResult<ScanMetadata>>> {
         let Some(batch) = self.next_action().await? else {
             return Ok(None);
         };
-        Ok(Some(batch.and_then(|batch| {
-            self.processor.process_actions_batch_sequential(batch)
-        })))
+        let metadata = batch.and_then_async(|batch| {
+            self.processor
+                .process_actions_batch_sequential_with_channel(channel, batch)
+        });
+        Ok(Some(metadata.await))
     }
 }
 

@@ -34,8 +34,9 @@ use tracing::{Instrument as _, Span, error};
 
 #[cfg_attr(not(feature = "internal-api"), expect(unused_imports))]
 pub use self::adapters::{
-    AsyncIntoIterator, Enumerate, FilterMap, FilterOk, Flatten, Iter, Map, MapAsync,
-    MapAsyncWitness, MapOk, Peekable, Unfold, empty, map_async_witness, unfold,
+    AsyncIntoIterator, Enumerate, FilterMap, FilterOk, Flatten, FlattenBy, FlattenIdent,
+    FlattenResult, Iter, Map, MapAsync, MapAsyncWitness, MapOk, OnComplete, Peekable, Unfold,
+    empty, map_async_witness, unfold,
 };
 pub(crate) use self::adapters::{unfold_mut_with, unfold_mut_witness};
 use super::witness::invoke_witness;
@@ -67,6 +68,14 @@ pub trait GeneratorExt {
         FilterMap::new(self, Map::new(map))
     }
 
+    /// Invokes `on_complete` after successful generator completion.
+    fn on_complete<F>(self, on_complete: F) -> OnComplete<Self, F>
+    where
+        Self: Sized,
+    {
+        OnComplete::new(self, on_complete)
+    }
+
     /// Counterpart of [`itertools::Itertools::map_ok`]: transforms each successful yielded item.
     fn map_ok<F>(self, map: F) -> FilterMap<Self, MapOk<F>>
     where
@@ -95,6 +104,22 @@ pub trait GeneratorExt {
         W: for<'a> MapAsyncWitness<'a, P, F, Self::Item, U>,
     {
         MapAsync::new(self, mapper, witness)
+    }
+
+    /// Flattens inner generators, preserving this generator's completion value.
+    fn flatten_async<I, T>(self) -> FlattenBy<Self, FlattenIdent<I, T>>
+    where
+        Self: Sized,
+    {
+        FlattenBy::new(self)
+    }
+
+    /// Counterpart of `itertools::Itertools::flatten_ok`: flattens successful inner generators.
+    fn flatten_ok<I, T>(self) -> FlattenBy<Self, FlattenResult<I, T>>
+    where
+        Self: Sized,
+    {
+        FlattenBy::new(self)
     }
 
     /// Counterpart of [`Iterator::flatten`]: yields the elements of each collection-valued item.
@@ -564,7 +589,6 @@ impl<'a, P: Send + 'static, Y: Send> GeneratorChannel<'a, P, Y> {
 
     /// Forward every item from `generator` and return its completion.
     #[internal_api]
-    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
     pub(crate) async fn yield_from<G, O: Send + 'static>(&self, mut generator: G) -> KernelResult<O>
     where
         G: BoundGenerator<Item = Y, Output = O> + Unpin,
