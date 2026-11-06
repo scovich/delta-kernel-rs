@@ -90,6 +90,17 @@ impl LogSegment {
         base: Option<&Arc<Crc>>,
         incremental_replay: IncrementalReplay,
     ) -> KernelResult<Option<(Arc<Crc>, ProtocolMetadataSource)>> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.try_build_crc_within_budget_with_channel(channel, base, incremental_replay)
+        })
+    }
+
+    pub(crate) async fn try_build_crc_within_budget_with_channel(
+        &self,
+        channel: &Channel,
+        base: Option<&Arc<Crc>>,
+        incremental_replay: IncrementalReplay,
+    ) -> KernelResult<Option<(Arc<Crc>, ProtocolMetadataSource)>> {
         let Some(base) = base else {
             return Ok(None);
         };
@@ -99,7 +110,7 @@ impl LogSegment {
         if !incremental_replay.should_advance(base.version, self.end_version)? {
             return Ok(None);
         }
-        let advanced = self.build_crc_from_base(engine, base)?;
+        let advanced = self.build_crc_from_base_with_channel(channel, base).await?;
         Ok(Some((
             Arc::new(advanced),
             ProtocolMetadataSource::CrcAdvancedByReplay,
@@ -159,15 +170,25 @@ impl LogSegment {
     /// Produce a fresh `Crc` at `self.end_version` by reverse-replaying the commits in
     /// `(base_crc.version, self.end_version]` and applying the resulting delta to
     /// `base_crc` via [`Crc::apply`].
+    pub(crate) fn build_crc_from_base(
+        &self,
+        engine: &dyn Engine,
+        base_crc: &Crc,
+    ) -> KernelResult<Crc> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.build_crc_from_base_with_channel(channel, base_crc)
+        })
+    }
+
     #[instrument(
         name = "log_seg.build_crc_from_base",
         skip_all,
         fields(enable_call_frame),
         err
     )]
-    pub(crate) fn build_crc_from_base(
+    pub(crate) async fn build_crc_from_base_with_channel(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         base_crc: &Crc,
     ) -> KernelResult<Crc> {
         let seed_histogram = base_crc
@@ -177,7 +198,9 @@ impl LogSegment {
                 FileSizeHistogram::create_empty_with_boundaries(h.sorted_bin_boundaries().to_vec())
             })
             .transpose()?;
-        let delta = self.build_crc_delta_from_base(engine, base_crc.version, seed_histogram)?;
+        let delta = self
+            .build_crc_delta_from_base_with_channel(channel, base_crc.version, seed_histogram)
+            .await?;
         Ok(base_crc.clone().apply(delta, self.end_version))
     }
 
