@@ -25,14 +25,10 @@ use crate::checkpoint::collation_stats::{
     build_collation_stats_read_transform, source_collation_stats,
 };
 use crate::committer::CatalogCommit;
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::coroutine::generator::BoundGenerator;
-use crate::coroutine::generator::GeneratorExt as _;
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::generator::{BoundGenerator, Generator as _, GeneratorExt as _};
 use crate::coroutine::kernel::{
     Channel, ChannelExt as _, KernelResultGenerator, iterate_prepared_result_coroutine_with_engine,
-    run_workflow_with_storage,
+    run_workflow_with_engine, run_workflow_with_storage,
 };
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
@@ -1306,6 +1302,15 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<(Option<SchemaRef>, Vec<FileMeta>)> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.get_file_actions_schema_and_sidecars_with_channel(channel)
+        })
+    }
+
+    async fn get_file_actions_schema_and_sidecars_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<(Option<SchemaRef>, Vec<FileMeta>)> {
         // Hint schema from `_last_checkpoint` avoids footer reads when available.
         let hint_schema = self.checkpoint_hint_schema();
 
@@ -1318,22 +1323,36 @@ impl LogSegment {
         match &checkpoint.file_type {
             MultiPartCheckpoint { .. } => {
                 // Multi-part checkpoints are always V1 and never have sidecars.
-                let schema =
-                    Self::read_checkpoint_schema(engine, checkpoint, hint_schema.as_ref())?;
+                let schema = Self::read_checkpoint_schema_with_channel(
+                    channel,
+                    checkpoint,
+                    hint_schema.as_ref(),
+                );
+                let schema = schema.await?;
                 Ok((Some(schema), vec![]))
             }
             UuidCheckpoint if checkpoint.extension.as_str() == "json" => {
                 // JSON checkpoint is always V2. No checkpoint schema is available since JSON
                 // checkpoints don't have a parquet footer to read.
-                self.read_sidecar_schema_and_files(engine, checkpoint, None)
+                self.read_sidecar_schema_and_files_with_channel(channel, checkpoint, None)
+                    .await
             }
             ClassicCheckpoint | UuidCheckpoint if checkpoint.extension.as_str() == "parquet" => {
                 // Parquet checkpoint (classic-named or UUID-named): either can be V1 or V2.
                 // Check for sidecar column to distinguish.
-                let checkpoint_schema =
-                    Self::read_checkpoint_schema(engine, checkpoint, hint_schema.as_ref())?;
+                let checkpoint_schema = Self::read_checkpoint_schema_with_channel(
+                    channel,
+                    checkpoint,
+                    hint_schema.as_ref(),
+                );
+                let checkpoint_schema = checkpoint_schema.await?;
                 if checkpoint_schema.field(SIDECAR_NAME).is_some() {
-                    self.read_sidecar_schema_and_files(engine, checkpoint, Some(&checkpoint_schema))
+                    self.read_sidecar_schema_and_files_with_channel(
+                        channel,
+                        checkpoint,
+                        Some(&checkpoint_schema),
+                    )
+                    .await
                 } else {
                     Ok((Some(checkpoint_schema), vec![]))
                 }
@@ -1342,36 +1361,41 @@ impl LogSegment {
         }
     }
 
-    /// Reads a parquet footer schema through the engine.
-    fn read_footer_schema(engine: &dyn Engine, file: &FileMeta) -> KernelResult<SchemaRef> {
-        Ok(engine.parquet_handler().read_parquet_footer(file)?.schema)
+    /// Reads a parquet footer schema.
+    async fn read_footer_schema_with_channel(
+        channel: &Channel,
+        file: &FileMeta,
+    ) -> KernelResult<SchemaRef> {
+        Ok(channel.read_parquet_footer(file).await?.schema)
     }
 
     /// Returns the checkpoint's parquet schema, using the hint from `_last_checkpoint` if
     /// available or reading the parquet footer otherwise.
-    fn read_checkpoint_schema(
-        engine: &dyn Engine,
+    async fn read_checkpoint_schema_with_channel(
+        channel: &Channel,
         checkpoint: &ParsedLogPath<FileMeta>,
         hint_schema: Option<&SchemaRef>,
     ) -> KernelResult<SchemaRef> {
         match hint_schema {
             Some(schema) => Ok(schema.clone()),
-            None => Self::read_footer_schema(engine, &checkpoint.location),
+            None => Self::read_footer_schema_with_channel(channel, &checkpoint.location).await,
         }
     }
 
     /// Extracts sidecar file references and reads the file actions schema from the first
     /// sidecar's parquet footer. If no sidecars exist, falls back to `checkpoint_schema`
     /// since V2 checkpoints may store add actions directly in the main file.
-    fn read_sidecar_schema_and_files(
+    async fn read_sidecar_schema_and_files_with_channel(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         checkpoint: &ParsedLogPath<FileMeta>,
         checkpoint_schema: Option<&SchemaRef>,
     ) -> KernelResult<(Option<SchemaRef>, Vec<FileMeta>)> {
-        let sidecar_files = self.extract_sidecar_refs(engine, checkpoint)?;
+        let sidecar_files = self
+            .extract_sidecar_refs_with_channel(channel, checkpoint)
+            .await?;
         let file_actions_schema = match sidecar_files.first() {
-            Some(first) => Some(Self::read_footer_schema(engine, first)?),
+            Some(first) => Some(Self::read_footer_schema_with_channel(channel, first).await?),
             None => checkpoint_schema.cloned(),
         };
         Ok((file_actions_schema, sidecar_files))
@@ -1529,29 +1553,36 @@ impl LogSegment {
     }
 
     /// Extracts sidecar file references from a checkpoint file.
-    fn extract_sidecar_refs(
+    async fn extract_sidecar_refs_with_channel(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         checkpoint: &ParsedLogPath,
     ) -> KernelResult<Vec<FileMeta>> {
         // Read checkpoint with just the sidecar column
-        let batches = match checkpoint.extension.as_str() {
-            "json" => engine.json_handler().read_json_files(
-                std::slice::from_ref(&checkpoint.location),
-                Self::sidecar_read_schema(),
-                None,
-            )?,
-            "parquet" => engine.parquet_handler().read_parquet_files(
-                std::slice::from_ref(&checkpoint.location),
-                Self::sidecar_read_schema(),
-                None,
-            )?,
+        let mut batches = match checkpoint.extension.as_str() {
+            "json" => channel
+                .prepare_json_files(
+                    std::slice::from_ref(&checkpoint.location),
+                    Self::sidecar_read_schema(),
+                    None,
+                )
+                .await?
+                .into_boxed(),
+            "parquet" => channel
+                .prepare_parquet_files(
+                    std::slice::from_ref(&checkpoint.location),
+                    Self::sidecar_read_schema(),
+                    None,
+                )
+                .await?
+                .into_boxed(),
             _ => return Ok(vec![]),
-        };
+        }
+        .bind(channel);
 
         // Extract sidecar file references
         let mut visitor = SidecarVisitor::default();
-        for batch_result in batches {
+        while let Some(batch_result) = batches.next().await? {
             let batch = batch_result?;
             visitor.visit_rows_of(batch.as_ref())?;
         }
