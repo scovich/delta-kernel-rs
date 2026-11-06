@@ -26,11 +26,15 @@ use crate::checkpoint::collation_stats::{
 };
 use crate::committer::CatalogCommit;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::content_tree::read_checkpoint_action;
-use crate::coroutine::generator::{BoundGenerator, Generator as _, GeneratorExt as _};
+use crate::content_tree::read_checkpoint_action_generator;
+use crate::coroutine::AsyncOption as _;
+use crate::coroutine::generator::{self, BoundGenerator, Generator, GeneratorExt as _, map_async};
+use crate::coroutine::kernel::engine::EngineConnector;
+#[cfg(test)]
+use crate::coroutine::kernel::run_workflow_with_engine;
 use crate::coroutine::kernel::{
-    Channel, ChannelExt as _, KernelResultGenerator, iterate_prepared_result_coroutine_with_engine,
-    run_workflow_with_engine, run_workflow_with_storage,
+    Channel, ChannelExt as _, KernelResultGenerator, Request,
+    iterate_prepared_result_coroutine_with_engine, run_workflow_with_storage, workflow,
 };
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
@@ -132,6 +136,13 @@ pub(crate) struct ActionsWithCheckpointInfo<A> {
     #[allow(unused)]
     pub checkpoint_info: CheckpointReadInfo,
 }
+
+/// Type-erased generator of action batches. The generator forms of
+/// [`LogSegment::read_actions_with_projected_checkpoint_actions`] and
+/// [`LogSegment::read_actions_with_checkpoint_action`] return it, as their Engine forms return
+/// `Box<dyn KernelResultIterator>`, so that a caller can choose between them.
+type ActionBatchGenerator =
+    Box<dyn Generator<Request, Item = KernelResult<ActionsBatch>, Output = ()>>;
 
 /// A [`LogSegment`] represents a contiguous section of the log and is made of checkpoint files
 /// and commit files and guarantees the following:
@@ -1081,6 +1092,7 @@ impl LogSegment {
     /// Otherwise projection-based pruning is disabled. Readers may ignore the resulting predicate,
     /// and downstream log replay must tolerate rows that do not satisfy it.
     #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_actions_with_projected_checkpoint_actions(
         &self,
@@ -1091,6 +1103,37 @@ impl LogSegment {
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
     ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
+        let connector = EngineConnector::new(engine);
+        let workflow = workflow!(|channel| {
+            self.read_actions_with_projected_checkpoint_actions_with_channel(
+                channel,
+                commit_read_schema,
+                checkpoint_read_schema,
+                meta_predicate,
+                stats_schema,
+                partition_schema,
+            )
+        });
+        let (actions, checkpoint_info) = connector
+            .iterate_prepared_result_coroutine_with_companion(workflow, |result| {
+                (result.actions, result.checkpoint_info)
+            })?;
+        Ok(ActionsWithCheckpointInfo {
+            actions: Box::new(actions),
+            checkpoint_info,
+        })
+    }
+
+    /// Generates projected commit and checkpoint actions with eagerly prepared checkpoint info.
+    pub(crate) async fn read_actions_with_projected_checkpoint_actions_with_channel(
+        &self,
+        channel: &Channel,
+        commit_read_schema: SchemaRef,
+        checkpoint_read_schema: SchemaRef,
+        meta_predicate: Option<PredicateRef>,
+        stats_schema: Option<&StructType>,
+        partition_schema: Option<&StructType>,
+    ) -> KernelResult<ActionsWithCheckpointInfo<ActionBatchGenerator>> {
         // Combine the action-presence predicate with the caller's skipping predicate so readers
         // can omit checkpoint data that cannot contain a relevant action.
         let projection_predicate = checkpoint_action_projection_predicate(&checkpoint_read_schema);
@@ -1099,18 +1142,21 @@ impl LogSegment {
 
         // `replay` expects commit files to be sorted in descending order, so the return value here
         // is correct
-        let commit_stream = self.read_commit_actions(engine, commit_read_schema)?;
+        let commit_stream = self
+            .read_commit_actions_generator(channel, commit_read_schema)
+            .await?;
 
-        let checkpoint_result = self.create_checkpoint_stream(
-            engine,
+        let checkpoint_result = self.create_checkpoint_stream_with_channel(
+            channel,
             checkpoint_read_schema,
             checkpoint_predicate,
             stats_schema,
             partition_schema,
-        )?;
+        );
+        let checkpoint_result = checkpoint_result.await?;
 
         Ok(ActionsWithCheckpointInfo {
-            actions: Box::new(commit_stream.chain(checkpoint_result.actions)),
+            actions: commit_stream.chain(checkpoint_result.actions).into_boxed(),
             checkpoint_info: checkpoint_result.checkpoint_info,
         })
     }
@@ -1132,6 +1178,40 @@ impl LogSegment {
         checkpoint_read_schema: SchemaRef,
         stats_schema: Option<&StructType>,
     ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
+        let connector = EngineConnector::new(engine);
+        let workflow = workflow!(|channel| {
+            self.read_actions_with_checkpoint_action_with_channel(
+                channel,
+                checkpoint,
+                table_root,
+                commit_read_schema,
+                checkpoint_read_schema,
+                stats_schema,
+            )
+        });
+        let (actions, checkpoint_info) = connector
+            .iterate_prepared_result_coroutine_with_companion(workflow, |result| {
+                (result.actions, result.checkpoint_info)
+            })?;
+        Ok(ActionsWithCheckpointInfo {
+            actions: Box::new(actions),
+            checkpoint_info,
+        })
+    }
+
+    /// Generates the commits after the AMT `checkpoint` action's version, followed by the actions
+    /// it carries, with eagerly prepared checkpoint info.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn read_actions_with_checkpoint_action_with_channel(
+        &self,
+        channel: &Channel,
+        checkpoint: &CheckpointAction,
+        table_root: &Url,
+        commit_read_schema: SchemaRef,
+        checkpoint_read_schema: SchemaRef,
+        stats_schema: Option<&StructType>,
+    ) -> KernelResult<ActionsWithCheckpointInfo<ActionBatchGenerator>> {
         let version = Version::try_from(checkpoint.version())
             .ok()
             .filter(|v| *v <= self.end_version)
@@ -1161,11 +1241,12 @@ impl LogSegment {
             )));
         }
 
-        let commits = Self::read_commit_files(
-            engine,
+        let commits = Self::read_commit_files_with_channel(
+            channel,
             &self.find_commit_cover_after(Some(version)),
             commit_read_schema,
-        )?;
+        )
+        .await?;
         let stats_fallback =
             needs_json_stats_fallback(&checkpoint_read_schema, stats_schema, false)
                 .then(|| StructField::nullable("stats", DataType::STRING));
@@ -1174,14 +1255,15 @@ impl LogSegment {
             stats_fallback.into_iter().collect(),
             false,
         )?;
-        let checkpoint_actions = read_checkpoint_action(
-            engine,
+        let checkpoint_actions = read_checkpoint_action_generator(
+            channel,
             checkpoint,
             &LogRoot::new(table_root.clone())?,
             checkpoint_read_schema.clone(),
-        )?;
+        )
+        .await?;
         Ok(ActionsWithCheckpointInfo {
-            actions: Box::new(commits.chain(checkpoint_actions)),
+            actions: commits.chain(checkpoint_actions).into_boxed(),
             // TODO(#2866): the content tree reader produces neither `stats_parsed` nor
             // `partitionValues_parsed`, so replay parses the JSON stats.
             checkpoint_info: CheckpointReadInfo {
@@ -1201,14 +1283,26 @@ impl LogSegment {
         engine: &dyn Engine,
         action_schema: SchemaRef,
     ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
-        let result = self.read_actions_with_projected_checkpoint_actions(
-            engine,
+        iterate_prepared_result_coroutine_with_engine!(engine, |channel| {
+            self.read_actions_generator(channel, action_schema)
+        })
+    }
+
+    /// Generates this segment's action batches using one schema for checkpoints and commits.
+    pub(crate) async fn read_actions_generator(
+        &self,
+        channel: &Channel,
+        action_schema: SchemaRef,
+    ) -> KernelResult<impl KernelResultGenerator<ActionsBatch> + 'static + use<>> {
+        let result = self.read_actions_with_projected_checkpoint_actions_with_channel(
+            channel,
             action_schema.clone(),
             action_schema,
             None,
             None,
             None,
-        )?;
+        );
+        let result = result.await?;
         Ok(result.actions)
     }
 
@@ -1268,6 +1362,7 @@ impl LogSegment {
     /// Files are returned in descending version order, as log replay expects. Only the commit
     /// cover is read; checkpoints and sidecars are not consulted.
     #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
     pub(crate) fn read_commit_actions(
         &self,
         engine: &dyn Engine,
@@ -1375,18 +1470,6 @@ impl LogSegment {
     }
 
     /// Reads `commit_files` as log batches (`is_log_batch = true`), in the order given.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn read_commit_files(
-        engine: &dyn Engine,
-        commit_files: &[FileMeta],
-        schema: SchemaRef,
-    ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
-        iterate_prepared_result_coroutine_with_engine!(engine, |channel| {
-            Self::read_commit_files_with_channel(channel, commit_files, schema)
-        })
-    }
-
-    /// Reads `commit_files` as log batches (`is_log_batch = true`), in the order given.
     async fn read_commit_files_with_channel(
         channel: &Channel,
         commit_files: &[FileMeta],
@@ -1485,6 +1568,7 @@ impl LogSegment {
     ///   footer, then check for sidecar column to distinguish
     ///   - Has sidecar column (V2): extract sidecars, read first sidecar's schema
     ///   - No sidecar column (V1): use checkpoint schema directly
+    #[cfg(test)]
     fn get_file_actions_schema_and_sidecars(
         &self,
         engine: &dyn Engine,
@@ -1596,6 +1680,7 @@ impl LogSegment {
     /// 3. Reads checkpoint and sidecar data using cached sidecar refs
     ///
     /// Returns a tuple of the actions iterator and [`CheckpointReadInfo`].
+    #[cfg(test)]
     fn create_checkpoint_stream(
         &self,
         engine: &dyn Engine,
@@ -1605,10 +1690,41 @@ impl LogSegment {
         partition_schema: Option<&StructType>,
     ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch> + use<>>>
     {
+        let connector = EngineConnector::new(engine);
+        let workflow = workflow!(|channel| {
+            self.create_checkpoint_stream_with_channel(
+                channel,
+                action_schema,
+                meta_predicate,
+                stats_schema,
+                partition_schema,
+            )
+        });
+        let (actions, checkpoint_info) = connector
+            .iterate_prepared_result_coroutine_with_companion(workflow, |result| {
+                (result.actions, result.checkpoint_info)
+            })?;
+        Ok(ActionsWithCheckpointInfo {
+            actions,
+            checkpoint_info,
+        })
+    }
+
+    async fn create_checkpoint_stream_with_channel(
+        &self,
+        channel: &Channel,
+        action_schema: SchemaRef,
+        meta_predicate: Option<PredicateRef>,
+        stats_schema: Option<&StructType>,
+        partition_schema: Option<&StructType>,
+    ) -> KernelResult<
+        ActionsWithCheckpointInfo<impl KernelResultGenerator<ActionsBatch> + 'static + use<>>,
+    > {
         let need_file_actions = schema_contains_file_actions(&action_schema);
 
         let (file_actions_schema, sidecar_files) = if need_file_actions {
-            self.get_file_actions_schema_and_sidecars(engine)?
+            self.get_file_actions_schema_and_sidecars_with_channel(channel)
+                .await?
         } else {
             (None, vec![])
         };
@@ -1660,13 +1776,14 @@ impl LogSegment {
             });
         let evaluator = read_transform
             .as_ref()
-            .map(|read_transform| {
-                engine.evaluation_handler().new_expression_evaluator(
+            .map_async(|read_transform| {
+                channel.create_expression_evaluator(
                     read_transform.read_schema.clone(),
                     read_transform.expression.clone(),
                     read_transform.output_schema.as_ref().clone().into(),
                 )
             })
+            .await
             .transpose()?;
 
         // Historically, we had a shared file reader trait for JSON and Parquet handlers,
@@ -1674,20 +1791,22 @@ impl LogSegment {
         // where it *could* have been useful, but for now, we're keeping them separate.
         // If similar patterns start appearing elsewhere, we should reconsider that decision.
         let actions = match self.listed.checkpoint_parts.first() {
-            Some(parsed_log_path) if parsed_log_path.extension == "json" => {
-                engine.json_handler().read_json_files(
-                    &checkpoint_file_meta,
+            Some(parsed_log_path) if parsed_log_path.extension == "json" => channel
+                .prepare_json_files(
+                    checkpoint_file_meta,
                     read_schema.clone(),
                     meta_predicate.clone(),
-                )?
-            }
-            Some(parsed_log_path) if parsed_log_path.extension == "parquet" => {
-                engine.parquet_handler().read_parquet_files(
-                    &checkpoint_file_meta,
+                )
+                .await?
+                .into_boxed(),
+            Some(parsed_log_path) if parsed_log_path.extension == "parquet" => channel
+                .prepare_parquet_files(
+                    checkpoint_file_meta,
                     read_schema.clone(),
                     meta_predicate.clone(),
-                )?
-            }
+                )
+                .await?
+                .into_boxed(),
             Some(parsed_log_path) => {
                 return Err(KernelError::invalid_checkpoint(format!(
                     "Unsupported checkpoint file type: {}",
@@ -1695,8 +1814,8 @@ impl LogSegment {
                 )));
             }
             // This is the case when there are no checkpoints in the log segment
-            // so we return an empty iterator
-            None => Box::new(std::iter::empty()),
+            // so we return an empty generator
+            None => generator::empty().into_boxed(),
         };
 
         // Read sidecars with the same schema as checkpoint (including stats_parsed if available).
@@ -1704,22 +1823,22 @@ impl LogSegment {
         // Both checkpoint and sidecar parquet files share the same `add.stats_parsed.*` column
         // layout, so we reuse the same predicate for row group skipping.
         let sidecar_batches = if !sidecar_files.is_empty() {
-            engine.parquet_handler().read_parquet_files(
-                &sidecar_files,
-                read_schema.clone(),
-                meta_predicate,
-            )?
+            channel
+                .prepare_parquet_files(sidecar_files, read_schema.clone(), meta_predicate)
+                .await?
+                .into_boxed()
         } else {
-            Box::new(std::iter::empty())
+            generator::empty().into_boxed()
         };
 
         // Chain checkpoint batches with sidecar batches.
         // The boolean flag indicates whether the batch originated from a commit file
         // (true) or a checkpoint file (false).
-        let actions_iter = actions.chain(sidecar_batches).map(move |batch| {
+        let actions_iter = actions.chain(sidecar_batches);
+        let actions_iter = map_async!(actions_iter, async move |channel, batch| {
             let batch = batch?;
             let batch = match &evaluator {
-                Some(evaluator) => evaluator.evaluate(batch.as_ref())?,
+                Some(evaluator) => channel.evaluate_expression(evaluator, batch).await?,
                 None => batch,
             };
             Ok(ActionsBatch::new(batch, false))

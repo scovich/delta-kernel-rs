@@ -93,7 +93,6 @@ impl EngineConnector {
 
     /// Prepare a fallible result coroutine and split its result with `into_parts` into a generator
     /// and a companion value; return an iterator that drives the generator, plus the companion.
-    #[cfg(test)]
     pub(crate) fn iterate_prepared_result_coroutine_with_companion<'a, R, G, Item, Companion>(
         self,
         workflow: Workflow<'_, R>,

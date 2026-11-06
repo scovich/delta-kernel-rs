@@ -809,7 +809,6 @@ impl<G: BoundGenerator + Unpin> BoundGenerator for Peekable<G> {
 }
 
 /// Counterpart of [`std::iter::empty`]: a generator that yields nothing.
-#[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
 pub fn empty<Y: Send>() -> Iter<std::iter::Empty<Y>> {
     Iter(std::iter::empty())
 }

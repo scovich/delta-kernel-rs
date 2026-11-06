@@ -28,7 +28,7 @@ use crate::actions::{
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{LAST_MANIFEST_COMMIT_FIELD, LastManifestCommit};
 use crate::coroutine::AsyncOption as _;
-use crate::coroutine::generator::BoundGenerator as _;
+use crate::coroutine::generator::{BoundGenerator as _, Generator as _};
 use crate::coroutine::kernel::{Channel, ChannelExt as _, run_workflow_with_engine};
 use crate::crc::{
     Crc, CrcDelta, FileSizeHistogram, FileStatsDelta, FileStatsPolicy,
@@ -218,6 +218,15 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<Crc>> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.build_crc_from_checkpoint_with_channel(channel)
+        })
+    }
+
+    pub(crate) async fn build_crc_from_checkpoint_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<Option<Crc>> {
         let Some(version) = self.checkpoint_version else {
             return Ok(None);
         };
@@ -225,10 +234,18 @@ impl LogSegment {
         // Invalid Add sizes mark replay unsafe and degrade its file stats to `Indeterminate`.
         let mut acc = CrcReplayAccumulator::new(Some(FileSizeHistogram::create_default()));
         // Read only the checkpoint parquet plus any V2 sidecars via `create_checkpoint_stream`.
-        let batches = self
-            .create_checkpoint_stream(engine, CHECKPOINT_CRC_SCHEMA.clone(), None, None, None)?
-            .actions;
-        for batch in batches {
+        let mut batches = self
+            .create_checkpoint_stream_with_channel(
+                channel,
+                CHECKPOINT_CRC_SCHEMA.clone(),
+                None,
+                None,
+                None,
+            )
+            .await?
+            .actions
+            .bind(channel);
+        while let Some(batch) = batches.next().await? {
             let batch = batch?;
             let mut visitor = CheckpointCrcVisitor { acc: &mut acc };
             visitor.visit_rows_of(batch.actions())?;

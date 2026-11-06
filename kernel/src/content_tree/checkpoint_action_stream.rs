@@ -13,16 +13,17 @@ use crate::actions::{
 use crate::coroutine::generator::{
     self, AsyncIntoIterator as _, Generator, GeneratorExt as _, map_async,
 };
-use crate::coroutine::kernel::{
-    Channel, ChannelExt as _, KernelResultGenerator, Request,
-    iterate_prepared_result_coroutine_with_engine,
-};
+#[cfg(test)]
+use crate::coroutine::kernel::iterate_prepared_result_coroutine_with_engine;
+use crate::coroutine::kernel::{Channel, ChannelExt as _, KernelResultGenerator, Request};
 use crate::expressions::Scalar;
 use crate::log_replay::ActionsBatch;
 use crate::path::LogRoot;
 use crate::schema::SchemaRef;
 use crate::utils::require;
-use crate::{Engine, KernelError, KernelResult, KernelResultIterator};
+#[cfg(test)]
+use crate::{Engine, KernelResultIterator};
+use crate::{KernelError, KernelResult};
 
 /// The action kinds a read schema may ask a checkpoint action for.
 const CHECKPOINT_ACTION_KINDS: &[&str] = &[
@@ -47,6 +48,7 @@ type ActionBatchGenerator =
 /// `add` rows come from the action's content tree, `protocol` and `metaData` rows from the action
 /// itself, and `txn` and `domainMetadata` rows from the action and its sidecars of that kind. A
 /// checkpoint holds reconciled state, so `remove` rows are never produced.
+#[cfg(test)]
 pub(crate) fn read_checkpoint_action(
     engine: &dyn Engine,
     checkpoint: &CheckpointAction,
