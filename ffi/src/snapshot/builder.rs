@@ -2,8 +2,9 @@
 
 use std::sync::Arc;
 
+use delta_kernel::coroutine::kernel::StaticWorkflow;
 use delta_kernel::snapshot::{IncrementalReplay, Snapshot, SnapshotHint, SnapshotRef};
-use delta_kernel::{Engine, KernelResult, LogPath, Version};
+use delta_kernel::{KernelResult, LogPath, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use url::Url;
 
@@ -11,7 +12,7 @@ use super::hint;
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::{
-    ExternEngine, KernelStringSlice, SharedExternEngine, SharedSnapshot, log_path,
+    ExternEngine, KernelStringSlice, SharedExternEngine, SharedSnapshot, drive_kernel, log_path,
     unwrap_and_parse_path_as_url,
 };
 
@@ -263,6 +264,14 @@ unsafe fn snapshot_builder_with_log_tail_impl(
 fn snapshot_builder_build_impl(
     builder: FfiSnapshotBuilder,
 ) -> KernelResult<Handle<SharedSnapshot>> {
+    let (engine, workflow) = snapshot_builder_build_workflow(builder)?;
+    let snapshot = drive_kernel(engine.as_ref(), workflow)?;
+    Ok(snapshot.into())
+}
+
+fn snapshot_builder_build_workflow(
+    builder: FfiSnapshotBuilder,
+) -> KernelResult<(Arc<dyn ExternEngine>, StaticWorkflow<SnapshotRef>)> {
     let FfiSnapshotBuilder {
         engine,
         source,
@@ -272,7 +281,6 @@ fn snapshot_builder_build_impl(
         max_catalog_version,
         snapshot_hint,
     } = builder;
-    let engine = engine.engine();
 
     struct BuildOptions {
         version: Option<Version>,
@@ -282,16 +290,15 @@ fn snapshot_builder_build_impl(
         snapshot_hint: Option<Box<SnapshotHint>>,
     }
 
-    fn build<Mode>(
+    fn build<Mode: 'static>(
         mut builder: delta_kernel::snapshot::SnapshotBuilder<Mode>,
-        engine: &dyn Engine,
         options: BuildOptions,
         apply_snapshot_hint: impl FnOnce(
             delta_kernel::snapshot::SnapshotBuilder<Mode>,
             Box<SnapshotHint>,
         )
             -> KernelResult<delta_kernel::snapshot::SnapshotBuilder<Mode>>,
-    ) -> KernelResult<SnapshotRef> {
+    ) -> KernelResult<StaticWorkflow<SnapshotRef>> {
         let BuildOptions {
             version,
             incremental_replay,
@@ -312,7 +319,7 @@ fn snapshot_builder_build_impl(
         if let Some(snapshot_hint) = snapshot_hint {
             builder = apply_snapshot_hint(builder, snapshot_hint)?;
         }
-        builder.build(engine)
+        Ok(builder.build_workflow())
     }
 
     let options = BuildOptions {
@@ -323,24 +330,20 @@ fn snapshot_builder_build_impl(
         snapshot_hint,
     };
     let snapshot = match source {
-        FfiSnapshotBuilderSource::TableRoot(url) => build(
-            Snapshot::builder_for(url),
-            engine.as_ref(),
-            options,
-            |builder, hint| Ok(builder.with_snapshot_hint(hint)),
-        ),
-        FfiSnapshotBuilderSource::ExistingSnapshot(snapshot) => build(
-            Snapshot::builder_from(snapshot),
-            engine.as_ref(),
-            options,
-            |_, _| {
+        FfiSnapshotBuilderSource::TableRoot(url) => {
+            build(Snapshot::builder_for(url), options, |builder, hint| {
+                Ok(builder.with_snapshot_hint(hint))
+            })
+        }
+        FfiSnapshotBuilderSource::ExistingSnapshot(snapshot) => {
+            build(Snapshot::builder_from(snapshot), options, |_, _| {
                 // The public API rejects this combination; retain the invariant here for
                 // internal construction paths.
                 Err(hint::invalid(
                     "A snapshot hint cannot be used with Snapshot::builder_from",
                 ))
-            },
-        ),
+            })
+        }
     }?;
-    Ok(snapshot.into())
+    Ok((engine, snapshot))
 }

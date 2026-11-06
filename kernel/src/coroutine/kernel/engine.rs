@@ -63,6 +63,8 @@ pub(crate) struct EngineConnector {
     json: Arc<dyn JsonHandler>,
     parquet: Arc<dyn ParquetHandler>,
     evaluation: Arc<dyn EvaluationHandler>,
+    #[cfg(feature = "declarative-plans")]
+    plan_executor: Option<Arc<dyn PlanExecutor>>,
 }
 
 impl EngineConnector {
@@ -73,6 +75,8 @@ impl EngineConnector {
             json: engine.json_handler(),
             parquet: engine.parquet_handler(),
             evaluation: engine.evaluation_handler(),
+            #[cfg(feature = "declarative-plans")]
+            plan_executor: engine.plan_executor(),
         }
     }
 
@@ -135,6 +139,13 @@ impl EngineConnector {
         StorageConnector::new(self.storage.as_ref())
     }
 
+    #[cfg(feature = "declarative-plans")]
+    fn plan_executor(&self) -> KernelResult<&dyn PlanExecutor> {
+        self.plan_executor
+            .as_deref()
+            .ok_or_else(|| KernelError::unsupported("this engine does not provide a PlanExecutor"))
+    }
+
     fn write_json_file(&self, operation: WriteJsonFile) -> KernelResult<FileSize> {
         let iterator = self.clone().iterate_result_coroutine(operation.input);
         self.json
@@ -152,6 +163,21 @@ impl ConnectorRespond for EngineConnector {
             }
             Request::ReadJson(request) => respond_paged(self, request)?,
             Request::ReadParquet(request) => respond_paged(self, request)?,
+            #[cfg(feature = "declarative-plans")]
+            Request::ExecutePlan(PlanRequest::Available(reply)) => {
+                complete(reply, Ok(self.plan_executor.is_some()))?
+            }
+            #[cfg(feature = "declarative-plans")]
+            Request::ExecutePlan(PlanRequest::Query(request)) => {
+                self.plan_executor()?;
+                respond_paged(self, request)?
+            }
+            #[cfg(feature = "declarative-plans")]
+            Request::ExecutePlan(PlanRequest::ParquetFooter(file, reply)) => {
+                let executor = self.plan_executor()?;
+                complete(reply, executor.read_parquet_footer(file))?
+            }
+            #[cfg(not(feature = "declarative-plans"))]
             Request::ExecutePlan(..) => {
                 return Err(KernelError::internal_error(
                     "Engine connector does not execute declarative plans",
@@ -372,6 +398,7 @@ struct PlanExecutorConnector<'a>(&'a dyn PlanExecutor);
 impl ConnectorRespond for PlanExecutorConnector<'_> {
     fn respond(&self, request: Request) -> KernelResult<()> {
         match request {
+            Request::ExecutePlan(PlanRequest::Available(reply)) => complete(reply, Ok(true)),
             Request::ExecutePlan(PlanRequest::Query(request)) => respond_paged(self, request),
             Request::ExecutePlan(PlanRequest::ParquetFooter(file, reply)) => {
                 complete(reply, self.0.read_parquet_footer(file))
@@ -455,6 +482,19 @@ impl EnginePagination<ForwardListing> for StorageConnector<'_> {
 
     fn next(&self, listing: Self::State) -> KernelResult<Page<ForwardListing>> {
         next_page(listing, ForwardListing::DEFAULT_PAGE_SIZE)
+    }
+}
+
+#[cfg(feature = "declarative-plans")]
+impl EnginePagination<PlanOperation> for EngineConnector {
+    type State = FileDataReadResultIterator;
+
+    fn prepare(&self, operation: PlanOperation) -> KernelResult<Self::State> {
+        self.plan_executor()?.execute_op(operation)?.into_data()
+    }
+
+    fn next(&self, state: Self::State) -> KernelResult<Page<PlanOperation>> {
+        next_engine_data(state)
     }
 }
 

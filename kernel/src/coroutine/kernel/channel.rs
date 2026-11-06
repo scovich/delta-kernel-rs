@@ -21,6 +21,8 @@ use super::request::{
     ReadParquetFiles, WriteJsonFile,
 };
 use super::{Request, StaticCoroutine};
+#[cfg(feature = "declarative-plans")]
+use crate::KernelError;
 use crate::coroutine::generator::{self, BoundGenerator, Flatten, Generator, GeneratorExt as _};
 use crate::coroutine::{
     ChannelExchange, Cursor, KernelFuture, Page, PageGenerator, PageRequest, PagedOperation,
@@ -30,6 +32,8 @@ use crate::expressions::{ExpressionRef, PredicateRef};
 #[cfg(feature = "declarative-plans")]
 use crate::plans::{Operation, Plan};
 use crate::schema::{DataType, SchemaRef};
+#[cfg(feature = "declarative-plans")]
+use crate::utils::require;
 use crate::{EngineData, FileIndex, FileMeta, FileSize, KernelResult, ParquetFooter, Scalar};
 
 /// Kernel's [`crate::coroutine::Channel`] specialized to [`Request`].
@@ -65,6 +69,24 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
         self.exchange(file.clone(), Request::ReadParquetFooter)
     }
 
+    /// Reports whether the connector provides a declarative plan executor.
+    #[cfg(feature = "declarative-plans")]
+    fn has_plan_executor(&self) -> impl KernelFuture<bool> {
+        self.exchange((), |(), reply| {
+            Request::ExecutePlan(PlanRequest::Available(reply))
+        })
+    }
+
+    /// Verifies that the connector provides a declarative plan executor.
+    #[cfg(feature = "declarative-plans")]
+    async fn require_plan_executor(&self) -> KernelResult<()> {
+        require!(
+            self.has_plan_executor().await?,
+            KernelError::unsupported("this engine does not provide a PlanExecutor")
+        );
+        Ok(())
+    }
+
     /// Executes `plan`, streaming its output batches.
     #[cfg(feature = "declarative-plans")]
     async fn execute_query_plan(
@@ -73,8 +95,15 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
     ) -> KernelResult<
         impl BoundGenerator<Item = KernelResult<Box<dyn EngineData>>, Output = ()> + Unpin + '_,
     > {
+        let query = self.prepare_query_plan(plan).await?;
+        Ok(self.bind(query))
+    }
+
+    /// Prepares a declarative query as an unbound stream of result batches.
+    #[cfg(feature = "declarative-plans")]
+    async fn prepare_query_plan(&self, plan: Plan) -> KernelResult<FlattenedPages<Operation>> {
         let cursor = self.prepare_paged(Operation::QueryPlan(plan)).await?;
-        Ok(self.bind(PageGenerator::Next(cursor).flatten()))
+        Ok(PageGenerator::Next(cursor).flatten())
     }
 
     /// Reads one Parquet footer through the declarative plan executor.

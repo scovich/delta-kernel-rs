@@ -17,6 +17,8 @@ use std::sync::{Arc, LazyLock};
 use tracing::{instrument, warn};
 
 use super::LogSegment;
+#[cfg(test)]
+use crate::Engine;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::visitors::visit_last_manifest_commit_at;
 use crate::actions::visitors::{
@@ -30,7 +32,9 @@ use crate::actions::{
 use crate::actions::{LAST_MANIFEST_COMMIT_FIELD, LastManifestCommit};
 use crate::coroutine::AsyncOption as _;
 use crate::coroutine::generator::{BoundGenerator as _, Generator as _};
-use crate::coroutine::kernel::{Channel, ChannelExt as _, run_workflow_with_engine};
+#[cfg(test)]
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::{Channel, ChannelExt as _};
 use crate::crc::{
     Crc, CrcDelta, FileSizeHistogram, FileStatsDelta, is_incremental_safe_operation,
     read_crc_file_or_none_with_channel, size_to_u64,
@@ -44,7 +48,7 @@ use crate::schema::{
 };
 use crate::snapshot::IncrementalReplay;
 use crate::utils::require;
-use crate::{Engine, FileMeta, KernelError, KernelResult, RowVisitor, Version};
+use crate::{FileMeta, KernelError, KernelResult, RowVisitor, Version};
 
 static REPLAY_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     // size is the only Add leaf the visitor reads, and it is required, so its presence marks
@@ -85,17 +89,6 @@ impl LogSegment {
     /// - Case 2: base CRC at `end_version` -> return it as-is
     /// - Case 3: stale base CRC older than `end_version` -> advance it to `end_version` when
     ///   `incremental_replay` permits, else fall back to normal log replay (return None)
-    pub(crate) fn try_build_crc_within_budget(
-        &self,
-        engine: &dyn Engine,
-        base: Option<&Arc<Crc>>,
-        incremental_replay: IncrementalReplay,
-    ) -> KernelResult<Option<(Arc<Crc>, ProtocolMetadataSource)>> {
-        run_workflow_with_engine!(engine, |channel| {
-            self.try_build_crc_within_budget_with_channel(channel, base, incremental_replay)
-        })
-    }
-
     pub(crate) async fn try_build_crc_within_budget_with_channel(
         &self,
         channel: &Channel,
@@ -122,6 +115,7 @@ impl LogSegment {
     /// `in_memory_base`, whichever is newer, falling back to `in_memory_base` on a failed on-disk
     /// read, except cancellation. Drops a base below the checkpoint; returns None when no candidate
     /// remains.
+    #[cfg(test)]
     pub(crate) fn pick_latest_base_crc(
         &self,
         engine: &dyn Engine,
@@ -156,6 +150,7 @@ impl LogSegment {
     /// Read this segment's latest on-disk CRC (`latest_crc_file`), at whatever version it sits.
     /// Returns None when there is no CRC file or a non-cancellation read failure. The CRC may be
     /// stale (older than `end_version`).
+    #[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
     pub(crate) fn read_latest_crc(&self, engine: &dyn Engine) -> KernelResult<Option<Arc<Crc>>> {
         run_workflow_with_engine!(engine, |channel| self.read_latest_crc_with_channel(channel))
     }

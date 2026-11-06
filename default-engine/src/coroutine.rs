@@ -157,6 +157,7 @@ impl AsyncEngineConnector {
             }
             Request::ReadJson(request) => respond_paged(self, request).await?,
             Request::ReadParquet(request) => respond_paged(self, request).await?,
+            Request::ExecutePlan(PlanRequest::Available(reply)) => reply.send(Ok(false)),
             Request::ExecutePlan(PlanRequest::Query(_) | PlanRequest::ParquetFooter(..)) => {
                 return Err(KernelError::unsupported(
                     "Default async connector does not execute plans",

@@ -24,6 +24,8 @@ use crate::coroutine::generator::{
 };
 use crate::coroutine::kernel::engine::EngineConnector;
 use crate::coroutine::kernel::request::ReadParquetFiles;
+#[cfg(feature = "declarative-plans")]
+use crate::coroutine::kernel::run_workflow_with_engine;
 use crate::coroutine::kernel::{
     Channel, ChannelExt as _, KernelResultGenerator, Request, Workflow, run_workflow_with_storage,
     workflow,
@@ -1418,15 +1420,32 @@ impl Scan {
     /// with `TIMESTAMP` partition columns, if planning requires a
     /// [`PlanExecutor`](crate::plans::PlanExecutor) that the engine does not provide, or if log
     /// discovery, checkpoint inspection, or plan construction fails.
+    pub fn declarative_metadata_scan_plan(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<Plan>> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.declarative_metadata_scan_plan_with_channel(channel)
+        })
+    }
+
+    /// Returns a lazy workflow that builds this scan's declarative metadata plan.
+    #[cfg(feature = "declarative-plans")]
+    #[internal_api]
+    pub(crate) fn declarative_metadata_scan_plan_workflow(&self) -> Workflow<'_, Option<Plan>> {
+        workflow!(|channel| self.declarative_metadata_scan_plan_with_channel(channel))
+    }
+
+    #[cfg(feature = "declarative-plans")]
     #[tracing::instrument(
         name = "scan.declarative_metadata_scan_plan",
         skip_all,
         fields(enable_call_frame),
         err
     )]
-    pub fn declarative_metadata_scan_plan(
+    async fn declarative_metadata_scan_plan_with_channel(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
     ) -> KernelResult<Option<Plan>> {
         // TODO(#3609): Support connector-supplied timezone in declarative metadata scans.
         require!(
@@ -1447,7 +1466,9 @@ impl Scan {
         }
 
         let planner = scan_plan::MetadataPlanner::try_new(self)?;
-        let base = scan_plan::MetadataReplayBase::try_new(&self.snapshot, engine, &planner)?;
+        let base =
+            scan_plan::MetadataReplayBase::try_new_with_channel(&self.snapshot, channel, &planner)
+                .await?;
         self.build_metadata_scan_plan_with(base, &planner)
     }
 

@@ -341,7 +341,7 @@ pub(crate) const LOG_SEGMENT_LOADED_SPAN: &str = "segment.for_snapshot";
 #[non_exhaustive]
 pub enum SnapshotLoadType {
     /// The segment was listed from its base (a checkpoint, else version 0) up to the target. A
-    /// fresh snapshot build (`LogSegment::for_snapshot`) reads this way.
+    /// fresh snapshot build reads this way.
     Full,
     /// The build started from an existing snapshot. It may return that snapshot unchanged, replay
     /// newer commits, or rebuild from a newly discovered checkpoint.

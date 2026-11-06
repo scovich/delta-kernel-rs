@@ -1,7 +1,12 @@
 use super::MetadataPlanner;
+#[cfg(test)]
+use crate::Engine;
 use crate::actions::Add;
 use crate::checkpoint::CheckpointShape;
-use crate::{Engine, KernelResult, Snapshot, Version};
+#[cfg(test)]
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::{Channel, ChannelExt as _};
+use crate::{KernelResult, Snapshot, Version};
 
 /// Reconciled table state from which metadata replay starts.
 pub(in crate::scan) enum MetadataReplayBase {
@@ -15,10 +20,21 @@ pub(in crate::scan) enum MetadataReplayBase {
 }
 
 impl MetadataReplayBase {
-    /// Select the newest eligible metadata base and resolve checkpoint shape only when needed.
+    #[cfg(test)]
     pub(in crate::scan) fn try_new(
         snapshot: &Snapshot,
         engine: &dyn Engine,
+        planner: &MetadataPlanner<'_>,
+    ) -> KernelResult<Self> {
+        run_workflow_with_engine!(engine, |channel| {
+            Self::try_new_with_channel(snapshot, channel, planner)
+        })
+    }
+
+    /// Select the newest eligible metadata base and resolve checkpoint shape only when needed.
+    pub(in crate::scan) async fn try_new_with_channel(
+        snapshot: &Snapshot,
+        channel: &Channel,
         planner: &MetadataPlanner<'_>,
     ) -> KernelResult<Self> {
         let checkpoint_version = snapshot.log_segment().checkpoint_version;
@@ -38,11 +54,11 @@ impl MetadataReplayBase {
 
         // Resolve the checkpoint shape once. The planner owns the decision to retain the file-
         // action schema; checkpoint discovery owns how that schema is obtained.
-        let plan_executor = engine.require_plan_executor()?;
+        channel.require_plan_executor().await?;
         let shape = if planner.requires_checkpoint_add_schema() {
-            CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), snapshot)?
+            CheckpointShape::try_new_with_leaf_schema_with_channel(channel, snapshot).await?
         } else {
-            CheckpointShape::try_new(plan_executor.as_ref(), snapshot)?
+            CheckpointShape::try_new_with_channel(channel, snapshot).await?
         };
         Ok(Self::Checkpoint {
             version: checkpoint_version,

@@ -144,8 +144,9 @@ pub(crate) struct ActionsWithCheckpointInfo<A> {
 ///     3. All checkpoint_parts must belong to the same checkpoint version, and must form a complete
 ///        version. Multi-part checkpoints must have all their parts.
 ///
-/// [`LogSegment`] is used in [`Snapshot`] when built with [`LogSegment::for_snapshot`], and
-/// in `TableChanges` when built with [`LogSegment::for_table_changes`].
+/// [`LogSegment`] is used in [`Snapshot`] when built with
+/// [`LogSegment::for_snapshot_with_channel`], and in `TableChanges` when built with
+/// [`LogSegment::for_table_changes`].
 ///
 /// [`Snapshot`]: crate::snapshot::Snapshot
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -547,7 +548,7 @@ impl LogSegment {
     /// [`Snapshot`]: crate::snapshot::Snapshot
     ///
     /// Reports metrics: `LogSegmentLoadSuccess` or `LogSegmentLoadFailure`.
-    #[internal_api]
+    #[cfg(test)]
     pub(crate) fn for_snapshot(
         storage: &dyn StorageHandler,
         log_root: Url,
