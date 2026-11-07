@@ -238,7 +238,7 @@ mod tests {
             .update_table(UpdateTableOperation::Write, "test", true)
             .with_transaction_id("app", 7)
             .with_domain_metadata("test", "config")
-            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+            .build(&engine)?;
         for metadata in files {
             let data = metadata?.scan_files.apply_selection_vector()?;
             if !data.is_empty() {
@@ -248,7 +248,9 @@ mod tests {
                 break;
             }
         }
-        let snapshot = transaction.commit(&engine)?.unwrap_post_commit_snapshot();
+        let snapshot = transaction
+            .commit(&engine, &FileSystemCommitter)?
+            .unwrap_post_commit_snapshot();
         let version = crate::version_as_i64(snapshot.version())?;
 
         // Compare full selected payloads against imperative checkpoint reconstruction.

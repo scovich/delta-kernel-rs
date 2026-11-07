@@ -3119,8 +3119,8 @@ mod tests {
         }
 
         let _ = create_table_builder
-            .build(&engine, Box::new(FileSystemCommitter::new()))?
-            .commit(&engine)?;
+            .build(&engine)?
+            .commit(&engine, &FileSystemCommitter)?;
 
         let snapshot = Snapshot::builder_for(&table_path).build(&engine)?;
         let ts = snapshot.get_timestamp(&engine)?;
@@ -3463,12 +3463,9 @@ mod tests {
             .fold_with(column_mapping_mode, |builder, mode| {
                 builder.with_table_properties([("delta.columnMapping.mode", mode)])
             })
-            .build(
-                &engine,
-                Box::new(crate::committer::FileSystemCommitter::new()),
-            )
+            .build(&engine)
             .unwrap()
-            .commit(&engine)
+            .commit(&engine, &FileSystemCommitter)
             .unwrap();
         let snapshot = Snapshot::builder_for("memory:///").build(&engine).unwrap();
         let result = snapshot.get_clustering_column_infos(&engine).unwrap();
@@ -3583,9 +3580,9 @@ mod tests {
             let store = Arc::new(InMemory::new());
             let engine = SyncEngine::new_with_store(store);
             create_table("memory:///", schema, "test", true)
-                .build(&engine, Box::new(FileSystemCommitter::new()))
+                .build(&engine)
                 .unwrap()
-                .commit(&engine)
+                .commit(&engine, &FileSystemCommitter)
                 .unwrap()
                 .unwrap_committed();
             Snapshot::builder_for("memory:///").build(&engine).unwrap()

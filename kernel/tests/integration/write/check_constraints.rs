@@ -31,7 +31,7 @@ fn build_write_txn(snapshot: &SnapshotRef, engine: &dyn Engine) -> KernelResult<
     snapshot
         .clone()
         .update_table(UpdateTableOperation::Write, "Test/1.0", true)
-        .build(engine, Box::new(FileSystemCommitter::new()))
+        .build(engine)
 }
 
 fn stage_one_file(txn: &mut Transaction) -> KernelResult<()> {
@@ -133,7 +133,7 @@ async fn snapshot_and_transaction_return_stored_constraints_in_name_order(
     assert_eq!(from_txn, constraints);
 
     stage_one_file(&mut txn)?;
-    assert_gate_error(txn.commit(engine.as_ref()));
+    assert_gate_error(txn.commit(engine.as_ref(), &FileSystemCommitter));
     Ok(())
 }
 
@@ -165,7 +165,7 @@ async fn write_state_and_commits_require_ack_only_on_tables_with_constraints(
         seed_txn.ack_check_constraints();
         stage_one_file(&mut seed_txn)?;
         snapshot = seed_txn
-            .commit(engine.as_ref())?
+            .commit(engine.as_ref(), &FileSystemCommitter)?
             .unwrap_post_commit_snapshot();
     }
 
@@ -196,9 +196,10 @@ async fn write_state_and_commits_require_ack_only_on_tables_with_constraints(
     let result = if op == GatedOp::WriteState {
         txn.write_state().map(|_write_state| ())
     } else {
-        txn.commit(engine.as_ref()).map(|committed| {
-            let _committed = committed.unwrap_committed();
-        })
+        txn.commit(engine.as_ref(), &FileSystemCommitter)
+            .map(|committed| {
+                let _committed = committed.unwrap_committed();
+            })
     };
     if acknowledge || !declares_constraints {
         result?;
@@ -236,14 +237,16 @@ async fn alter_table_commit_succeeds_only_with_ack_and_keeps_constraints(
     let mut txn = snapshot
         .update_table(UpdateTableOperation::AlterTable, "Test/1.0", false)
         .add_column(StructField::nullable("note", DataType::STRING))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
     if !acknowledge {
-        assert_gate_error(txn.commit(engine.as_ref()));
+        assert_gate_error(txn.commit(engine.as_ref(), &FileSystemCommitter));
         return Ok(());
     }
 
     txn.ack_check_constraints();
-    let altered = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    let altered = txn
+        .commit(engine.as_ref(), &FileSystemCommitter)?
+        .unwrap_post_commit_snapshot();
     let from_altered = constraint_pairs(altered.check_constraints());
     assert_eq!(from_altered, POSITIVE_AMOUNT);
     Ok(())

@@ -65,8 +65,8 @@ async fn test_create_simple_table() -> delta_kernel::Result<()> {
 
     // Create table using new API
     let _ = create_table(&table_path, schema.clone(), "DeltaKernel-RS/0.17.0", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?;
 
     // Verify table was created
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
@@ -136,13 +136,13 @@ async fn create_table_validates_cdf_column_names(
     }
     let result = create_table(&table_path, schema, "test", true)
         .with_table_properties(properties)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+        .build(engine.as_ref());
 
     if let Some(expected_error) = expected_error {
         assert_result_error_with_message(result, expected_error);
     } else {
         let snapshot = result?
-            .commit(engine.as_ref())?
+            .commit(engine.as_ref(), &FileSystemCommitter)?
             .unwrap_post_commit_snapshot();
         assert!(snapshot.schema().contains(column_name));
         assert_eq!(
@@ -181,13 +181,13 @@ async fn create_table_validates_cdf_reserved_physical_column_names(
     }
     let result = create_table(&table_path, schema, "test", true)
         .with_table_properties(properties)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+        .build(engine.as_ref());
 
     if let Some(expected_error) = expected_error {
         assert_result_error_with_message(result, expected_error);
     } else {
         let snapshot = result?
-            .commit(engine.as_ref())?
+            .commit(engine.as_ref(), &FileSystemCommitter)?
             .unwrap_post_commit_snapshot();
         let expected_physical_name =
             (cm_mode != "none").then(|| MetadataValue::String("_change_type".into()));
@@ -212,7 +212,7 @@ async fn test_create_table_with_user_domain_metadata() -> delta_kernel::Result<(
     // Create table with domainMetadata feature enabled
     let txn = create_table(&table_path, schema, "Test/1.0", true)
         .with_table_properties([("delta.feature.domainMetadata", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
 
     // Add user domain metadata during table creation
     let domain = "app.settings";
@@ -220,7 +220,7 @@ async fn test_create_table_with_user_domain_metadata() -> delta_kernel::Result<(
 
     let _ = txn
         .with_domain_metadata(domain.to_string(), config.to_string())
-        .commit(engine.as_ref())?;
+        .commit(engine.as_ref(), &FileSystemCommitter)?;
 
     // Load snapshot and verify domain metadata was persisted
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
@@ -279,8 +279,8 @@ async fn test_create_table_already_exists() -> KernelResult<()> {
         "UserManagementService/1.2.0",
         true,
     )
-    .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-    .commit(engine.as_ref())?;
+    .build(engine.as_ref())?
+    .commit(engine.as_ref(), &FileSystemCommitter)?;
 
     // Try to create again - should fail at build time (table already exists)
     let result = create_table(
@@ -289,7 +289,7 @@ async fn test_create_table_already_exists() -> KernelResult<()> {
         "UserManagementService/1.2.0",
         true,
     )
-    .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+    .build(engine.as_ref());
 
     assert!(matches!(
         result,
@@ -308,8 +308,8 @@ async fn test_create_table_empty_schema_succeeds() -> delta_kernel::Result<()> {
     let schema = schema_ref! {};
 
     create_table(&table_path, schema, "EmptySchemaApp/0.1.0", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?
         .unwrap_committed();
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
@@ -340,8 +340,8 @@ async fn test_create_table_empty_schema_checkpoint_round_trip(
         builder = builder.with_table_properties([("delta.columnMapping.mode", mode)]);
     }
     builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?
         .unwrap_committed();
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
@@ -375,7 +375,7 @@ async fn test_create_table_empty_schema_layout_errors(
     let schema = schema_ref! {};
     let result = create_table(&table_path, schema, "EmptySchemaApp/0.1.0", true)
         .with_data_layout(layout)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+        .build(engine.as_ref());
 
     assert_result_error_with_message(result, expected_err);
 
@@ -409,8 +409,8 @@ fn test_create_table_with_non_null_columns_auto_enables_invariants(
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let _ = create_table(&table_path, schema, "Test/1.0", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?;
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let protocol = snapshot.table_configuration().protocol();
@@ -445,8 +445,8 @@ async fn test_create_table_with_invariants_feature_signal_allowed() -> delta_ker
 
     let _ = create_table(&table_path, schema, "Test/1.0", true)
         .with_table_properties([("delta.feature.invariants", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?;
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let protocol = snapshot.table_configuration().protocol();
@@ -484,8 +484,7 @@ async fn test_create_table_rejects_delta_invariants_metadata() -> KernelResult<(
     );
     let schema = schema_ref! { (field) };
 
-    let result = create_table(&table_path, schema, "Test/1.0", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+    let result = create_table(&table_path, schema, "Test/1.0", true).build(engine.as_ref());
 
     assert_result_error_with_message(result, "delta.invariants");
 
@@ -516,11 +515,11 @@ async fn test_create_table_log_actions(
         } else {
             [("numFiles", Some("0"))]
         })
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
     if replace_metrics_after_build {
         txn = txn.with_operation_metrics([("numFiles", Some("0"))]);
     }
-    let _ = txn.commit(engine.as_ref())?;
+    let _ = txn.commit(engine.as_ref(), &FileSystemCommitter)?;
 
     // Read the actual Delta log file
     let log_file_path = format!("{table_path}/_delta_log/00000000000000000000.json");
@@ -642,8 +641,7 @@ fn create_test_create_table_txn() -> KernelResult<(
         nullable "id": INTEGER,
         nullable "name": STRING,
     };
-    let txn = create_table(&table_path, schema, "test_engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    let txn = create_table(&table_path, schema, "test_engine", true).build(engine.as_ref())?;
     Ok((engine, txn, tempdir))
 }
 
@@ -699,8 +697,8 @@ fn test_create_table_with_feature_signal(
     let property_key = format!("delta.feature.{feature_name}");
     let _ = create_table(&table_path, simple_schema()?, "Test/1.0", true)
         .with_table_properties([(property_key.as_str(), "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?;
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let table_config = snapshot.table_configuration();
@@ -753,7 +751,7 @@ fn create_table_rejects_preview_feature_signals(
     let key = format!("delta.feature.{feature_name}");
     let result = create_table(&table_path, simple_schema()?, "Test/1.0", false)
         .with_table_properties([(key.as_str(), "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+        .build(engine.as_ref());
     assert_result_error_with_message(
         result,
         &format!(
@@ -782,8 +780,8 @@ fn create_resolves_domain_metadata_after_all_feature_selection(
     let snapshot = create_table(&table_path, simple_schema()?, "test", true)
         .with_table_properties(properties.iter().copied())
         .with_data_layout(layout)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?
         .unwrap_post_commit_snapshot();
     let features = snapshot
         .table_configuration()
@@ -809,8 +807,8 @@ fn test_create_table_with_variant_shredding_has_variant_feature() -> delta_kerne
 
     let _ = create_table(&table_path, schema, "Test/1.0", true)
         .with_table_properties([("delta.feature.variantShredding", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?;
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let protocol = snapshot.table_configuration().protocol();
@@ -840,8 +838,8 @@ fn test_create_table_checkpoint_policy_auto_enables_v2_checkpoint(
 
     let _ = create_table(&table_path, simple_schema()?, "Test/1.0", true)
         .with_table_properties([("delta.checkpointPolicy", policy)])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?;
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let table_config = snapshot.table_configuration();
@@ -883,8 +881,8 @@ fn test_create_table_with_checkpoint_stats_properties(
             ("delta.checkpoint.writeStatsAsJson", json_val.as_str()),
             ("delta.checkpoint.writeStatsAsStruct", struct_val.as_str()),
         ])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?;
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let tp = snapshot.table_properties();
@@ -918,8 +916,8 @@ fn create_table_compression_codec_round_trips(
 
     create_table(&table_path, simple_schema()?, "test", true)
         .with_table_properties([(property, value.as_str())])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?
         .unwrap_committed();
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -949,7 +947,7 @@ fn create_table_rejects_invalid_compression_codec(
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let result = create_table(&table_path, simple_schema()?, "test", true)
         .with_table_properties([("delta.parquet.compression.codec", codec)])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+        .build(engine.as_ref());
 
     assert_result_error_with_message(
         result,
@@ -977,8 +975,8 @@ fn test_create_table_with_enablement_property(
 
     let _ = create_table(&table_path, simple_schema()?, "Test/1.0", true)
         .with_table_properties([(property, value.as_str())])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?;
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let table_config = snapshot.table_configuration();
@@ -1031,11 +1029,11 @@ fn test_create_table_special_char_column_name(
     if cm_enabled {
         builder = builder.with_table_properties([("delta.columnMapping.mode", "name")]);
     }
-    let result = builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+    let result = builder.build(engine.as_ref());
 
     if cm_enabled {
         let txn = result?;
-        let _ = txn.commit(engine.as_ref())?;
+        let _ = txn.commit(engine.as_ref(), &FileSystemCommitter)?;
 
         let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
         assert_eq!(snapshot.version(), 0);

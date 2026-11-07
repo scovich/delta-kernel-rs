@@ -16,8 +16,8 @@
 //! let disk_props = get_required_properties_for_disk(&staging_info.table_id);
 //! let create_table_txn = kernel::create_table(path, schema, "MyApp/1.0", /* data_change */ true)
 //!     .with_table_properties(disk_props)
-//!     .build(engine, committer);
-//! create_table_txn.commit(engine)?;
+//!     .build(engine);
+//! create_table_txn.commit(engine, committer)?;
 //!
 //! // Step 3: Finalize table in UC
 //! let snapshot = /* load post-commit snapshot at version 0 */;
@@ -219,9 +219,9 @@ mod tests {
         create_table(table_path, schema, "Test/1.0", true)
             .with_table_properties(disk_props)
             .with_data_layout(data_layout)
-            .build(engine, Box::new(TestCatalogCommitter))
+            .build(engine)
             .unwrap()
-            .commit(engine)
+            .commit(engine, &TestCatalogCommitter)
             .unwrap()
             .unwrap_committed();
         let snapshot = Snapshot::builder_for(table_path)
@@ -349,9 +349,9 @@ mod tests {
         create_table(table_path, schema, "Test/1.0", true)
             .with_table_properties(disk_props)
             .with_domain_metadata("myApp.retention", r#"{"days":30}"#)
-            .build(&engine, Box::new(TestCatalogCommitter))
+            .build(&engine)
             .unwrap()
-            .commit(&engine)
+            .commit(&engine, &TestCatalogCommitter)
             .unwrap()
             .unwrap_committed();
 
@@ -422,9 +422,9 @@ mod tests {
         let disk_props = get_required_properties_for_disk("test-table-id");
         let _ = create_table(table_path, schema, "Test/1.0", true)
             .with_table_properties(disk_props)
-            .build(&engine, Box::new(TestCatalogCommitter))
+            .build(&engine)
             .unwrap()
-            .commit(&engine)
+            .commit(&engine, &TestCatalogCommitter)
             .unwrap();
         let v0_snapshot = Snapshot::builder_for(table_path)
             .with_max_catalog_version(0)
@@ -432,9 +432,9 @@ mod tests {
             .unwrap();
         let result = v0_snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(&engine, Box::new(TestCatalogCommitter))
+            .build(&engine)
             .unwrap()
-            .commit(&engine)
+            .commit(&engine, &TestCatalogCommitter)
             .unwrap();
         assert!(result.is_committed());
 

@@ -21,8 +21,8 @@ fn test_create_table_partitioned_basic(#[case] partition_col: &str) -> delta_ker
 
     let _ = create_table(&table_path, schema, "Test/1.0", true)
         .with_data_layout(DataLayout::partitioned([partition_col]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?;
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 0);
@@ -65,8 +65,8 @@ fn test_create_table_with_materialize_partition_columns_partitioned_and_not(
         builder = builder.with_data_layout(DataLayout::partitioned(["date"]));
     }
     let _ = builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?;
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert!(

@@ -600,7 +600,7 @@ fn create_clustered_table(
         .with_data_layout(DataLayout::Clustered {
             columns: vec![column],
         })
-        .build(engine, Box::new(FileSystemCommitter::new()))
+        .build(engine)
 }
 
 /// `checksum` and `inline` have no min/max statistics, so clustering on either is rejected.
@@ -632,7 +632,7 @@ async fn test_clustering_on_file_sub_field(
         cm_mode,
         column_name!("c.Size"),
     )?
-    .commit(engine.as_ref())?;
+    .commit(engine.as_ref(), &FileSystemCommitter)?;
     let snapshot = Snapshot::builder_for(Url::from_directory_path(&table_path).unwrap())
         .build(engine.as_ref())?;
     let arrow_schema: ArrowSchema = clustering_test_schema().as_ref().try_into_arrow()?;

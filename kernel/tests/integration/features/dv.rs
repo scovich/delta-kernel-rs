@@ -9,6 +9,7 @@ use delta_kernel::actions::deletion_vector_writer::KernelDeletionVector;
 use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
 use delta_kernel::arrow::array::{BooleanArray, Int64Array, StructArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::StatsOptions;
@@ -197,10 +198,7 @@ async fn test_write_deletion_vectors_end_to_end() -> delta_kernel::Result<()> {
     let mut txn = Snapshot::builder_for(table_url.clone())
         .build(engine.as_ref())?
         .update_table(UpdateTableOperation::Write, "test engine", true)
-        .build(
-            engine.as_ref(),
-            Box::new(delta_kernel::committer::FileSystemCommitter::new()),
-        )?;
+        .build(engine.as_ref())?;
 
     // Create add file metadata for both files
     let add_files_schema = txn.add_files_schema();
@@ -223,7 +221,7 @@ async fn test_write_deletion_vectors_end_to_end() -> delta_kernel::Result<()> {
     )?;
 
     txn.add_files(add_metadata);
-    let commit_result = txn.commit(engine.as_ref())?;
+    let commit_result = txn.commit(engine.as_ref(), &FileSystemCommitter)?;
     assert!(matches!(commit_result, CommitResult::Committed(_)));
 
     // Step 3: Verify we can read all 20 rows before deletion
@@ -255,7 +253,7 @@ async fn test_write_deletion_vectors_end_to_end() -> delta_kernel::Result<()> {
     dv_map.insert(data_file_path_1.clone(), dv_descriptor_1);
 
     txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
-    let commit_result = txn.commit(engine.as_ref())?;
+    let commit_result = txn.commit(engine.as_ref(), &FileSystemCommitter)?;
     assert!(matches!(commit_result, CommitResult::Committed(_)));
 
     // Step 6: Verify first deletion - should have 17 rows (7 from file 1 + 10 from file 2)
@@ -307,7 +305,7 @@ async fn test_write_deletion_vectors_end_to_end() -> delta_kernel::Result<()> {
             .into_iter()
             .map(Ok),
     )?;
-    let commit_result = txn.commit(engine.as_ref())?;
+    let commit_result = txn.commit(engine.as_ref(), &FileSystemCommitter)?;
     assert!(matches!(commit_result, CommitResult::Committed(_)));
 
     // Step 9: Verify final deletion - should have 14 rows (6 from file 1 + 8 from file 2)
@@ -514,7 +512,8 @@ async fn test_dv_update_stats_tight_bound(
     let mut dv_map = HashMap::new();
     dv_map.insert(data_file_path.to_string(), dv_descriptor);
     txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
-    txn.commit(engine.as_ref())?.unwrap_committed();
+    txn.commit(engine.as_ref(), &FileSystemCommitter)?
+        .unwrap_committed();
 
     // The new AddFile must report tightBounds: false while preserving every other stats field.
     let v2_adds = read_actions_from_commit(&table_url, 2, "add")?;

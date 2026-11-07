@@ -83,8 +83,8 @@ fn test_create_table_ict(
 
     let committed = create_table(&table_path, super::simple_schema()?, "Test/1.0", true)
         .with_table_properties(properties.iter().copied())
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?
         .unwrap_committed();
 
     // Verify via post-commit snapshot (reads ICT from in-memory CRC delta)

@@ -48,8 +48,8 @@ impl Transaction<UpdateTable, Imperative> {
     /// ```no_run
     /// # use std::sync::Arc;
     /// # use delta_kernel::Engine;
-    /// # use delta_kernel::snapshot::Snapshot;
     /// # use delta_kernel::committer::FileSystemCommitter;
+    /// # use delta_kernel::snapshot::Snapshot;
     /// # fn example(
     /// #     engine: Arc<dyn Engine>,
     /// #     table_url: url::Url,
@@ -63,7 +63,7 @@ impl Transaction<UpdateTable, Imperative> {
     ///         "my-app/1.0",
     ///         /* data_change */ true,
     ///     )
-    ///     .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    ///     .build(engine.as_ref())?;
     ///
     /// // Get file metadata from a scan
     /// let scan = snapshot.scan_builder().build()?;
@@ -78,7 +78,7 @@ impl Transaction<UpdateTable, Imperative> {
     /// }
     ///
     /// // Commit the transaction
-    /// txn.commit(engine.as_ref())?;
+    /// txn.commit(engine.as_ref(), &FileSystemCommitter)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -155,7 +155,7 @@ impl Transaction<UpdateTable, Imperative> {
     /// let mut txn = snapshot
     ///     .clone()
     ///     .update_table(UpdateTableOperation::Update, "my-app/1.0", /* data_change */ true)
-    ///     .build(engine, Box::new(FileSystemCommitter::new()))?;
+    ///     .build(engine)?;
     ///
     /// let scan = snapshot.scan_builder().build()?;
     /// let files: Vec<FilteredEngineData> = scan.scan_metadata(engine)?
@@ -169,7 +169,7 @@ impl Transaction<UpdateTable, Imperative> {
     /// // ... populate dv_map with file paths and their new DV descriptors ...
     ///
     /// txn.update_deletion_vectors(dv_map, files.into_iter())?;
-    /// txn.commit(engine)?;
+    /// txn.commit(engine, &FileSystemCommitter)?;
     /// ```
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]

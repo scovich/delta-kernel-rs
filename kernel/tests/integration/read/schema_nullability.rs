@@ -35,8 +35,8 @@ async fn read_nullable_struct_with_required_child(
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
     let table_root = "memory:///";
     create_table(table_root, schema.clone(), "test/1.0", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?
         .unwrap_committed();
 
     // The Parquet field permits nulls that the Delta schema forbids when its parent is present.

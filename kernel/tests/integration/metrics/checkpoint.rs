@@ -72,12 +72,12 @@ async fn checkpoint_reports_reconciled_counts_and_stored_bytes(
     let snapshot = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
     let mut transaction = snapshot
         .update_table(UpdateTableOperation::Write, "checkpoint-metrics-test", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
     for files in get_scan_files(first_data, engine.as_ref())? {
         transaction.remove_files(files);
     }
     let snapshot = transaction
-        .commit(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?
         .unwrap_post_commit_snapshot();
 
     let (result, checkpointed) = snapshot.checkpoint(engine.as_ref(), spec.as_ref())?;

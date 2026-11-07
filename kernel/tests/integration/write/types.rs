@@ -86,7 +86,10 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     txn.add_files(add_files_metadata);
 
     // Commit the transaction
-    assert!(txn.commit(engine.as_ref())?.is_committed());
+    assert!(
+        txn.commit(engine.as_ref(), &FileSystemCommitter)?
+            .is_committed()
+    );
 
     // Verify the commit was written correctly
     let commit1 = store
@@ -169,7 +172,10 @@ async fn test_append_timestamp_stats_are_millisecond_truncated()
         .write_parquet(&ArrowEngineData::new(data.clone()), &write_context)
         .await?;
     txn.add_files(add_files_metadata);
-    assert!(txn.commit(engine.as_ref())?.is_committed());
+    assert!(
+        txn.commit(engine.as_ref(), &FileSystemCommitter)?
+            .is_committed()
+    );
 
     let commit1 = store
         .get(&Path::from(
@@ -351,7 +357,10 @@ async fn test_append_variant(
     txn.add_files(add_files_metadata);
 
     // Commit the transaction
-    assert!(txn.commit(engine.as_ref())?.is_committed());
+    assert!(
+        txn.commit(engine.as_ref(), &FileSystemCommitter)?
+            .is_committed()
+    );
 
     // Verify the commit was written correctly
     let commit1_url = tmp_test_dir_url
@@ -512,7 +521,10 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     txn.add_files(add_files_metadata);
 
     // Commit the transaction
-    assert!(txn.commit(engine.as_ref())?.is_committed());
+    assert!(
+        txn.commit(engine.as_ref(), &FileSystemCommitter)?
+            .is_committed()
+    );
 
     // Verify the commit was written correctly
     let commit1_url = tmp_test_dir_url
@@ -574,8 +586,8 @@ async fn test_not_null_data_column_rejects_null_in_batch(
     let schema = schema_ref! { not_null "c": (data_type.clone()) };
     let (_tmp_dir, table_path, engine) = test_table_setup()?;
     let _ = kernel_create_table(&table_path, schema.clone(), "test/1.0", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?;
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     // The non-null schema auto-enables the `invariants` writer feature.
@@ -723,7 +735,7 @@ async fn try_write_with_void_schema(schema: SchemaRef) -> KernelError {
         .expect("snapshot should build");
     let mut txn = snapshot
         .update_table(UpdateTableOperation::Write, "test-engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build(engine.as_ref())
         .expect("transaction should create");
 
     // Add dummy file metadata to trigger write validation
@@ -732,7 +744,7 @@ async fn try_write_with_void_schema(schema: SchemaRef) -> KernelError {
         create_add_files_metadata(&add_schema, vec![("file.parquet", 100, 1000, Some(1))])
             .expect("metadata creation should succeed");
     txn.add_files(metadata);
-    txn.commit(engine.as_ref())
+    txn.commit(engine.as_ref(), &FileSystemCommitter)
         .expect_err("commit should fail for invalid void schema")
 }
 
@@ -862,7 +874,7 @@ async fn write_state_creation_fails_fast_on_invalid_void_schema(
         .expect("snapshot should build");
     let txn = snapshot
         .update_table(UpdateTableOperation::Write, "test-engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build(engine.as_ref())
         .expect("transaction should create");
 
     let err = txn
@@ -896,7 +908,7 @@ async fn write_context_excludes_void_from_physical_schema() -> Result<(), Box<dy
 
     let txn = snapshot
         .update_table(UpdateTableOperation::Write, "test-engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
 
     let wc = txn.write_state()?.write_context_builder().build()?;
     let physical = wc.physical_data_schema();
@@ -925,10 +937,10 @@ async fn metadata_only_commit_with_void_in_array_succeeds() -> Result<(), Box<dy
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let txn = snapshot
         .update_table(UpdateTableOperation::Write, "test-engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
 
     // Commit with NO add_files — this is a metadata-only operation and should succeed
-    let result = txn.commit(engine.as_ref());
+    let result = txn.commit(engine.as_ref(), &FileSystemCommitter);
     assert!(
         result.is_ok(),
         "Metadata-only commit on void-in-array schema should succeed, got: {:?}",
@@ -971,7 +983,7 @@ async fn write_context_excludes_nested_void_from_physical_schema()
 
     let txn = snapshot
         .update_table(UpdateTableOperation::Write, "test-engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
     let wc = txn.write_state()?.write_context_builder().build()?;
     let physical = wc.physical_data_schema();
 
@@ -1011,7 +1023,7 @@ async fn write_transform_drops_nested_void_fields() -> Result<(), Box<dyn std::e
 
     let txn = snapshot
         .update_table(UpdateTableOperation::Write, "test-engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
     let wc = txn.write_state()?.write_context_builder().build()?;
 
     // The transform expression should mention dropping "b" inside the struct

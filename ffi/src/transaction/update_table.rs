@@ -9,7 +9,7 @@ use super::*;
 ///
 /// Returned by an update-table builder's build function. Supports all transaction
 /// operations including existing-table-only operations like blind append and file removal.
-#[handle_descriptor(target=Transaction, mutable=true, sized=true)]
+#[handle_descriptor(target=FfiTransaction, mutable=true, sized=true)]
 pub struct ExclusiveUpdateTableTransaction;
 
 /// A handle for configuring a transaction against an existing table.
@@ -140,8 +140,8 @@ fn update_table_txn_builder_build_with_committer_impl(
     committer: Box<dyn Committer>,
 ) -> KernelResult<Handle<ExclusiveUpdateTableTransaction>> {
     let engine = extern_engine.engine();
-    let transaction = builder.build(engine.as_ref(), committer);
-    Ok(Box::new(transaction?).into())
+    let transaction = builder.build(engine.as_ref());
+    Ok(Box::new(FfiTransaction::new(transaction?, committer)).into())
 }
 
 /// Frees an update-table builder without building it.
@@ -390,7 +390,8 @@ pub unsafe extern "C" fn update_table_txn_with_transaction_id(
     let txn = unsafe { *txn.into_inner() };
     let engine = unsafe { engine.as_ref() };
     let app_id: KernelResult<String> = unsafe { TryFromStringSlice::try_from_slice(&app_id) };
-    let result = app_id.map(|app_id| Box::new(txn.with_transaction_id(app_id, version)).into());
+    let result = app_id
+        .map(|app_id| Box::new(txn.map(|txn| txn.with_transaction_id(app_id, version))).into());
     unsafe { result.into_extern_result(&engine) }
 }
 
@@ -412,7 +413,7 @@ pub unsafe extern "C" fn update_table_txn_with_operation_metrics(
     let txn = unsafe { *txn.into_inner() };
     let engine = unsafe { engine.as_ref() };
     let result =
-        unsafe { apply_nullable_string_map(txn, metrics, Transaction::with_operation_metrics) }
+        unsafe { apply_nullable_string_map(txn, metrics, FfiTransaction::with_operation_metrics) }
             .map(|txn| Box::new(txn).into());
     unsafe { result.into_extern_result(&engine) }
 }
@@ -437,7 +438,7 @@ pub unsafe extern "C" fn update_table_txn_with_commit_info(
     let commit_info = unsafe { commit_info.into_inner() };
     let engine = unsafe { engine.as_ref() };
     let result =
-        unsafe { apply_commit_info(txn, commit_info, schema, Transaction::with_commit_info) }
+        unsafe { apply_commit_info(txn, commit_info, schema, FfiTransaction::with_commit_info) }
             .map(|txn| Box::new(txn).into());
     unsafe { result.into_extern_result(&engine) }
 }
@@ -509,7 +510,7 @@ pub unsafe extern "C" fn update_table_txn_with_domain_metadata(
             txn,
             domain,
             configuration,
-            Transaction::with_domain_metadata,
+            FfiTransaction::with_domain_metadata,
         )
     }
     .map(|txn| Box::new(txn).into());
@@ -531,7 +532,8 @@ pub unsafe extern "C" fn update_table_txn_with_domain_metadata_removed(
     let txn = unsafe { *txn.into_inner() };
     let engine = unsafe { engine.as_ref() };
     let domain: KernelResult<String> = unsafe { TryFromStringSlice::try_from_slice(&domain) };
-    let result = domain.map(|domain| Box::new(txn.with_domain_metadata_removed(domain)).into());
+    let result = domain
+        .map(|domain| Box::new(txn.map(|txn| txn.with_domain_metadata_removed(domain))).into());
     unsafe { result.into_extern_result(&engine) }
 }
 
@@ -582,10 +584,11 @@ pub unsafe extern "C" fn update_table_txn_with_row_tracking_high_water_mark(
 }
 
 fn with_row_tracking_high_water_mark_impl(
-    txn: Transaction,
+    txn: FfiTransaction,
     high_water_mark: i64,
 ) -> KernelResult<Handle<ExclusiveUpdateTableTransaction>> {
-    Ok(Box::new(txn.with_row_tracking_high_water_mark(high_water_mark)?).into())
+    let txn = txn.try_map(|txn| txn.with_row_tracking_high_water_mark(high_water_mark))?;
+    Ok(Box::new(txn).into())
 }
 
 /// Stages `file` to be committed as this transaction's root manifest.
@@ -609,7 +612,7 @@ pub unsafe extern "C" fn update_table_txn_with_root_manifest_file(
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn with_root_manifest_file_impl(
-    txn: Transaction,
+    txn: FfiTransaction,
     file: &FileMeta,
 ) -> KernelResult<Handle<ExclusiveUpdateTableTransaction>> {
     let path: &str = unsafe { TryFromStringSlice::try_from_slice(&file.path) }?;
@@ -623,7 +626,8 @@ fn with_root_manifest_file_impl(
         last_modified: file.last_modified,
         size,
     };
-    Ok(Box::new(txn.with_root_manifest_file(delta_file)?).into())
+    let txn = txn.try_map(|txn| txn.with_root_manifest_file(delta_file))?;
+    Ok(Box::new(txn).into())
 }
 
 /// Add file metadata to the transaction for files that have been written. The metadata contains

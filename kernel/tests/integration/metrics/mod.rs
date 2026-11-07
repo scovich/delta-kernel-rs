@@ -105,8 +105,8 @@ async fn setup_table_with_v1_checkpoint() -> delta_kernel::Result<(
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
     let _ = create_table(&table_path, simple_schema(), "Test/1.0", true)
-        .build(setup_engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(setup_engine.as_ref())?;
+        .build(setup_engine.as_ref())?
+        .commit(setup_engine.as_ref(), &FileSystemCommitter)?;
 
     let snap0 = Snapshot::builder_for(table_url.clone()).build(setup_engine.as_ref())?;
     let committed = insert_data(

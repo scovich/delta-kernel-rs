@@ -37,8 +37,8 @@ fn create_snapshot(engine: &dyn Engine) -> KernelResult<SnapshotRef> {
         DataType::INTEGER,
     )])?);
     Ok(create_table("memory:///", schema, "test", true)
-        .build(engine, Box::new(FileSystemCommitter::new()))?
-        .commit(engine)?
+        .build(engine)?
+        .commit(engine, &FileSystemCommitter)?
         .unwrap_post_commit_snapshot())
 }
 
@@ -49,8 +49,8 @@ fn snapshot_for_root(engine: &dyn Engine, root: CrcRoot) -> Result<SnapshotRef> 
         CrcRoot::StaleCrc => {
             let (_, base) = snapshot.write_checksum(engine)?;
             base.update_table(UpdateTableOperation::Write, "test", true)
-                .build(engine, Box::new(FileSystemCommitter::new()))?
-                .commit(engine)?
+                .build(engine)?
+                .commit(engine, &FileSystemCommitter)?
                 .unwrap_committed();
         }
         CrcRoot::Checkpoint => {

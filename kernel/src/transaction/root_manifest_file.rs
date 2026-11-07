@@ -498,8 +498,8 @@ mod tests {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
         let schema = schema_ref! { nullable "id": INTEGER };
         let _ = create_table("memory:///t/", schema, "test", true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))?
-            .commit(&engine)?;
+            .build(&engine)?
+            .commit(&engine, &FileSystemCommitter)?;
         let snapshot = Snapshot::builder_for("memory:///t/").build(&engine)?;
 
         let file = manifest_file("s3://bucket/metadata/root-v1.parquet", 1024)?;

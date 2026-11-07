@@ -86,14 +86,13 @@ async fn try_main() -> delta_kernel::Result<()> {
     let sample_data = create_sample_data(&snapshot.schema(), cli.num_rows)?;
 
     // Write sample data to the table
-    let committer = Box::new(FileSystemCommitter::new());
     let mut txn = snapshot
         .update_table(
             UpdateTableOperation::Custom("INSERT".to_string()),
             "default_engine/write-table-example",
             /* data_change */ true,
         )
-        .build(&engine, committer)?;
+        .build(&engine)?;
 
     // This example assumes the table is unpartitioned.
     let write_context = txn.write_state()?.write_context_builder().build()?;
@@ -111,7 +110,7 @@ async fn try_main() -> delta_kernel::Result<()> {
             )
             .into());
         }
-        txn = match txn.commit(&engine)? {
+        txn = match txn.commit(&engine, &FileSystemCommitter)? {
             CommitResult::Committed(committed) => break committed,
             CommitResult::Conflicted(conflicted) => {
                 let conflicting_version = conflicted.conflict_version();
@@ -212,8 +211,8 @@ async fn create_table(
         "write-table-example/1.0",
         /* data_change */ true,
     )
-    .build(engine, Box::new(FileSystemCommitter::new()))?
-    .commit(engine)?;
+    .build(engine)?
+    .commit(engine, &FileSystemCommitter)?;
 
     println!("✓ Created Delta table with schema: {schema:#?}");
     Ok(())

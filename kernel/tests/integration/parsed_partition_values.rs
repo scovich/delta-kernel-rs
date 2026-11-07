@@ -921,9 +921,9 @@ fn create_timestamp_partition_table_with_parsed_partition(
                 },
             ),
         ])
-        .build(engine, Box::new(FileSystemCommitter::new()))
+        .build(engine)
         .unwrap()
-        .commit(engine)
+        .commit(engine, &FileSystemCommitter)
         .unwrap()
         .unwrap_post_commit_snapshot()
 }

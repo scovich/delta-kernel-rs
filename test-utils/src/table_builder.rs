@@ -1330,8 +1330,8 @@ impl TestTableBuilder {
         let mut stale_hint_bytes: Option<Vec<u8>> = None;
 
         let mut snapshot = builder
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-            .commit(engine.as_ref())?
+            .build(engine.as_ref())?
+            .commit(engine.as_ref(), &FileSystemCommitter)?
             .unwrap_post_commit_snapshot();
 
         let crcs_at = self.log_state.crcs_at();
@@ -1462,7 +1462,7 @@ async fn write_data_commit<E: TaskExecutor>(
             "test-utils",
             true,
         )
-        .build(engine, Box::new(FileSystemCommitter::new()))?;
+        .build(engine)?;
     let write_state = txn.write_state()?;
 
     let partition_set: HashSet<&str> = partition_columns.iter().map(String::as_str).collect();
@@ -1512,7 +1512,7 @@ async fn write_data_commit<E: TaskExecutor>(
         txn.add_files(add_files);
     }
 
-    txn.commit(engine)
+    txn.commit(engine, &FileSystemCommitter)
 }
 
 /// Generate a single column of data based on its Arrow type.

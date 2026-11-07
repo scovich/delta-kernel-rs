@@ -24,8 +24,8 @@ fn test_create_table_iceberg_native_v4_then_commit_root_manifest_only()
 
     create_table(&table_path, schema, "Test/1.0", true)
         .with_table_properties([("delta.enableIcebergNativeV4", "true")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?
         .unwrap_committed();
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -83,9 +83,9 @@ fn test_create_table_iceberg_native_v4_then_commit_root_manifest_only()
     };
     let committed = snapshot
         .update_table(UpdateTableOperation::Write, "Test/1.0", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref())?
         .with_root_manifest_file(root_manifest.clone())?
-        .commit(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?
         .unwrap_committed();
     assert_eq!(committed.commit_version(), 1);
 

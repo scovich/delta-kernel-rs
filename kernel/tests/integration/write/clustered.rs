@@ -130,8 +130,8 @@ fn setup_clustered_table(
         .with_data_layout(DataLayout::Clustered {
             columns: clustering_cols,
         })
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?;
 
     let snapshot = set_table_properties(
         &table_path,
@@ -381,13 +381,13 @@ async fn write_new_files_to_clustered_table(
         .with_data_layout(DataLayout::Clustered {
             columns: vec![column_name!("id")],
         })
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?
         .unwrap_post_commit_snapshot();
 
     let txn = snapshot
         .update_table(UpdateTableOperation::Write, "Test/1.0", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
     let write_state = txn.write_state()?;
     let write_context = write_state.write_context_builder().build()?;
     let mut file_metadata = Vec::new();
@@ -463,7 +463,7 @@ async fn test_add_file_tags_and_clustering_provider_written_to_add_actions(
         add_files_metadata.append_columns(Arc::new(StructType::try_new(fields)?), columns)?
     });
     let version = txn
-        .commit(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?
         .unwrap_committed()
         .commit_version();
 
@@ -547,7 +547,7 @@ async fn test_add_files_with_mixed_optional_columns(
         });
     }
     let version = txn
-        .commit(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?
         .unwrap_committed()
         .commit_version();
     let adds = read_actions_from_commit(&table_url, version, "add")?;
@@ -593,7 +593,7 @@ fn test_add_file_clustering_provider_on_unclustered_table(
     };
     let mut create = create_table_txn(table_url.as_str(), get_simple_schema(), "Test/1.0", true)
         .with_table_properties(properties)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
     let mut metadata = create_add_files_metadata(
         create.add_files_schema(),
         vec![
@@ -626,17 +626,17 @@ fn test_add_file_clustering_provider_on_unclustered_table(
     let result = if create_transaction {
         create.add_files(metadata);
         create
-            .commit(engine.as_ref())
+            .commit(engine.as_ref(), &FileSystemCommitter)
             .map(|result| result.unwrap_committed().commit_version())
     } else {
         let snapshot = create
-            .commit(engine.as_ref())?
+            .commit(engine.as_ref(), &FileSystemCommitter)?
             .unwrap_post_commit_snapshot();
         let mut txn = snapshot
             .update_table(UpdateTableOperation::Write, "Test/1.0", true)
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+            .build(engine.as_ref())?;
         txn.add_files(metadata);
-        txn.commit(engine.as_ref())
+        txn.commit(engine.as_ref(), &FileSystemCommitter)
             .map(|result| result.unwrap_committed().commit_version())
     };
     if providers.is_some_and(|values| values.iter().any(Option::is_some)) {
@@ -683,7 +683,7 @@ async fn test_add_file_reversed_optional_columns_rejected_at_commit(
     let metadata = ArrowEngineData::new(add_files_metadata).append_columns(schema, columns)?;
     txn.add_files(metadata);
     assert_result_error_with_message(
-        txn.commit(engine.as_ref()),
+        txn.commit(engine.as_ref(), &FileSystemCommitter),
         "Expected schema field 'clusteringProvider' is out of order",
     );
     Ok(())
@@ -725,7 +725,7 @@ async fn test_add_file_optional_column_wrong_type_rejected(
     )?;
     txn.add_files(metadata);
     assert!(
-        txn.commit(engine.as_ref()).is_err(),
+        txn.commit(engine.as_ref(), &FileSystemCommitter).is_err(),
         "accepted wrong type for {name}"
     );
     Ok(())

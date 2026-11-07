@@ -219,7 +219,7 @@ fn manifest_commit_after_schema_change_uses_evolved_schema(
     let mut txn = snapshot
         .update_table(operation, "test-engine", !is_alter)
         .add_column(StructField::nullable("fresh_column", DataType::INTEGER))
-        .build(&engine, Box::new(FileSystemCommitter::new()))?;
+        .build(&engine)?;
     let expected = txn.effective_table_config.physical_schema();
     assert_ne!(expected, initial_schema);
     let writer = txn
@@ -227,7 +227,7 @@ fn manifest_commit_after_schema_change_uses_evolved_schema(
         .new_leaf_node_writer(&engine);
     assert_eq!(writer.physical_schema(), &expected);
     if is_alter {
-        let error = txn.commit(&engine).unwrap_err();
+        let error = txn.commit(&engine, &FileSystemCommitter).unwrap_err();
         assert!(
             matches!(&error, KernelError::InvalidTransactionState(message)
             if message == "ALTER TABLE cannot include manifest writes")
@@ -243,7 +243,10 @@ fn commit_rejects_pending_manifest_commit() -> Result<()> {
     let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
     txn.effective_table_config = adaptive_table_config();
     txn.with_manifest_commit(engine.as_ref())?;
-    assert_result_error_with_message(txn.commit(engine.as_ref()), "not yet supported");
+    assert_result_error_with_message(
+        txn.commit(engine.as_ref(), &FileSystemCommitter),
+        "not yet supported",
+    );
     Ok(())
 }
 

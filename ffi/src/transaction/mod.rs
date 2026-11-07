@@ -9,6 +9,7 @@ mod update_table;
 mod write_context;
 
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 pub use committed::{
@@ -26,16 +27,15 @@ pub use deletion_vector_writer::{
     FfiDvWriterOutput, deletion_vector_add_indexes, dv_writer_finalize, dv_writer_write,
     free_deletion_vector, free_dv_writer, new_deletion_vector, new_dv_writer,
 };
-use delta_kernel::EngineData;
 use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::schema::SchemaRef;
-use delta_kernel::transaction::create_table::{
-    CreateTableTransaction, CreateTableTransactionBuilder,
-};
+use delta_kernel::transaction::create_table::CreateTableTransactionBuilder;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::{
-    CommittedTransaction, Transaction, UpdateTableOperation, UpdateTableTransactionBuilder,
+    CommitResult, CommittedTransaction, CreateTable, Transaction, UpdateTable,
+    UpdateTableOperation, UpdateTableTransactionBuilder,
 };
+use delta_kernel::{Engine, EngineData};
 use delta_kernel_ffi_macros::handle_descriptor;
 pub use partition_value::{
     ExclusivePartitionValueMap, free_partition_value_map, partition_value_map_insert_binary,
@@ -110,6 +110,68 @@ pub struct ExclusiveCommittedTransaction;
 /// Handle for a mutable boxed committer that can be passed across FFI
 #[handle_descriptor(target = dyn Committer, mutable = true, sized = false)]
 pub struct MutableCommitter;
+
+/// A transaction paired with the committer its C caller chose when building it.
+///
+/// The C API binds the committer at build time and commits without one, so transaction handles
+/// carry both.
+pub struct FfiTransaction<STATE = UpdateTable> {
+    transaction: Transaction<STATE>,
+    committer: Box<dyn Committer>,
+}
+
+/// The create-table counterpart of [`FfiTransaction`].
+pub type FfiCreateTableTransaction = FfiTransaction<CreateTable>;
+
+impl<STATE: 'static> FfiTransaction<STATE> {
+    fn new(transaction: Transaction<STATE>, committer: Box<dyn Committer>) -> Self {
+        Self {
+            transaction,
+            committer,
+        }
+    }
+
+    fn map(self, map: impl FnOnce(Transaction<STATE>) -> Transaction<STATE>) -> Self {
+        Self::new(map(self.transaction), self.committer)
+    }
+
+    fn try_map(
+        self,
+        map: impl FnOnce(Transaction<STATE>) -> KernelResult<Transaction<STATE>>,
+    ) -> KernelResult<Self> {
+        Ok(Self::new(map(self.transaction)?, self.committer))
+    }
+
+    fn with_operation_metrics(self, metrics: HashMap<String, Option<String>>) -> Self {
+        self.map(|txn| txn.with_operation_metrics(metrics))
+    }
+
+    fn with_commit_info(self, commit_info: Box<dyn EngineData>, schema: SchemaRef) -> Self {
+        self.map(|txn| txn.with_commit_info(commit_info, schema))
+    }
+
+    fn with_domain_metadata(self, domain: String, configuration: String) -> Self {
+        self.map(|txn| txn.with_domain_metadata(domain, configuration))
+    }
+
+    fn commit(self, engine: &dyn Engine) -> KernelResult<CommitResult<STATE>> {
+        self.transaction.commit(engine, self.committer.as_ref())
+    }
+}
+
+impl<STATE> Deref for FfiTransaction<STATE> {
+    type Target = Transaction<STATE>;
+
+    fn deref(&self) -> &Transaction<STATE> {
+        &self.transaction
+    }
+}
+
+impl<STATE> DerefMut for FfiTransaction<STATE> {
+    fn deref_mut(&mut self) -> &mut Transaction<STATE> {
+        &mut self.transaction
+    }
+}
 
 #[cfg(test)]
 use create_table::{collect_create_table_columns, create_table_txn_builder_with_data_layout_impl};
@@ -4398,8 +4460,8 @@ mod tests {
             "test-engine/1.0",
             true,
         )
-        .build(&kernel_engine, Box::new(FileSystemCommitter::new()))?
-        .commit(&kernel_engine)?
+        .build(&kernel_engine)?
+        .commit(&kernel_engine, &FileSystemCommitter)?
         .unwrap_committed();
         let engine = engine_handle_for_store(store);
 
@@ -4763,14 +4825,16 @@ mod tests {
         let mut add_txn = snapshot
             .clone()
             .update_table(UpdateTableOperation::Write, "test-engine/1.0", true)
-            .build(kernel_engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+            .build(kernel_engine.as_ref())?;
         let add_files_schema = add_txn.add_files_schema();
         let add_metadata = test_utils::create_add_files_metadata(
             add_files_schema,
             vec![(&data_file_path, parquet_len as i64, 1_000_000, Some(4))],
         )?;
         add_txn.add_files(add_metadata);
-        let _ = add_txn.commit(kernel_engine.as_ref())?.unwrap_committed();
+        let _ = add_txn
+            .commit(kernel_engine.as_ref(), &FileSystemCommitter)?
+            .unwrap_committed();
 
         // Build and write a connector-authored DV file deleting rows 1 and 2 (ids 20, 30).
         let mut dv = KernelDeletionVector::new();

@@ -982,7 +982,7 @@ mod tests {
         )?;
         let mut initial = snapshot
             .update_table(UpdateTableOperation::Write, "dv-test", true)
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+            .build(engine.as_ref())?;
         let mut original_files = Vec::new();
         let mut adds = Vec::new();
         for (path, ids) in [
@@ -1013,7 +1013,7 @@ mod tests {
             adds,
         )?);
         let snapshot = initial
-            .commit(engine.as_ref())?
+            .commit(engine.as_ref(), &FileSystemCommitter)?
             .unwrap_post_commit_snapshot();
         let original_version = snapshot.version();
         let handle: Handle<SharedSnapshot> = snapshot.clone().into();

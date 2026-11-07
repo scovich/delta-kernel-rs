@@ -32,8 +32,8 @@ async fn test_post_commit_snapshot_create_then_insert() -> KernelResult<()> {
     // Create table and verify post_commit_snapshot
     let create_result =
         create_table_txn(table_url.as_str(), schema, env!("CARGO_PKG_VERSION"), true)
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-            .commit(engine.as_ref())?;
+            .build(engine.as_ref())?
+            .commit(engine.as_ref(), &FileSystemCommitter)?;
 
     let mut current_snapshot = match create_result {
         CommitResult::Committed(committed) => {
@@ -66,7 +66,7 @@ async fn test_post_commit_snapshot_create_then_insert() -> KernelResult<()> {
             |builder| builder,
         )?;
 
-        match txn.commit(engine.as_ref())? {
+        match txn.commit(engine.as_ref(), &FileSystemCommitter)? {
             CommitResult::Committed(committed) => {
                 let post_snapshot = committed
                     .post_commit_snapshot()

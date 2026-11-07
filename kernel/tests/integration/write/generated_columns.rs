@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::{
     ColumnMetadataKey, DataType, GeneratedColumn, MetadataValue, SchemaRef, StructField, StructType,
@@ -142,7 +143,7 @@ async fn snapshot_and_transaction_return_stored_generated_columns_in_schema_orde
     assert_eq!(from_txn, EXAMPLE_GENERATED_COLUMNS);
 
     stage_one_file(&mut txn)?;
-    assert_gate_error(txn.commit(engine.as_ref()));
+    assert_gate_error(txn.commit(engine.as_ref(), &FileSystemCommitter));
     Ok(())
 }
 
@@ -209,7 +210,7 @@ async fn write_state_and_commits_require_ack_only_on_tables_with_generated_colum
         seed_txn.ack_generated_columns();
         stage_one_file(&mut seed_txn)?;
         snapshot = seed_txn
-            .commit(engine.as_ref())?
+            .commit(engine.as_ref(), &FileSystemCommitter)?
             .unwrap_post_commit_snapshot();
     }
 
@@ -240,9 +241,10 @@ async fn write_state_and_commits_require_ack_only_on_tables_with_generated_colum
     let result = if op == GatedOp::WriteState {
         txn.write_state().map(|_write_state| ())
     } else {
-        txn.commit(engine.as_ref()).map(|committed| {
-            let _committed = committed.unwrap_committed();
-        })
+        txn.commit(engine.as_ref(), &FileSystemCommitter)
+            .map(|committed| {
+                let _committed = committed.unwrap_committed();
+            })
     };
     if acknowledge || !declares_generated_columns {
         result?;
@@ -265,7 +267,9 @@ async fn expressions_without_feature_define_no_generated_columns_and_writes_need
     let mut txn = begin_transaction(snapshot, engine.as_ref())?;
     let _write_state = txn.write_state()?;
     stage_one_file(&mut txn)?;
-    let _committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let _committed = txn
+        .commit(engine.as_ref(), &FileSystemCommitter)?
+        .unwrap_committed();
     Ok(())
 }
 
@@ -302,7 +306,7 @@ async fn protocol_upgrade_turns_existing_expressions_into_generated_columns_that
 
     let mut txn = begin_transaction(incremental, engine.as_ref())?;
     stage_one_file(&mut txn)?;
-    assert_gate_error(txn.commit(engine.as_ref()));
+    assert_gate_error(txn.commit(engine.as_ref(), &FileSystemCommitter));
     Ok(())
 }
 

@@ -30,7 +30,6 @@ use crate::arrow::array::{
 use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::concat_batches;
 use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_conversion::{TryIntoArrow as _, parquet_field_id_metadata};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::SyncEngine;
@@ -373,6 +372,7 @@ pub(crate) mod adaptive_metadata_fixtures {
         LastManifestCommit, Sidecar,
     };
     use crate::arrow::array::{Array as _, AsArray as _};
+    use crate::committer::FileSystemCommitter;
     use crate::content_tree::ContentTreeNodeEntry;
     use crate::content_tree::test_utils::write_manifest;
     use crate::engine_data::FilteredEngineData;
@@ -507,8 +507,8 @@ pub(crate) mod adaptive_metadata_fixtures {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
         let schema = schema_ref! { nullable "id": INTEGER };
         let _ = create_table("memory:///", schema, "test", true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))?
-            .commit(&engine)?;
+            .build(&engine)?
+            .commit(&engine, &FileSystemCommitter)?;
         let table_root = Snapshot::builder_for("memory:///")
             .build(&engine)?
             .table_root()
@@ -735,7 +735,7 @@ pub(crate) mod adaptive_metadata_fixtures {
                 "not every file in {removes:?} is live"
             );
         }
-        txn.commit(engine)
+        txn.commit(engine, &FileSystemCommitter)
             .unwrap()
             .unwrap_committed()
             .commit_version()
@@ -766,7 +766,7 @@ pub(crate) mod adaptive_metadata_fixtures {
         write_transaction(engine, snapshot)
             .with_root_manifest_file(file)
             .unwrap()
-            .commit(engine)
+            .commit(engine, &FileSystemCommitter)
             .unwrap()
             .unwrap_committed()
             .commit_version()
@@ -792,7 +792,7 @@ pub(crate) mod adaptive_metadata_fixtures {
     fn write_transaction(engine: &SyncEngine, snapshot: SnapshotRef) -> Transaction {
         snapshot
             .update_table(UpdateTableOperation::Write, "test", true)
-            .build(engine, Box::new(FileSystemCommitter::new()))
+            .build(engine)
             .unwrap()
     }
 }
@@ -1610,7 +1610,7 @@ pub(crate) fn setup_column_mapping_txn(
 
     let txn = create_table("memory:///test_table", schema, "DefaultEngine", true)
         .with_table_properties([("delta.columnMapping.mode", mode_str)])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
     Ok((engine, txn))
 }
 
