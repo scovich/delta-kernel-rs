@@ -10,7 +10,7 @@ use crate::delta_types::FfiColumnNameArray;
 /// creation: adding files, late-bound commit information, domain metadata, and committing.
 /// Operations like
 /// file removal, blind append, and deletion vector updates are not available.
-#[handle_descriptor(target=CreateTableTransaction, mutable=true, sized=true)]
+#[handle_descriptor(target=FfiCreateTableTransaction, mutable=true, sized=true)]
 pub struct ExclusiveCreateTableTransaction;
 
 // ============================================================================
@@ -38,7 +38,8 @@ pub unsafe extern "C" fn create_table_txn_with_transaction_id(
     let txn = unsafe { *txn.into_inner() };
     let engine = unsafe { engine.as_ref() };
     let app_id: KernelResult<String> = unsafe { TryFromStringSlice::try_from_slice(&app_id) };
-    let result = app_id.map(|app_id| Box::new(txn.with_transaction_id(app_id, version)).into());
+    let result = app_id
+        .map(|app_id| Box::new(txn.map(|txn| txn.with_transaction_id(app_id, version))).into());
     unsafe { result.into_extern_result(&engine) }
 }
 
@@ -57,7 +58,11 @@ pub unsafe extern "C" fn create_table_txn_with_operation_metrics(
     let txn = unsafe { *txn.into_inner() };
     let engine = unsafe { engine.as_ref() };
     let result = unsafe {
-        apply_nullable_string_map(txn, metrics, CreateTableTransaction::with_operation_metrics)
+        apply_nullable_string_map(
+            txn,
+            metrics,
+            FfiCreateTableTransaction::with_operation_metrics,
+        )
     }
     .map(|txn| Box::new(txn).into());
     unsafe { result.into_extern_result(&engine) }
@@ -84,7 +89,7 @@ pub unsafe extern "C" fn create_table_txn_with_commit_info(
             txn,
             commit_info,
             schema,
-            CreateTableTransaction::with_commit_info,
+            FfiCreateTableTransaction::with_commit_info,
         )
     }
     .map(|txn| Box::new(txn).into());
@@ -125,7 +130,7 @@ pub unsafe extern "C" fn create_table_txn_with_domain_metadata(
             txn,
             domain,
             configuration,
-            CreateTableTransaction::with_domain_metadata,
+            FfiCreateTableTransaction::with_domain_metadata,
         )
     }
     .map(|txn| Box::new(txn).into());
@@ -565,8 +570,8 @@ fn create_table_txn_builder_build_impl(
     extern_engine: &dyn ExternEngine,
 ) -> KernelResult<Handle<ExclusiveCreateTableTransaction>> {
     let engine = extern_engine.engine();
-    let create_txn = builder.build(engine.as_ref(), committer)?;
-    Ok(Box::new(create_txn).into())
+    let create_txn = builder.build(engine.as_ref())?;
+    Ok(Box::new(FfiTransaction::new(create_txn, committer)).into())
 }
 
 /// Free a [`CreateTableTransactionBuilder`] without building.

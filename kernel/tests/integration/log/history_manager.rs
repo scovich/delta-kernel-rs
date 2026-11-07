@@ -72,8 +72,8 @@ fn test_at_timestamp_resolves_to_intermediate_version() -> KernelResult<()> {
     // v0: CreateTable
     let schema = get_simple_int_schema();
     let mut snap = create_table(&table_path, schema, "AtTimestampTest/1.0", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?
         .unwrap_post_commit_snapshot();
 
     // v1..=4: noop commits (each writes a metaData-free, add-free commit JSON).
@@ -86,7 +86,7 @@ fn test_at_timestamp_resolves_to_intermediate_version() -> KernelResult<()> {
             true,
             |builder| builder,
         )?
-        .commit(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?
         .unwrap_post_commit_snapshot();
     }
 

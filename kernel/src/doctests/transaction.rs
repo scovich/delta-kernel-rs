@@ -15,11 +15,16 @@ pub struct CreateRemove;
 /// An execution-mode bound does not provide the imperative commit API.
 ///
 /// ```compile_fail,E0599
+/// use delta_kernel::committer::Committer;
 /// use delta_kernel::transaction::{ExecutionMode, UpdateTable, Transaction};
 /// use delta_kernel::Engine;
 ///
-/// fn commit<MODE: ExecutionMode>(txn: Transaction<UpdateTable, MODE>, engine: &dyn Engine) {
-///     txn.commit(engine);
+/// fn commit<MODE: ExecutionMode>(
+///     txn: Transaction<UpdateTable, MODE>,
+///     engine: &dyn Engine,
+///     committer: &dyn Committer,
+/// ) {
+///     txn.commit(engine, committer);
 /// }
 /// ```
 pub struct GenericModeCommit;
@@ -86,6 +91,7 @@ pub struct SharedConfiguration;
 /// use std::collections::HashMap;
 ///
 /// use delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
+/// use delta_kernel::committer::Committer;
 /// use delta_kernel::engine_data::FilteredEngineData;
 /// use delta_kernel::transaction::{CommitResult, UpdateTable, Imperative, Transaction};
 /// use delta_kernel::{Engine, EngineData, KernelResult, KernelResultIterator};
@@ -93,6 +99,7 @@ pub struct SharedConfiguration;
 /// fn stage_and_commit(
 ///     txn: Transaction,
 ///     engine: &dyn Engine,
+///     committer: &dyn Committer,
 ///     add_metadata: Box<dyn EngineData>,
 ///     remove_metadata: FilteredEngineData,
 ///     new_dv_descriptors: HashMap<String, DeletionVectorDescriptor>,
@@ -103,7 +110,7 @@ pub struct SharedConfiguration;
 ///     txn.remove_files(remove_metadata);
 ///     #[cfg(feature = "internal-api")]
 ///     txn.update_deletion_vectors(new_dv_descriptors, existing_data_files)?;
-///     txn.commit(engine)
+///     txn.commit(engine, committer)
 /// }
 /// ```
 pub struct ImperativeCommit;
@@ -111,7 +118,6 @@ pub struct ImperativeCommit;
 /// Builder entry points default to imperative transactions without an explicit mode selection.
 ///
 /// ```no_run
-/// use delta_kernel::committer::FileSystemCommitter;
 /// use delta_kernel::schema::SchemaRef;
 /// use delta_kernel::snapshot::SnapshotRef;
 /// use delta_kernel::transaction::create_table::create_table;
@@ -127,12 +133,12 @@ pub struct ImperativeCommit;
 /// ) -> KernelResult<()> {
 ///     let update = snapshot
 ///         .update_table(UpdateTableOperation::Write, "connector/1.0", true)
-///         .build(engine, Box::new(FileSystemCommitter::new()))?;
+///         .build(engine)?;
 ///     let _update_state = update.write_state()?;
 ///     let _: Transaction<UpdateTable, Imperative> = update;
 ///
 ///     let create = create_table("/path/to/new-table", schema, "connector/1.0", true)
-///         .build(engine, Box::new(FileSystemCommitter::new()))?;
+///         .build(engine)?;
 ///     let _create_state = create.write_state()?;
 ///     let _: Transaction<CreateTable, Imperative> = create;
 ///     Ok(())
@@ -173,10 +179,10 @@ pub struct ModeSelectionRequiresDeclarativePlans;
 ///         .update_table(UpdateTableOperation::Write, "connector/1.0", true)
 ///         .with_execution_mode::<Declarative>()
 ///         .with_transaction_id("app", 1)
-///         .build(engine, Box::new(FileSystemCommitter::new()))?;
+///         .build(engine)?;
 ///     txn.add_files_ref(adds);
 ///     txn.remove_files_ref(removes);
-///     txn.commit_declarative(executor)
+///     txn.commit_declarative(executor, &FileSystemCommitter)
 /// }
 /// ```
 #[cfg(feature = "declarative-plans")]
@@ -201,9 +207,9 @@ pub struct DeclarativeCommit;
 ///     let mut txn = create_table("/path/to/new-table", schema, "connector/1.0", true)
 ///         .with_execution_mode::<Declarative>()
 ///         .with_table_properties([("app.version", "1")])
-///         .build(engine, Box::new(FileSystemCommitter::new()))?;
+///         .build(engine)?;
 ///     txn.add_files_ref(adds);
-///     txn.commit_declarative(executor)
+///     txn.commit_declarative(executor, &FileSystemCommitter)
 /// }
 /// ```
 #[cfg(feature = "declarative-plans")]
@@ -212,11 +218,16 @@ pub struct DeclarativeCreateTableCommit;
 /// Declarative transactions cannot invoke the imperative commit path.
 ///
 /// ```compile_fail,E0599
+/// use delta_kernel::committer::Committer;
 /// use delta_kernel::transaction::{Declarative, UpdateTable, Transaction};
 /// use delta_kernel::Engine;
 ///
-/// fn commit(txn: Transaction<UpdateTable, Declarative>, engine: &dyn Engine) {
-///     txn.commit(engine);
+/// fn commit(
+///     txn: Transaction<UpdateTable, Declarative>,
+///     engine: &dyn Engine,
+///     committer: &dyn Committer,
+/// ) {
+///     txn.commit(engine, committer);
 /// }
 /// ```
 #[cfg(feature = "declarative-plans")]

@@ -15,6 +15,7 @@ use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::{TryFromArrow, TryIntoArrow};
 use delta_kernel::expressions::{col, column_name, lit};
 use delta_kernel::schema::{
@@ -33,8 +34,8 @@ use test_utils::{
 };
 
 use super::{
-    annotated_field, assert_rows, committer, create_fixture, generated_table, mapped_bounds,
-    physical_name, physical_path, rewrite_as_preview_table,
+    annotated_field, assert_rows, create_fixture, generated_table, mapped_bounds, physical_name,
+    physical_path, rewrite_as_preview_table,
 };
 use crate::common::write_utils::{resolve_json_path, rewrite_commit};
 
@@ -318,8 +319,8 @@ async fn arrow_round_trip_schema_can_create_table(
     let recovered = Arc::new(StructType::try_from_arrow(&arrow)?);
     assert_eq!(schema, recovered);
     let snapshot = create_table(&path, recovered, "test", false)
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?
         .unwrap_post_commit_snapshot();
     assert_eq!(snapshot.schema(), schema);
     assert!(
@@ -346,8 +347,8 @@ async fn alter_requires_existing_feature_without_upgrade(
         builder = builder.with_table_properties([("delta.feature.collations", "supported")]);
     }
     let mut snapshot = builder
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?
         .unwrap_post_commit_snapshot();
     if signal == Some("collations-preview") {
         rewrite_as_preview_table(&path)?;
@@ -359,10 +360,10 @@ async fn alter_requires_existing_feature_without_upgrade(
         .clone()
         .update_table(UpdateTableOperation::AlterTable, "test", false)
         .add_column(collated_field.clone())
-        .build(engine.as_ref(), committer());
+        .build(engine.as_ref());
     if supported {
         let updated = result?
-            .commit(engine.as_ref())?
+            .commit(engine.as_ref(), &FileSystemCommitter)?
             .unwrap_post_commit_snapshot();
         let reloaded = Snapshot::builder_for(&path).build(engine.as_ref())?;
         assert_eq!(reloaded.version(), updated.version());
@@ -390,7 +391,7 @@ async fn alter_requires_existing_feature_without_upgrade(
     let error = snapshot
         .update_table(UpdateTableOperation::AlterTable, "test", false)
         .add_column(malformed)
-        .build(engine.as_ref(), committer())
+        .build(engine.as_ref())
         .err()
         .unwrap();
     assert!(error.to_string().contains("STRING target"));
@@ -422,8 +423,8 @@ async fn annotations_inside_container_structs_auto_enable_feature(
             .is_none()
     );
     let snapshot = create_table(&path, schema.clone(), "test", false)
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?
         .unwrap_post_commit_snapshot();
     assert_eq!(snapshot.schema(), schema);
     assert!(
@@ -551,8 +552,8 @@ async fn collation_domain_hints_survive_append_alter_checkpoint_and_crc(
         builder = builder.with_table_properties([("delta.feature.v2Checkpoint", "supported")]);
     }
     let mut seeded = builder
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?
         .unwrap_post_commit_snapshot();
     if preview {
         rewrite_as_preview_table(&path)?;
@@ -569,8 +570,8 @@ async fn collation_domain_hints_survive_append_alter_checkpoint_and_crc(
         .clone()
         .update_table(UpdateTableOperation::AlterTable, "test", false)
         .add_column(StructField::nullable("extra", DataType::INTEGER))
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?
         .unwrap_post_commit_snapshot();
     for snapshot in [seeded, appended, altered.clone()] {
         let reloaded = Snapshot::builder_for(&path)
@@ -636,17 +637,17 @@ async fn malformed_annotations_rejected_before_create_and_alter(
         MetadataValue::Other(metadata),
     )]);
     let create = create_table(&path, schema_ref! { (invalid.clone()) }, "test", false)
-        .build(engine.as_ref(), committer());
+        .build(engine.as_ref());
     assert_result_error_with_message(create, message);
     let snapshot = create_table(&path, schema_ref! { nullable "id": INTEGER }, "test", false)
         .with_table_properties([("delta.feature.collations", "supported")])
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?
         .unwrap_post_commit_snapshot();
     let alter = snapshot
         .update_table(UpdateTableOperation::AlterTable, "test", false)
         .add_column(invalid)
-        .build(engine.as_ref(), committer());
+        .build(engine.as_ref());
     assert_result_error_with_message(alter, message);
     assert_eq!(
         Snapshot::builder_for(&path)
@@ -679,8 +680,8 @@ async fn snapshot_loading_rejects_malformed_collation_annotations(
         false,
     )
     .with_table_properties([("delta.feature.collations", "supported")])
-    .build(engine.as_ref(), committer())?
-    .commit(engine.as_ref())?
+    .build(engine.as_ref())?
+    .commit(engine.as_ref(), &FileSystemCommitter)?
     .unwrap_committed();
     if feature == "collations-preview" {
         rewrite_as_preview_table(&path)?;
@@ -723,8 +724,8 @@ async fn snapshot_loading_requires_collation_feature_for_annotated_schema(
         "test",
         false,
     )
-    .build(engine.as_ref(), committer())?
-    .commit(engine.as_ref())?
+    .build(engine.as_ref())?
+    .commit(engine.as_ref(), &FileSystemCommitter)?
     .unwrap_committed();
     let schema = schema_ref! {
         (annotated_field("name", DataType::STRING, "name", "test.ASCII_CI"))
@@ -840,8 +841,8 @@ async fn checkpoint_repeatedly_preserves_multiple_identifiers_and_sparse_bounds(
             snapshot = snapshot
                 .update_table(UpdateTableOperation::AlterTable, "test", false)
                 .set_nullable(column_name!("id"))
-                .build(engine.as_ref(), committer())?
-                .commit(engine.as_ref())?
+                .build(engine.as_ref())?
+                .commit(engine.as_ref(), &FileSystemCommitter)?
                 .unwrap_post_commit_snapshot();
         }
     }

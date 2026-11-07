@@ -177,10 +177,6 @@ fn nested_batch(rows: &[Row]) -> RecordBatch {
     .unwrap()
 }
 
-fn committer() -> Box<FileSystemCommitter> {
-    Box::new(FileSystemCommitter::new())
-}
-
 fn physical_name(field: &StructField) -> &str {
     match field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
         Some(MetadataValue::String(name)) => name,
@@ -235,8 +231,8 @@ async fn create_fixture(
 ) -> Result<SnapshotRef, Box<dyn std::error::Error>> {
     let mut snapshot = create_table(table_path, fixture.schema.clone(), "collation-test", false)
         .with_table_properties(properties.iter().copied())
-        .build(engine, committer())?
-        .commit(engine)?
+        .build(engine)?
+        .commit(engine, &FileSystemCommitter)?
         .unwrap_post_commit_snapshot();
     for (batch, collation_stats) in &fixture.files {
         snapshot = write_batch_to_table(&snapshot, engine, batch.clone(), HashMap::new()).await?;

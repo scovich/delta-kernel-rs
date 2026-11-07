@@ -601,9 +601,9 @@ fn post_build_metadata_reads_inherit_operation_token(
     .with_data_layout(DataLayout::Clustered {
         columns: vec![ColumnName::new(["id"])],
     })
-    .build(&original, Box::new(FileSystemCommitter::new()))
+    .build(&original)
     .unwrap()
-    .commit(&original)
+    .commit(&original, &FileSystemCommitter)
     .unwrap()
     .unwrap_committed();
     let mut reads = RecordingReads::new(None);

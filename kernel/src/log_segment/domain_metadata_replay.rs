@@ -180,9 +180,9 @@ mod tests {
         )
         .with_table_properties([("delta.feature.domainMetadata", "supported")])
         .with_domain_metadata("domainC", "cfgC")
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build(&engine)
         .unwrap()
-        .commit(&engine)
+        .commit(&engine, &FileSystemCommitter)
         .unwrap();
 
         // Commit 1: add domainA and domainB via an existing-table transaction.
@@ -191,9 +191,9 @@ mod tests {
             .update_table(UpdateTableOperation::Write, "test-engine", true)
             .with_domain_metadata("domainA", "cfgA")
             .with_domain_metadata("domainB", "cfgB")
-            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .build(&engine)
             .unwrap()
-            .commit(&engine)
+            .commit(&engine, &FileSystemCommitter)
             .unwrap();
 
         let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
@@ -333,9 +333,9 @@ mod tests {
         let _ = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
             .with_domain_metadata_removed("domainA")
-            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .build(&engine)
             .unwrap()
-            .commit(&engine)
+            .commit(&engine, &FileSystemCommitter)
             .unwrap();
         let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
         (engine, snapshot)

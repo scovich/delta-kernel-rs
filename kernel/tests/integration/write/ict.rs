@@ -5,6 +5,7 @@ use std::sync::Arc;
 use delta_kernel::Snapshot;
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::path::Path;
@@ -121,7 +122,7 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
     generate_and_add_data_file(&mut txn, &engine, schema.clone(), vec![1, 2, 3]).await?;
 
     // First commit
-    let commit_result = txn.commit(&engine)?;
+    let commit_result = txn.commit(&engine, &FileSystemCommitter)?;
     match commit_result {
         CommitResult::Committed(committed) => {
             assert_eq!(
@@ -172,7 +173,7 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
     generate_and_add_data_file(&mut txn2, &engine, schema, vec![4, 5, 6]).await?;
 
     // Second commit
-    let commit_result2 = txn2.commit(&engine)?;
+    let commit_result2 = txn2.commit(&engine, &FileSystemCommitter)?;
     match commit_result2 {
         CommitResult::Committed(committed) => {
             assert_eq!(

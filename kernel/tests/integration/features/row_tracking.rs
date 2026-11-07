@@ -7,6 +7,7 @@ use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field, Int32Type, Int64Type, Schema as ArrowSchema,
 };
 use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::to_json_bytes;
@@ -117,7 +118,7 @@ async fn write_data_to_table(
     }
 
     // Commit the transaction
-    txn.commit(engine.as_ref())
+    txn.commit(engine.as_ref(), &FileSystemCommitter)
 }
 
 /// Helper function to create a row-tracking table with a single `number: INTEGER` column.
@@ -658,7 +659,10 @@ async fn test_row_tracking_without_adds() -> KernelResult<()> {
     let txn = load_and_begin_transaction(table_url.clone(), engine.as_ref())?;
 
     // Commit without adding any add files
-    assert!(txn.commit(engine.as_ref())?.is_committed());
+    assert!(
+        txn.commit(engine.as_ref(), &FileSystemCommitter)?
+            .is_committed()
+    );
 
     // Fetch and parse the commit
     let commit_url = table_url.join(&format!("_delta_log/{:020}.json", 1))?;
@@ -736,7 +740,7 @@ async fn test_row_tracking_parallel_transactions_conflict() -> KernelResult<()> 
     txn2.add_files(metadata2);
 
     // Commit the first transaction - this should succeed
-    let result1 = txn1.commit(engine1.as_ref())?;
+    let result1 = txn1.commit(engine1.as_ref(), &FileSystemCommitter)?;
     match result1 {
         CommitResult::Committed(committed) => {
             assert_eq!(
@@ -757,7 +761,7 @@ async fn test_row_tracking_parallel_transactions_conflict() -> KernelResult<()> 
     }
 
     // Commit the second transaction - this should result in a conflict
-    let result2 = txn2.commit(engine2.as_ref())?;
+    let result2 = txn2.commit(engine2.as_ref(), &FileSystemCommitter)?;
     match result2 {
         CommitResult::Committed(committed) => {
             panic!(
@@ -1288,7 +1292,8 @@ async fn test_read_row_tracking_metadata_stable_across_deletion_vector_update(
             .map(Ok),
     )?;
     txn.ack_row_tracking_preservation();
-    txn.commit(engine.as_ref())?.unwrap_committed();
+    txn.commit(engine.as_ref(), &FileSystemCommitter)?
+        .unwrap_committed();
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let after = collect_number_to_column(

@@ -206,9 +206,9 @@ async fn live_create_table() {
     .with_data_layout(DataLayout::Clustered {
         columns: vec![column_name!("name"), column_name!("address", "city")],
     })
-    .build(engine.as_ref(), committer)
+    .build(engine.as_ref())
     .expect("failed to build create-table transaction")
-    .commit(engine.as_ref())
+    .commit(engine.as_ref(), committer.as_ref())
     .expect("failed to commit create-table transaction")
     .unwrap_committed();
 

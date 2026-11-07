@@ -198,12 +198,12 @@ mod tests {
             .build(&engine)
             .unwrap();
         // Try to commit a transaction with FileSystemCommitter
-        let committer = Box::new(FileSystemCommitter::new());
+        let committer = FileSystemCommitter::new();
         let err = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(&engine, committer)
+            .build(&engine)
             .unwrap()
-            .commit(&engine)
+            .commit(&engine, &committer)
             .unwrap_err();
         assert!(matches!(
             err,

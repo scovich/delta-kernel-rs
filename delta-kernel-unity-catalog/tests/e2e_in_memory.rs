@@ -127,8 +127,8 @@ fn commit(
     Ok(snapshot
         .clone()
         .update_table(UpdateTableOperation::Write, "test-engine", true)
-        .build(engine, Box::new(uc_committer(update_table_client)))?
-        .commit(engine)?
+        .build(engine)?
+        .commit(engine, &uc_committer(update_table_client))?
         .unwrap_post_commit_snapshot())
 }
 
@@ -383,12 +383,12 @@ async fn test_insert_without_publish_hits_limit() -> Result<(), TestError> {
     assert_eq!(snapshot.version(), max);
 
     // Next insert should fail with MaxUnpublishedCommitsExceeded
-    let committer = Box::new(uc_committer(&update_table_client));
+    let committer = uc_committer(&update_table_client);
     let err = snapshot
         .clone()
         .update_table(UpdateTableOperation::Write, "test-engine", true)
-        .build(&engine, committer)?
-        .commit(&engine)
+        .build(&engine)?
+        .commit(&engine, &committer)
         .unwrap_err();
     assert!(
         matches!(err, delta_kernel::KernelError::Generic(msg) if msg.contains("Max unpublished commits"))
@@ -463,8 +463,8 @@ async fn test_append_scan_back_and_incremental_read() -> Result<(), TestError> {
     // v0 create: writes 000.json directly to storage, does not call the catalog.
     create_table(table_uri.as_str(), schema, "delta-kernel-uc-test", true)
         .with_table_properties(get_required_properties_for_disk(TABLE_ID))
-        .build(engine.as_ref(), Box::new(uc_committer(&client)))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &uc_committer(&client))?
         .unwrap_committed();
     client.create_table(TABLE_ID)?;
 

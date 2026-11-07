@@ -19,6 +19,7 @@ use delta_kernel::actions::deletion_vector_writer::{
 use delta_kernel::actions::{MAX_VALUES, MIN_VALUES};
 use delta_kernel::arrow::array::{Int32Array, StructArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
@@ -278,7 +279,7 @@ pub async fn write_data_and_check_result_and_stats(
     }
 
     // commit!
-    match txn.commit(engine.as_ref())? {
+    match txn.commit(engine.as_ref(), &FileSystemCommitter)? {
         CommitResult::Committed(committed) => {
             assert_eq!(committed.commit_version(), expected_since_commit as Version);
             assert_eq!(
@@ -431,10 +432,7 @@ pub async fn create_dv_table_with_files(
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = snapshot
         .update_table(UpdateTableOperation::Write, "test engine", true)
-        .build(
-            engine.as_ref(),
-            Box::new(delta_kernel::committer::FileSystemCommitter::new()),
-        )?;
+        .build(engine.as_ref())?;
 
     let add_files_schema = txn.add_files_schema();
 
@@ -466,7 +464,7 @@ pub async fn create_dv_table_with_files(
     };
     txn.add_files(metadata);
 
-    let _ = txn.commit(engine.as_ref())?;
+    let _ = txn.commit(engine.as_ref(), &FileSystemCommitter)?;
 
     let paths: Vec<String> = file_paths.iter().map(|&s| s.to_string()).collect();
     Ok((store, engine, table_url, paths))
@@ -538,8 +536,5 @@ pub fn create_dv_update_transaction(
     Snapshot::builder_for(table_url.clone())
         .build(engine)?
         .update_table(UpdateTableOperation::Delete, "test engine", true)
-        .build(
-            engine,
-            Box::new(delta_kernel::committer::FileSystemCommitter::new()),
-        )
+        .build(engine)
 }

@@ -45,10 +45,10 @@ async fn test_commit_info_defaults_to_empty_parameters_and_omitted_metrics(
         let txn = Snapshot::builder_for(table_url.clone())
             .build(&engine)?
             .update_table(operation.clone(), engine_info, true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+            .build(&engine)?;
 
         // commit!
-        let _ = txn.commit(&engine)?;
+        let _ = txn.commit(&engine, &FileSystemCommitter)?;
 
         let commit1 = store
             .get(&Path::from(format!(
@@ -102,9 +102,11 @@ async fn transaction_builder_writes_operation_parameters_and_metrics()
             .update_table(UpdateTableOperation::Write, "test-engine", true)
             .with_operation_parameters([("mode", Some("Append"))])
             .with_operation_metrics([("numFiles", Some("3"))])
-            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+            .build(&engine)?;
 
-        transaction.commit(&engine)?.unwrap_committed();
+        transaction
+            .commit(&engine, &FileSystemCommitter)?
+            .unwrap_committed();
 
         let commit = store
             .get(&Path::from(format!(
@@ -138,9 +140,9 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
         let txn = Snapshot::builder_for(table_url.clone())
             .build(&engine)?
             .update_table(UpdateTableOperation::Write, "default engine", true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+            .build(&engine)?;
 
-        let _ = txn.commit(&engine)?;
+        let _ = txn.commit(&engine, &FileSystemCommitter)?;
 
         let commit = store
             .get(&Path::from(format!(
@@ -205,7 +207,7 @@ async fn test_commit_info_with_operation_maps() -> Result<(), Box<dyn std::error
             },
         )?;
 
-        let _ = txn.commit(&engine)?;
+        let _ = txn.commit(&engine, &FileSystemCommitter)?;
 
         let commit = store
             .get(&Path::from(format!(
@@ -263,7 +265,7 @@ async fn test_commit_info_with_empty_operation_map(
             },
         )?;
 
-        let _ = txn.commit(&engine)?;
+        let _ = txn.commit(&engine, &FileSystemCommitter)?;
 
         let commit = store
             .get(&Path::from(format!(
@@ -376,7 +378,7 @@ async fn test_commit_info_merges_custom_fields_and_ignores_reserved_fields(
             },
         )?;
 
-        let _ = txn.commit(&engine)?;
+        let _ = txn.commit(&engine, &FileSystemCommitter)?;
 
         let commit = store
             .get(&Path::from(format!(

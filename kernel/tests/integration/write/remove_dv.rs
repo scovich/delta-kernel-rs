@@ -105,8 +105,8 @@ async fn append_only_enforces_data_change_for_file_actions(
             ("delta.appendOnly", "true"),
             ("delta.enableDeletionVectors", "true"),
         ])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?
         .unwrap_post_commit_snapshot();
     let mut txn = begin_transaction_with(
         snapshot,
@@ -130,7 +130,9 @@ async fn append_only_enforces_data_change_for_file_actions(
         )?);
         txn.add_files(engine.write_parquet(&data, &write_context).await?);
     }
-    let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    let snapshot = txn
+        .commit(engine.as_ref(), &FileSystemCommitter)?
+        .unwrap_post_commit_snapshot();
 
     let staged_batches = (0..2)
         .map(|index| {
@@ -160,7 +162,7 @@ async fn append_only_enforces_data_change_for_file_actions(
             for scan_files in staged_batches {
                 txn.remove_files(scan_files);
             }
-            txn.commit(engine.as_ref())
+            txn.commit(engine.as_ref(), &FileSystemCommitter)
         }
         AppendOnlyWrite::DeletionVectorUpdate => {
             let add_actions = read_actions_from_commit(&table_url, 1, "add")?;
@@ -185,7 +187,7 @@ async fn append_only_enforces_data_change_for_file_actions(
                 })
                 .collect();
             txn.update_deletion_vectors(dv_map, staged_batches.into_iter().map(Ok))?;
-            txn.commit(engine.as_ref())
+            txn.commit(engine.as_ref(), &FileSystemCommitter)
         }
     };
 
@@ -479,7 +481,7 @@ async fn commit_validates_file_action_uniqueness(
     )?;
 
     // === Commit and assert the result ===
-    let result = txn.commit(engine.as_ref());
+    let result = txn.commit(engine.as_ref(), &FileSystemCommitter);
     if let Some(expected_error) = case.expected_error {
         assert_result_error_with_message(result, expected_error);
     } else {
@@ -708,7 +710,8 @@ async fn commit_validates_staged_remove_fields(
         ],
     )?;
     txn.add_files(adds);
-    txn.commit(engine.as_ref())?.unwrap_committed();
+    txn.commit(engine.as_ref(), &FileSystemCommitter)?
+        .unwrap_committed();
 
     // === Modify staged remove metadata ===
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
@@ -743,7 +746,7 @@ async fn commit_validates_staged_remove_fields(
         Box::new(ArrowEngineData::new(corrupted)),
         selection_vector.to_vec(),
     )?);
-    let result = txn.commit(engine.as_ref());
+    let result = txn.commit(engine.as_ref(), &FileSystemCommitter);
     if let Some(expected_error) = expected_error {
         assert_result_error_with_message(result, expected_error);
     } else {
@@ -788,7 +791,7 @@ async fn test_remove_files_adds_expected_entries() -> KernelResult<()> {
     let mut txn = snapshot
         .clone()
         .update_table(UpdateTableOperation::Write, "test engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
 
     let scan = snapshot.scan_builder().build()?;
     let scan_metadata = scan.scan_metadata(engine.as_ref())?.next().unwrap()?;
@@ -798,7 +801,7 @@ async fn test_remove_files_adds_expected_entries() -> KernelResult<()> {
 
     txn.remove_files(remove_metadata);
 
-    let result = txn.commit(engine.as_ref())?;
+    let result = txn.commit(engine.as_ref(), &FileSystemCommitter)?;
 
     match result {
         CommitResult::Committed(committed) => {
@@ -960,7 +963,7 @@ async fn remove_on_adaptive_metadata_table_nulls_deletion_timestamp_and_forces_e
     txn.remove_files(scan_files);
     txn.ack_row_tracking_preservation();
     let version = txn
-        .commit(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?
         .unwrap_committed()
         .commit_version();
 
@@ -1016,7 +1019,7 @@ async fn test_remove_scanned_file_sets_extended_metadata(
             missing_fields,
         )?);
     }
-    let commit_result = txn.commit(engine.as_ref());
+    let commit_result = txn.commit(engine.as_ref(), &FileSystemCommitter);
     commit_result?.unwrap_committed();
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
 
@@ -1083,7 +1086,7 @@ async fn test_update_deletion_vectors_adds_expected_entries() -> KernelResult<()
     let mut txn = snapshot
         .clone()
         .update_table(UpdateTableOperation::Update, "test engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
 
     // Build scan and collect all scan metadata
     let scan = snapshot.clone().scan_builder().build()?;
@@ -1115,7 +1118,7 @@ async fn test_update_deletion_vectors_adds_expected_entries() -> KernelResult<()
     txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
 
     // Commit the transaction
-    let result = txn.commit(engine.as_ref())?;
+    let result = txn.commit(engine.as_ref(), &FileSystemCommitter)?;
 
     match result {
         CommitResult::Committed(committed) => {
@@ -1485,7 +1488,10 @@ async fn test_update_deletion_vectors_rejects_corrupted_scan_files(
     }
     txn.update_deletion_vectors(descriptors, scan_files.into_iter().map(Ok))?;
 
-    assert_result_error_with_message(txn.commit(engine.as_ref()), expected_error);
+    assert_result_error_with_message(
+        txn.commit(engine.as_ref(), &FileSystemCommitter),
+        expected_error,
+    );
     Ok(())
 }
 
@@ -1630,7 +1636,7 @@ async fn test_update_deletion_vectors_multiple_files(
     let mut txn = snapshot
         .clone()
         .update_table(UpdateTableOperation::Update, "test engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
 
     let mut scan_files = get_scan_files(snapshot.clone(), engine.as_ref())?;
 
@@ -1640,7 +1646,7 @@ async fn test_update_deletion_vectors_multiple_files(
     txn.update_deletion_vectors(dv_map, scan_files.drain(..).map(Ok))?;
 
     // Commit the transaction
-    let result = txn.commit(engine.as_ref())?;
+    let result = txn.commit(engine.as_ref(), &FileSystemCommitter)?;
 
     match result {
         CommitResult::Committed(committed) => {
@@ -1776,7 +1782,9 @@ async fn test_update_deletion_vectors_respects_selection_vector(
             .into_iter()
             .map(Ok),
     )?;
-    setup_txn.commit(engine.as_ref())?.unwrap_committed();
+    setup_txn
+        .commit(engine.as_ref(), &FileSystemCommitter)?
+        .unwrap_committed();
 
     let targeted: Vec<String> = target_indexes
         .iter()
@@ -1786,7 +1794,7 @@ async fn test_update_deletion_vectors_respects_selection_vector(
     let mut txn = snapshot
         .clone()
         .update_table(UpdateTableOperation::Update, "test engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
 
     let dv_map: HashMap<String, DeletionVectorDescriptor> = targeted
         .iter()
@@ -1827,7 +1835,9 @@ async fn test_update_deletion_vectors_respects_selection_vector(
     } else {
         update_result?;
     }
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let committed = txn
+        .commit(engine.as_ref(), &FileSystemCommitter)?
+        .unwrap_committed();
     let version = committed.commit_version();
 
     // Read the commit directly from the (in-memory) store.
@@ -1962,7 +1972,7 @@ async fn test_remove_files_verify_files_excluded_from_scan() -> KernelResult<()>
         txn.remove_files(scan_metadata2.scan_files);
 
         // Commit the transaction
-        let result = txn.commit(engine.as_ref());
+        let result = txn.commit(engine.as_ref(), &FileSystemCommitter);
 
         match result? {
             CommitResult::Committed(committed) => {
@@ -2091,7 +2101,7 @@ async fn test_remove_files_with_modified_selection_vector() -> KernelResult<()> 
         let mut txn = snapshot
             .clone()
             .update_table(UpdateTableOperation::Delete, "selective remove test", true)
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+            .build(engine.as_ref())?;
 
         // First batch: Remove only the first file
         let scan2 = snapshot.clone().scan_builder().build()?;
@@ -2144,7 +2154,7 @@ async fn test_remove_files_with_modified_selection_vector() -> KernelResult<()> 
         txn.remove_files(FilteredEngineData::try_new(data2, selection_vector2)?);
 
         // Commit the transaction
-        let result = txn.commit(engine.as_ref())?;
+        let result = txn.commit(engine.as_ref(), &FileSystemCommitter)?;
 
         match result {
             CommitResult::Committed(committed) => {
@@ -2283,7 +2293,9 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
             txn.remove_files(scan_metadata?.scan_files);
         }
 
-        let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+        let committed = txn
+            .commit(engine.as_ref(), &FileSystemCommitter)?
+            .unwrap_committed();
         assert_eq!(committed.commit_version(), expected_commit_version);
 
         let remove_actions =
@@ -2407,7 +2419,8 @@ async fn test_remove_files_partitioned_with_parsed_columns(
             let add_meta = engine.write_parquet(data?.as_ref(), &ctx).await?;
             txn.add_files(add_meta);
         }
-        txn.commit(engine.as_ref())?.unwrap_committed();
+        txn.commit(engine.as_ref(), &FileSystemCommitter)?
+            .unwrap_committed();
 
         let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
         let mut scan_builder = snapshot
@@ -2431,7 +2444,9 @@ async fn test_remove_files_partitioned_with_parsed_columns(
         for scan_metadata in scan.scan_metadata(engine.as_ref())? {
             txn.remove_files(scan_metadata?.scan_files);
         }
-        let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+        let committed = txn
+            .commit(engine.as_ref(), &FileSystemCommitter)?
+            .unwrap_committed();
         assert_eq!(committed.commit_version(), 2);
 
         let remove_actions = read_actions_from_commit(&table_url, 2, "remove")?;
@@ -2569,7 +2584,9 @@ async fn adaptive_metadata_remove_cancels_add_across_dv_storage_types()
             .map(Ok),
     )?;
     txn.ack_row_tracking_preservation();
-    let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    let snapshot = txn
+        .commit(engine.as_ref(), &FileSystemCommitter)?
+        .unwrap_post_commit_snapshot();
 
     // v3: remove the file, then rewrite the remove's DV to the equivalent `'r'` encoding.
     let mut txn = begin_transaction_with(
@@ -2585,7 +2602,7 @@ async fn adaptive_metadata_remove_cancels_add_across_dv_storage_types()
     }
     txn.ack_row_tracking_preservation();
     let version = txn
-        .commit(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?
         .unwrap_committed()
         .commit_version();
     let commit_path = table_url
@@ -2756,7 +2773,7 @@ async fn commit_validates_remove_row_tracking_metadata(
     let mut txn = begin_transaction(snapshot, engine.as_ref())?;
     txn.ack_row_tracking_preservation();
     txn.remove_files(corrupted);
-    let result = txn.commit(engine.as_ref());
+    let result = txn.commit(engine.as_ref(), &FileSystemCommitter);
 
     // === Expect a validation error or the exact surviving file metadata ===
     if let Some(expected_error) = expected_error {
@@ -2813,7 +2830,7 @@ async fn commit_validates_dv_row_tracking_metadata(
         sequential_dv_descriptors(&selected_paths),
         std::iter::once(Ok(corrupted)),
     )?;
-    let result = txn.commit(engine.as_ref());
+    let result = txn.commit(engine.as_ref(), &FileSystemCommitter);
 
     // === Expect a validation error or the exact surviving file metadata ===
     if let Some(expected_error) = expected_error {
@@ -2868,8 +2885,8 @@ fn create_row_tracking_table(
         true,
     )
     .with_table_properties(properties)
-    .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-    .commit(engine.as_ref())?
+    .build(engine.as_ref())?
+    .commit(engine.as_ref(), &FileSystemCommitter)?
     .unwrap_post_commit_snapshot();
     let mut txn = begin_transaction(snapshot, engine.as_ref())?;
     txn.add_files(create_add_files_metadata(
@@ -2880,7 +2897,9 @@ fn create_row_tracking_table(
             ("file2.parquet", 10, 1, Some(3)),
         ],
     )?);
-    let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    let snapshot = txn
+        .commit(engine.as_ref(), &FileSystemCommitter)?
+        .unwrap_post_commit_snapshot();
     // Create-table does not support suspension; suspend after assigning the original metadata.
     let snapshot = if row_tracking_state == RowTrackingState::Suspended {
         let table_url = Url::from_directory_path(&table_path).unwrap();

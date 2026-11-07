@@ -54,8 +54,8 @@ fn test_create_table_with_variant(
 
     let _ = create_table(&table_path, schema.clone(), "Test/1.0", true)
         .with_table_properties(cm_properties(cm_mode))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?;
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
@@ -100,8 +100,8 @@ fn test_create_table_no_variant_no_feature() -> KernelResult<()> {
     };
 
     let _ = create_table(&table_path, schema, "Test/1.0", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?;
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
@@ -122,7 +122,7 @@ fn test_create_table_variant_clustering_rejected() -> KernelResult<()> {
 
     let result = create_table(&table_path, top_level_variant_schema(), "Test/1.0", true)
         .with_data_layout(DataLayout::clustered(["col"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+        .build(engine.as_ref());
 
     assert_result_error_with_message(result, "unsupported type");
 

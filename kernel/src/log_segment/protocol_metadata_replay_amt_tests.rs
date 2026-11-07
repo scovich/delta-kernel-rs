@@ -584,7 +584,7 @@ async fn post_commit_snapshot_resolves_latest_checkpoint_action(
 
     let mut txn = snapshot
         .update_table(UpdateTableOperation::Write, "test-engine", true)
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build(&engine)
         .unwrap();
     // A root manifest commit captures the action it writes; a plain commit carries the read
     // snapshot's action forward.
@@ -597,7 +597,10 @@ async fn post_commit_snapshot_resolves_latest_checkpoint_action(
             })
             .unwrap();
     }
-    let post_commit = txn.commit(&engine).unwrap().unwrap_post_commit_snapshot();
+    let post_commit = txn
+        .commit(&engine, &FileSystemCommitter)
+        .unwrap()
+        .unwrap_post_commit_snapshot();
 
     // With every commit file deleted, resolving the action proves no log scan is needed.
     for version in 0..=1 {
@@ -627,9 +630,9 @@ async fn post_commit_snapshot_follows_transaction_last_manifest_commit() {
 
     let post_commit = snapshot
         .update_table(UpdateTableOperation::Write, "test-engine", true)
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build(&engine)
         .unwrap()
-        .commit(&engine)
+        .commit(&engine, &FileSystemCommitter)
         .unwrap()
         .unwrap_post_commit_snapshot();
 

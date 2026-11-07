@@ -1,6 +1,7 @@
 use super::{CommitResult, Declarative, Transaction, UpdateTable};
 #[cfg(doc)]
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
+use crate::committer::Committer;
 use crate::plans::{RelationRef, ScopedPlanExecutor};
 #[cfg(doc)]
 use crate::scan::scan_row_schema;
@@ -14,6 +15,7 @@ impl<S> Transaction<S, Declarative> {
     pub fn commit_declarative(
         self,
         _executor: &dyn ScopedPlanExecutor,
+        _committer: &dyn Committer,
     ) -> KernelResult<CommitResult<S, Declarative>> {
         Err(KernelError::unsupported(
             "Declarative transaction commits are not implemented",
@@ -97,7 +99,7 @@ mod tests {
         let mut txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
             .with_execution_mode::<Declarative>()
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+            .build(engine.as_ref())?;
         if add_files {
             txn.add_files_ref(RelationRef::new("adds", txn.add_files_schema().clone()));
         }
@@ -130,9 +132,11 @@ mod tests {
         let txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
             .with_execution_mode::<Declarative>()
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+            .build(engine.as_ref())?;
         let executor = SyncPlanExecutor::default().get_scoped();
-        let error = txn.commit_declarative(&executor).unwrap_err();
+        let error = txn
+            .commit_declarative(&executor, &FileSystemCommitter)
+            .unwrap_err();
         assert!(matches!(&error, KernelError::Unsupported(_)));
         assert!(error.to_string().contains("not implemented"));
         Ok(())

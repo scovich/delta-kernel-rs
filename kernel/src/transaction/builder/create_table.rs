@@ -19,7 +19,6 @@ use super::TransactionBuilder;
 use super::state::TransactionBuilderState;
 use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
-use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::schema::collation_utils::schema_has_collations;
 use crate::schema::file_utils::schema_contains_file_type;
@@ -972,7 +971,6 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
     /// # Arguments
     ///
     /// * `engine` - The engine instance to use for validation
-    /// * `committer` - The committer to use for the transaction
     ///
     /// # Errors
     ///
@@ -985,11 +983,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
     /// - Connector commit information does not contain exactly one row
     /// - An application transaction identifier occurs more than once
     #[internal_api]
-    pub(crate) fn build(
-        self,
-        engine: &dyn Engine,
-        committer: Box<dyn Committer>,
-    ) -> KernelResult<CreateTableTransaction<MODE>> {
+    pub(crate) fn build(self, engine: &dyn Engine) -> KernelResult<CreateTableTransaction<MODE>> {
         self.common_state.validate()?;
 
         // Validate path
@@ -1109,7 +1103,6 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
         // Create Transaction<CreateTable> with the effective table configuration
         let transaction = try_new_create_table(
             table_configuration,
-            committer,
             data_layout_result.system_domain_metadata,
             data_layout_result.clustering_columns,
             self.common_state,
@@ -1121,7 +1114,6 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
 
 fn try_new_create_table<MODE: ExecutionMode>(
     effective_table_config: TableConfiguration,
-    committer: Box<dyn Committer>,
     system_domain_metadata: Vec<DomainMetadata>,
     clustering_columns: Option<Vec<ColumnName>>,
     common_state: TransactionBuilderState,
@@ -1146,7 +1138,6 @@ fn try_new_create_table<MODE: ExecutionMode>(
         ..Transaction::new(
             common_state,
             effective_table_config,
-            committer,
             CommitOperation::CreateTable,
             span,
             commit_timestamp,
@@ -1228,7 +1219,7 @@ mod tests {
         if skip_dedup_validation {
             builder = builder.without_dedup_validation();
         }
-        let transaction = builder.build(&engine, Box::new(FileSystemCommitter::new()))?;
+        let transaction = builder.build(&engine)?;
 
         assert_eq!(transaction.skip_dedup_validation, skip_dedup_validation);
         assert_eq!(transaction.engine_info, "test-engine");
@@ -1247,7 +1238,9 @@ mod tests {
             Some(transaction.commit_timestamp)
         );
         assert_eq!(transaction.data_change, expected_data_change);
-        let committed = transaction.commit(&engine)?.unwrap_committed();
+        let committed = transaction
+            .commit(&engine, &FileSystemCommitter)?
+            .unwrap_committed();
         assert_eq!(committed.commit_version(), 0);
         let metrics = reporter
             .events()
@@ -1284,7 +1277,7 @@ mod tests {
             true,
         )
         .with_commit_info(commit_info, commit_info_schema)
-        .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))
+        .build(&SyncEngine::new())
         .unwrap_err();
         assert!(
             error
@@ -1308,7 +1301,7 @@ mod tests {
         )
         .with_transaction_id("app", 1)
         .with_transaction_id("app", 2)
-        .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))
+        .build(&SyncEngine::new())
         .unwrap_err();
         assert!(
             error
@@ -1345,10 +1338,7 @@ mod tests {
             builder = builder.with_table_properties([property]);
         }
 
-        assert_result_error_with_message(
-            builder.build(&SyncEngine::new(), Box::new(FileSystemCommitter::new())),
-            expected,
-        );
+        assert_result_error_with_message(builder.build(&SyncEngine::new()), expected);
         Ok(())
     }
 
@@ -1365,7 +1355,7 @@ mod tests {
         )
         .with_data_layout(DataLayout::clustered(["id"]))
         .with_domain_metadata("delta.clustering", "{}")
-        .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))
+        .build(&SyncEngine::new())
         .unwrap_err();
 
         assert!(error.to_string().contains("system controlled"), "{error}");
@@ -1445,7 +1435,7 @@ mod tests {
             "test-engine",
             true,
         )
-        .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()));
+        .build(&SyncEngine::new());
 
         let is_unsupported = matches!(&result, Err(KernelError::Unsupported(_)));
         assert!(is_unsupported);

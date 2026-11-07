@@ -6,7 +6,6 @@ use delta_kernel_derive::internal_api;
 
 use super::TransactionBuilder;
 use super::state::TransactionBuilderState;
-use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
@@ -27,9 +26,8 @@ use crate::{Engine, KernelError, KernelResult};
 ///
 /// This builder does not create or replace tables. Construct it with
 /// [`Snapshot::update_table`](crate::Snapshot::update_table); operation, engine info, and
-/// `data_change` cannot be changed afterward.
-/// [`build`](UpdateTableTransactionBuilder::build) validates the accumulated intent and constructs
-/// the transaction.
+/// `data_change` cannot be changed afterward. [`build`](UpdateTableTransactionBuilder::build)
+/// validates the accumulated intent and constructs the transaction.
 ///
 /// # Schema changes
 ///
@@ -46,7 +44,8 @@ use crate::{Engine, KernelError, KernelResult};
 ///
 /// Set `data_change` when constructing the builder: `true` for logical data changes, or `false`
 /// for metadata-only changes and data-preserving rewrites. `ALTER TABLE` requires `false`, while
-/// blind append requires `true`. [`build`](UpdateTableTransactionBuilder::build) rejects
+/// blind append requires `true`.
+/// [`build`](UpdateTableTransactionBuilder::build) rejects
 /// incompatible intent; commit validates the staged file actions and rejects any staged
 /// data-file batches or manifest writes for `ALTER TABLE`.
 ///
@@ -108,7 +107,8 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         self
     }
 
-    /// Adds schema changes to validate and apply during [`build`](Self::build).
+    /// Adds schema changes to validate and apply during
+    /// [`build`](Self::build).
     ///
     /// Appends `changes` in call order and returns the updated builder. Each change observes the
     /// result of prior changes. Empty input is rejected immediately.
@@ -139,7 +139,8 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// must be nullable because existing data files do not contain it. On column-mapping tables,
     /// Kernel assigns or preserves column-mapping IDs and physical names.
     ///
-    /// Schema changes are applied in call order and validated by [`build`](Self::build).
+    /// Schema changes are applied in call order and validated by
+    /// [`build`](Self::build).
     pub fn add_column(mut self, field: StructField) -> Self {
         self.local_state
             .schema_changes
@@ -156,7 +157,8 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// sibling. On column-mapping tables, Kernel assigns or preserves column-mapping IDs and
     /// physical names.
     ///
-    /// Schema changes are applied in call order and validated by [`build`](Self::build).
+    /// Schema changes are applied in call order and validated by
+    /// [`build`](Self::build).
     pub fn add_column_at(mut self, parent: ColumnName, field: StructField) -> Self {
         self.local_state
             .schema_changes
@@ -201,7 +203,6 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// # Parameters
     ///
     /// - `engine`: Provides table-state reads needed during validation.
-    /// - `committer`: Executes the eventual atomic commit.
     ///
     /// For clustered tables, building performs log replay to load clustering columns from domain
     /// metadata and may therefore incur additional I/O.
@@ -217,13 +218,9 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// Schema changes are rejected when `icebergCompatV2`, `icebergCompatV3`, or
     /// `allowColumnDefaults` is enabled. This applies to standalone ALTER TABLE transactions and
     /// schema evolution during data-changing writes.
-    pub fn build(
-        self,
-        engine: &dyn Engine,
-        committer: Box<dyn Committer>,
-    ) -> KernelResult<Transaction<UpdateTable, MODE>> {
+    pub fn build(self, engine: &dyn Engine) -> KernelResult<Transaction<UpdateTable, MODE>> {
         self.validate()?;
-        let transaction = try_new_update_table(self, committer, engine)?;
+        let transaction = try_new_update_table(self, engine)?;
         transaction.validate_domain_metadata_operations()?;
         Ok(transaction)
     }
@@ -288,7 +285,6 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
 
 fn try_new_update_table<MODE: ExecutionMode>(
     builder: UpdateTableTransactionBuilder<MODE>,
-    committer: Box<dyn Committer>,
     engine: &dyn Engine,
 ) -> KernelResult<Transaction<UpdateTable, MODE>> {
     let TransactionBuilder {
@@ -359,7 +355,6 @@ fn try_new_update_table<MODE: ExecutionMode>(
         ..Transaction::new(
             common_state,
             effective_table_config,
-            committer,
             operation.into(),
             span,
             commit_timestamp,
@@ -432,7 +427,7 @@ mod tests {
             .with_operation_parameters([("mode", Some("Append"))])
             .with_operation_metrics([("numFiles", Some("3"))])
             .with_transaction_id("app", 7)
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+            .build(engine.as_ref())?;
 
         assert_eq!(transaction.operation, operation.into());
         assert_eq!(transaction.engine_info, "test-engine");
@@ -465,7 +460,7 @@ mod tests {
             .with_operation_parameters([("second", Some("value"))])
             .with_operation_metrics([("first", Some("value"))])
             .with_operation_metrics([("second", Some("value"))])
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+            .build(engine.as_ref())?;
 
         assert_eq!(transaction.operation, UpdateTableOperation::Delete.into());
         assert_eq!(transaction.engine_info, "second-engine");
@@ -514,7 +509,7 @@ mod tests {
                 StructField::nullable("new_column", DataType::STRING),
             )])
             .expect("non-empty schema changes must be accepted by the setter")
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+            .build(engine.as_ref())?;
         transaction.ack_column_defaults();
         transaction.ack_row_tracking_preservation();
         transaction = transaction.with_row_tracking_high_water_mark(17)?;
@@ -547,7 +542,7 @@ mod tests {
         let error = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
             .with_commit_info(commit_info, commit_info_schema)
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .build(engine.as_ref())
             .unwrap_err();
         assert!(
             error
@@ -582,7 +577,7 @@ mod tests {
         let transaction = snapshot
             .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
             .add_column(StructField::nullable("new_column", DataType::STRING))
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+            .build(engine.as_ref())?;
 
         assert_eq!(
             transaction.operation,
@@ -608,7 +603,7 @@ mod tests {
                 true,
             )
             .add_column(StructField::nullable("new_column", DataType::STRING))
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+            .build(engine.as_ref())?;
 
         assert!(transaction.should_emit_metadata);
         Ok(())
@@ -625,7 +620,7 @@ mod tests {
                 "test-engine",
                 false,
             )
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .build(engine.as_ref())
             .unwrap_err();
 
         assert!(
@@ -640,7 +635,7 @@ mod tests {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let error = snapshot
             .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .build(engine.as_ref())
             .unwrap_err();
 
         assert!(
@@ -748,7 +743,7 @@ mod tests {
             .clone()
             .update_table(operation.clone(), "test-engine", true);
         assert!(builder.local_state.schema_changes.is_none());
-        let result = builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+        let result = builder.build(engine.as_ref());
         if operation == UpdateTableOperation::AlterTable {
             let error = result.unwrap_err();
             assert!(
@@ -790,7 +785,7 @@ mod tests {
             builder.local_state.schema_changes.as_ref().unwrap().len(),
             1
         );
-        let result = builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+        let result = builder.build(engine.as_ref());
         if let Some(feature) = feature.filter(|_| feature_enabled) {
             assert!(
                 snapshot
@@ -883,7 +878,7 @@ mod tests {
                 && second_column == &StructField::nullable("another_column", DataType::INTEGER)
         ));
         let transaction = builder
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .build(engine.as_ref())
             .expect("schema changes must build in call order");
         assert!(transaction.should_emit_metadata);
         let schema = transaction.effective_table_config.logical_schema();
@@ -942,9 +937,7 @@ mod tests {
             }
         };
 
-        let error = builder
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
-            .unwrap_err();
+        let error = builder.build(engine.as_ref()).unwrap_err();
         assert!(matches!(&error, KernelError::InvalidTransactionState(_)));
         assert!(error.to_string().contains(expected), "{error}");
         Ok(())
@@ -974,7 +967,7 @@ mod tests {
         let mut transaction = snapshot
             .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
             .add_column(StructField::nullable("new_column", DataType::STRING))
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+            .build(engine.as_ref())?;
 
         assert!(!transaction.data_change);
 
@@ -1005,7 +998,9 @@ mod tests {
             }
         }
         assert!(!transaction.data_change);
-        let error = transaction.commit(engine.as_ref()).unwrap_err();
+        let error = transaction
+            .commit(engine.as_ref(), &FileSystemCommitter)
+            .unwrap_err();
         assert!(
             matches!(&error, KernelError::InvalidTransactionState(message)
             if message == "ALTER TABLE cannot include data-file actions")
@@ -1024,7 +1019,7 @@ mod tests {
         let builder = snapshot
             .update_table(UpdateTableOperation::AlterTable, "test-engine", data_change)
             .add_column(StructField::nullable("new_column", DataType::STRING));
-        let result = builder.build(&engine, Box::new(FileSystemCommitter::new()));
+        let result = builder.build(&engine);
         if data_change {
             let error = result.unwrap_err();
             assert!(
@@ -1034,7 +1029,9 @@ mod tests {
         } else {
             let transaction = result?;
             assert!(!transaction.data_change);
-            let snapshot = transaction.commit(&engine)?.unwrap_post_commit_snapshot();
+            let snapshot = transaction
+                .commit(&engine, &FileSystemCommitter)?
+                .unwrap_post_commit_snapshot();
             assert_eq!(snapshot.version(), version + 1);
             assert!(snapshot.schema().contains("new_column"));
         }
@@ -1047,9 +1044,11 @@ mod tests {
         let mut transaction = snapshot
             .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
             .add_column(StructField::nullable("new_column", DataType::STRING))
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+            .build(engine.as_ref())?;
         transaction.data_change = true;
-        let error = transaction.commit(engine.as_ref()).unwrap_err();
+        let error = transaction
+            .commit(engine.as_ref(), &FileSystemCommitter)
+            .unwrap_err();
         assert!(
             matches!(&error, KernelError::InvalidTransactionState(message)
             if message == "ALTER TABLE requires data_change to be false")
@@ -1069,7 +1068,7 @@ mod tests {
                 data_change,
             )
             .add_column(StructField::nullable("new_column", DataType::STRING))
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+            .build(engine.as_ref())?;
 
         assert_eq!(transaction.data_change, data_change);
 
@@ -1122,9 +1121,7 @@ mod tests {
             builder = builder.with_transaction_id(*app_id, 1);
         }
 
-        let error = builder
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
-            .unwrap_err();
+        let error = builder.build(engine.as_ref()).unwrap_err();
         assert!(matches!(&error, KernelError::InvalidTransactionState(_)));
         assert!(error.to_string().contains(expected), "{error}");
         Ok(())
@@ -1136,7 +1133,7 @@ mod tests {
         let error = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
             .with_domain_metadata("app.config", "{}")
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .build(engine.as_ref())
             .unwrap_err();
 
         assert!(error.to_string().contains("domainMetadata"), "{error}");
@@ -1170,9 +1167,9 @@ mod tests {
                 let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
                 let snapshot = create_table("memory:///", test_schema_flat(), "test", true)
                     .with_table_properties(properties)
-                    .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+                    .build(engine.as_ref())
                     .expect("valid table properties")
-                    .commit(engine.as_ref())
+                    .commit(engine.as_ref(), &FileSystemCommitter)
                     .expect("create schema-validation table")
                     .unwrap_post_commit_snapshot();
                 (engine, snapshot, None)

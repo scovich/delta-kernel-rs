@@ -226,7 +226,7 @@ async fn v3_invalid_type_change_blocks_writes_but_not_snapshot_loading() {
         .unwrap();
     let err = snapshot
         .update_table(UpdateTableOperation::Write, "test-engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build(engine.as_ref())
         .unwrap_err()
         .to_string();
     assert!(
@@ -292,7 +292,7 @@ async fn v2_and_deletion_vectors_active_blocks_writes() {
         .unwrap();
     let err = snapshot
         .update_table(UpdateTableOperation::Write, "test-engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build(engine.as_ref())
         .unwrap_err()
         .to_string();
     assert!(
@@ -311,9 +311,9 @@ async fn iceberg_compat_commit_validates_num_records(
 
     let _ = create_table(TABLE_ROOT, simple_schema(), "Test/1.0", true)
         .with_table_properties([(feature_property, "true")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build(engine.as_ref())
         .unwrap()
-        .commit(engine.as_ref())
+        .commit(engine.as_ref(), &FileSystemCommitter)
         .unwrap();
     let snapshot = Snapshot::builder_for(TABLE_ROOT)
         .build(engine.as_ref())
@@ -321,7 +321,7 @@ async fn iceberg_compat_commit_validates_num_records(
 
     let mut txn = snapshot
         .update_table(UpdateTableOperation::Write, "Test/1.0", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build(engine.as_ref())
         .unwrap();
     let add_files = create_add_files_metadata(
         txn.add_files_schema(),
@@ -331,10 +331,16 @@ async fn iceberg_compat_commit_validates_num_records(
     txn.add_files(add_files);
 
     if num_records.is_some() {
-        let committed = txn.commit(engine.as_ref()).unwrap().unwrap_committed();
+        let committed = txn
+            .commit(engine.as_ref(), &FileSystemCommitter)
+            .unwrap()
+            .unwrap_committed();
         assert_eq!(committed.commit_version(), 1);
     } else {
-        let err = txn.commit(engine.as_ref()).unwrap_err().to_string();
+        let err = txn
+            .commit(engine.as_ref(), &FileSystemCommitter)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("'stats.numRecords' is required") && err.contains("part-fake.parquet"),
             "expected missing numRecords error for part-fake.parquet, got: {err}",
@@ -362,9 +368,9 @@ async fn v2_partitioned_write_materializes_partition_and_nested_field_ids() {
     let snapshot = create_table(&table_path, schema, "Test/1.0", true)
         .with_table_properties([("delta.enableIcebergCompatV2", "true")])
         .with_data_layout(DataLayout::partitioned(["region"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build(engine.as_ref())
         .unwrap()
-        .commit(engine.as_ref())
+        .commit(engine.as_ref(), &FileSystemCommitter)
         .unwrap()
         .unwrap_post_commit_snapshot();
 
@@ -480,9 +486,9 @@ async fn v3_e2e_partitioned_writes_with_field_ids(
     let _ = create_table(&table_path, schema.clone(), "Test/1.0", true)
         .with_table_properties(props)
         .with_data_layout(DataLayout::partitioned(["region"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build(engine.as_ref())
         .unwrap()
-        .commit(engine.as_ref())
+        .commit(engine.as_ref(), &FileSystemCommitter)
         .unwrap();
 
     // === 4 commits (2 outer iters x 2 partitions), checkpoint, 4 more commits ===

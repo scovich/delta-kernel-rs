@@ -87,8 +87,8 @@ async fn setup_multi_version_table<E: TaskExecutor>(
         ]),
     };
     let create_snapshot = builder
-        .build(engine.as_ref(), kind.committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), kind.committer().as_ref())?
         .unwrap_post_commit_snapshot();
 
     // The create-table snapshot is built as latest (version 0 is necessarily the latest).
@@ -203,8 +203,8 @@ async fn snapshot_load_validates_reader_protocol(
         "test_engine",
         true,
     )
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
-    .commit(&engine)?
+    .build(&engine)?
+    .commit(&engine, &FileSystemCommitter)?
     .unwrap_committed();
     let base = Snapshot::builder_for(table_url.as_str()).build(&engine)?;
     assert_eq!(base.version(), 0);
@@ -273,8 +273,8 @@ async fn row_tracking_configuration_rejects_only_enabled_and_suspended(
     let (store, engine, table_url) = engine_store_setup("row_tracking_configuration", None);
     create_table(&table_url, schema, "test_engine", true)
         .with_table_properties([("delta.feature.rowTracking", "supported")])
-        .build(&engine, Box::new(FileSystemCommitter::new()))?
-        .commit(&engine)?
+        .build(&engine)?
+        .commit(&engine, &FileSystemCommitter)?
         .unwrap_committed();
 
     let base = Snapshot::builder_for(&table_url).build(&engine)?;

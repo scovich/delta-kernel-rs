@@ -37,7 +37,7 @@ async fn write_batch_to_table_simple(
         .write_parquet(&ArrowEngineData::new(data), &write_context)
         .await?;
     txn.add_files(add_meta);
-    let committed = txn.commit(engine)?.unwrap_committed();
+    let committed = txn.commit(engine, &FileSystemCommitter)?.unwrap_committed();
     Ok(committed.post_commit_snapshot().unwrap().clone())
 }
 
@@ -99,7 +99,9 @@ async fn test_multiple_files_in_commit_all_use_relative_paths()
             .await?;
         txn.add_files(add_meta);
     }
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let committed = txn
+        .commit(engine.as_ref(), &FileSystemCommitter)?
+        .unwrap_committed();
     let snapshot = committed.post_commit_snapshot().unwrap().clone();
 
     let add_infos = read_add_infos(&snapshot, engine.as_ref())?;
@@ -149,7 +151,7 @@ async fn test_create_table_with_data_uses_relative_paths() -> Result<(), Box<dyn
     let table_url = Url::from_directory_path(&table_path).unwrap();
 
     let mut txn = create_table_txn(table_url.as_str(), schema.clone(), "test/1.0", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
     let write_context = txn.write_state()?.write_context_builder().build()?;
     let add_meta = engine
         .write_parquet(
@@ -158,7 +160,9 @@ async fn test_create_table_with_data_uses_relative_paths() -> Result<(), Box<dyn
         )
         .await?;
     txn.add_files(add_meta);
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let committed = txn
+        .commit(engine.as_ref(), &FileSystemCommitter)?
+        .unwrap_committed();
     let snapshot = committed.post_commit_snapshot().unwrap().clone();
 
     let add_infos = read_add_infos(&snapshot, engine.as_ref())?;

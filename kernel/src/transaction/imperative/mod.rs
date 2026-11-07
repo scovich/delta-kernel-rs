@@ -21,7 +21,7 @@ use crate::actions::{
     LOG_PROTOCOL_SCHEMA, LOG_REMOVE_SCHEMA, LOG_TXN_SCHEMA, Metadata, Protocol, SetTransaction,
     as_log_add_schema,
 };
-use crate::committer::{CommitMetadata, CommitResponse};
+use crate::committer::{CommitMetadata, CommitResponse, Committer};
 use crate::crc::FileStatsDelta;
 use crate::engine_data::FilteredEngineData;
 use crate::error::KernelError;
@@ -74,8 +74,15 @@ impl<STATE: 'static> Transaction<STATE, Imperative> {
     ///   transaction in case of a conflict so the user can retry, etc.)
     /// - Err(KernelError) indicates a non-retryable error (e.g. logic/validation error).
     ///
+    /// `committer` performs the atomic commit. Catalog-managed tables require a catalog committer
+    /// and path-based tables a non-catalog one, such as [`FileSystemCommitter`]. A retry of a
+    /// [`RetryableTransaction`] may pass the same committer again.
+    ///
     /// `ALTER TABLE` returns a validation error if any data-file batches or manifest writes are
     /// staged. Empty or fully unselected data-file batches are also rejected.
+    ///
+    /// [`FileSystemCommitter`]: crate::committer::FileSystemCommitter
+    /// [`RetryableTransaction`]: super::RetryableTransaction
     #[instrument(
         parent = &self.span,
         name = TRANSACTION_COMMIT_SPAN,
@@ -100,7 +107,11 @@ impl<STATE: 'static> Transaction<STATE, Imperative> {
         ),
         err
     )]
-    pub fn commit(self, engine: &dyn Engine) -> KernelResult<CommitResult<STATE>> {
+    pub fn commit(
+        self,
+        engine: &dyn Engine,
+        committer: &dyn Committer,
+    ) -> KernelResult<CommitResult<STATE>> {
         let commit_start = Instant::now();
 
         // === Pre-commit validation ===
@@ -132,6 +143,7 @@ impl<STATE: 'static> Transaction<STATE, Imperative> {
 
         // === Commit ===
         let commit_metadata = self.create_commit_metadata(
+            committer,
             commit_version,
             kernel_commit_info.in_commit_timestamp,
             protocol,
@@ -140,7 +152,7 @@ impl<STATE: 'static> Transaction<STATE, Imperative> {
         )?;
         let prepare_duration = commit_start.elapsed();
         let (commit_response, committer_duration) =
-            self.perform_commit(engine, actions, commit_metadata);
+            self.perform_commit(engine, committer, actions, commit_metadata);
 
         // === Result translation ===
         let post_commit_inputs = PostCommitInputs {
@@ -207,11 +219,12 @@ impl<STATE: 'static> Transaction<STATE, Imperative> {
     fn perform_commit(
         &self,
         engine: &dyn Engine,
+        committer: &dyn Committer,
         actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
         commit_metadata: CommitMetadata,
     ) -> (KernelResult<CommitResponse>, Duration) {
         let committer_start = Instant::now();
-        let commit_response = self.committer.commit(engine, actions, commit_metadata);
+        let commit_response = committer.commit(engine, actions, commit_metadata);
         (commit_response, committer_start.elapsed())
     }
 
@@ -858,7 +871,6 @@ mod tests {
     };
     use crate::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
     use crate::arrow::record_batch::RecordBatch;
-    use crate::committer::FileSystemCommitter;
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
@@ -1080,7 +1092,7 @@ mod tests {
         let snapshot = Snapshot::builder_for(url).build(&engine)?;
         let txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", data_change)
-            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+            .build(&engine)?;
         Ok((engine, txn, tempdir))
     }
 
@@ -1191,7 +1203,7 @@ mod tests {
             "test-engine",
             data_change,
         )
-        .build(&engine, Box::new(FileSystemCommitter::new()))?;
+        .build(&engine)?;
         transaction.add_files(Box::new(ArrowEngineData::new(create_valid_add_file_batch(
             false, /* all_nullable */
         ))));
@@ -1363,7 +1375,7 @@ mod tests {
         let (engine, snapshot) = non_dv_table();
         let txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .build(&engine)
             .unwrap()
             .with_clustering_columns_for_test(vec![column_name!("value")]);
 
@@ -1382,7 +1394,7 @@ mod tests {
         let (engine, snapshot) = non_dv_table();
         let txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .build(&engine)
             .unwrap()
             // Enable clustering columns for this test
             .with_clustering_columns_for_test(vec![column_name!("value")]);
@@ -1410,7 +1422,7 @@ mod tests {
         let (engine, snapshot) = non_dv_table();
         let txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .build(&engine)
             .unwrap()
             // Enable clustering columns for this test
             .with_clustering_columns_for_test(vec![column_name!("value")]);
@@ -1432,7 +1444,7 @@ mod tests {
         let (engine, snapshot) = non_dv_table();
         let txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .build(&engine)
             .unwrap();
         // No clustering columns set (default)
 

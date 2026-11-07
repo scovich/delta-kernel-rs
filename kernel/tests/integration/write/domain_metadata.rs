@@ -55,7 +55,7 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
     // write context does not conflict with domain metadata
     let _write_context = txn.write_state()?.write_context_builder().build()?;
 
-    assert!(txn.commit(&engine)?.is_committed());
+    assert!(txn.commit(&engine, &FileSystemCommitter)?.is_committed());
 
     let commit_data = store
         .get(&Path::from(format!(
@@ -123,7 +123,7 @@ async fn test_set_domain_metadata_errors() -> Result<(), Box<dyn std::error::Err
     let txn = begin_transaction(snapshot.clone(), &engine)?;
     let res = txn
         .with_domain_metadata("delta.system".to_string(), "config".to_string())
-        .commit(&engine);
+        .commit(&engine, &FileSystemCommitter);
     assert_result_error_with_message(
         res,
         "Cannot modify domains that start with 'delta.' as those are system controlled",
@@ -134,7 +134,7 @@ async fn test_set_domain_metadata_errors() -> Result<(), Box<dyn std::error::Err
     let res = txn2
         .with_domain_metadata("app.config".to_string(), "v1".to_string())
         .with_domain_metadata("app.config".to_string(), "v2".to_string())
-        .commit(&engine);
+        .commit(&engine, &FileSystemCommitter);
     assert_result_error_with_message(
         res,
         "Metadata for domain app.config already specified in this transaction",
@@ -168,7 +168,7 @@ async fn test_set_domain_metadata_unsupported_writer_feature()
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let res = begin_transaction(snapshot, &engine)?
         .with_domain_metadata("app.config".to_string(), "test_config".to_string())
-        .commit(&engine);
+        .commit(&engine, &FileSystemCommitter);
 
     assert_result_error_with_message(
         res,
@@ -245,7 +245,7 @@ async fn test_remove_domain_metadata_non_existent_domain() -> Result<(), Box<dyn
     let txn = load_and_begin_transaction(table_url.clone(), &engine)?;
     let _ = txn
         .with_domain_metadata_removed(domain.to_string())
-        .commit(&engine)?;
+        .commit(&engine, &FileSystemCommitter)?;
 
     let commit_data = store
         .get(&Path::from(format!(
@@ -301,7 +301,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
         .update_table(UpdateTableOperation::Write, "test-engine", true)
         .with_domain_metadata("app.config", "v1")
         .with_domain_metadata_removed("app.config")
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build(&engine)
         .unwrap_err();
     assert!(
         err.to_string()
@@ -314,7 +314,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
         .update_table(UpdateTableOperation::Write, "test-engine", true)
         .with_domain_metadata_removed("test.domain")
         .with_domain_metadata("test.domain", "v1")
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build(&engine)
         .unwrap_err();
     assert!(
         err.to_string()
@@ -327,7 +327,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
         .update_table(UpdateTableOperation::Write, "test-engine", true)
         .with_domain_metadata_removed("another.domain")
         .with_domain_metadata_removed("another.domain")
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build(&engine)
         .unwrap_err();
     assert!(err.to_string().contains("removed more than once"));
 
@@ -376,7 +376,7 @@ async fn test_builder_domain_metadata_with_late_operation(
         true,
         |builder| builder.with_domain_metadata("app.other", "original"),
     )?
-    .commit(&engine)?
+    .commit(&engine, &FileSystemCommitter)?
     .unwrap_post_commit_snapshot();
     let transaction = begin_transaction_with(
         snapshot.clone(),
@@ -391,7 +391,7 @@ async fn test_builder_domain_metadata_with_late_operation(
     } else {
         transaction.with_domain_metadata(late_domain.to_string(), "late".to_string())
     };
-    let result = transaction.commit(&engine);
+    let result = transaction.commit(&engine, &FileSystemCommitter);
 
     if late_domain == "app.config" {
         assert_result_error_with_message(result, "already specified in this transaction");
@@ -456,7 +456,7 @@ async fn test_domain_metadata_set_then_remove() -> Result<(), Box<dyn std::error
     let txn = load_and_begin_transaction(table_url.clone(), &engine)?;
     let _ = txn
         .with_domain_metadata(domain.to_string(), configuration.to_string())
-        .commit(&engine)?;
+        .commit(&engine, &FileSystemCommitter)?;
 
     // txn 2: remove the same domain metadata
     let _ = begin_transaction_with(
@@ -467,7 +467,7 @@ async fn test_domain_metadata_set_then_remove() -> Result<(), Box<dyn std::error
         true,
         |builder| builder.with_domain_metadata_removed(domain),
     )?
-    .commit(&engine)?;
+    .commit(&engine, &FileSystemCommitter)?;
 
     // verify removal commit preserves the previous configuration
     let commit_data = store

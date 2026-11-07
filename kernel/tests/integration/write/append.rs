@@ -144,7 +144,7 @@ async fn test_no_add_actions() -> KernelResult<()> {
         )?;
 
         // Commit without adding any add files
-        assert!(txn.commit(&engine)?.is_committed());
+        assert!(txn.commit(&engine, &FileSystemCommitter)?.is_committed());
 
         let commit1 = store
             .get(&Path::from(format!(
@@ -272,7 +272,10 @@ async fn test_append_partitioned(
         }
 
         // commit!
-        assert!(txn.commit(engine.as_ref())?.is_committed());
+        assert!(
+            txn.commit(engine.as_ref(), &FileSystemCommitter)?
+                .is_committed()
+        );
 
         let commit1 = store
             .get(&Path::from(format!(
@@ -467,7 +470,7 @@ async fn commit_rejects_add_missing_required_field() -> KernelResult<()> {
         txn.add_files(Box::new(ArrowEngineData::new(corrupted)));
 
         let err = txn
-            .commit(engine.as_ref())
+            .commit(engine.as_ref(), &FileSystemCommitter)
             .expect_err(&format!(
                 "commit should reject an add missing required field '{field}'"
             ))
@@ -526,8 +529,8 @@ async fn commit_rejects_add_with_invalid_partition_keys(
         builder = builder.with_table_properties([("delta.columnMapping.mode", mode)]);
     }
     builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?
         .unwrap_post_commit_snapshot();
 
     let data_schema = schema! { nullable "d": INTEGER };
@@ -569,11 +572,14 @@ async fn commit_rejects_add_with_invalid_partition_keys(
         .collect();
     let mut txn = snapshot
         .update_table(UpdateTableOperation::Write, "test-engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
     let write_state = txn.write_state()?;
     let add = make_add(&write_state, "b", 6)?;
     let corrupted = modify_add_file_partition_keys(into_record_batch(add), &modifications);
     txn.add_files(Box::new(ArrowEngineData::new(corrupted)));
-    assert_result_error_with_message(txn.commit(engine.as_ref()), "partitionValues keys");
+    assert_result_error_with_message(
+        txn.commit(engine.as_ref(), &FileSystemCommitter),
+        "partitionValues keys",
+    );
     Ok(())
 }

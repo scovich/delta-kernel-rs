@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+#[cfg(feature = "checkpoint-protection")]
 use delta_kernel::committer::FileSystemCommitter;
 #[cfg(feature = "checkpoint-protection")]
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -31,11 +32,13 @@ async fn checkpoint_protection_with_feature_allows_writes() -> KernelResult<()> 
             "test-engine",
             true, /* data_change */
         )
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
     let context = txn.write_state()?.write_context_builder().build()?;
     let data = ArrowEngineData::new(simple_id_batch(&schema, vec![1, 2, 3]));
     txn.add_files(engine.write_parquet(&data, &context).await?);
-    let committed = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    let committed = txn
+        .commit(engine.as_ref(), &FileSystemCommitter)?
+        .unwrap_post_commit_snapshot();
     let (_, checkpointed) = committed.checkpoint(engine.as_ref(), None /* spec */)?;
     checkpointed.write_checksum(engine.as_ref())?;
     test_read(&data, &table_url, engine.clone())?;
@@ -60,7 +63,7 @@ async fn checkpoint_protection_without_feature_blocks_writes() -> KernelResult<(
             "test-engine",
             true, /* data_change */
         )
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+        .build(engine.as_ref());
     let expected = "Feature 'checkpointProtection' is not supported";
     assert_result_error_with_message(result, expected);
     assert_result_error_with_message(

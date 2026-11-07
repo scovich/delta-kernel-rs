@@ -1261,8 +1261,8 @@ async fn partitioned_snapshot(
         } else {
             DataLayout::partitioned(partition_columns)
         })
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter)?
         .unwrap_committed();
     add_commit(
         table_url.as_str(),
@@ -1576,8 +1576,8 @@ async fn incremental_scan_from_cached_snapshot_matches_full_scan_with_timezone(
         true, /* data_change */
     )
     .with_data_layout(DataLayout::partitioned(["ts"]))
-    .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-    .commit(engine.as_ref())?
+    .build(engine.as_ref())?
+    .commit(engine.as_ref(), &FileSystemCommitter)?
     .unwrap_committed();
 
     let before = "2024-01-15 11:30:45.123456";

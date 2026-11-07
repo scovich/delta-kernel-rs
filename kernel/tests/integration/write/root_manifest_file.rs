@@ -78,7 +78,8 @@ async fn test_with_root_manifest_file_produces_a_self_contained_checkpoint_actio
         |builder| builder,
     )?
     .with_root_manifest_file(file.clone())?;
-    txn.commit(&engine)?.unwrap_committed();
+    txn.commit(&engine, &FileSystemCommitter)?
+        .unwrap_committed();
 
     let checkpoint_actions = read_actions_from_commit(&table_url, 1, "checkpoint")?;
     assert_eq!(checkpoint_actions.len(), 1);
@@ -131,10 +132,10 @@ async fn alter_table_commit_rejects_root_manifest() -> Result<(), Box<dyn std::e
         .clone()
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .add_column(StructField::nullable("fresh_column", DataType::INTEGER))
-        .build(&engine, Box::new(FileSystemCommitter::new()))?
+        .build(&engine)?
         .with_root_manifest_file(file)?;
 
-    let error = txn.commit(&engine).unwrap_err();
+    let error = txn.commit(&engine, &FileSystemCommitter).unwrap_err();
     assert!(
         matches!(&error, KernelError::InvalidTransactionState(message)
         if message == "ALTER TABLE cannot include manifest writes")
@@ -163,7 +164,9 @@ async fn test_with_root_manifest_file_merges_domain_metadata_and_transactions()
                 .with_domain_metadata("my.domain", "v1")
         },
     )?;
-    let snapshot = txn.commit(&engine)?.unwrap_post_commit_snapshot();
+    let snapshot = txn
+        .commit(&engine, &FileSystemCommitter)?
+        .unwrap_post_commit_snapshot();
 
     let file = FileMeta {
         location: table_url.join("metadata/root-v1.parquet")?,
@@ -183,7 +186,8 @@ async fn test_with_root_manifest_file_merges_domain_metadata_and_transactions()
         },
     )?
     .with_root_manifest_file(file)?;
-    txn.commit(&engine)?.unwrap_committed();
+    txn.commit(&engine, &FileSystemCommitter)?
+        .unwrap_committed();
 
     let checkpoint_actions = read_actions_from_commit(&table_url, 2, "checkpoint")?;
     assert_eq!(checkpoint_actions.len(), 1);
@@ -291,7 +295,8 @@ async fn test_commit_info_data_change(
             size: 1024,
         })?;
     }
-    txn.commit(&engine)?.unwrap_committed();
+    txn.commit(&engine, &FileSystemCommitter)?
+        .unwrap_committed();
     let commit_info = commit_info_at(&table_url, 1)?;
     assert_eq!(commit_info["dataChange"], json!(data_change));
     Ok(())
@@ -332,13 +337,13 @@ async fn test_commit_info_records_data_change_and_last_manifest_commit(
             };
             Ok(begin_with_data_change(snapshot, &engine, data_change)?
                 .with_root_manifest_file(file)?
-                .commit(&engine)?
+                .commit(&engine, &FileSystemCommitter)?
                 .unwrap_post_commit_snapshot())
         };
 
     // v1: log commit before any manifest commit.
     let snapshot = begin_with_data_change(snapshot, &engine, data_change)?
-        .commit(&engine)?
+        .commit(&engine, &FileSystemCommitter)?
         .unwrap_post_commit_snapshot();
     assert_commit_info(1, &Value::Null)?;
 
@@ -355,7 +360,7 @@ async fn test_commit_info_records_data_change_and_last_manifest_commit(
     }
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let snapshot = begin_with_data_change(snapshot, &engine, data_change)?
-        .commit(&engine)?
+        .commit(&engine, &FileSystemCommitter)?
         .unwrap_post_commit_snapshot();
     assert_commit_info(4, &expected_last_manifest_commit)?;
 
@@ -380,7 +385,7 @@ async fn test_commit_info_omits_adaptive_metadata_fields_without_the_feature()
     create_table(store, table_url.clone(), schema, &[], true, vec![], vec![]).await?;
 
     test_utils::load_and_begin_transaction(table_url.as_str(), &engine)?
-        .commit(&engine)?
+        .commit(&engine, &FileSystemCommitter)?
         .unwrap_committed();
 
     let commit_info = commit_info_at(&table_url, 1)?;
