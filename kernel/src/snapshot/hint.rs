@@ -1018,8 +1018,7 @@ mod tests {
         let hinted_snapshot = SnapshotBuilder::new_for(&table_root)
             .with_snapshot_hint(hint)
             .with_correlation_id("hint-request")
-            .with_cancellation_token(token)
-            .build(engine.as_ref())?;
+            .build_with_cancellation(engine.as_ref(), Some(token))?;
 
         assert_eq!(hinted_snapshot.version(), storage_snapshot.version());
         assert_eq!(hinted_snapshot.schema(), storage_snapshot.schema());

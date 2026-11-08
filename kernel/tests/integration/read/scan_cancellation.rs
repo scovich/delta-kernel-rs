@@ -2,13 +2,16 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::scan::StatsOptions;
+use delta_kernel::schema::SchemaRef;
 use delta_kernel::{
-    CancellationToken as _, CancellationTokenRef, Engine, FileMeta, FileSlice, JsonHandler,
-    KernelError, KernelResult, KernelResultIterator, ParquetHandler, Snapshot, StorageHandler,
+    CancellationToken as _, CancellationTokenRef, Engine, FileDataReadResultIterator, FileMeta,
+    FileSlice, JsonHandler, KernelError, KernelResult, KernelResultIterator, ParquetHandler,
+    PredicateRef, Snapshot, StorageHandler,
 };
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
@@ -16,6 +19,7 @@ use test_utils::{
     TestAction, TestCancellationToken, TokenCapturingEngine, actions_to_string, add_commit,
     generate_simple_batch, load_test_data, record_batch_to_bytes,
 };
+use url::Url;
 
 const PARQUET_FILE1: &str = "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet";
 
@@ -59,14 +63,14 @@ async fn precancelled_scan_yields_cancelled(
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
     let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
-    let mut builder = snapshot.scan_builder().with_cancellation_token(token);
+    let mut builder = snapshot.scan_builder();
     if let Some(stats) = stats {
         builder = builder.with_stats(stats);
     }
     let scan = builder.build()?;
 
     // Cancellation may arrive from eager setup reads or from the lazy iterator.
-    assert_cancelled(scan.scan_metadata(&engine));
+    assert_cancelled(scan.scan_metadata_with_cancellation(&engine, Some(token)));
     Ok(())
 }
 
@@ -77,10 +81,10 @@ async fn precancelled_snapshot_reader_yields_cancelled() -> KernelResult<()> {
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
     let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
-    let result = snapshot
-        .reader()
-        .with_cancellation_token(token)
-        .get_app_id_version("missing-app", &engine);
+    let result =
+        snapshot
+            .reader()
+            .get_app_id_version_with_cancellation("missing-app", &engine, Some(token));
     assert!(matches!(result, Err(KernelError::Cancelled)));
     assert_eq!(
         snapshot
@@ -123,11 +127,7 @@ async fn uncancelled_json_scan_completes() -> KernelResult<()> {
 
     // An uncancelled token behaves identically.
     let token: CancellationTokenRef = Arc::new(TestCancellationToken::default());
-    let scan = snapshot
-        .scan_builder()
-        .with_cancellation_token(token)
-        .build()?;
-    for res in scan.scan_metadata(&engine)? {
+    for res in scan.scan_metadata_with_cancellation(&engine, Some(token))? {
         assert!(res.is_ok(), "uncancelled token must not inject errors");
     }
     Ok(())
@@ -141,12 +141,10 @@ async fn mid_stream_cancellation_yields_cancelled() -> KernelResult<()> {
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
     let token = Arc::new(TestCancellationToken::default());
-    let scan = snapshot
-        .scan_builder()
-        .with_cancellation_token(token.clone() as CancellationTokenRef)
-        .build()?;
+    let scan = snapshot.scan_builder().build()?;
 
-    let mut iter = scan.scan_metadata(&engine)?;
+    let mut iter =
+        scan.scan_metadata_with_cancellation(&engine, Some(token.clone() as CancellationTokenRef))?;
     assert!(
         matches!(iter.next(), Some(Ok(_))),
         "expected an Ok batch before cancellation"
@@ -186,12 +184,9 @@ async fn precancelled_scan_over_checkpoint_yields_cancelled(
 
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
     let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
-    let scan = snapshot
-        .scan_builder()
-        .with_cancellation_token(token)
-        .build()?;
+    let scan = snapshot.scan_builder().build()?;
 
-    assert_cancelled(scan.scan_metadata(engine.as_ref()));
+    assert_cancelled(scan.scan_metadata_with_cancellation(engine.as_ref(), Some(token)));
     Ok(())
 }
 
@@ -226,11 +221,9 @@ async fn engine_receives_the_callers_token_by_identity_json() -> KernelResult<()
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
     let token = Arc::new(TestCancellationToken::default());
-    let scan = snapshot
-        .scan_builder()
-        .with_cancellation_token(token.clone() as CancellationTokenRef)
-        .build()?;
-    scan.scan_metadata(&engine)?.for_each(drop);
+    let scan = snapshot.scan_builder().build()?;
+    scan.scan_metadata_with_cancellation(&engine, Some(token.clone() as CancellationTokenRef))?
+        .for_each(drop);
 
     assert_token_recovered_by_identity(engine.json_token(), token);
     Ok(())
@@ -249,37 +242,70 @@ async fn engine_receives_the_callers_token_by_identity_parquet() -> KernelResult
     let snapshot = Snapshot::builder_for(url).build(&engine)?;
 
     let token = Arc::new(TestCancellationToken::default());
-    let scan = snapshot
-        .scan_builder()
-        .with_cancellation_token(token.clone() as CancellationTokenRef)
-        .build()?;
-    scan.scan_metadata(&engine)?.for_each(drop);
+    let scan = snapshot.scan_builder().build()?;
+    scan.scan_metadata_with_cancellation(&engine, Some(token.clone() as CancellationTokenRef))?
+        .for_each(drop);
 
     assert_token_recovered_by_identity(engine.parquet_token(), token);
     Ok(())
 }
 
-// `parallel_scan_metadata` does not support cancellation; setting a token makes it error rather
-// than silently run to completion.
 #[tokio::test]
-async fn parallel_scan_metadata_errors_when_token_set() -> KernelResult<()> {
+async fn execute_with_cancellation_cancels_data_reads() -> KernelResult<()> {
     let (storage, table_root) = json_only_table().await?;
-    let engine: Arc<dyn delta_kernel::Engine> =
-        Arc::new(DefaultEngineBuilder::new(storage).build());
-    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
+    let base_engine = Arc::new(DefaultEngineBuilder::new(storage).build());
+    let snapshot = Snapshot::builder_for(table_root).build(base_engine.as_ref())?;
+    let scan = snapshot.scan_builder().build()?;
+    let token = Arc::new(TestCancellationToken::default());
+    let engine: Arc<dyn Engine> = Arc::new(CancelOnParquetEngine {
+        inner: base_engine,
+        token: token.clone(),
+    });
 
-    let token: CancellationTokenRef = Arc::new(TestCancellationToken::default());
-    let scan = snapshot
-        .scan_builder()
-        .with_cancellation_token(token)
-        .build()?;
+    let result = scan.execute_with_cancellation(engine, Some(token));
 
-    let result = scan.parallel_scan_metadata(engine);
-    assert!(
-        matches!(result, Err(KernelError::Unsupported(_))),
-        "parallel_scan_metadata must reject a cancellation token"
-    );
+    assert_cancelled_engine_data(result);
     Ok(())
+}
+
+#[tokio::test]
+async fn execute_with_cancellation_cancels_deletion_vector_reads() -> KernelResult<()> {
+    let table_name = "table-with-dv-small";
+    let url =
+        url::Url::from_directory_path(std::fs::canonicalize(format!("./tests/data/{table_name}"))?)
+            .unwrap();
+    let base_engine = test_utils::create_default_engine(&url)?;
+    let snapshot = Snapshot::builder_for(url).build(base_engine.as_ref())?;
+    let scan = snapshot.scan_builder().build()?;
+    let token = Arc::new(TestCancellationToken::default());
+    let storage = Arc::new(CancelOnDeletionVectorStorage {
+        inner: base_engine.storage_handler(),
+        token: token.clone(),
+    });
+    let engine: Arc<dyn Engine> = Arc::new(CancelOnStorageReadEngine {
+        inner: base_engine,
+        storage,
+    });
+
+    let result = scan.execute_with_cancellation(engine, Some(token));
+
+    assert_cancelled_engine_data(result);
+    Ok(())
+}
+
+fn assert_cancelled_engine_data(
+    result: KernelResult<impl KernelResultIterator<Box<dyn delta_kernel::EngineData>>>,
+) {
+    match result {
+        Err(KernelError::Cancelled) => {}
+        Err(other) => panic!("expected Cancelled, got {other:?}"),
+        Ok(mut iter) => {
+            assert!(
+                matches!(iter.next(), Some(Err(KernelError::Cancelled))),
+                "cancelled execute must yield Err(Cancelled), never an Ok batch or bare None"
+            );
+        }
+    }
 }
 
 // Building a snapshot with an already-cancelled token fails rather than returning a snapshot built
@@ -290,9 +316,7 @@ async fn precancelled_snapshot_build_yields_cancelled() -> KernelResult<()> {
     let engine = DefaultEngineBuilder::new(storage).build();
 
     let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
-    let result = Snapshot::builder_for(table_root)
-        .with_cancellation_token(token)
-        .build(&engine);
+    let result = Snapshot::builder_for(table_root).build_with_cancellation(&engine, Some(token));
 
     assert!(
         matches!(result, Err(KernelError::Cancelled)),
@@ -309,9 +333,8 @@ async fn snapshot_build_with_uncancelled_token_succeeds() -> KernelResult<()> {
     let engine = DefaultEngineBuilder::new(storage).build();
 
     let token: CancellationTokenRef = Arc::new(TestCancellationToken::default());
-    let with_token = Snapshot::builder_for(table_root)
-        .with_cancellation_token(token)
-        .build(&engine)?;
+    let with_token =
+        Snapshot::builder_for(table_root).build_with_cancellation(&engine, Some(token))?;
     let without_token = Snapshot::builder_for(table_root).build(&engine)?;
 
     assert_eq!(with_token.version(), without_token.version());
@@ -396,6 +419,138 @@ impl Engine for CancelOnListEngine {
     }
 }
 
+struct CancelOnParquetEngine {
+    inner: Arc<dyn Engine>,
+    token: Arc<TestCancellationToken>,
+}
+
+impl Engine for CancelOnParquetEngine {
+    fn evaluation_handler(&self) -> Arc<dyn delta_kernel::EvaluationHandler> {
+        self.inner.evaluation_handler()
+    }
+    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+        self.inner.storage_handler()
+    }
+    fn json_handler(&self) -> Arc<dyn JsonHandler> {
+        self.inner.json_handler()
+    }
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+        Arc::new(CancelOnParquetHandler {
+            inner: self.inner.parquet_handler(),
+            token: self.token.clone(),
+        })
+    }
+}
+
+struct CancelOnParquetHandler {
+    inner: Arc<dyn ParquetHandler>,
+    token: Arc<TestCancellationToken>,
+}
+
+impl ParquetHandler for CancelOnParquetHandler {
+    fn read_parquet_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> KernelResult<FileDataReadResultIterator> {
+        self.inner
+            .read_parquet_files(files, physical_schema, predicate)
+    }
+
+    fn read_parquet_files_with_cancellation(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> KernelResult<FileDataReadResultIterator> {
+        self.token.cancel();
+        self.inner.read_parquet_files_with_cancellation(
+            files,
+            physical_schema,
+            predicate,
+            cancellation_token,
+        )
+    }
+
+    fn read_parquet_footer(&self, file: &FileMeta) -> KernelResult<delta_kernel::ParquetFooter> {
+        self.inner.read_parquet_footer(file)
+    }
+
+    fn write_parquet_file(
+        &self,
+        location: Url,
+        data: FileDataReadResultIterator,
+    ) -> KernelResult<u64> {
+        self.inner.write_parquet_file(location, data)
+    }
+}
+
+struct CancelOnStorageReadEngine {
+    inner: Arc<dyn Engine>,
+    storage: Arc<dyn StorageHandler>,
+}
+
+impl Engine for CancelOnStorageReadEngine {
+    fn evaluation_handler(&self) -> Arc<dyn delta_kernel::EvaluationHandler> {
+        self.inner.evaluation_handler()
+    }
+    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+        self.storage.clone()
+    }
+    fn json_handler(&self) -> Arc<dyn JsonHandler> {
+        self.inner.json_handler()
+    }
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+        self.inner.parquet_handler()
+    }
+}
+
+struct CancelOnDeletionVectorStorage {
+    inner: Arc<dyn StorageHandler>,
+    token: Arc<TestCancellationToken>,
+}
+
+impl StorageHandler for CancelOnDeletionVectorStorage {
+    fn list_from(&self, path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        self.inner.list_from(path)
+    }
+
+    fn read_files(
+        &self,
+        files: Vec<FileSlice>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
+        self.inner.read_files(files)
+    }
+
+    fn read_files_with_cancellation(
+        &self,
+        files: Vec<FileSlice>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
+        self.token.cancel();
+        self.inner
+            .read_files_with_cancellation(files, cancellation_token)
+    }
+
+    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> KernelResult<()> {
+        self.inner.put(path, data, overwrite)
+    }
+
+    fn copy_atomic(&self, src: &Url, dest: &Url) -> KernelResult<()> {
+        self.inner.copy_atomic(src, dest)
+    }
+
+    fn head(&self, path: &Url) -> KernelResult<FileMeta> {
+        self.inner.head(path)
+    }
+
+    fn delete(&self, path: &Url) -> KernelResult<()> {
+        self.inner.delete(path)
+    }
+}
+
 // Cancellation reaches the log listing during a real `build()`, not only the pre-listing
 // `_last_checkpoint` read: the token is live when `try_read` runs (so that read succeeds) and flips
 // only once listing begins, so the `Err(Cancelled)` `build()` surfaces must come from the listing.
@@ -413,8 +568,7 @@ async fn snapshot_build_cancelled_during_listing() -> KernelResult<()> {
     };
 
     let result = Snapshot::builder_for(table_root)
-        .with_cancellation_token(token.clone() as CancellationTokenRef)
-        .build(&engine);
+        .build_with_cancellation(&engine, Some(token.clone() as CancellationTokenRef));
     assert!(
         matches!(result, Err(KernelError::Cancelled)),
         "cancellation during listing must surface from build()"
@@ -433,9 +587,7 @@ async fn precancelled_incremental_snapshot_build_yields_cancelled() -> KernelRes
     let base = Snapshot::builder_for(table_root).build(&engine)?;
 
     let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
-    let result = Snapshot::builder_from(base)
-        .with_cancellation_token(token)
-        .build(&engine);
+    let result = Snapshot::builder_from(base).build_with_cancellation(&engine, Some(token));
 
     assert!(
         matches!(result, Err(KernelError::Cancelled)),

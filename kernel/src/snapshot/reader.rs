@@ -12,7 +12,7 @@ use crate::expressions::ColumnName;
 use crate::log_segment::DomainMetadataMap;
 use crate::{CancellationTokenRef, Engine, KernelResult};
 
-/// Reads snapshot metadata with an optional cancellation token.
+/// Reads snapshot metadata that may require storage access.
 ///
 /// Use [`Snapshot::reader`] for domain metadata, clustering columns, application transactions,
 /// row-tracking metadata, and commit timestamps. These getters may read storage when the required
@@ -20,13 +20,12 @@ use crate::{CancellationTokenRef, Engine, KernelResult};
 /// [`Snapshot::version`] remain on the snapshot.
 ///
 /// Getters run synchronously and may block on I/O. By default, they use the supplied engine's
-/// normal cancellation and timeout behavior. [`Self::with_cancellation_token`] adds cooperative
-/// cancellation to handler-backed reads; it does not make the getters asynchronous. Cached
-/// results can be returned without checking the token, and interrupting in-flight I/O depends
-/// on the engine. Creating or configuring a reader does not issue I/O.
+/// normal cancellation and timeout behavior. The `*_with_cancellation` siblings add cooperative
+/// cancellation to handler-backed reads; they do not make the getters asynchronous. Cached results
+/// can be returned without checking the token, and interrupting in-flight I/O depends on the
+/// engine. Creating a reader does not issue I/O.
 ///
-/// The reader borrows its snapshot and retains no engine. The snapshot retains neither the reader
-/// nor its token, so callers can use different readers on the same snapshot.
+/// The reader borrows its snapshot and retains no engine.
 ///
 /// ```no_run
 /// # use delta_kernel::{CancellationTokenRef, Engine, KernelResult, Snapshot};
@@ -38,41 +37,21 @@ use crate::{CancellationTokenRef, Engine, KernelResult};
 /// // Read synchronously with the engine's normal behavior.
 /// let domain = snapshot.reader().get_domain_metadata("my-domain", engine)?;
 /// // Share an operation's cancellation scope across related metadata reads.
-/// let reader = snapshot.reader().with_cancellation_token(token);
-/// let version = reader.get_app_id_version("my-app", engine)?;
-/// let timestamp = reader.get_timestamp(engine)?;
+/// let reader = snapshot.reader();
+/// let version = reader.get_app_id_version_with_cancellation("my-app", engine, Some(token.clone()))?;
+/// let timestamp = reader.get_timestamp_with_cancellation(engine, Some(token))?;
 /// # Ok(())
 /// # }
 /// ```
 pub struct SnapshotReader<'a> {
     /// Immutable table state shared independently of this read scope.
     snapshot: &'a Snapshot,
-    /// Optional token bound to each getter's handler-backed reads.
-    cancellation_token: Option<CancellationTokenRef>,
 }
 
 #[cfg(test)]
 mod tests;
 
 impl<'a> SnapshotReader<'a> {
-    /// Sets the cancellation token for this reader's handler-backed reads.
-    ///
-    /// Each call replaces the reader's token binding. Passing `None` clears an existing binding.
-    ///
-    /// Reads return [`crate::KernelError::Cancelled`] when the engine observes cancellation.
-    /// The original token is forwarded unchanged, and getters remain synchronous. This does not
-    /// affect snapshot construction, scans, or other readers created from the same snapshot.
-    ///
-    /// This token is passed as the per-call token to cancellation-aware handlers; the engine
-    /// decides how it combines with its own cancellation.
-    pub fn with_cancellation_token(
-        mut self,
-        token: impl Into<Option<CancellationTokenRef>>,
-    ) -> Self {
-        self.cancellation_token = token.into();
-        self
-    }
-
     /// Returns the latest non-expired transaction version for `application_id`.
     ///
     /// Returns `None` if no transaction exists for the application or its latest transaction has
@@ -84,28 +63,56 @@ impl<'a> SnapshotReader<'a> {
     ///
     /// Reports `SetTransactionLoadSuccess` or `SetTransactionLoadFailure`. Returns read,
     /// retention-property, or cancellation errors.
+    ///
+    /// Use [`Self::get_app_id_version_with_cancellation`] to add a per-call cancellation token.
     pub fn get_app_id_version(
         &self,
         application_id: &str,
         engine: &dyn Engine,
     ) -> KernelResult<Option<i64>> {
-        self.read(engine, |snapshot, engine| {
-            snapshot.get_app_id_version(application_id, engine)
-        })
+        self.snapshot.get_app_id_version(application_id, engine)
+    }
+
+    /// Returns the latest non-expired transaction version with a cancellation token.
+    pub fn get_app_id_version_with_cancellation(
+        &self,
+        application_id: &str,
+        engine: &dyn Engine,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> KernelResult<Option<i64>> {
+        if let Some(token) = cancellation_token {
+            self.get_app_id_version(application_id, &CancellableEngine::new(engine, token))
+        } else {
+            self.get_app_id_version(application_id, engine)
+        }
     }
 
     /// Returns the latest configuration for the user-controlled `domain`, or `None` if absent.
     ///
     /// Uses `engine` to replay the log when needed. Returns an error for system-controlled
     /// `delta.*` domains, read failures, or cancellation.
+    ///
+    /// Use [`Self::get_domain_metadata_with_cancellation`] to add a per-call cancellation token.
     pub fn get_domain_metadata(
         &self,
         domain: &str,
         engine: &dyn Engine,
     ) -> KernelResult<Option<String>> {
-        self.read(engine, |snapshot, engine| {
-            snapshot.get_domain_metadata(domain, engine)
-        })
+        self.snapshot.get_domain_metadata(domain, engine)
+    }
+
+    /// Returns the latest domain configuration with a cancellation token.
+    pub fn get_domain_metadata_with_cancellation(
+        &self,
+        domain: &str,
+        engine: &dyn Engine,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> KernelResult<Option<String>> {
+        if let Some(token) = cancellation_token {
+            self.get_domain_metadata(domain, &CancellableEngine::new(engine, token))
+        } else {
+            self.get_domain_metadata(domain, engine)
+        }
     }
 
     /// Returns the row-tracking high-water mark, or `None` if no active row-tracking domain exists.
@@ -113,11 +120,27 @@ impl<'a> SnapshotReader<'a> {
     /// Uses `engine` to load domain metadata when needed. Returns read, malformed-configuration,
     /// or cancellation errors. [`crate::ROW_TRACKING_INITIAL_HIGH_WATER_MARK`] indicates that no
     /// row IDs have been assigned yet.
+    ///
+    /// Use [`Self::get_row_tracking_high_water_mark_with_cancellation`] to add a per-call
+    /// cancellation token.
     pub fn get_row_tracking_high_water_mark(
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<i64>> {
-        self.read(engine, Snapshot::get_row_tracking_high_water_mark)
+        self.snapshot.get_row_tracking_high_water_mark(engine)
+    }
+
+    /// Returns the row-tracking high-water mark with a cancellation token.
+    pub fn get_row_tracking_high_water_mark_with_cancellation(
+        &self,
+        engine: &dyn Engine,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> KernelResult<Option<i64>> {
+        if let Some(token) = cancellation_token {
+            self.get_row_tracking_high_water_mark(&CancellableEngine::new(engine, token))
+        } else {
+            self.get_row_tracking_high_water_mark(engine)
+        }
     }
 
     /// Returns this version's timestamp in milliseconds since the Unix epoch.
@@ -125,8 +148,23 @@ impl<'a> SnapshotReader<'a> {
     /// Uses the In-Commit Timestamp (ICT) when enabled, reading commit JSON through `engine` if
     /// needed; otherwise returns the retained commit-file modification time. Returns missing
     /// commit, invalid ICT configuration, read, or cancellation errors.
+    ///
+    /// Use [`Self::get_timestamp_with_cancellation`] to add a per-call cancellation token.
     pub fn get_timestamp(&self, engine: &dyn Engine) -> KernelResult<i64> {
-        self.read(engine, Snapshot::get_timestamp)
+        self.snapshot.get_timestamp(engine)
+    }
+
+    /// Returns this version's timestamp with a cancellation token.
+    pub fn get_timestamp_with_cancellation(
+        &self,
+        engine: &dyn Engine,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> KernelResult<i64> {
+        if let Some(token) = cancellation_token {
+            self.get_timestamp(&CancellableEngine::new(engine, token))
+        } else {
+            self.get_timestamp(engine)
+        }
     }
 
     /// Returns clustering descriptors in domain order.
@@ -141,7 +179,7 @@ impl<'a> SnapshotReader<'a> {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<Vec<ClusteringColumnInfo>>> {
-        self.read(engine, Snapshot::get_clustering_column_infos)
+        self.snapshot.get_clustering_column_infos(engine)
     }
 
     /// Returns physical clustering column names in domain order.
@@ -156,7 +194,7 @@ impl<'a> SnapshotReader<'a> {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<Vec<ColumnName>>> {
-        self.read(engine, Snapshot::get_physical_clustering_columns)
+        self.snapshot.get_physical_clustering_columns(engine)
     }
 
     /// Returns current metadata for `domains`, or all domains when the filter is `None`.
@@ -176,9 +214,7 @@ impl<'a> SnapshotReader<'a> {
         engine: &dyn Engine,
         domains: Option<&HashSet<&str>>,
     ) -> KernelResult<DomainMetadataMap> {
-        self.read(engine, |snapshot, engine| {
-            snapshot.get_domain_metadatas_internal(engine, domains)
-        })
+        self.snapshot.get_domain_metadatas_internal(engine, domains)
     }
 
     /// Returns the latest configuration for a user or system `domain`, or `None` if absent.
@@ -192,9 +228,7 @@ impl<'a> SnapshotReader<'a> {
         domain: &str,
         engine: &dyn Engine,
     ) -> KernelResult<Option<String>> {
-        self.read(engine, |snapshot, engine| {
-            snapshot.get_domain_metadata_internal(domain, engine)
-        })
+        self.snapshot.get_domain_metadata_internal(domain, engine)
     }
 
     /// Returns all active user-controlled domain metadata, excluding `delta.*` domains.
@@ -206,7 +240,7 @@ impl<'a> SnapshotReader<'a> {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Vec<DomainMetadata>> {
-        self.read(engine, Snapshot::get_all_domain_metadata)
+        self.snapshot.get_all_domain_metadata(engine)
     }
 
     /// Returns this version's In-Commit Timestamp (ICT), or `None` when ICT is disabled.
@@ -216,30 +250,11 @@ impl<'a> SnapshotReader<'a> {
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
     pub(crate) fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> KernelResult<Option<i64>> {
-        self.read(engine, Snapshot::get_in_commit_timestamp)
+        self.snapshot.get_in_commit_timestamp(engine)
     }
 
     /// Creates an unscoped metadata reader without issuing I/O.
     pub(super) fn new(snapshot: &'a Snapshot) -> Self {
-        Self {
-            snapshot,
-            cancellation_token: None,
-        }
-    }
-
-    /// Binds this reader's token for one getter while leaving the shared snapshot unchanged.
-    fn read<T>(
-        &self,
-        engine: &dyn Engine,
-        operation: impl FnOnce(&Snapshot, &dyn Engine) -> KernelResult<T>,
-    ) -> KernelResult<T> {
-        let scoped_engine = self
-            .cancellation_token
-            .as_ref()
-            .map(|token| CancellableEngine::new(engine, token.clone()));
-        let engine = scoped_engine
-            .as_ref()
-            .map_or(engine, |engine| engine as &dyn Engine);
-        operation(self.snapshot, engine)
+        Self { snapshot }
     }
 }

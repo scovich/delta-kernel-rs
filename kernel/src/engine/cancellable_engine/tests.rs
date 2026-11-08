@@ -205,8 +205,7 @@ fn builder_token_overrides_bound_read_token() {
         &original.evaluation_handler()
     ));
     Snapshot::builder_for("tests/data/table-without-dv-small")
-        .with_cancellation_token(reads.token.clone() as CancellationTokenRef)
-        .build(&engine)
+        .build_with_cancellation(&engine, Some(reads.token.clone() as CancellationTokenRef))
         .unwrap();
     let events = reads.events.lock().unwrap();
     assert!(events.contains(&Read::Hint));
@@ -493,13 +492,9 @@ fn snapshot_reads_keep_builder_token(
             .at_version(0)
             .build(reads.inner.as_ref())
             .unwrap();
-        Snapshot::builder_from(base)
-            .with_cancellation_token(token)
-            .build(engine)
+        Snapshot::builder_from(base).build_with_cancellation(engine, token)
     } else {
-        Snapshot::builder_for(&path)
-            .with_cancellation_token(token)
-            .build(engine)
+        Snapshot::builder_for(&path).build_with_cancellation(engine, token)
     };
     let events = reads.events.lock().unwrap();
     assert!(events.contains(&read));
@@ -525,8 +520,7 @@ fn discovery_keeps_builder_token(#[case] read: Read) {
     let reads = RecordingReads::new(Some(read));
     let token: CancellationTokenRef = reads.token.clone();
     let result = Snapshot::builder_for("tests/data/table-without-dv-small")
-        .with_cancellation_token(token)
-        .build(&reads.engine());
+        .build_with_cancellation(&reads.engine(), Some(token));
     assert!(matches!(result, Err(KernelError::Cancelled)));
     assert_eq!(reads.events.lock().unwrap().last(), Some(&read));
 }
@@ -538,24 +532,22 @@ fn completed_snapshot_does_not_retain_build_scope() {
     let cancelled: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
     assert!(matches!(
         Snapshot::builder_for("tests/data/table-without-dv-small")
-            .with_cancellation_token(cancelled)
-            .build(&engine),
+            .build_with_cancellation(&engine, Some(cancelled)),
         Err(KernelError::Cancelled)
     ));
     let token: CancellationTokenRef = Arc::new(TestCancellationToken::default());
     let weak = Arc::downgrade(&token);
     let snapshot = Snapshot::builder_for("tests/data/table-without-dv-small")
-        .with_cancellation_token(token)
-        .build(&engine)
+        .build_with_cancellation(&engine, Some(token))
         .unwrap();
     assert!(weak.upgrade().is_none());
     assert_eq!(snapshot.version(), 0);
     Snapshot::builder_from(snapshot)
         .at_version(0)
-        .with_cancellation_token(
-            Arc::new(TestCancellationToken::cancelled()) as CancellationTokenRef
+        .build_with_cancellation(
+            &engine,
+            Some(Arc::new(TestCancellationToken::cancelled()) as CancellationTokenRef),
         )
-        .build(&engine)
         .unwrap();
 }
 
@@ -665,10 +657,29 @@ fn post_build_metadata_reads_inherit_operation_token(
         }
         Ok(())
     };
-    let reader = snapshot
-        .reader()
-        .with_cancellation_token(reads.token.clone() as CancellationTokenRef);
-    let result = load(&reader, &engine);
+    let token = Some(reads.token.clone() as CancellationTokenRef);
+    let result = match read {
+        MetadataRead::Domain => snapshot
+            .reader()
+            .get_domain_metadata_with_cancellation("test", &engine, token.clone())
+            .map(|value| assert_eq!(value, Some("value".into()))),
+        MetadataRead::Transaction => snapshot
+            .reader()
+            .get_app_id_version_with_cancellation("app", &engine, token.clone())
+            .map(|value| assert_eq!(value, Some(7))),
+        MetadataRead::RowTracking => snapshot
+            .reader()
+            .get_row_tracking_high_water_mark_with_cancellation(&engine, token.clone())
+            .map(|value| assert_eq!(value, Some(crate::ROW_TRACKING_INITIAL_HIGH_WATER_MARK))),
+        MetadataRead::Timestamp => snapshot
+            .reader()
+            .get_timestamp_with_cancellation(&engine, token.clone())
+            .map(|value| assert!(value > 0)),
+        _ => {
+            let engine = CancellableEngine::new(&engine, reads.token.clone());
+            load(&snapshot.reader(), &engine)
+        }
+    };
     if cancelled {
         assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
     } else {
@@ -692,15 +703,18 @@ fn reader_cancellation_during_replay_persists_across_reads(
     let snapshot = Snapshot::builder_for(format!("tests/data/{table}"))
         .build(reads.inner.as_ref())
         .unwrap();
-    let reader = snapshot
-        .reader()
-        .with_cancellation_token(reads.token.clone() as CancellationTokenRef);
-    let result = reader.get_app_id_version("missing-app", &reads.engine());
+    let result = snapshot.reader().get_app_id_version_with_cancellation(
+        "missing-app",
+        &reads.engine(),
+        Some(reads.token.clone() as CancellationTokenRef),
+    );
     assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
     assert_eq!(reads.events.lock().unwrap().last(), Some(&boundary));
 
-    let result = reader.get_app_id_version("missing-app", reads.inner.as_ref());
-    assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
+    let result = snapshot
+        .reader()
+        .get_app_id_version("missing-app", reads.inner.as_ref());
+    assert_eq!(result.unwrap(), None);
 }
 
 /// Checks that cancelling a JSON read after successful batches terminates its iterator.

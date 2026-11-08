@@ -422,7 +422,6 @@ pub struct ScanBuilder {
     correlation_id: Option<Arc<str>>,
     without_row_transforms: bool,
     partition_values_options: PartitionValuesOptions,
-    cancellation_token: Option<CancellationTokenRef>,
 }
 
 impl std::fmt::Debug for ScanBuilder {
@@ -449,7 +448,6 @@ impl ScanBuilder {
             correlation_id: None,
             without_row_transforms: false,
             partition_values_options: PartitionValuesOptions::default(),
-            cancellation_token: None,
         }
     }
 
@@ -572,24 +570,6 @@ impl ScanBuilder {
         self
     }
 
-    /// Provide a [`CancellationToken`] so a cancelled request can stop an in-flight
-    /// [`scan_metadata`](Scan::scan_metadata) log replay instead of running to completion.
-    ///
-    /// Cancellation is cooperative: Kernel forwards the token (if any) to cancellation-aware
-    /// [`Engine`] operations, which own cancellation for their I/O and iterators. Work that
-    /// completes concurrently with cancellation may still succeed. Passing `None` leaves I/O
-    /// cancellation to the engine's handlers and disables scan-local checks on cached metadata.
-    ///
-    /// [`CancellationToken`]: crate::CancellationToken
-    /// [`KernelError::Cancelled`]: crate::KernelError::Cancelled
-    pub fn with_cancellation_token(
-        mut self,
-        token: impl Into<Option<CancellationTokenRef>>,
-    ) -> Self {
-        self.cancellation_token = token.into();
-        self
-    }
-
     /// Build the [`Scan`].
     ///
     /// This does not scan the table at this point, but does do some work to ensure that the
@@ -656,7 +636,6 @@ impl ScanBuilder {
             stats: self.stats,
             correlation_id: self.correlation_id,
             partition_values_options: self.partition_values_options,
-            cancellation_token: self.cancellation_token,
         })
     }
 }
@@ -915,9 +894,6 @@ pub struct Scan {
     stats: StatsOptions,
     correlation_id: Option<Arc<str>>,
     partition_values_options: PartitionValuesOptions,
-    /// Scan-local token for cached metadata checks and I/O; `None` retains engine I/O
-    /// cancellation.
-    cancellation_token: Option<CancellationTokenRef>,
 }
 
 /// Builds the consumer-visible stats schemas without predicate-only fields.
@@ -1078,19 +1054,27 @@ impl Scan {
     ///   row. The resultant schema for this expression is guaranteed to be
     ///   [`Self::logical_schema()`]. Some entries in this `Vec` may be `None`, and the whole `Vec`
     ///   may be empty. See [`ScanMetadata::scan_file_transforms`] for details of these cases.
+    ///
+    /// Use [`Self::scan_metadata_with_cancellation`] to add a per-call cancellation token.
     pub fn scan_metadata(
-        &self,
-        engine: &dyn Engine,
-    ) -> KernelResult<impl KernelResultIterator<ScanMetadata> + use<>> {
-        self.with_cancellable_engine(engine, |engine| self.scan_metadata_with_engine(engine))
-    }
-
-    fn scan_metadata_with_engine(
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<impl KernelResultIterator<ScanMetadata> + use<>> {
         let actions_with_checkpoint_info = self.replay_for_scan_metadata(engine)?;
         self.scan_metadata_inner(engine, actions_with_checkpoint_info)
+    }
+
+    /// Get scan metadata with a cancellation token for handler-backed reads.
+    pub fn scan_metadata_with_cancellation(
+        &self,
+        engine: &dyn Engine,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> KernelResult<impl KernelResultIterator<ScanMetadata> + use<>> {
+        if let Some(token) = cancellation_token {
+            self.scan_metadata(&CancellableEngine::new(engine, token))
+        } else {
+            self.scan_metadata(engine)
+        }
     }
 
     /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of
@@ -1142,31 +1126,19 @@ impl Scan {
     /// with `TIMESTAMP` partition columns,
     /// if `existing_version` exceeds the snapshot version, or if scan metadata cannot be
     /// restored or read.
+    ///
+    /// Use [`Self::scan_metadata_from_with_cancellation`] to add a per-call cancellation token.
     #[allow(unused)]
     #[internal_api]
     pub(crate) fn scan_metadata_from(
         &self,
         engine: &dyn Engine,
         existing_version: Version,
-        existing_data: impl IntoIterator<Item = Box<dyn EngineData>, IntoIter: Send + 'static>,
+        existing_data: impl IntoIterator<
+            Item = KernelResult<Box<dyn EngineData>>,
+            IntoIter: Send + 'static,
+        >,
         existing_predicate: Option<PredicateRef>,
-    ) -> KernelResult<Box<dyn KernelResultIterator<ScanMetadata>>> {
-        self.with_cancellable_engine(engine, |engine| {
-            self.scan_metadata_from_with_engine(
-                engine,
-                existing_version,
-                existing_data,
-                existing_predicate,
-            )
-        })
-    }
-
-    fn scan_metadata_from_with_engine(
-        &self,
-        engine: &dyn Engine,
-        existing_version: Version,
-        existing_data: impl IntoIterator<Item = Box<dyn EngineData>, IntoIter: Send + 'static>,
-        _existing_predicate: Option<PredicateRef>,
     ) -> KernelResult<Box<dyn KernelResultIterator<ScanMetadata>>> {
         // TODO(#3609): scan_metadata_from does not reuse existing partitionValues_parsed
         // from compatible checkpoints. Support reusing those values and enable connector-supplied
@@ -1183,10 +1155,7 @@ impl Scan {
         );
         // TODO(#966): validate that the current predicate is compatible with the hint predicate.
         let existing_data = existing_data.into_iter();
-        // Cached metadata bypasses engine handlers, so kernel must poll cancellation while
-        // consuming it.
-        let existing_data =
-            CancellableIterator::new(existing_data.map(Ok), self.cancellation_token.clone());
+        let _ = existing_predicate;
 
         if existing_version > self.snapshot.version() {
             return Err(KernelError::Generic(format!(
@@ -1239,7 +1208,7 @@ impl Scan {
         // TODO: we may be able to apply heuristics or other logic to try and fetch missing deltas
         // from the log.
         if matches!(log_segment.checkpoint_version, Some(v) if v > existing_version) {
-            return Ok(Box::new(self.scan_metadata_with_engine(engine)?));
+            return Ok(Box::new(self.scan_metadata(engine)?));
         }
 
         // create a new log segment containing only the commits added after the version hint.
@@ -1287,19 +1256,28 @@ impl Scan {
         )?))
     }
 
-    fn with_cancellable_engine<T>(
+    #[allow(unused)]
+    #[internal_api]
+    pub(crate) fn scan_metadata_from_with_cancellation(
         &self,
         engine: &dyn Engine,
-        operation: impl FnOnce(&dyn Engine) -> T,
-    ) -> T {
-        let scoped_engine = self
-            .cancellation_token
+        existing_version: Version,
+        existing_data: impl IntoIterator<Item = Box<dyn EngineData>, IntoIter: Send + 'static>,
+        existing_predicate: Option<PredicateRef>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<ScanMetadata>>> {
+        let scoped_engine = cancellation_token
             .clone()
             .map(|token| CancellableEngine::new(engine, token));
         let engine = scoped_engine
             .as_ref()
             .map_or(engine, |engine| engine as &dyn Engine);
-        operation(engine)
+
+        // Cached metadata bypasses engine handlers, so kernel must poll cancellation while
+        // consuming it.
+        let existing_data =
+            CancellableIterator::new(existing_data.into_iter().map(Ok), cancellation_token);
+        self.scan_metadata_from(engine, existing_version, existing_data, existing_predicate)
     }
 
     fn scan_metadata_inner<I>(
@@ -1556,13 +1534,8 @@ impl Scan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> KernelResult<SequentialScanMetadata> {
-        // The scan token is not carried across distributed phases.
-        if self.cancellation_token.is_some() {
-            return Err(KernelError::unsupported(
-                "cancellation is not supported by parallel_scan_metadata; \
-                 use scan_metadata for a cancellable scan",
-            ));
-        }
+        // There is no cancellable variant: distributed cancellation belongs to the engine or
+        // connector that owns the remote work.
         // TODO(#3609): Support connector-supplied timezone in parallel metadata scans.
         require!(
             !table_requires_timestamp_timezone_support(
@@ -1616,6 +1589,9 @@ impl Scan {
     /// [`ScanBuilder::without_row_transforms`] or
     /// [`PartitionValuesOptions::with_timestamp_timezone`] on a table with `TIMESTAMP` partition
     /// columns; use [`Scan::scan_metadata`] instead.
+    ///
+    /// Use [`Self::execute_with_cancellation`] to cover log replay, data reads, and deletion
+    /// vector reads with a per-call cancellation token.
     // This calls [`Scan::scan_metadata`] to get an iterator of `ScanMetadata` actions for the scan,
     // and then uses the `engine`'s [`crate::ParquetHandler`] to read the actual table data.
     pub fn execute(
@@ -1727,6 +1703,23 @@ impl Scan {
             // Iterator<Result<Result<Box<dyn EngineData>>>> to Iterator<Result<Box<dyn EngineData>>>
             .map(|x| x?);
         Ok(result)
+    }
+
+    /// Perform an "all in one" scan with a cancellation token.
+    ///
+    /// The token covers log replay, Parquet data reads, deletion-vector reads, and logical-row
+    /// transforms that use engine handlers. Passing `None` leaves the supplied engine's
+    /// cancellation behavior unchanged.
+    pub fn execute_with_cancellation(
+        &self,
+        engine: Arc<dyn Engine>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>> + use<>> {
+        if let Some(token) = cancellation_token {
+            self.execute(Arc::new(CancellableEngine::new(engine.as_ref(), token)))
+        } else {
+            self.execute(engine)
+        }
     }
 }
 

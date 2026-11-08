@@ -40,9 +40,7 @@ fn ordinary_protocol_metadata_replay_propagates_cancellation_after_batch() {
     let mut reads = RecordingReads::new(None);
     Arc::get_mut(&mut reads).unwrap().cancel_json_after_batch = true;
     let token: CancellationTokenRef = reads.token.clone();
-    let result = Snapshot::builder_for(url)
-        .with_cancellation_token(token)
-        .build(&reads.engine());
+    let result = Snapshot::builder_for(url).build_with_cancellation(&reads.engine(), Some(token));
     assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
     assert_eq!(
         reads
@@ -75,13 +73,11 @@ fn stale_crc_replay_keeps_builder_token(
             .unwrap();
         Snapshot::builder_from(base)
             .with_incremental_crc_replay(replay)
-            .with_cancellation_token(token)
-            .build(&engine)
+            .build_with_cancellation(&engine, Some(token))
     } else {
         Snapshot::builder_for(&url)
             .with_incremental_crc_replay(replay)
-            .with_cancellation_token(token)
-            .build(&engine)
+            .build_with_cancellation(&engine, Some(token))
     };
     if cancel_after_batch.is_some() {
         assert!(matches!(result, Err(KernelError::Cancelled)));
@@ -127,10 +123,9 @@ fn only_cancelled_crc_read_blocks_incremental_snapshot_build(
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let result = Snapshot::builder_from(base)
-        .with_cancellation_token(token)
         .with_incremental_crc_replay(IncrementalReplay::Unlimited)
         .with_correlation_id("incremental-crc-failure")
-        .build(&reads.engine());
+        .build_with_cancellation(&reads.engine(), token);
     let read_events = reads.events.lock().unwrap();
     assert!(read_events.contains(&Read::Crc));
     if !cancel_crc {
@@ -213,10 +208,11 @@ fn reader_stale_crc_replay_is_cancellable(
         .build(reads.inner.as_ref())
         .unwrap();
     assert!(snapshot.crc_at_version().is_none());
-    let reader = snapshot
-        .reader()
-        .with_cancellation_token(reads.token.clone() as CancellationTokenRef);
-    let result = reader.get_domain_metadata(domain, &reads.engine());
+    let result = snapshot.reader().get_domain_metadata_with_cancellation(
+        domain,
+        &reads.engine(),
+        Some(reads.token.clone() as CancellationTokenRef),
+    );
     if cancelled {
         assert!(matches!(result, Err(KernelError::Cancelled)));
     } else {
