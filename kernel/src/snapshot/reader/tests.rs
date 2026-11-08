@@ -14,33 +14,26 @@ use crate::unit_test_utils::{
 };
 use crate::{CancellationTokenRef, KernelError, Snapshot};
 
-/// Independent readers neither inherit a completed build token nor alter another reader's scope.
+/// Per-call cancellation neither inherits a completed build token nor alters ordinary reads.
 #[test]
-fn reader_scopes_are_independent_and_release_their_tokens() {
+fn reader_cancellation_siblings_are_independent_and_release_their_tokens() {
     let engine = SyncEngine::new();
     let build_token = Arc::new(TestCancellationToken::default());
     let snapshot = Snapshot::builder_for("tests/data/app-txn-no-checkpoint")
-        .with_cancellation_token(build_token.clone() as CancellationTokenRef)
-        .build(&engine)
+        .build_with_cancellation(&engine, Some(build_token.clone() as CancellationTokenRef))
         .unwrap();
     assert_eq!(Arc::strong_count(&build_token), 1);
     build_token.cancel();
 
     let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
     let weak = Arc::downgrade(&token);
-    let cancelled = snapshot.reader().with_cancellation_token(token);
-    let independent =
-        snapshot.reader().with_cancellation_token(
-            Arc::new(TestCancellationToken::default()) as CancellationTokenRef
-        );
     assert!(matches!(
-        cancelled.get_app_id_version("my-app", &engine),
+        snapshot
+            .reader()
+            .get_app_id_version_with_cancellation("my-app", &engine, Some(token)),
         Err(KernelError::Cancelled)
     ));
-    assert_eq!(
-        independent.get_app_id_version("my-app", &engine).unwrap(),
-        Some(3)
-    );
+    assert!(weak.upgrade().is_none());
     assert_eq!(
         snapshot
             .reader()
@@ -48,18 +41,16 @@ fn reader_scopes_are_independent_and_release_their_tokens() {
             .unwrap(),
         Some(3)
     );
-    let unscoped = cancelled.with_cancellation_token(None);
-    assert!(weak.upgrade().is_none());
-    assert_eq!(
-        unscoped.get_app_id_version("my-app", &engine).unwrap(),
-        Some(3)
-    );
 
     let token: CancellationTokenRef = Arc::new(TestCancellationToken::default());
     let weak = Arc::downgrade(&token);
-    let reader = snapshot.reader().with_cancellation_token(token);
-    reader.get_app_id_version("my-app", &engine).unwrap();
-    drop(reader);
+    assert_eq!(
+        snapshot
+            .reader()
+            .get_app_id_version_with_cancellation("my-app", &engine, Some(token))
+            .unwrap(),
+        Some(3)
+    );
     assert!(weak.upgrade().is_none());
 }
 
@@ -100,13 +91,16 @@ fn reader_crc_cache_respects_completeness(
         Arc::get_mut(&mut snapshot).unwrap().crc =
             SnapshotCrc::try_new(Some(Arc::new(crc)), 0, None).unwrap();
     }
-    let reader = snapshot.reader().with_cancellation_token(Arc::new(
-        TestCancellationToken::cancelled(),
-    ) as CancellationTokenRef);
-    let domain =
-        reader.get_domain_metadata(if hit { "myApp.metadata" } else { "missing" }, &engine);
-    let transaction =
-        reader.get_app_id_version(if hit { "spark-app-1" } else { "missing" }, &engine);
+    let domain = snapshot.reader().get_domain_metadata_with_cancellation(
+        if hit { "myApp.metadata" } else { "missing" },
+        &engine,
+        Some(Arc::new(TestCancellationToken::cancelled()) as CancellationTokenRef),
+    );
+    let transaction = snapshot.reader().get_app_id_version_with_cancellation(
+        if hit { "spark-app-1" } else { "missing" },
+        &engine,
+        Some(Arc::new(TestCancellationToken::cancelled()) as CancellationTokenRef),
+    );
     if partial && !hit {
         assert!(matches!(domain, Err(KernelError::Cancelled)));
         assert!(matches!(transaction, Err(KernelError::Cancelled)));
@@ -114,7 +108,10 @@ fn reader_crc_cache_respects_completeness(
         assert_eq!(domain.unwrap(), hit.then(|| r#"{"key":"value"}"#.into()));
         assert_eq!(transaction.unwrap(), hit.then_some(42));
         assert_eq!(
-            reader.get_row_tracking_high_water_mark(&engine).unwrap(),
+            snapshot
+                .reader()
+                .get_row_tracking_high_water_mark(&engine)
+                .unwrap(),
             Some(9)
         );
     }
@@ -128,19 +125,32 @@ fn reader_no_io_getters_can_succeed_after_cancellation() {
         .build(&engine)
         .unwrap();
     let expected = snapshot.reader().get_timestamp(&engine).unwrap();
-    let reader = snapshot.reader().with_cancellation_token(Arc::new(
-        TestCancellationToken::cancelled(),
-    ) as CancellationTokenRef);
-    assert_eq!(reader.get_timestamp(&engine).unwrap(), expected);
-    assert_eq!(reader.get_in_commit_timestamp(&engine).unwrap(), None);
+    assert_eq!(
+        snapshot
+            .reader()
+            .get_timestamp_with_cancellation(
+                &engine,
+                Some(Arc::new(TestCancellationToken::cancelled()) as CancellationTokenRef)
+            )
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        snapshot.reader().get_in_commit_timestamp(&engine).unwrap(),
+        None
+    );
     assert!(
-        reader
+        snapshot
+            .reader()
             .get_clustering_column_infos(&engine)
             .unwrap()
             .is_none()
     );
     assert_eq!(
-        reader.get_physical_clustering_columns(&engine).unwrap(),
+        snapshot
+            .reader()
+            .get_physical_clustering_columns(&engine)
+            .unwrap(),
         None
     );
 }
@@ -159,14 +169,18 @@ fn reader_preserves_metadata_metrics_and_errors(#[values(false, true)] cancelled
     if cancelled {
         token.cancel();
     }
-    let reader = snapshot
+    let token = Some(token as CancellationTokenRef);
+    let domain =
+        snapshot
+            .reader()
+            .get_domain_metadata_with_cancellation("missing", &engine, token.clone());
+    let txn = snapshot
         .reader()
-        .with_cancellation_token(token as CancellationTokenRef);
-    let domain = reader.get_domain_metadata("missing", &engine);
-    let txn = reader.get_app_id_version("my-app", &engine);
+        .get_app_id_version_with_cancellation("my-app", &engine, token);
     assert_eq!(domain.is_err(), cancelled);
     assert_eq!(txn.is_err(), cancelled);
-    let error = reader
+    let error = snapshot
+        .reader()
         .get_domain_metadata("delta.reserved", &engine)
         .unwrap_err();
     assert!(error.to_string().contains("system-controlled"));

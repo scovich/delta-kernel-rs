@@ -717,7 +717,7 @@ fn test_scan_metadata_from_same_version() {
         .try_collect()
         .unwrap();
     let new_files: Vec<_> = scan
-        .scan_metadata_from(engine.as_ref(), version, files, None)
+        .scan_metadata_from(engine.as_ref(), version, files.into_iter().map(Ok), None)
         .unwrap()
         .try_collect()
         .unwrap();
@@ -761,7 +761,7 @@ fn scan_metadata_from_requires_timezone_support_only_for_timestamp_partitions(
         .build()
         .unwrap();
 
-    let result = scan.scan_metadata_from(&engine, version, Vec::new(), None);
+    let result = scan.scan_metadata_from(&engine, version, Vec::new().into_iter().map(Ok), None);
     if timestamp_partition {
         assert_result_error_with_message(result, "with_timestamp_timezone in scan_metadata_from");
     } else {
@@ -789,13 +789,15 @@ fn scan_metadata_from_cancels_cached_metadata_consumption() {
 
     let token = Arc::new(TestCancellationToken::default());
     let token_ref: CancellationTokenRef = token.clone();
-    let scan = snapshot
-        .scan_builder()
-        .with_cancellation_token(token_ref)
-        .build()
-        .unwrap();
+    let scan = snapshot.scan_builder().build().unwrap();
     let mut metadata = scan
-        .scan_metadata_from(engine.as_ref(), version, files, None)
+        .scan_metadata_from_with_cancellation(
+            engine.as_ref(),
+            version,
+            files,
+            None,
+            Some(token_ref),
+        )
         .unwrap();
 
     token.cancel();
@@ -858,13 +860,15 @@ fn scan_metadata_from_binds_token_to_new_reads(
     if pre_cancelled {
         reads.token.cancel();
     }
-    let scan = snapshot
-        .scan_builder()
-        .with_cancellation_token(reads.token.clone() as CancellationTokenRef)
-        .build()
-        .unwrap();
+    let scan = snapshot.scan_builder().build().unwrap();
     let engine = reads.engine();
-    let result = scan.scan_metadata_from(&engine, existing_version, files, None);
+    let result = scan.scan_metadata_from_with_cancellation(
+        &engine,
+        existing_version,
+        files,
+        None,
+        Some(reads.token.clone() as CancellationTokenRef),
+    );
 
     if pre_cancelled {
         let cancelled = match result {

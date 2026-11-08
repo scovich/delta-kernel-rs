@@ -56,8 +56,6 @@ pub struct SnapshotBuilder<Mode = FromTableRoot> {
     /// Opaque, caller-supplied id recorded on this build's metric events. Not interpreted by
     /// kernel; set via [`with_correlation_id`](Self::with_correlation_id).
     correlation_id: Option<Arc<str>>,
-    /// Optional cooperative cancellation token for this build's handler-backed reads.
-    cancellation_token: Option<CancellationTokenRef>,
     // Carries the zero-sized typestate that limits mode-specific methods at compile time.
     mode: PhantomType<Mode>,
 }
@@ -65,8 +63,7 @@ pub struct SnapshotBuilder<Mode = FromTableRoot> {
 /// Builder for incrementally updating an existing [`Snapshot`].
 pub type IncrementalSnapshotBuilder = SnapshotBuilder<FromSnapshot>;
 
-// Hand-written because `CancellationToken` is not `Debug`: the token is projected to a bool. Ends
-// with `finish_non_exhaustive` so a future field is not silently dropped from the output.
+// Ends with `finish_non_exhaustive` so a future field is not silently dropped from the output.
 impl<Mode> std::fmt::Debug for SnapshotBuilder<Mode> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SnapshotBuilder")
@@ -80,7 +77,6 @@ impl<Mode> std::fmt::Debug for SnapshotBuilder<Mode> {
             .field("snapshot_hint", &self.snapshot_hint)
             .field("operation_id", &self.operation_id)
             .field("correlation_id", &self.correlation_id)
-            .field("cancellable", &self.cancellation_token.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -150,7 +146,6 @@ impl SnapshotBuilder<FromTableRoot> {
             snapshot_hint: None,
             operation_id: MetricId::new(),
             correlation_id: None,
-            cancellation_token: None,
             mode: PhantomType::default(),
         }
     }
@@ -194,7 +189,6 @@ impl SnapshotBuilder<FromSnapshot> {
             snapshot_hint: None,
             operation_id: MetricId::new(),
             correlation_id: None,
-            cancellation_token: None,
             mode: PhantomType::default(),
         }
     }
@@ -276,30 +270,6 @@ impl<Mode> SnapshotBuilder<Mode> {
         self
     }
 
-    /// Supply a [`CancellationToken`] for snapshot builds that list or read the log.
-    ///
-    /// Kernel forwards the token (if any) to cancellation-aware [`Engine`] listing and read
-    /// operations, including CRC and imperative protocol/metadata replay. Declarative plan
-    /// execution does not use this token. The build fails with [`Error::Kernel`] wrapping
-    /// [`KernelError::Cancelled`] if cancellation is observed during these reads. Snapshot-hint
-    /// builds perform no listing or reads, so the token has no effect on them. By default (or
-    /// when passing `None`), the supplied engine's cancellation behavior is unchanged.
-    ///
-    /// This token applies only to the build and is not retained by the snapshot. Builds run
-    /// synchronously and may block on I/O, including when a cancellation token is supplied.
-    /// Configure [`Snapshot::reader`] with a token for subsequent metadata reads.
-    ///
-    /// [`CancellationToken`]: crate::CancellationToken
-    /// [`Error::Kernel`]: crate::Error::Kernel
-    /// [`KernelError::Cancelled`]: crate::KernelError::Cancelled
-    pub fn with_cancellation_token(
-        mut self,
-        token: impl Into<Option<CancellationTokenRef>>,
-    ) -> Self {
-        self.cancellation_token = token.into();
-        self
-    }
-
     /// Bound how many commits kernel will replay to advance a stale CRC to the target version.
     /// See [`IncrementalReplay`]. Defaults to [`IncrementalReplay::Disabled`].
     ///
@@ -353,6 +323,8 @@ impl<Mode> SnapshotBuilder<Mode> {
     /// [`DeltaPathDoesNotExist`]: crate::DeltaErrorCondition::DeltaPathDoesNotExist
     /// [`MetricEvent::SnapshotBuildSuccess`]: crate::metrics::MetricEvent::SnapshotBuildSuccess
     /// [`MetricEvent::SnapshotBuildFailure`]: crate::metrics::MetricEvent::SnapshotBuildFailure
+    ///
+    /// Use [`Self::build_with_cancellation`] to add a per-call cancellation token.
     // `is_catalog_managed` is the requested load mode, not the confirmed protocol
     // (see `IS_CATALOG_MANAGED_FIELD`).
     #[instrument(
@@ -389,7 +361,6 @@ impl<Mode> SnapshotBuilder<Mode> {
             snapshot_hint,
             operation_id,
             correlation_id,
-            cancellation_token,
             mode: _,
         } = self;
 
@@ -409,11 +380,6 @@ impl<Mode> SnapshotBuilder<Mode> {
                 incremental_replay,
             )?
         } else {
-            let scoped_engine =
-                cancellation_token.map(|token| CancellableEngine::new(engine, token));
-            let engine = scoped_engine
-                .as_ref()
-                .map_or(engine, |engine| engine as &dyn Engine);
             let log_tail: Vec<_> = log_tail.into_iter().map(Into::into).collect();
 
             // Pre-build validations for catalog-managed tables
@@ -477,6 +443,24 @@ impl<Mode> SnapshotBuilder<Mode> {
         Self::validate_catalog_managed_build_result(&snapshot, version, max_catalog_version)?;
         tracing::Span::current().record("version", snapshot.version());
         Ok(snapshot)
+    }
+
+    /// Create a new [`Snapshot`] with a cancellation token for handler-backed reads.
+    ///
+    /// Kernel forwards the token to cancellation-aware [`Engine`] listing and read operations,
+    /// including CRC and imperative protocol/metadata replay. Declarative plan execution does not
+    /// use this token. Snapshot-hint builds perform no listing or reads, so the token has no
+    /// effect on them. Passing `None` leaves the supplied engine's cancellation behavior unchanged.
+    pub fn build_with_cancellation(
+        self,
+        engine: &dyn Engine,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> Result<SnapshotRef> {
+        if let Some(token) = cancellation_token {
+            self.build(&CancellableEngine::new(engine, token))
+        } else {
+            self.build(engine)
+        }
     }
 
     // ============================================================================

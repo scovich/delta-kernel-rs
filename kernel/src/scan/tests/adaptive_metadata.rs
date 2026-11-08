@@ -303,7 +303,12 @@ fn scan_metadata_from_hint_before_checkpoint_action_rescans(
     let scan = snapshot_at(&engine, 3).scan_builder().build().unwrap();
     let mut paths = vec![];
     for metadata in scan
-        .scan_metadata_from(&engine, existing_version, existing_data, None)
+        .scan_metadata_from(
+            &engine,
+            existing_version,
+            existing_data.into_iter().map(Ok),
+            None,
+        )
         .unwrap()
     {
         paths = metadata
