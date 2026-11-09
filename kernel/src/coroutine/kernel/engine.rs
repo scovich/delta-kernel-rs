@@ -11,7 +11,7 @@ use derive_more::Constructor;
 
 use super::request::{
     ExpressionEvaluatorHandle, ForwardListing, PredicateEvaluatorHandle, ReadJsonFiles,
-    ReadParquetFiles, WriteJsonFile,
+    ReadParquetFiles, WriteJsonFile, WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
 };
 #[cfg(feature = "declarative-plans")]
 use super::request::{PlanOperation, PlanRequest};
@@ -154,6 +154,21 @@ impl EngineConnector {
         self.json
             .write_json_file(&operation.url, Box::new(iterator), operation.overwrite)
     }
+
+    fn write_parquet_file(&self, operation: WriteParquetFile) -> KernelResult<FileSize> {
+        let WriteParquetFile { url, input } = operation;
+        let iterator = self.clone().iterate_result_coroutine(input);
+        self.parquet.write_parquet_file(url, Box::new(iterator))
+    }
+
+    fn write_parquet_files(
+        &self,
+        operation: WriteParquetFiles,
+    ) -> KernelResult<WriteParquetFilesResult> {
+        let WriteParquetFiles { write, input } = operation;
+        let iterator = self.clone().iterate_result_coroutine(input);
+        self.parquet.write_parquet_files(write, Box::new(iterator))
+    }
 }
 
 impl ConnectorRespond for EngineConnector {
@@ -161,6 +176,7 @@ impl ConnectorRespond for EngineConnector {
         match request {
             Request::ListForward(request) => respond_paged(&self.storage_connector(), request)?,
             Request::ReadSmallFile(..) => self.storage_connector().respond(request)?,
+            Request::Head(..) => self.storage_connector().respond(request)?,
             Request::ReadParquetFooter(file, reply) => {
                 complete(reply, self.parquet.read_parquet_footer(&file))?
             }
@@ -219,6 +235,14 @@ impl ConnectorRespond for EngineConnector {
             )?,
             Request::WriteJson(operation, reply) => {
                 complete(reply, self.write_json_file(*operation))?
+            }
+            Request::WriteParquet(operation, reply) => {
+                // The write request's input must drop before size verification takes the state.
+                complete(reply, self.write_parquet_file(*operation))?
+            }
+            Request::WriteParquetFiles(operation, reply) => {
+                // The write request's input must drop before size verification takes the state.
+                complete(reply, self.write_parquet_files(*operation))?
             }
         }
         Ok(())
@@ -408,6 +432,7 @@ impl ConnectorRespond for PlanExecutorConnector<'_> {
             }
             Request::ListForward(_)
             | Request::ReadSmallFile(..)
+            | Request::Head(..)
             | Request::ReadParquetFooter(..)
             | Request::ReadJson(_)
             | Request::ReadParquet(_)
@@ -416,7 +441,9 @@ impl ConnectorRespond for PlanExecutorConnector<'_> {
             | Request::CreatePredicateEvaluator(..)
             | Request::EvaluateExpression(..)
             | Request::EvaluatePredicate(..)
-            | Request::WriteJson(..) => Err(KernelError::internal_error(
+            | Request::WriteJson(..)
+            | Request::WriteParquet(..)
+            | Request::WriteParquetFiles(..) => Err(KernelError::internal_error(
                 "plan-executor workflow requested a non-plan operation",
             )),
         }
@@ -436,6 +463,7 @@ impl ConnectorRespond for StorageConnector<'_> {
             Request::ReadSmallFile(file, reply) => {
                 complete(reply, self.storage.read_small_file(file))
             }
+            Request::Head(url, reply) => complete(reply, self.storage.head(&url)),
             Request::ReadJson(_) => Err(KernelError::internal_error(
                 "JSON reads require an Engine connector",
             )),
@@ -452,9 +480,11 @@ impl ConnectorRespond for StorageConnector<'_> {
             | Request::EvaluatePredicate(..) => Err(KernelError::internal_error(
                 "evaluation requires an Engine connector",
             )),
-            Request::WriteJson(..) => Err(KernelError::internal_error(
-                "file writes require an Engine connector",
-            )),
+            Request::WriteJson(..) | Request::WriteParquet(..) | Request::WriteParquetFiles(..) => {
+                Err(KernelError::internal_error(
+                    "file writes require an Engine connector",
+                ))
+            }
         }
     }
 }

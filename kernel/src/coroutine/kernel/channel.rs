@@ -18,7 +18,7 @@ use super::PlanRequest;
 use super::request::{
     CreateEngineData, CreateExpressionEvaluator, CreatePredicateEvaluator, EvaluateExpression,
     EvaluatePredicate, ExpressionEvaluatorHandle, PredicateEvaluatorHandle, ReadJsonFiles,
-    ReadParquetFiles, WriteJsonFile,
+    ReadParquetFiles, WriteJsonFile, WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
 };
 use super::{Request, StaticCoroutine};
 #[cfg(feature = "declarative-plans")]
@@ -34,7 +34,10 @@ use crate::plans::{Operation, Plan};
 use crate::schema::{DataType, SchemaRef};
 #[cfg(feature = "declarative-plans")]
 use crate::utils::require;
-use crate::{EngineData, FileIndex, FileMeta, FileSize, KernelResult, ParquetFooter, Scalar};
+use crate::{
+    EngineData, FileIndex, FileMeta, FileSize, KernelResult, ParquetFooter, ParquetMultiFileWrite,
+    Scalar,
+};
 
 /// Kernel's [`crate::coroutine::Channel`] specialized to [`Request`].
 ///
@@ -67,6 +70,11 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
     /// Reads one Parquet file footer via [`Request::ReadParquetFooter`].
     fn read_parquet_footer(&self, file: &FileMeta) -> impl KernelFuture<ParquetFooter> {
         self.exchange(file.clone(), Request::ReadParquetFooter)
+    }
+
+    /// Fetches metadata for one object via [`Request::Head`].
+    fn head(&self, url: &Url) -> impl KernelFuture<FileMeta> {
+        self.exchange(url.clone(), Request::Head)
     }
 
     /// Reports whether the connector provides a declarative plan executor.
@@ -211,6 +219,26 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
     ) -> impl KernelFuture<FileSize> {
         let operation = WriteJsonFile::new(url.clone(), input, overwrite);
         self.exchange(Box::new(operation), Request::WriteJson)
+    }
+
+    /// Writes generated row batches to one Parquet file.
+    fn write_parquet_file(
+        &self,
+        url: Url,
+        input: StaticCoroutine<KernelResult<Box<dyn EngineData>>>,
+    ) -> impl KernelFuture<FileSize> {
+        let operation = WriteParquetFile::new(url, input);
+        self.exchange(Box::new(operation), Request::WriteParquet)
+    }
+
+    /// Writes generated row batches to connector-selected Parquet files.
+    fn write_parquet_files(
+        &self,
+        write: ParquetMultiFileWrite,
+        input: StaticCoroutine<KernelResult<Box<dyn EngineData>>>,
+    ) -> impl KernelFuture<WriteParquetFilesResult> {
+        let operation = WriteParquetFiles::new(write, input);
+        self.exchange(Box::new(operation), Request::WriteParquetFiles)
     }
 
     /// Initialize `operation` via [`PageRequest::Prepare`] without fetching its first page.

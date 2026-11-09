@@ -16,7 +16,10 @@ use crate::expressions::{ExpressionRef, PredicateRef};
 #[cfg(feature = "declarative-plans")]
 pub use crate::plans::Operation as PlanOperation;
 use crate::schema::{DataType, SchemaRef};
-use crate::{EngineData, FileMeta, FileSize, FileSlice, KernelResult, ParquetFooter, Scalar};
+use crate::{
+    EngineData, FileMeta, FileSize, FileSlice, KernelResult, ParquetFooter, ParquetMultiFileWrite,
+    Scalar,
+};
 
 /// Operations Kernel can request from a connector.
 #[derive(From)]
@@ -28,6 +31,8 @@ pub enum Request {
     /// Missing-object failures remain connector errors. `Ok(None)` means the connector returned no
     /// result. Extra objects from a single-file read are an error.
     ReadSmallFile(FileSlice, Reply<Option<Bytes>>),
+    /// Fetch metadata for one object.
+    Head(Url, Reply<FileMeta>),
     /// Read one Parquet footer.
     ReadParquetFooter(FileMeta, Reply<ParquetFooter>),
     /// Read JSON files as ordered [`EngineData`] batches. Each file may produce multiple batches,
@@ -50,6 +55,10 @@ pub enum Request {
     EvaluatePredicate(EvaluatePredicate, Reply<Box<dyn EngineData>>),
     /// Write one newline-delimited JSON file from streamed row batches.
     WriteJson(Box<WriteJsonFile>, Reply<FileSize>),
+    /// Write one Parquet file from streamed row batches.
+    WriteParquet(Box<WriteParquetFile>, Reply<FileSize>),
+    /// Write streamed row batches to connector-selected Parquet files.
+    WriteParquetFiles(Box<WriteParquetFiles>, Reply<WriteParquetFilesResult>),
 }
 
 /// Declarative plan operations with result-specific reply types.
@@ -207,6 +216,11 @@ pub struct EvaluatePredicate {
     pub input: Box<dyn EngineData>,
 }
 
+// === Writes ===
+
+/// Files written from one input stream.
+pub type WriteParquetFilesResult = Vec<(Url, FileSize)>;
+
 /// Writes newline-delimited JSON rows to one file.
 #[derive(Constructor)]
 pub struct WriteJsonFile {
@@ -216,4 +230,22 @@ pub struct WriteJsonFile {
     pub input: StaticCoroutine<KernelResult<FilteredEngineData>>,
     /// Whether an existing destination may be overwritten.
     pub overwrite: bool,
+}
+
+/// Writes row batches to one Parquet file.
+#[derive(Constructor)]
+pub struct WriteParquetFile {
+    /// Destination URL.
+    pub url: Url,
+    /// Row batches to serialize in yield order.
+    pub input: StaticCoroutine<KernelResult<Box<dyn EngineData>>>,
+}
+
+/// Writes one row stream to connector-selected Parquet files.
+#[derive(Constructor)]
+pub struct WriteParquetFiles {
+    /// Connector-owned file placement and sizing policy.
+    pub write: ParquetMultiFileWrite,
+    /// Row batches to serialize in yield order.
+    pub input: StaticCoroutine<KernelResult<Box<dyn EngineData>>>,
 }
