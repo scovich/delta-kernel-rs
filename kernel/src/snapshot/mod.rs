@@ -338,7 +338,7 @@ impl Snapshot {
     /// pointer and the log disagree. On an AMT-enabled snapshot, the pointer comes only from the
     /// CRC or the `commitInfo` at this version, so a snapshot with neither (a classic checkpoint
     /// without its commit) yields [`KernelError::MissingVersion`].
-    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
     pub(crate) fn latest_checkpoint_action(
         &self,
         engine: &dyn Engine,

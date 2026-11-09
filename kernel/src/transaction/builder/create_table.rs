@@ -19,6 +19,10 @@ use super::TransactionBuilder;
 use super::state::TransactionBuilderState;
 use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
+use crate::coroutine::generator::BoundGenerator as _;
+use crate::coroutine::kernel::{
+    Channel, ChannelExt as _, StaticWorkflow, run_workflow_with_engine, static_workflow,
+};
 use crate::expressions::ColumnName;
 use crate::schema::collation_utils::schema_has_collations;
 use crate::schema::file_utils::schema_contains_file_type;
@@ -55,7 +59,7 @@ use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
 use crate::transaction::{CommitOperation, CreateTable, ExecutionMode, Imperative, Transaction};
 use crate::utils::{current_time_ms, try_parse_uri};
-use crate::{Engine, KernelError, KernelResult, StorageHandler};
+use crate::{Engine, KernelError, KernelResult};
 
 /// Table features allowed to be enabled via `delta.feature.*=supported` during CREATE TABLE.
 ///
@@ -163,22 +167,22 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
 /// - For other errors (permissions, network), propagates the error
 ///
 /// # Arguments
-/// * `storage` - The storage handler to use for listing
+/// * `channel` - The channel to use for listing
 /// * `delta_log_url` - URL to the `_delta_log` directory
 /// * `table_path` - Original table path (for error messages)
-fn ensure_table_does_not_exist(
-    storage: &dyn StorageHandler,
+async fn ensure_table_does_not_exist_with_channel(
+    channel: &Channel,
     delta_log_url: &Url,
     table_path: &str,
 ) -> KernelResult<()> {
-    match storage.list_from(delta_log_url, None) {
+    match channel.list_directory(delta_log_url.clone()).await {
         Ok(mut files) => {
             // files.next() returns Option<KernelResult<FileMeta>>
             // - Some(Ok(_)) means a file exists -> table exists
             // - Some(Err(FileNotFound)) means path doesn't exist -> OK for new table
             // - Some(Err(other)) means real error -> propagate
             // - None means empty iterator -> OK for new table
-            match files.next() {
+            match files.next().await? {
                 Some(Ok(_)) => Err(KernelError::TableAlreadyExistsAtPath(
                     table_path.to_string(),
                 )),
@@ -1068,6 +1072,23 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
     /// - An application transaction identifier occurs more than once
     #[internal_api]
     pub(crate) fn build(self, engine: &dyn Engine) -> KernelResult<CreateTableTransaction<MODE>> {
+        run_workflow_with_engine!(engine, |channel| self.build_with_channel(channel))
+    }
+
+    /// Returns a lazy workflow that validates this builder and creates its transaction.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
+    pub(crate) fn build_workflow(self) -> StaticWorkflow<CreateTableTransaction<MODE>>
+    where
+        MODE: 'static,
+    {
+        static_workflow!(|channel| self.build_with_channel(channel))
+    }
+
+    async fn build_with_channel(
+        self,
+        channel: &Channel,
+    ) -> KernelResult<CreateTableTransaction<MODE>> {
         self.common_state.validate()?;
 
         // Validate path
@@ -1075,8 +1096,8 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
 
         // Check if table already exists by looking for _delta_log directory
         let delta_log_url = table_url.join("_delta_log/")?;
-        let storage = engine.storage_handler();
-        ensure_table_does_not_exist(storage.as_ref(), &delta_log_url, &self.local_state.path)?;
+        ensure_table_does_not_exist_with_channel(channel, &delta_log_url, &self.local_state.path)
+            .await?;
 
         // Validate and transform table properties
         // - Extracts and validates feature signals

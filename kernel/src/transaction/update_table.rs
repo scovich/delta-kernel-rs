@@ -8,6 +8,8 @@ use super::{
     ManifestWrite, manifest_commit_state::ManifestCommitState, root_manifest_file::RootManifestFile,
 };
 use crate::KernelResult;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::coroutine::kernel::{Channel, run_workflow_with_engine};
 use crate::error::KernelError;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::table_features::TableFeature;
@@ -139,6 +141,16 @@ impl<MODE: ExecutionMode> Transaction<UpdateTable, MODE> {
         &mut self,
         engine: &dyn Engine,
     ) -> KernelResult<&mut ManifestCommitState> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.with_manifest_commit_with_channel(channel)
+        })
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) async fn with_manifest_commit_with_channel(
+        &mut self,
+        channel: &Channel,
+    ) -> KernelResult<&mut ManifestCommitState> {
         match &self.manifest_write {
             Some(ManifestWrite::RootFile(_)) => {
                 return Err(KernelError::invalid_transaction_state(
@@ -153,12 +165,13 @@ impl<MODE: ExecutionMode> Transaction<UpdateTable, MODE> {
                         "existing-table transaction unexpectedly has no snapshot",
                     )
                 })?;
-                let state = ManifestCommitState::try_new(
-                    engine,
+                let state = ManifestCommitState::try_new_with_channel(
+                    channel,
                     read_snapshot,
                     self.get_commit_version(),
                     &self.effective_table_config,
-                )?;
+                )
+                .await?;
                 self.manifest_write = Some(ManifestWrite::Commit(state));
             }
         }

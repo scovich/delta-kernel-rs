@@ -569,8 +569,8 @@ fn create_table_txn_builder_build_impl(
     committer: Box<dyn Committer>,
     extern_engine: &dyn ExternEngine,
 ) -> KernelResult<Handle<ExclusiveCreateTableTransaction>> {
-    let engine = extern_engine.engine();
-    let create_txn = builder.build(engine.as_ref())?;
+    let workflow = builder.build_workflow();
+    let create_txn = crate::drive_kernel(extern_engine, workflow)?;
     Ok(Box::new(FfiTransaction::new(create_txn, committer)).into())
 }
 
