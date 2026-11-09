@@ -17,13 +17,11 @@ use url::Url;
 use super::PlanRequest;
 use super::request::{
     CreateEngineData, CreateExpressionEvaluator, CreatePredicateEvaluator, EvaluateExpression,
-    EvaluatePredicate, ExpressionEvaluatorHandle, PredicateEvaluatorHandle, ReadJsonFiles,
-    ReadParquetFiles, WriteBytes, WriteJsonFile, WriteParquetFile, WriteParquetFiles,
-    WriteParquetFilesResult,
+    EvaluatePredicate, ExpressionEvaluatorHandle, ForwardListing, ListingBounds,
+    PredicateEvaluatorHandle, ReadJsonFiles, ReadParquetFiles, WriteBytes, WriteJsonFile,
+    WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
 };
 use super::{Request, StaticCoroutine};
-#[cfg(feature = "declarative-plans")]
-use crate::KernelError;
 use crate::coroutine::generator::{self, BoundGenerator, Flatten, Generator, GeneratorExt as _};
 use crate::coroutine::{
     ChannelExchange, Cursor, KernelFuture, Page, PageGenerator, PageRequest, PagedOperation,
@@ -36,8 +34,8 @@ use crate::schema::{DataType, SchemaRef};
 #[cfg(feature = "declarative-plans")]
 use crate::utils::require;
 use crate::{
-    EngineData, FileIndex, FileMeta, FileSize, KernelResult, ParquetFooter, ParquetMultiFileWrite,
-    Scalar,
+    EngineData, FileIndex, FileMeta, FileSize, KernelError, KernelResult, ParquetFooter,
+    ParquetMultiFileWrite, Scalar,
 };
 
 /// Kernel's [`crate::coroutine::Channel`] specialized to [`Request`].
@@ -58,6 +56,25 @@ type FlattenedPages<Op> =
 #[internal_api]
 #[allow(async_fn_in_trait)]
 pub(crate) trait ChannelExt: ChannelExchange<Request> {
+    /// Lists every object beneath directory `prefix` via [`Request::ListForward`].
+    async fn list_directory(
+        &self,
+        prefix: Url,
+    ) -> KernelResult<impl BoundGenerator<Item = KernelResult<FileMeta>, Output = ()> + Unpin + '_>
+    {
+        let Some(dir) = prefix.path().strip_suffix('/') else {
+            return Err(KernelError::generic(format!(
+                "directory listing prefix must end in '/': {prefix}"
+            )));
+        };
+        // `0` is the byte after `/`, so `<dir>0` sorts after every path beneath `<dir>/`.
+        let mut high = prefix.clone();
+        high.set_path(&format!("{dir}0"));
+        let bounds = ListingBounds { low: prefix, high };
+        let cursor = self.prepare_paged(ForwardListing::new(bounds)).await?;
+        Ok(self.bind(PageGenerator::Next(cursor).flatten()))
+    }
+
     /// Read one small file, or one half-open byte range, completely into memory via
     /// [`Request::ReadSmallFile`].
     fn read_small_file(

@@ -139,8 +139,8 @@ fn update_table_txn_builder_build_with_committer_impl(
     extern_engine: &dyn ExternEngine,
     committer: Box<dyn Committer>,
 ) -> KernelResult<Handle<ExclusiveUpdateTableTransaction>> {
-    let engine = extern_engine.engine();
-    let transaction = builder.build(engine.as_ref());
+    let workflow = builder.build_workflow();
+    let transaction = crate::drive_kernel(extern_engine, workflow);
     Ok(Box::new(FfiTransaction::new(transaction?, committer)).into())
 }
 

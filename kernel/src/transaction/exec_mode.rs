@@ -1,3 +1,4 @@
+use std::fmt::Debug;
 use std::sync::Arc;
 
 #[cfg(doc)]
@@ -14,7 +15,7 @@ use crate::plans::RelationRef;
 ///
 /// This trait is sealed; only kernel-provided execution modes can implement it.
 #[allow(private_bounds)] // Staged-data inspection is an internal implementation detail.
-pub trait ExecutionMode: sealed::Sealed + StagedDataChanges + Default + std::fmt::Debug {}
+pub trait ExecutionMode: sealed::Sealed + StagedDataChanges + Default + Debug + Send {}
 
 /// Surfaces methods for inspecting staged operations without inspecting the actual row contents.
 /// This allows validations (that are independent of the physical format of data) to share code.

@@ -728,6 +728,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lists_all_directory_paths_through_native_async_storage() {
+        let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
+        for path in [
+            "_delta_log/00000000000000000000.json",
+            "_delta_log/_sidecars/part.parquet",
+            "sibling",
+        ] {
+            store
+                .put(&Path::from(path), Bytes::new().into())
+                .await
+                .unwrap();
+        }
+        let connector = AsyncEngineConnector::new(Arc::clone(&store));
+        let prefix = Url::parse("memory:///_delta_log/").unwrap();
+        let listing_prefix = prefix.clone();
+        let workflow = static_workflow!(async move |channel| {
+            let mut files = channel.list_directory(listing_prefix).await?;
+            let mut locations = Vec::new();
+            while let Some(file) = files.next().await? {
+                locations.push(file?.location);
+            }
+            Ok(locations)
+        });
+
+        let locations = connector.run(workflow).await.unwrap();
+
+        assert_eq!(
+            locations,
+            [
+                prefix.join("00000000000000000000.json").unwrap(),
+                prefix.join("_sidecars/part.parquet").unwrap(),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn evaluates_through_native_async_connector() {
         let connector = AsyncEngineConnector::new(Arc::new(InMemory::new()));
         let workflow = static_workflow!(async move |channel| {
