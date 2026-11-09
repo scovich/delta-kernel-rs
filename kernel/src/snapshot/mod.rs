@@ -26,11 +26,12 @@ use crate::clustering::{CLUSTERING_DOMAIN_NAME, ClusteringColumnInfo, parse_clus
 use crate::committer::{Committer, PublishMetadata};
 use crate::coroutine::generator::Generator as _;
 use crate::coroutine::kernel::{
-    Channel, KernelResultGenerator, StaticWorkflow, run_workflow_with_engine, static_workflow,
+    Channel, KernelResultGenerator, StaticWorkflow, Workflow, run_workflow_with_engine,
+    static_workflow, workflow,
 };
 use crate::crc::{
     Crc, CrcDelta, DomainMetadataState, FileSizeHistogram, FileStats, SetTransactionState,
-    try_write_crc_file,
+    try_write_crc_file_with_channel,
 };
 use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
@@ -1662,11 +1663,25 @@ impl Snapshot {
     /// - The underlying read error if in-commit timestamps are enabled but the timestamp cannot be
     ///   read from the commit file.
     /// - I/O errors from the engine's storage handler if the write fails.
-    #[instrument(parent = &self.span, name = CHECKSUM_WRITE_SPAN, skip_all, err,
-        fields(report, outcome, resolution_mode, bytes_written))]
     pub fn write_checksum(
         self: &SnapshotRef,
         engine: &dyn Engine,
+    ) -> KernelResult<(ChecksumWriteResult, SnapshotRef)> {
+        run_workflow_with_engine!(engine, |channel| self.write_checksum_with_channel(channel))
+    }
+
+    /// Returns a lazy workflow that writes this snapshot's version checksum.
+    pub fn write_checksum_workflow<'a>(
+        self: &'a SnapshotRef,
+    ) -> Workflow<'a, (ChecksumWriteResult, SnapshotRef)> {
+        workflow!(|channel| self.write_checksum_with_channel(channel))
+    }
+
+    #[instrument(parent = &self.span, name = CHECKSUM_WRITE_SPAN, skip_all, err,
+        fields(report, outcome, resolution_mode, bytes_written))]
+    async fn write_checksum_with_channel(
+        self: &SnapshotRef,
+        channel: &Channel,
     ) -> KernelResult<(ChecksumWriteResult, SnapshotRef)> {
         let has_crc_on_disk = self
             .log_segment
@@ -1687,11 +1702,13 @@ impl Snapshot {
 
         self.table_configuration().ensure_read_write_supported()?;
 
-        let crc = self.resolve_crc_for_write(engine, &tracing::Span::current())?;
+        let crc = self
+            .resolve_crc_for_write_with_channel(channel, &tracing::Span::current())
+            .await?;
 
         let crc_path = ParsedLogPath::new_crc(self.table_root(), self.version())?;
 
-        match try_write_crc_file(engine, &crc_path.location, &crc) {
+        match try_write_crc_file_with_channel(channel, &crc_path.location, &crc).await {
             Ok(bytes_written) => {
                 info!("Wrote CRC file at {}", crc_path.location);
                 let new_log_segment = self.log_segment.try_new_with_crc_file(crc_path)?;
@@ -1733,16 +1750,6 @@ impl Snapshot {
     /// stats).
     ///
     /// The `root` span field records the selected root. `write_span` records its resolution mode.
-    fn resolve_crc_for_write(
-        &self,
-        engine: &dyn Engine,
-        write_span: &tracing::Span,
-    ) -> KernelResult<Arc<Crc>> {
-        run_workflow_with_engine!(engine, |channel| {
-            self.resolve_crc_for_write_with_channel(channel, write_span)
-        })
-    }
-
     #[instrument(parent = &self.span, name = "snap.resolve_crc_for_write", skip_all, err, fields(root))]
     async fn resolve_crc_for_write_with_channel(
         &self,
@@ -1876,6 +1883,24 @@ impl Snapshot {
     ///
     /// Note: There is currently no public api for callers to determine whether a table supports V2
     /// checkpoints directly. Tracked in <https://github.com/delta-io/delta-kernel-rs/issues/2450>.
+    pub fn checkpoint(
+        self: &SnapshotRef,
+        engine: &dyn Engine,
+        spec: Option<&CheckpointSpec>,
+    ) -> KernelResult<(CheckpointWriteResult, SnapshotRef)> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.checkpoint_with_channel(channel, spec)
+        })
+    }
+
+    /// Returns a lazy workflow that writes a checkpoint for this snapshot.
+    pub fn checkpoint_workflow<'a>(
+        self: &'a SnapshotRef,
+        spec: Option<&'a CheckpointSpec>,
+    ) -> Workflow<'a, (CheckpointWriteResult, SnapshotRef)> {
+        workflow!(|channel| self.checkpoint_with_channel(channel, spec))
+    }
+
     #[instrument(
         parent = &self.span,
         name = "snap.checkpoint",
@@ -1884,9 +1909,9 @@ impl Snapshot {
             num_actions, num_sidecars),
         err
     )]
-    pub fn checkpoint(
+    async fn checkpoint_with_channel(
         self: &SnapshotRef,
-        engine: &dyn Engine,
+        channel: &Channel,
         spec: Option<&CheckpointSpec>,
     ) -> KernelResult<(CheckpointWriteResult, SnapshotRef)> {
         let start = Instant::now();
@@ -1946,7 +1971,9 @@ impl Snapshot {
         };
         span.record("mode", mode.as_ref());
 
-        let writer = Arc::clone(self).create_checkpoint_writer(engine)?;
+        let writer = Arc::clone(self)
+            .create_checkpoint_writer_with_channel(channel)
+            .await?;
 
         let write_result = match spec {
             Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
@@ -1954,9 +1981,15 @@ impl Snapshot {
             })) => {
                 let hint =
                     file_actions_per_sidecar_hint.unwrap_or(DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT);
-                writer.write_v2_checkpoint_with_sidecars(engine, hint)
+                writer
+                    .write_v2_checkpoint_with_sidecars_with_channel(channel, hint)
+                    .await
             }
-            _ => writer.write_checkpoint_without_sidecars(engine),
+            _ => {
+                writer
+                    .write_checkpoint_without_sidecars_with_channel(channel)
+                    .await
+            }
         };
 
         let info = match write_result {
@@ -1983,7 +2016,9 @@ impl Snapshot {
         );
         // TODO(#3828): Report separate outcome and duration metrics for `_last_checkpoint`
         // publication.
-        writer.finalize(engine, &info.last_checkpoint_stats)?;
+        writer
+            .finalize_with_channel(channel, &info.last_checkpoint_stats)
+            .await?;
 
         let checkpoint_log_path = ParsedLogPath::new(info.file_meta).ok_or_else(|| {
             KernelError::internal_error("Checkpoint path could not be parsed as a log path")

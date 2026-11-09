@@ -18,7 +18,8 @@ use super::PlanRequest;
 use super::request::{
     CreateEngineData, CreateExpressionEvaluator, CreatePredicateEvaluator, EvaluateExpression,
     EvaluatePredicate, ExpressionEvaluatorHandle, PredicateEvaluatorHandle, ReadJsonFiles,
-    ReadParquetFiles, WriteJsonFile, WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
+    ReadParquetFiles, WriteBytes, WriteJsonFile, WriteParquetFile, WriteParquetFiles,
+    WriteParquetFilesResult,
 };
 use super::{Request, StaticCoroutine};
 #[cfg(feature = "declarative-plans")]
@@ -239,6 +240,12 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
     ) -> impl KernelFuture<WriteParquetFilesResult> {
         let operation = WriteParquetFiles::new(write, input);
         self.exchange(Box::new(operation), Request::WriteParquetFiles)
+    }
+
+    /// Writes `data` as one complete object via [`Request::WriteBytes`].
+    fn write_bytes(&self, url: &Url, data: Bytes, overwrite: bool) -> impl KernelFuture<()> {
+        let operation = WriteBytes::new(url.clone(), data, overwrite);
+        self.exchange(operation, Request::WriteBytes)
     }
 
     /// Initialize `operation` via [`PageRequest::Prepare`] without fetching its first page.
