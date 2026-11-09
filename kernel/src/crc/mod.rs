@@ -39,7 +39,7 @@ use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 pub use state::{DomainMetadataState, FileStatsState, SetTransactionState};
 #[allow(unused)]
-pub(crate) use writer::try_write_crc_file;
+pub(crate) use writer::try_write_crc_file_with_channel;
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::LastManifestCommit;

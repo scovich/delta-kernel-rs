@@ -59,6 +59,8 @@ pub enum Request {
     WriteParquet(Box<WriteParquetFile>, Reply<FileSize>),
     /// Write streamed row batches to connector-selected Parquet files.
     WriteParquetFiles(Box<WriteParquetFiles>, Reply<WriteParquetFilesResult>),
+    /// Write one complete object.
+    WriteBytes(WriteBytes, Reply<()>),
 }
 
 /// Declarative plan operations with result-specific reply types.
@@ -248,4 +250,16 @@ pub struct WriteParquetFiles {
     pub write: ParquetMultiFileWrite,
     /// Row batches to serialize in yield order.
     pub input: StaticCoroutine<KernelResult<Box<dyn EngineData>>>,
+}
+
+/// Writes raw bytes as the entire contents of one object.
+#[derive(Constructor)]
+pub struct WriteBytes {
+    /// Destination URL.
+    pub url: Url,
+    /// Complete object contents.
+    pub data: Bytes,
+    /// Whether an existing destination may be overwritten. If not, an existing destination fails
+    /// with [`crate::KernelError::FileAlreadyExists`].
+    pub overwrite: bool,
 }

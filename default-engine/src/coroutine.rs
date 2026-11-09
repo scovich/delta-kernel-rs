@@ -25,7 +25,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use delta_kernel::coroutine::kernel::request::{
     ExpressionEvaluatorHandle, ForwardListing, PredicateEvaluatorHandle, ReadJsonFiles,
-    ReadParquetFiles, WriteJsonFile, WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
+    ReadParquetFiles, WriteBytes, WriteJsonFile, WriteParquetFile, WriteParquetFiles,
+    WriteParquetFilesResult,
 };
 use delta_kernel::coroutine::kernel::{
     Coroutine, CoroutineStep, PlanRequest, Request, StaticCoroutine, Workflow,
@@ -40,6 +41,7 @@ use delta_kernel::metrics::{
     emit_storage_read_completed,
 };
 use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::object_store::path::Path;
 use delta_kernel::{
     EngineData, EvaluationHandler, ExpressionEvaluator, FileMeta, FileSize, FileSlice, KernelError,
     KernelResult, PredicateEvaluator,
@@ -48,7 +50,7 @@ use futures::stream::BoxStream;
 use futures::{Stream, StreamExt as _};
 use tokio_util::sync::CancellationToken;
 
-use crate::filesystem::{head_impl, list_from_impl, read_files_impl};
+use crate::filesystem::{head_impl, list_from_impl, put_impl, read_files_impl};
 use crate::json::{read_json_files_impl, write_json_file_impl};
 use crate::parquet::{
     ParquetBatchSource, read_parquet_files_impl, read_parquet_footer_impl, write_parquet_file_impl,
@@ -207,6 +209,7 @@ impl AsyncEngineConnector {
                 // Await the write before replying so request input drops before size verification.
                 reply.send(Box::pin(self.write_parquet_files(*operation)).await)
             }
+            Request::WriteBytes(operation, reply) => reply.send(self.write_bytes(operation).await),
         }
         Ok(())
     }
@@ -269,6 +272,12 @@ impl AsyncEngineConnector {
             },
         )
         .await
+    }
+
+    async fn write_bytes(&self, operation: WriteBytes) -> KernelResult<()> {
+        let path = Path::from_url_path(operation.url.path())?;
+        let store = Arc::clone(&self.object_store);
+        put_impl(store, path, operation.data, operation.overwrite).await
     }
 
     async fn read_small_file(&self, file: FileSlice) -> KernelResult<Option<Bytes>> {
@@ -580,6 +589,23 @@ mod tests {
 
         assert!(matches!(result, Err(KernelError::Cancelled)));
         assert!(workflow.advance().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn writes_bytes_through_native_async_storage() {
+        let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
+        let connector = AsyncEngineConnector::new(Arc::clone(&store));
+        let url = Url::parse("memory:///data").unwrap();
+        let workflow = static_workflow!(async move |channel| {
+            channel
+                .write_bytes(&url, Bytes::from_static(b"delta"), false)
+                .await
+        });
+
+        connector.run(workflow).await.unwrap();
+
+        let data = store.get(&Path::from("data")).await.unwrap().bytes().await;
+        assert_eq!(data.unwrap(), Bytes::from_static(b"delta"));
     }
 
     #[tokio::test]

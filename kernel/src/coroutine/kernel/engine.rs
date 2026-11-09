@@ -174,6 +174,7 @@ impl ConnectorRespond for EngineConnector {
             Request::ListForward(request) => respond_paged(&self.storage_connector(), request)?,
             Request::ReadSmallFile(..) => self.storage_connector().respond(request)?,
             Request::Head(..) => self.storage_connector().respond(request)?,
+            Request::WriteBytes(..) => self.storage_connector().respond(request)?,
             Request::ReadParquetFooter(file, reply) => {
                 complete(reply, self.parquet.read_parquet_footer(&file))?
             }
@@ -440,7 +441,8 @@ impl ConnectorRespond for PlanExecutorConnector<'_> {
             | Request::EvaluatePredicate(..)
             | Request::WriteJson(..)
             | Request::WriteParquet(..)
-            | Request::WriteParquetFiles(..) => Err(KernelError::internal_error(
+            | Request::WriteParquetFiles(..)
+            | Request::WriteBytes(..) => Err(KernelError::internal_error(
                 "plan-executor workflow requested a non-plan operation",
             )),
         }
@@ -461,6 +463,11 @@ impl ConnectorRespond for StorageConnector<'_> {
                 complete(reply, self.storage.read_small_file(file))
             }
             Request::Head(url, reply) => complete(reply, self.storage.head(&url)),
+            Request::WriteBytes(operation, reply) => {
+                let storage = self.storage;
+                let result = storage.put(&operation.url, operation.data, operation.overwrite);
+                complete(reply, result)
+            }
             Request::ReadJson(_) => Err(KernelError::internal_error(
                 "JSON reads require an Engine connector",
             )),
