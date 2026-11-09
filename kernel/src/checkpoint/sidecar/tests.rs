@@ -6,6 +6,7 @@ use serde_json::json;
 use url::Url;
 
 use crate::action_reconciliation::ActionReconciliationIteratorState;
+use crate::action_reconciliation::log_replay::ActionReconciliationState;
 use crate::actions::{ADD_NAME, Add, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::arrow::array::{Array, ArrayRef, AsArray, RecordBatch, StructArray};
 use crate::arrow::datatypes::{ArrowPrimitiveType, Int32Type, Int64Type};
@@ -16,8 +17,10 @@ use crate::checkpoint::tests::{
     create_remove_action, create_v2_checkpoint_protocol_action, new_in_memory_store,
     write_commit_to_store,
 };
+use crate::coroutine::kernel::{
+    Channel, ChannelExt as _, StaticCoroutine, run_workflow_with_engine, workflow,
+};
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
-use crate::engine::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::sync::SyncEngine;
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
@@ -40,10 +43,20 @@ fn generate_checkpoint_parts(
     engine: &dyn Engine,
     file_actions_per_sidecar_hint: usize,
 ) -> KernelResult<CheckpointParts> {
-    let (data_iter, output_schema) = writer.checkpoint_data_with_schema(engine)?;
-    let iter_state = data_iter.state();
+    run_workflow_with_engine!(engine, |channel| {
+        generate_checkpoint_parts_impl(writer, channel, file_actions_per_sidecar_hint)
+    })
+}
 
-    let splitter = SidecarSplitter::new(engine.evaluation_handler().as_ref(), output_schema)?;
+async fn generate_checkpoint_parts_impl(
+    writer: &CheckpointWriter,
+    channel: &Channel,
+    file_actions_per_sidecar_hint: usize,
+) -> KernelResult<CheckpointParts> {
+    let (actions, output_schema) = writer.checkpoint_data_impl(channel).await?;
+    let (data_iter, iter_state) = ActionReconciliationState::with_shared_state(actions);
+
+    let splitter = SidecarSplitter::new_with_channel(channel, output_schema).await?;
     let non_file_batches = splitter.non_file_action_batches();
 
     let directory = writer.snapshot.log_segment().log_root.join("_sidecars/")?;
@@ -54,9 +67,9 @@ fn generate_checkpoint_parts(
         NonZero::new(file_actions_per_sidecar_hint),
     );
     let data = SidecarSplitter::file_action_batches(splitter, data_iter);
-    let sidecar_files = engine
-        .parquet_handler()
-        .write_parquet_files(write, Box::new(data))?
+    let sidecar_files = channel
+        .write_parquet_files(write, StaticCoroutine::from_generator(data))
+        .await?
         .into_iter()
         .map(|(url, _)| url)
         .collect();
@@ -683,7 +696,9 @@ fn dummy_struct() -> DataType {
     "'remove' field must be nullable"
 )]
 fn test_splitter_rejects_invalid_schema(#[case] schema: StructType, #[case] expected_msg: &str) {
-    let result = SidecarSplitter::new(&ArrowEvaluationHandler, Arc::new(schema));
+    let mut workflow =
+        workflow!(|channel| SidecarSplitter::new_with_channel(channel, Arc::new(schema)));
+    let result = workflow.try_advance();
     assert!(result.is_err(), "should reject invalid schema");
     let err = result.err().unwrap();
     assert!(

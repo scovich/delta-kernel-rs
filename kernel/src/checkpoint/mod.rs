@@ -136,9 +136,7 @@ use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
-use crate::{
-    Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator, version_as_i64,
-};
+use crate::{Engine, EngineData, FileMeta, KernelError, KernelResult, version_as_i64};
 
 #[cfg(feature = "declarative-plans")]
 mod checkpoint_shape;
@@ -152,7 +150,7 @@ pub(crate) use checkpoint_shape::{CheckpointShape, CheckpointType};
 use checkpoint_transform::{
     StatsTransformConfig, build_checkpoint_read_schema, build_checkpoint_transform,
 };
-use sidecar::{SidecarSplitter, create_sidecar_action_batch};
+use sidecar::{SidecarSplitter, create_sidecar_action_batch_with_channel};
 #[cfg(test)]
 mod tests;
 
@@ -673,11 +671,23 @@ impl CheckpointWriter {
         engine: &dyn Engine,
         file_actions_per_sidecar_hint: usize,
     ) -> KernelResult<WrittenCheckpointInfo> {
-        let (data_iter, output_schema) = self.checkpoint_data_with_schema(engine)?;
-        let iter_state = data_iter.state();
+        run_workflow_with_engine!(engine, |channel| {
+            self.write_v2_checkpoint_with_sidecars_with_channel(
+                channel,
+                file_actions_per_sidecar_hint,
+            )
+        })
+    }
 
-        let splitter =
-            SidecarSplitter::new(engine.evaluation_handler().as_ref(), output_schema.clone())?;
+    async fn write_v2_checkpoint_with_sidecars_with_channel(
+        &self,
+        channel: &Channel,
+        file_actions_per_sidecar_hint: usize,
+    ) -> KernelResult<WrittenCheckpointInfo> {
+        let (actions, output_schema) = self.checkpoint_data_impl(channel).await?;
+        let (data_iter, iter_state) = ActionReconciliationState::with_shared_state(actions);
+
+        let splitter = SidecarSplitter::new_with_channel(channel, output_schema.clone()).await?;
         let non_file_batches = splitter.non_file_action_batches();
 
         // Write sidecar files
@@ -693,9 +703,9 @@ impl CheckpointWriter {
             Some(file_actions_per_sidecar_hint),
         )?;
         let data = SidecarSplitter::file_action_batches(splitter, data_iter);
-        let sidecar_files = engine
-            .parquet_handler()
-            .write_parquet_files(write.clone(), Box::new(data))?;
+        let sidecar_files = channel
+            .write_parquet_files(write.clone(), StaticCoroutine::from_generator(data))
+            .await?;
         let mut sidecar_metas = Vec::with_capacity(sidecar_files.len());
         for (sidecar_url, written_size) in sidecar_files {
             let filename = write
@@ -711,7 +721,7 @@ impl CheckpointWriter {
                         "connector returned invalid sidecar path: {sidecar_url}"
                     ))
                 })?;
-            let meta = engine.storage_handler().head(&sidecar_url)?;
+            let meta = channel.head(&sidecar_url).await?;
             verify_written_size(&sidecar_url, written_size, meta.size)?;
             sidecar_metas.push((filename, meta));
         }
@@ -728,15 +738,17 @@ impl CheckpointWriter {
         // the `sidecar` column, e.g. `sidecar: { path: "<sidecar_filename>.parquet", sizeInBytes:
         // <size>, modificationTime: <time>, tags: null }`, with all other action columns
         // left null.
-        let sidecar_batch = create_sidecar_action_batch(engine, &output_schema, &sidecar_metas)?;
+        let sidecar_batch =
+            create_sidecar_action_batch_with_channel(channel, &output_schema, &sidecar_metas)
+                .await?;
 
         // Write main checkpoint file: non-file actions + sidecar references
         let checkpoint_path = self.checkpoint_path()?;
-        let main_data: Box<dyn KernelResultIterator<Box<dyn EngineData>>> =
-            Box::new(non_file_batches.into_iter().chain(sidecar_batch).map(Ok));
-        let main_size = engine
-            .parquet_handler()
-            .write_parquet_file(checkpoint_path.clone(), main_data)?;
+        let main_data = non_file_batches.into_iter().chain(sidecar_batch).map(Ok);
+        let main_data = StaticCoroutine::from_generator(main_data.into_generator());
+        let main_size = channel
+            .write_parquet_file(checkpoint_path.clone(), main_data)
+            .await?;
 
         // size_in_bytes covers the main checkpoint file plus all sidecar files.
         let sidecar_sizes_sum = sidecar_metas
@@ -744,14 +756,15 @@ impl CheckpointWriter {
             .try_fold(0u64, |acc, (_, m)| acc.checked_add(m.size))
             .ok_or_else(|| KernelError::internal_error("sidecar sizes sum overflowed u64"))?;
         let sidecar_count = sidecar_metas.len() as u64;
-        build_written_checkpoint_info(
-            engine,
+        build_written_checkpoint_info_with_channel(
+            channel,
             &checkpoint_path,
             iter_state,
             main_size,
             sidecar_sizes_sum,
             sidecar_count,
         )
+        .await
     }
 
     /// Writes a checkpoint without sidecars, will automatically choose V1 or V2
@@ -760,22 +773,34 @@ impl CheckpointWriter {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<WrittenCheckpointInfo> {
-        let checkpoint_path = self.checkpoint_path()?;
-        let data_iter = self.checkpoint_data(engine)?;
-        let state = data_iter.state();
-        let lazy_data = data_iter.map(|r| r.and_then(|f| f.apply_selection_vector()));
-        let main_size = engine
-            .parquet_handler()
-            .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))?;
+        run_workflow_with_engine!(engine, |channel| {
+            self.write_checkpoint_without_sidecars_with_channel(channel)
+        })
+    }
 
-        build_written_checkpoint_info(
-            engine,
+    async fn write_checkpoint_without_sidecars_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<WrittenCheckpointInfo> {
+        let checkpoint_path = self.checkpoint_path()?;
+        let (actions, _) = self.checkpoint_data_impl(channel).await?;
+        let (data_iter, state) = ActionReconciliationState::with_shared_state(actions);
+        let lazy_data = data_iter
+            .map(|r: KernelResult<FilteredEngineData>| r.and_then(|f| f.apply_selection_vector()));
+        let lazy_data = StaticCoroutine::from_generator(lazy_data);
+        let main_size = channel
+            .write_parquet_file(checkpoint_path.clone(), lazy_data)
+            .await?;
+
+        build_written_checkpoint_info_with_channel(
+            channel,
             &checkpoint_path,
             state,
             main_size,
             0, /* sidecar_sizes_sum */
             0, /* sidecar_count */
         )
+        .await
     }
 
     /// Creates the checkpoint metadata action for V2 checkpoints.
@@ -984,15 +1009,15 @@ fn verify_written_size(path: &Url, written_size: u64, observed_size: u64) -> Ker
     Ok(())
 }
 
-fn build_written_checkpoint_info(
-    engine: &dyn Engine,
+async fn build_written_checkpoint_info_with_channel(
+    channel: &Channel,
     checkpoint_path: &Url,
     state: Arc<ActionReconciliationIteratorState>,
     written_size: u64,
     sidecar_sizes_sum: u64,
     sidecar_count: u64,
 ) -> KernelResult<WrittenCheckpointInfo> {
-    let file_meta = engine.storage_handler().head(checkpoint_path)?;
+    let file_meta = channel.head(checkpoint_path).await?;
     verify_written_size(checkpoint_path, written_size, file_meta.size)?;
     let total_size_in_bytes = file_meta
         .size

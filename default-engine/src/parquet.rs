@@ -475,20 +475,20 @@ pub(crate) async fn write_parquet_file_impl(
 pub(crate) async fn write_parquet_files_impl(
     store: Arc<DynObjectStore>,
     write: ParquetMultiFileWrite,
-    mut batches: impl Stream<Item = KernelResult<Box<dyn EngineData>>> + Unpin,
+    mut batches: impl ParquetBatchSource,
 ) -> KernelResult<Vec<(url::Url, FileSize)>> {
     let preferred_rows_per_file = write
         .preferred_rows_per_file
         .map(NonZero::get)
         .unwrap_or(DEFAULT_ROWS_PER_FILE);
     let mut files = Vec::new();
-    while let Some(first) = batches.next().await {
+    while let Some(first) = batches.next_batch().await? {
         let location = write.new_file_url()?;
         let path = Path::from_url_path(location.path())?;
         let size = write_one_parquet_file(
             Arc::clone(&store),
             path,
-            first?,
+            first,
             &mut batches,
             preferred_rows_per_file - 1,
         )

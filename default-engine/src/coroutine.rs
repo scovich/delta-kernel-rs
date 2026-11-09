@@ -25,9 +25,11 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use delta_kernel::coroutine::kernel::request::{
     ExpressionEvaluatorHandle, ForwardListing, PredicateEvaluatorHandle, ReadJsonFiles,
-    ReadParquetFiles, WriteJsonFile,
+    ReadParquetFiles, WriteJsonFile, WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
 };
-use delta_kernel::coroutine::kernel::{Coroutine, CoroutineStep, PlanRequest, Request, Workflow};
+use delta_kernel::coroutine::kernel::{
+    Coroutine, CoroutineStep, PlanRequest, Request, StaticCoroutine, Workflow,
+};
 use delta_kernel::coroutine::{
     AsyncResult as _, Cursor, Page, PageRequest, PagedOperation, drive_workflow_async,
 };
@@ -46,9 +48,12 @@ use futures::stream::BoxStream;
 use futures::{Stream, StreamExt as _};
 use tokio_util::sync::CancellationToken;
 
-use crate::filesystem::{list_from_impl, read_files_impl};
+use crate::filesystem::{head_impl, list_from_impl, read_files_impl};
 use crate::json::{read_json_files_impl, write_json_file_impl};
-use crate::parquet::{read_parquet_files_impl, read_parquet_footer_impl};
+use crate::parquet::{
+    ParquetBatchSource, read_parquet_files_impl, read_parquet_footer_impl, write_parquet_file_impl,
+    write_parquet_files_impl,
+};
 use crate::{DEFAULT_READ_BATCH_SIZE, DEFAULT_READ_BUFFER_SIZE};
 
 /// Drives Kernel workflows one request at a time through the default engine's native async I/O.
@@ -152,6 +157,9 @@ impl AsyncEngineConnector {
         match request {
             Request::ListForward(request) => respond_paged(self, request).await?,
             Request::ReadSmallFile(file, reply) => reply.send(self.read_small_file(file).await),
+            Request::Head(url, reply) => {
+                reply.send(head_impl(Arc::clone(&self.object_store), url).await)
+            }
             Request::ReadParquetFooter(file, reply) => {
                 reply.send(read_parquet_footer_impl(Arc::clone(&self.object_store), file).await)
             }
@@ -191,6 +199,14 @@ impl AsyncEngineConnector {
             Request::WriteJson(operation, reply) => {
                 reply.send(Box::pin(self.write_json_file(*operation)).await)
             }
+            Request::WriteParquet(operation, reply) => {
+                // Await the write before replying so request input drops before size verification.
+                reply.send(Box::pin(self.write_parquet_file(*operation)).await)
+            }
+            Request::WriteParquetFiles(operation, reply) => {
+                // Await the write before replying so request input drops before size verification.
+                reply.send(Box::pin(self.write_parquet_files(*operation)).await)
+            }
         }
         Ok(())
     }
@@ -228,6 +244,31 @@ impl AsyncEngineConnector {
         }
         let store = Arc::clone(&self.object_store);
         write_json_file_impl(store, operation.url, buffer, operation.overwrite).await
+    }
+
+    async fn write_parquet_file(&self, operation: WriteParquetFile) -> KernelResult<FileSize> {
+        let WriteParquetFile { url, mut input } = operation;
+        let batches = CoroutineParquetSource {
+            connector: self,
+            input: &mut input,
+        };
+        write_parquet_file_impl(Arc::clone(&self.object_store), url, batches).await
+    }
+
+    async fn write_parquet_files(
+        &self,
+        operation: WriteParquetFiles,
+    ) -> KernelResult<WriteParquetFilesResult> {
+        let WriteParquetFiles { write, mut input } = operation;
+        write_parquet_files_impl(
+            Arc::clone(&self.object_store),
+            write,
+            CoroutineParquetSource {
+                connector: self,
+                input: &mut input,
+            },
+        )
+        .await
     }
 
     async fn read_small_file(&self, file: FileSlice) -> KernelResult<Option<Bytes>> {
@@ -382,6 +423,21 @@ impl AsyncPagination<ReadParquetFiles> for AsyncEngineConnector {
     }
 }
 
+/// Pulls write batches from a Kernel coroutine as the Parquet writer requests them.
+struct CoroutineParquetSource<'a> {
+    connector: &'a AsyncEngineConnector,
+    input: &'a mut StaticCoroutine<KernelResult<Box<dyn EngineData>>>,
+}
+
+impl ParquetBatchSource for CoroutineParquetSource<'_> {
+    async fn next_batch(&mut self) -> KernelResult<Option<Box<dyn EngineData>>> {
+        match self.connector.advance_inner(self.input).await? {
+            ControlFlow::Continue(data) => Ok(Some(data?)),
+            ControlFlow::Break(()) => Ok(None),
+        }
+    }
+}
+
 struct MeteredStream<T> {
     inner: ResultStream<T>,
     start: Instant,
@@ -459,17 +515,21 @@ where
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::FileMeta;
     use delta_kernel::coroutine::PageGenerator;
-    use delta_kernel::coroutine::generator::{BoundGenerator as _, GeneratorExt as _};
+    use delta_kernel::coroutine::generator::{
+        AsyncIntoIterator as _, BoundGenerator as _, GeneratorExt as _,
+    };
     use delta_kernel::coroutine::kernel::request::{ForwardListing, ListingBounds};
-    use delta_kernel::coroutine::kernel::{ChannelExt as _, WorkflowStep, static_workflow};
+    use delta_kernel::coroutine::kernel::{
+        ChannelExt as _, StaticCoroutine, WorkflowStep, static_workflow,
+    };
     use delta_kernel::expressions::{col, lit};
     use delta_kernel::object_store::ObjectStoreExt as _;
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::schema::{DataType, schema_ref};
+    use delta_kernel::{FileMeta, ParquetMultiFileWrite};
     use url::Url;
 
     use super::*;
@@ -547,6 +607,35 @@ mod tests {
         let result = connector.run(workflow).await.unwrap();
 
         assert_eq!(result, (1, true));
+    }
+
+    #[tokio::test]
+    async fn writes_parquet_files_through_native_async_storage() {
+        let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
+        let connector = AsyncEngineConnector::new(Arc::clone(&store));
+        let directory = Url::parse("memory:///sidecars/").unwrap();
+        let write = ParquetMultiFileWrite::new(directory, "part-", ".parquet", NonZero::new(2));
+        let workflow = static_workflow!(async move |channel| {
+            let schema = schema_ref! { nullable "value": LONG };
+            let mut batches = Vec::new();
+            for value in 0..3_i64 {
+                let rows = vec![vec![value.into()]];
+                batches.push(channel.create_many(schema.clone(), rows).await?);
+            }
+            let input =
+                StaticCoroutine::from_generator(batches.into_iter().map(Ok).into_generator());
+            let files = channel.write_parquet_files(write, input).await?;
+            let mut sizes = Vec::new();
+            for (location, written_size) in files {
+                sizes.push((written_size, channel.head(&location).await?.size));
+            }
+            Ok(sizes)
+        });
+
+        let sizes = connector.run(workflow).await.unwrap();
+
+        assert_eq!(sizes.len(), 2);
+        assert!(sizes.iter().all(|(written, observed)| written == observed));
     }
 
     #[tokio::test]
