@@ -253,7 +253,7 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
     /// 1, connectors should publish staged commits to the delta log immediately after writing;
     /// UC expects to be informed of the last known published version during commit.
     fn commit(&self, engine: &dyn Engine, commit: KernelCommit) -> KernelResult<CommitResponse> {
-        let (commit_metadata, actions) = commit.try_into_parts(true)?;
+        let (commit_metadata, actions) = commit.try_into_engine_parts(engine, true)?;
         if commit_metadata.version() == 0 {
             return self.commit_version_0(&commit_metadata, |path| {
                 let file_size = engine

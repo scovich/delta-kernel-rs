@@ -38,6 +38,9 @@ pub use publish_types::{CatalogCommit, PublishMetadata};
 
 #[cfg(feature = "declarative-plans")]
 use crate::KernelError;
+use crate::coroutine::generator::{AsyncIntoIterator as _, Generator};
+use crate::coroutine::kernel::engine::EngineConnector;
+use crate::coroutine::kernel::{Coroutine, Request};
 #[cfg(feature = "declarative-plans")]
 use crate::plans::{RelationRef, ScopedPlanExecutor};
 use crate::{Engine, FilteredEngineData, KernelResult, KernelResultIterator, Version};
@@ -45,15 +48,27 @@ use crate::{Engine, FilteredEngineData, KernelResult, KernelResultIterator, Vers
 /// Actions ready to be committed in Delta log order.
 pub type CommitActions = Box<dyn KernelResultIterator<FilteredEngineData>>;
 
+/// Connector-driven actions ready to be committed in Delta log order.
+pub type CommitActionsGenerator =
+    Box<dyn Generator<Request, Item = KernelResult<FilteredEngineData>, Output = ()>>;
+
 /// A Delta log commit ready for a [`Committer`] to persist.
 pub struct Commit {
     metadata: CommitMetadata,
-    actions: CommitActions,
+    actions: CommitActionsGenerator,
 }
 
 impl Commit {
     /// Creates a prepared commit from owned actions and their metadata.
     pub fn new(metadata: CommitMetadata, actions: CommitActions) -> Self {
+        Self::from_generator(metadata, Box::new(actions.into_generator()))
+    }
+
+    /// Creates a prepared commit from connector-driven actions and their metadata.
+    pub(crate) fn from_generator(
+        metadata: CommitMetadata,
+        actions: CommitActionsGenerator,
+    ) -> Self {
         Self { metadata, actions }
     }
 
@@ -61,9 +76,21 @@ impl Commit {
     pub fn try_into_parts(
         self,
         is_catalog_committer: bool,
-    ) -> KernelResult<(CommitMetadata, CommitActions)> {
+    ) -> KernelResult<(CommitMetadata, CommitActionsGenerator)> {
         self.metadata.validate_committer(is_catalog_committer)?;
         Ok((self.metadata, self.actions))
+    }
+
+    /// Like [`Self::try_into_parts`], but returns actions driven through `engine`.
+    pub fn try_into_engine_parts(
+        self,
+        engine: &dyn Engine,
+        is_catalog_committer: bool,
+    ) -> KernelResult<(CommitMetadata, CommitActions)> {
+        let (metadata, actions) = self.try_into_parts(is_catalog_committer)?;
+        let actions = EngineConnector::new(engine)
+            .iterate_result_coroutine(Coroutine::from_generator(actions));
+        Ok((metadata, Box::new(actions)))
     }
 
     pub(crate) fn version(&self) -> Version {

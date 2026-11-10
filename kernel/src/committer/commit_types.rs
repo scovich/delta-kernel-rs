@@ -195,8 +195,7 @@ impl CommitMetadata {
         ) {
             (true, true) | (false, false) => Ok(()),
             (false, true) => Err(KernelError::generic(
-                "This table is catalog-managed and requires a catalog committer. \
-                 Please provide a catalog committer to Transaction::commit().",
+                "This table is catalog-managed and requires a catalog committer.",
             )),
             (true, false) => Err(KernelError::generic(
                 "This table is path-based and cannot be committed to with a catalog committer.",

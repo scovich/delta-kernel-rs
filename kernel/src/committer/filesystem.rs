@@ -9,6 +9,10 @@ use super::publish_types::PublishMetadata;
 use super::{Commit, Committer};
 #[cfg(feature = "declarative-plans")]
 use crate::committer::write_commit_json_declarative;
+use crate::coroutine::kernel::{
+    Channel, ChannelExt as _, StaticCoroutine, StaticWorkflow, run_workflow_with_engine,
+    static_workflow,
+};
 #[cfg(feature = "declarative-plans")]
 use crate::plans::{RelationRef, ScopedPlanExecutor};
 use crate::{Engine, FileMeta, KernelError, KernelResult};
@@ -49,23 +53,30 @@ impl FileSystemCommitter {
             Err(e) => Err(e),
         }
     }
-}
 
-impl Committer for FileSystemCommitter {
+    /// Returns a lazy workflow that writes a prepared path-based commit.
+    pub fn commit_workflow(commit: Commit) -> StaticWorkflow<CommitResponse> {
+        static_workflow!(|channel| Self::commit_with_channel(channel, commit))
+    }
+
     #[instrument(
         name = "fs_committer.commit",
         skip_all,
         fields(version = commit.version()),
         err
     )]
-    fn commit(&self, engine: &dyn Engine, commit: Commit) -> KernelResult<CommitResponse> {
+    async fn commit_with_channel(
+        channel: &Channel,
+        commit: Commit,
+    ) -> KernelResult<CommitResponse> {
         let (commit_metadata, actions) = commit.try_into_parts(false)?;
         let version = commit_metadata.version();
         let published_commit_path = commit_metadata.published_commit_path()?;
 
-        let result = engine
-            .json_handler()
+        let actions = StaticCoroutine::from_generator(actions);
+        let result = channel
             .write_json_file(&published_commit_path, actions, false)
+            .await
             .map(|written_size| {
                 FileMeta::new(
                     published_commit_path,
@@ -74,6 +85,12 @@ impl Committer for FileSystemCommitter {
                 )
             });
         Self::commit_response(result, version)
+    }
+}
+
+impl Committer for FileSystemCommitter {
+    fn commit(&self, engine: &dyn Engine, commit: Commit) -> KernelResult<CommitResponse> {
+        run_workflow_with_engine!(engine, |channel| Self::commit_with_channel(channel, commit))
     }
 
     #[cfg(feature = "declarative-plans")]

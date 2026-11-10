@@ -22,6 +22,7 @@ use super::request::{
     WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
 };
 use super::{Request, StaticCoroutine};
+use crate::committer::{Commit, CommitResponse};
 use crate::coroutine::generator::{self, BoundGenerator, Flatten, Generator, GeneratorExt as _};
 use crate::coroutine::{
     ChannelExchange, Cursor, KernelFuture, Page, PageGenerator, PageRequest, PagedOperation,
@@ -263,6 +264,11 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
     fn write_bytes(&self, url: &Url, data: Bytes, overwrite: bool) -> impl KernelFuture<()> {
         let operation = WriteBytes::new(url.clone(), data, overwrite);
         self.exchange(operation, Request::WriteBytes)
+    }
+
+    /// Delegates a prepared transaction to the connector's committer.
+    fn commit(&self, commit: Commit) -> impl KernelFuture<CommitResponse> {
+        self.exchange(Box::new(commit), Request::Commit)
     }
 
     /// Initialize `operation` via [`PageRequest::Prepare`] without fetching its first page.

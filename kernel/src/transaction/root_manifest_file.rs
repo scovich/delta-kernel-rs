@@ -1,16 +1,20 @@
 //! Commits a caller-supplied root manifest file as the table's content root.
 
+#[cfg(test)]
+use crate::Engine;
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::visitors::SetTransactionMap;
 use crate::actions::{CheckpointAction, ContentRoot, DomainMetadata, SetTransaction};
-use crate::coroutine::kernel::{Channel, run_workflow_with_engine};
+use crate::coroutine::kernel::Channel;
+#[cfg(test)]
+use crate::coroutine::kernel::run_workflow_with_engine;
 use crate::crc::{DomainMetadataState, SetTransactionState, merge_domain_metadata};
 use crate::error::KernelError;
 use crate::log_segment::DomainMetadataMap;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
-use crate::{Engine, FileMeta, KernelResult, Version, version_as_i64};
+use crate::{FileMeta, KernelResult, Version, version_as_i64};
 
 /// A pointer to an on-disk root manifest file to be committed as the table's content root via a
 /// `checkpoint` action.
@@ -33,6 +37,7 @@ impl RootManifestFile {
     /// `commit_version`. A reader restores from it without replaying earlier commits, so it carries
     /// the table's protocol and metadata plus every active domain metadata and set transaction
     /// (this transaction's `dm_changes` and `set_transactions` merged in, newest wins).
+    #[cfg(test)]
     pub(super) fn compute_checkpoint_action(
         &self,
         engine: &dyn Engine,
