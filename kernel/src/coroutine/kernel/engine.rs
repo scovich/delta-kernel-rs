@@ -89,7 +89,7 @@ impl EngineConnector {
         drive_connector(self, workflow)
     }
 
-    /// Drives a workflow using `committer` for commit requests.
+    /// Drives a workflow using `committer` for commit and catalog-publish requests.
     pub(crate) fn drive_with_committer<O>(
         &self,
         workflow: Workflow<'_, O>,
@@ -268,6 +268,11 @@ impl ConnectorRespond for EngineConnector {
                     "commit request requires a committer-aware driver",
                 ));
             }
+            Request::RequireCatalogCommitter(..) | Request::Publish(..) => {
+                return Err(KernelError::internal_error(
+                    "catalog committer request requires a committer-aware driver",
+                ));
+            }
         }
         Ok(())
     }
@@ -318,7 +323,7 @@ pub(crate) fn drive_with_engine<O, E: From<KernelError>>(
     EngineConnector::new(engine).drive(workflow)
 }
 
-/// Drives `workflow` through `engine`, using `committer` for commit requests.
+/// Drives `workflow` through `engine`, using `committer` for commit and catalog-publish requests.
 #[internal_api]
 pub(crate) fn drive_with_committer<O>(
     engine: &dyn Engine,
@@ -479,7 +484,9 @@ impl ConnectorRespond for PlanExecutorConnector<'_> {
             | Request::WriteParquet(..)
             | Request::WriteParquetFiles(..)
             | Request::WriteBytes(..)
-            | Request::Commit(..) => Err(KernelError::internal_error(
+            | Request::Commit(..)
+            | Request::RequireCatalogCommitter(..)
+            | Request::Publish(..) => Err(KernelError::internal_error(
                 "plan-executor workflow requested a non-plan operation",
             )),
         }
@@ -529,6 +536,12 @@ impl ConnectorRespond for StorageConnector<'_> {
             Request::Commit(..) => Err(KernelError::internal_error(
                 "commit request requires an Engine connector with a committer",
             )),
+            Request::RequireCatalogCommitter(..) => Err(KernelError::internal_error(
+                "catalog committer validation requires an Engine connector with a committer",
+            )),
+            Request::Publish(..) => Err(KernelError::internal_error(
+                "publish request requires an Engine connector with a catalog committer",
+            )),
         }
     }
 }
@@ -544,6 +557,20 @@ impl ConnectorRespond for CommitterConnector<'_> {
         match request {
             Request::Commit(commit, reply) => {
                 complete(reply, self.committer.commit(self.engine, *commit))
+            }
+            Request::RequireCatalogCommitter(reply) => {
+                let result = if self.committer.is_catalog_committer() {
+                    Ok(())
+                } else {
+                    Err(KernelError::generic(
+                        "There are catalog commits that need publishing, but the committer is \
+                         not a catalog committer.",
+                    ))
+                };
+                complete(reply, result)
+            }
+            Request::Publish(metadata, reply) => {
+                complete(reply, self.committer.publish(self.engine, metadata))
             }
             request => self.connector.respond(request),
         }

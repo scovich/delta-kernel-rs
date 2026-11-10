@@ -10,7 +10,7 @@ use derive_more::{Constructor, From};
 use url::Url;
 
 use super::StaticCoroutine;
-use crate::committer::{Commit, CommitResponse};
+use crate::committer::{Commit, CommitResponse, PublishMetadata};
 use crate::coroutine::{PageRequest, PagedOperation, Reply};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ExpressionRef, PredicateRef};
@@ -64,6 +64,10 @@ pub enum Request {
     WriteBytes(WriteBytes, Reply<()>),
     /// Commit one prepared transaction through a connector-selected committer.
     Commit(Box<Commit>, Reply<CommitResponse>),
+    /// Verifies that the connector selected a catalog committer.
+    RequireCatalogCommitter(Reply<()>),
+    /// Publish catalog commits through a connector-selected committer.
+    Publish(PublishMetadata, Reply<()>),
 }
 
 /// Declarative plan operations with result-specific reply types.

@@ -774,8 +774,8 @@ pub(crate) fn drive_kernel<O: Send + 'static, E: From<KernelError>>(
     drive_with_engine(extern_engine.engine().as_ref(), workflow)
 }
 
-/// Drives a workflow through the engine exposed by `extern_engine`, serving commit requests with
-/// `committer`.
+/// Drives a workflow through the engine exposed by `extern_engine`, serving commit and
+/// catalog-publish requests with `committer`.
 pub(crate) fn drive_kernel_with_committer<O: Send + 'static>(
     extern_engine: &dyn ExternEngine,
     workflow: Workflow<'_, O>,
@@ -1376,8 +1376,8 @@ pub unsafe extern "C" fn snapshot_publish_with_committer(
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot_ref: SnapshotRef = unsafe { snapshot.clone_as_arc() };
     let committer = unsafe { committer.into_inner() };
-    let result = snapshot_ref
-        .publish(engine_ref.engine().as_ref(), committer.as_ref())
+    let workflow = snapshot_ref.publish_workflow();
+    let result = drive_kernel_with_committer(engine_ref, workflow, committer.as_ref())
         .map(|updated| updated.into());
     unsafe { result.into_extern_result(&engine_ref) }
 }
