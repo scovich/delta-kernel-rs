@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use delta_kernel_derive::internal_api;
 
+#[cfg(test)]
+use crate::Engine;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{CheckpointAction, LastManifestCommit};
 use crate::actions::{
@@ -11,6 +13,8 @@ use crate::actions::{
     Protocol, SetTransaction, TIGHT_BOUNDS,
 };
 use crate::committer::{CommitMetadata, CommitProtocolMetadata, CommitType};
+use crate::coroutine::generator::Generator;
+use crate::coroutine::kernel::{Channel, Request};
 use crate::crc::{CrcDelta, FileStatsDelta};
 use crate::error::KernelError;
 use crate::expressions::ColumnName;
@@ -31,7 +35,7 @@ use crate::table_properties::CheckConstraint;
 use crate::utils::{PhantomType, require};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::version_as_i64;
-use crate::{DataType, Engine, EngineData, FileMeta, KernelResult, KernelResultIterator, Version};
+use crate::{DataType, EngineData, FileMeta, KernelResult, Version};
 
 #[cfg(feature = "internal-api")]
 pub mod builder;
@@ -95,8 +99,9 @@ pub(crate) use manifest_commit_state::ManifestCommitState;
 use root_manifest_file::RootManifestFile;
 pub use write_state::{BoundWriteContextBuilder, RowTrackingMetadataColumns, WriteState};
 
-/// Type alias for an iterator of [`EngineData`] results.
-pub(crate) type EngineDataResultIterator = Box<dyn KernelResultIterator<Box<dyn EngineData>>>;
+/// Type alias for a generator of [`EngineData`] results.
+pub(crate) type EngineDataResultGenerator =
+    Box<dyn Generator<Request, Item = KernelResult<Box<dyn EngineData>>, Output = ()>>;
 
 /// The static instance referenced by [`add_files_schema`] that doesn't contain the dataChange
 /// column.
@@ -474,6 +479,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// implementation that clustered the file.
     ///
     /// [`add_files`]: crate::transaction::Transaction::add_files
+    /// [`Engine`]: crate::Engine
     /// [`ParquetHandler`]: crate::ParquetHandler
     /// [`stats_schema`]: Transaction::stats_schema
     pub fn add_files_schema(&self) -> &'static SchemaRef {
@@ -853,22 +859,23 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// Builds the `checkpoint` action committing the configured root manifest file, or `None` if
     /// this transaction has none.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn generate_checkpoint_action(
+    async fn generate_checkpoint_action_with_channel(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         commit_version: Version,
         dm_changes: &[DomainMetadata],
     ) -> KernelResult<Option<CheckpointAction>> {
         let Some(ManifestWrite::RootFile(root_manifest_file)) = &self.manifest_write else {
             return Ok(None);
         };
-        let action = root_manifest_file.compute_checkpoint_action(
-            engine,
+        let action = root_manifest_file.compute_checkpoint_action_with_channel(
+            channel,
             commit_version,
             &self.effective_table_config,
             dm_changes,
             &self.set_transactions,
-        )?;
+        );
+        let action = action.await?;
         Ok(Some(action))
     }
 
@@ -880,14 +887,15 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// Sets the adaptiveMetadata `dataChange` and `lastManifestCommit` fields on `commit_info` when
     /// the feature is enabled.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn set_adaptive_metadata_commit_info(
+    async fn set_adaptive_metadata_commit_info_with_channel(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         commit_info: &mut CommitInfo,
     ) -> KernelResult<()> {
         if self.is_adaptive_metadata_enabled() {
             commit_info.set_data_change(self.data_change);
-            commit_info.set_last_manifest_commit(self.last_manifest_commit(engine)?);
+            commit_info
+                .set_last_manifest_commit(self.last_manifest_commit_with_channel(channel).await?);
         }
         Ok(())
     }
@@ -896,9 +904,9 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// (whose content root is at the commit version), otherwise the read snapshot's carried
     /// forward. `None` before the table's first manifest commit.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn last_manifest_commit(
+    async fn last_manifest_commit_with_channel(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
     ) -> KernelResult<Option<LastManifestCommit>> {
         match &self.manifest_write {
             Some(ManifestWrite::RootFile(_)) => {
@@ -911,7 +919,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
                 "lastManifestCommit for a manifest commit is not yet supported",
             )),
             None => match &self.read_snapshot_opt {
-                Some(snapshot) => snapshot.last_manifest_commit(engine),
+                Some(snapshot) => snapshot.last_manifest_commit_with_channel(channel).await,
                 None => Ok(None),
             },
         }
@@ -1065,7 +1073,10 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// Returns `None` if ICT is not enabled on the table. A feature being in the protocol
     /// (`is_feature_supported`) is not sufficient -- the `delta.enableInCommitTimestamps`
     /// property must also be `true` (`is_feature_enabled`).
-    fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> KernelResult<Option<i64>> {
+    async fn get_in_commit_timestamp_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<Option<i64>> {
         let has_ict = self
             .effective_table_config
             .is_feature_enabled(&TableFeature::InCommitTimestamp);
@@ -1086,7 +1097,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         Ok(self
             .read_snapshot()?
             .reader()
-            .get_in_commit_timestamp(engine)?
+            .get_in_commit_timestamp_with_channel(channel)
+            .await?
             .map(|prev_ict| self.commit_timestamp.max(prev_ict + 1)))
     }
 
@@ -1175,9 +1187,12 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
 
     /// Generate non-file commit actions as in-memory structs, that can then be encoded into the
     /// committable format (e.g EngineData)
-    fn prepare_nonfile_actions(&self, engine: &dyn Engine) -> KernelResult<NonfileCommitActions> {
+    async fn prepare_nonfile_actions_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> KernelResult<NonfileCommitActions> {
         let set_transactions = self.set_transactions.clone();
-        let in_commit_timestamp = self.get_in_commit_timestamp(engine)?;
+        let in_commit_timestamp = self.get_in_commit_timestamp_with_channel(channel).await?;
         let mut kernel_commit_info = CommitInfo::new(
             self.commit_timestamp,
             in_commit_timestamp,
@@ -1204,7 +1219,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         }
 
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        self.set_adaptive_metadata_commit_info(engine, &mut kernel_commit_info)?;
+        self.set_adaptive_metadata_commit_info_with_channel(channel, &mut kernel_commit_info)
+            .await?;
         Ok(NonfileCommitActions {
             commit_version: self.get_commit_version(),
             kernel_commit_info,

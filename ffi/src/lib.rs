@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 use delta_kernel::actions::Protocol;
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
-use delta_kernel::coroutine::kernel::{Workflow, drive_with_engine};
+use delta_kernel::committer::Committer;
+use delta_kernel::coroutine::kernel::{Workflow, drive_with_committer, drive_with_engine};
 use delta_kernel::history_manager::{
     CommitAt, HistoryCommitType, first_version_after_workflow, get_earliest_commit_workflow,
     latest_version_as_of_workflow,
@@ -765,6 +766,16 @@ pub(crate) fn drive_kernel<O: Send + 'static>(
     workflow: Workflow<'_, O>,
 ) -> KernelResult<O> {
     drive_with_engine(extern_engine.engine().as_ref(), workflow)
+}
+
+/// Drives a workflow through the engine exposed by `extern_engine`, serving commit requests with
+/// `committer`.
+pub(crate) fn drive_kernel_with_committer<O: Send + 'static>(
+    extern_engine: &dyn ExternEngine,
+    workflow: Workflow<'_, O>,
+    committer: &dyn Committer,
+) -> KernelResult<O> {
+    drive_with_committer(extern_engine.engine().as_ref(), workflow, committer)
 }
 
 #[handle_descriptor(target=dyn ExternEngine, mutable=false)]

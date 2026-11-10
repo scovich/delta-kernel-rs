@@ -193,7 +193,9 @@ pub(crate) mod parallel;
 pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliationIteratorState};
 use cancellation::{CancellableIterator, check_cancelled};
 pub use cancellation::{CancellationToken, CancellationTokenRef, CancelledFuture};
-use coroutine::kernel::{Channel, ChannelExt as _, run_workflow_with_engine};
+#[cfg(test)]
+use coroutine::kernel::run_workflow_with_engine;
+use coroutine::kernel::{Channel, ChannelExt as _};
 pub use delta_kernel_derive;
 pub use engine_data::{
     EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
@@ -605,6 +607,7 @@ pub trait EvaluationHandler: AsAny {
 /// Creates one row containing a single scalar value.
 ///
 /// `schema` must contain exactly one top-level field whose type matches `value`.
+#[cfg(test)]
 pub(crate) fn create_row(
     engine: &dyn Engine,
     schema: SchemaRef,

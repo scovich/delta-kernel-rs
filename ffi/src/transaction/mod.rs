@@ -21,6 +21,7 @@ pub use deletion_vector::{
     dv_descriptor_map_new, dv_descriptor_new, free_dv_descriptor, free_dv_descriptor_map,
     update_table_txn_update_deletion_vectors,
 };
+use delta_kernel::EngineData;
 use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::transaction::create_table::CreateTableTransactionBuilder;
@@ -29,7 +30,6 @@ use delta_kernel::transaction::{
     CommitResult, CommittedTransaction, CreateTable, Transaction, UpdateTable,
     UpdateTableOperation, UpdateTableTransactionBuilder,
 };
-use delta_kernel::{Engine, EngineData};
 use delta_kernel_ffi_macros::handle_descriptor;
 pub use partition_value::{
     ExclusivePartitionValueMap, free_partition_value_map, partition_value_map_insert_binary,
@@ -148,8 +148,9 @@ impl<STATE: 'static> FfiTransaction<STATE> {
         self.map(|txn| txn.with_domain_metadata(domain, configuration))
     }
 
-    fn commit(self, engine: &dyn Engine) -> KernelResult<CommitResult<STATE>> {
-        self.transaction.commit(engine, self.committer.as_ref())
+    fn commit(self, extern_engine: &dyn ExternEngine) -> KernelResult<CommitResult<STATE>> {
+        let workflow = self.transaction.commit_workflow();
+        crate::drive_kernel_with_committer(extern_engine, workflow, self.committer.as_ref())
     }
 }
 

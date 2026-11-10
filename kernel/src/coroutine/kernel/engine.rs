@@ -16,6 +16,7 @@ use super::request::{
 #[cfg(feature = "declarative-plans")]
 use super::request::{PlanOperation, PlanRequest};
 use super::{Coroutine, CoroutineStep, KernelResultGenerator, Request, Workflow};
+use crate::committer::Committer;
 use crate::coroutine::{Cursor, Page, PageRequest, PagedOperation, Reply, drive_workflow};
 #[cfg(feature = "declarative-plans")]
 use crate::plans::PlanExecutor;
@@ -83,6 +84,23 @@ impl EngineConnector {
     /// Drive an existing workflow through this connector.
     pub(crate) fn drive<O>(&self, workflow: Workflow<'_, O>) -> KernelResult<O> {
         drive_connector(self, workflow)
+    }
+
+    /// Drives a workflow using `committer` for commit requests.
+    pub(crate) fn drive_with_committer<O>(
+        &self,
+        workflow: Workflow<'_, O>,
+        engine: &dyn Engine,
+        committer: &dyn Committer,
+    ) -> KernelResult<O> {
+        drive_connector(
+            &CommitterConnector {
+                connector: self,
+                engine,
+                committer,
+            },
+            workflow,
+        )
     }
 
     /// Prepare a fallible result coroutine and return an iterator that drives it and its requests.
@@ -242,6 +260,11 @@ impl ConnectorRespond for EngineConnector {
                 // The write request's input must drop before size verification takes the state.
                 complete(reply, self.write_parquet_files(*operation))?
             }
+            Request::Commit(..) => {
+                return Err(KernelError::internal_error(
+                    "commit request requires a committer-aware driver",
+                ));
+            }
         }
         Ok(())
     }
@@ -290,6 +313,16 @@ pub(crate) fn drive_with_engine<O>(
     workflow: Workflow<'_, O>,
 ) -> KernelResult<O> {
     EngineConnector::new(engine).drive(workflow)
+}
+
+/// Drives `workflow` through `engine`, using `committer` for commit requests.
+#[internal_api]
+pub(crate) fn drive_with_committer<O>(
+    engine: &dyn Engine,
+    workflow: Workflow<'_, O>,
+    committer: &dyn Committer,
+) -> KernelResult<O> {
+    EngineConnector::new(engine).drive_with_committer(workflow, engine, committer)
 }
 
 /// Return an iterator that drives a fallible result coroutine through `engine`.
@@ -442,7 +475,8 @@ impl ConnectorRespond for PlanExecutorConnector<'_> {
             | Request::WriteJson(..)
             | Request::WriteParquet(..)
             | Request::WriteParquetFiles(..)
-            | Request::WriteBytes(..) => Err(KernelError::internal_error(
+            | Request::WriteBytes(..)
+            | Request::Commit(..) => Err(KernelError::internal_error(
                 "plan-executor workflow requested a non-plan operation",
             )),
         }
@@ -489,6 +523,26 @@ impl ConnectorRespond for StorageConnector<'_> {
                     "file writes require an Engine connector",
                 ))
             }
+            Request::Commit(..) => Err(KernelError::internal_error(
+                "commit request requires an Engine connector with a committer",
+            )),
+        }
+    }
+}
+
+struct CommitterConnector<'a> {
+    connector: &'a EngineConnector,
+    engine: &'a dyn Engine,
+    committer: &'a dyn Committer,
+}
+
+impl ConnectorRespond for CommitterConnector<'_> {
+    fn respond(&self, request: Request) -> KernelResult<()> {
+        match request {
+            Request::Commit(commit, reply) => {
+                complete(reply, self.committer.commit(self.engine, *commit))
+            }
+            request => self.connector.respond(request),
         }
     }
 }

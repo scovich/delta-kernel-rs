@@ -2,14 +2,20 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use super::{Imperative, Transaction};
+#[cfg(test)]
+use crate::Engine;
 use crate::actions::{COMMIT_INFO_NAME, CommitInfo, LOG_COMMIT_INFO_SCHEMA};
+#[cfg(test)]
+use crate::coroutine::kernel::run_workflow_with_engine;
+use crate::coroutine::kernel::{Channel, ChannelExt as _};
 use crate::engine_data::{GetData, MapItem, RowVisitor, TypedGetData as _};
 use crate::expressions::{MapData, Scalar, lit, null_lit};
 use crate::schema::{ColumnName, MapType, ToSchema, column_name, schema_ref};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::utils::require;
 use crate::{
-    DataType, Engine, EngineData, Expression, ExpressionRef, KernelError, KernelResult, create_row,
+    DataType, EngineData, Expression, ExpressionRef, KernelError, KernelResult,
+    create_row_with_channel,
 };
 
 pub(super) fn collect_operation_metadata<I, K, V>(entries: I) -> HashMap<String, Option<String>>
@@ -95,9 +101,20 @@ fn string_map_literal_expr(
 }
 
 impl<STATE> Transaction<STATE, Imperative> {
+    #[cfg(test)]
     pub(super) fn generate_commit_info(
         &self,
         engine: &dyn Engine,
+        kernel_commit_info: CommitInfo,
+    ) -> KernelResult<Box<dyn EngineData>> {
+        run_workflow_with_engine!(engine, |channel| {
+            self.generate_commit_info_with_channel(channel, kernel_commit_info)
+        })
+    }
+
+    pub(super) async fn generate_commit_info_with_channel(
+        &self,
+        channel: &Channel,
         kernel_commit_info: CommitInfo,
     ) -> KernelResult<Box<dyn EngineData>> {
         match &self.engine_commit_info {
@@ -150,14 +167,20 @@ impl<STATE> Transaction<STATE, Imperative> {
                 // with the None branch which uses `LOG_COMMIT_INFO_SCHEMA`.
                 let wrapped_expr = Expression::struct_from([patch]);
                 let wrapped_schema = schema_ref! { nullable COMMIT_INFO_NAME: (output_schema) };
-                let evaluator = engine.evaluation_handler().new_expression_evaluator(
+                let evaluator = channel.create_expression_evaluator(
                     engine_commit_info_schema.clone(),
                     Arc::new(wrapped_expr),
                     wrapped_schema.into(),
-                )?;
-                evaluator.evaluate(engine_commit_info.as_ref())
+                );
+                let evaluator = evaluator.await?;
+                channel
+                    .evaluate_expression(&evaluator, engine_commit_info.clone_data())
+                    .await
             }
-            None => create_row(engine, LOG_COMMIT_INFO_SCHEMA.clone(), kernel_commit_info),
+            None => {
+                create_row_with_channel(channel, LOG_COMMIT_INFO_SCHEMA.clone(), kernel_commit_info)
+                    .await
+            }
         }
     }
 }

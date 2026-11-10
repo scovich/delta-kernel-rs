@@ -183,7 +183,6 @@ impl<'a> SnapshotReader<'a> {
     /// row-tracking domain exists.
     ///
     /// Cancellation is the connector's.
-    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
     #[internal_api]
     pub(crate) async fn get_row_tracking_high_water_mark_with_channel(
         &self,
@@ -313,7 +312,6 @@ impl<'a> SnapshotReader<'a> {
     /// `None`.
     ///
     /// Cancellation is the connector's.
-    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
     #[internal_api]
     pub(crate) async fn get_domain_metadatas_internal_with_channel(
         &self,
@@ -419,7 +417,6 @@ impl<'a> SnapshotReader<'a> {
     /// Gets this version's In-Commit Timestamp through `channel`, or `None` when ICT is disabled.
     ///
     /// Cancellation is the connector's.
-    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
     pub(crate) async fn get_in_commit_timestamp_with_channel(
         &self,

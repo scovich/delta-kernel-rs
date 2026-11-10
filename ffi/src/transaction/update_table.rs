@@ -717,7 +717,6 @@ pub unsafe extern "C" fn update_table_txn_commit(
 ) -> ExternResult<Handle<ExclusiveCommittedTransaction>> {
     let txn = unsafe { txn.into_inner() };
     let extern_engine = unsafe { engine.as_ref() };
-    let engine = extern_engine.engine();
-    let result = commit_result_to_committed_handle(txn.commit(engine.as_ref()));
+    let result = commit_result_to_committed_handle(txn.commit(extern_engine));
     unsafe { result.into_extern_result(&extern_engine) }
 }

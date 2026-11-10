@@ -11,9 +11,11 @@ use write_validation::RowTrackingEnablement;
 
 use super::stats_verifier::StatsColumnVerifier;
 use super::{
-    CommitResult, EngineDataResultIterator, Imperative, NonfileCommitActions, PostCommitInputs,
+    CommitResult, EngineDataResultGenerator, Imperative, NonfileCommitActions, PostCommitInputs,
     Transaction, UpdateTable, add_files_schema_with, stats_verifier, with_row_tracking_cols,
 };
+#[cfg(test)]
+use crate::KernelResultIterator;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{BackReference, CheckpointAction};
 use crate::actions::{
@@ -21,7 +23,18 @@ use crate::actions::{
     LOG_PROTOCOL_SCHEMA, LOG_REMOVE_SCHEMA, LOG_TXN_SCHEMA, Metadata, Protocol, SetTransaction,
     as_log_add_schema,
 };
-use crate::committer::{Commit, CommitActions, CommitMetadata, CommitResponse, Committer};
+use crate::committer::{Commit, CommitActionsGenerator, CommitMetadata, CommitResponse, Committer};
+use crate::coroutine::generator::{
+    AsyncIntoIterator as _, Generator as _, GeneratorExt as _, empty, map_async,
+};
+#[cfg(test)]
+use crate::coroutine::kernel::Coroutine;
+#[cfg(test)]
+use crate::coroutine::kernel::engine::EngineConnector;
+use crate::coroutine::kernel::{
+    Channel, ChannelExt as _, KernelResultGenerator, StaticWorkflow, drive_with_committer, workflow,
+};
+use crate::coroutine::{AsyncBool as _, AsyncOption as _};
 use crate::crc::FileStatsDelta;
 use crate::engine_data::FilteredEngineData;
 use crate::error::KernelError;
@@ -48,8 +61,8 @@ use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{
-    DataType, Engine, EngineData, Expression, ExpressionEvaluator, KernelResult,
-    KernelResultIterator, Predicate, RowVisitor, Version, create_row, version_as_i64,
+    DataType, Engine, EngineData, Expression, KernelResult, Predicate, RowVisitor, Version,
+    create_row_with_channel, version_as_i64,
 };
 
 mod update_table;
@@ -57,7 +70,7 @@ mod write_validation;
 
 /// The encoded commit actions, plus the state the post-commit CRC and snapshot are built from.
 struct CommitBatches {
-    actions: CommitActions,
+    actions: CommitActionsGenerator,
     dm_changes: Vec<DomainMetadata>,
     /// The `checkpoint` action this commit writes, if any (adaptiveMetadata).
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -68,6 +81,15 @@ struct CommitBatches {
 // Imperative commit APIs
 // =============================================================================
 impl<STATE: 'static> Transaction<STATE, Imperative> {
+    /// Returns a lazy, committer-free workflow that commits this transaction.
+    ///
+    /// The connector serving [`Request::Commit`] selects the committer.
+    ///
+    /// [`Request::Commit`]: crate::coroutine::kernel::Request::Commit
+    pub fn commit_workflow(self) -> StaticWorkflow<CommitResult<STATE>> {
+        workflow!(|channel| self.commit_with_channel(channel))
+    }
+
     /// Consume the transaction and commit it to the table. The result is a result of
     /// [CommitResult] with the following semantics:
     /// - Ok(CommitResult) for either success or a recoverable error (includes the failed
@@ -83,6 +105,14 @@ impl<STATE: 'static> Transaction<STATE, Imperative> {
     ///
     /// [`FileSystemCommitter`]: crate::committer::FileSystemCommitter
     /// [`RetryableTransaction`]: super::RetryableTransaction
+    pub fn commit(
+        self,
+        engine: &dyn Engine,
+        committer: &dyn Committer,
+    ) -> KernelResult<CommitResult<STATE>> {
+        drive_with_committer(engine, self.commit_workflow(), committer)
+    }
+
     #[instrument(
         parent = &self.span,
         name = TRANSACTION_COMMIT_SPAN,
@@ -107,11 +137,7 @@ impl<STATE: 'static> Transaction<STATE, Imperative> {
         ),
         err
     )]
-    pub fn commit(
-        self,
-        engine: &dyn Engine,
-        committer: &dyn Committer,
-    ) -> KernelResult<CommitResult<STATE>> {
+    async fn commit_with_channel(self, channel: &Channel) -> KernelResult<CommitResult<STATE>> {
         let commit_start = Instant::now();
 
         // === Pre-commit validation ===
@@ -126,20 +152,22 @@ impl<STATE: 'static> Transaction<STATE, Imperative> {
             protocol,
             metadata,
             set_transactions,
-        } = self.prepare_nonfile_actions(engine)?;
+        } = self.prepare_nonfile_actions_with_channel(channel).await?;
         let CommitBatches {
             actions,
             dm_changes,
             #[cfg(feature = "adaptive-metadata-in-dev")]
             checkpoint_action,
-        } = self.assemble_commit_batches(
-            engine,
-            commit_version,
-            kernel_commit_info.clone(),
-            protocol.as_ref(),
-            metadata.as_ref(),
-            set_transactions,
-        )?;
+        } = self
+            .assemble_commit_batches_with_channel(
+                channel,
+                commit_version,
+                kernel_commit_info.clone(),
+                protocol.as_ref(),
+                metadata.as_ref(),
+                set_transactions,
+            )
+            .await?;
 
         // === Commit ===
         let commit_metadata = self.create_commit_metadata(
@@ -150,8 +178,9 @@ impl<STATE: 'static> Transaction<STATE, Imperative> {
             dm_changes.clone(),
         )?;
         let prepare_duration = commit_start.elapsed();
-        let (commit_response, committer_duration) =
-            self.perform_commit(engine, committer, actions, commit_metadata);
+        let (commit_response, committer_duration) = self
+            .perform_commit_with_channel(channel, actions, commit_metadata)
+            .await;
 
         // === Result translation ===
         let post_commit_inputs = PostCommitInputs {
@@ -215,15 +244,16 @@ impl<STATE: 'static> Transaction<STATE, Imperative> {
 // =============================================================================
 impl<STATE: 'static> Transaction<STATE, Imperative> {
     /// Submits actions and returns the committer's response with its elapsed time.
-    fn perform_commit(
+    async fn perform_commit_with_channel(
         &self,
-        engine: &dyn Engine,
-        committer: &dyn Committer,
-        actions: CommitActions,
+        channel: &Channel,
+        actions: CommitActionsGenerator,
         commit_metadata: CommitMetadata,
     ) -> (KernelResult<CommitResponse>, Duration) {
         let committer_start = Instant::now();
-        let commit_response = committer.commit(engine, Commit::new(commit_metadata, actions));
+        let commit_response = channel
+            .commit(Commit::from_generator(commit_metadata, actions))
+            .await;
         (commit_response, committer_start.elapsed())
     }
 
@@ -368,67 +398,86 @@ impl<STATE: 'static> Transaction<STATE, Imperative> {
     /// Encodes actions (both non-file and file) into a committable iterator of EngineData,
     /// retaining per-action errors in the commit iterator. Returns the action iterator with the
     /// domain changes and checkpoint action used by the post-commit CRC and snapshot logic.
-    fn assemble_commit_batches(
+    async fn assemble_commit_batches_with_channel(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         commit_version: Version,
         kernel_commit_info: CommitInfo,
         protocol: Option<&Protocol>,
         metadata: Option<&Metadata>,
         set_transactions: Vec<SetTransaction>,
     ) -> KernelResult<CommitBatches> {
-        let set_transaction_actions = (!set_transactions.is_empty()).then(|| {
+        let set_transaction_actions = (!set_transactions.is_empty()).then_async(|| {
             let rows = set_transactions.into_iter().map(|txn| vec![txn.into()]);
-            engine
-                .evaluation_handler()
-                .create_many(LOG_TXN_SCHEMA.clone(), Vec::from_iter(rows))
+            channel.create_many(LOG_TXN_SCHEMA.clone(), Vec::from_iter(rows))
         });
-        let commit_info_action = self.generate_commit_info(engine, kernel_commit_info);
+        let set_transaction_actions = set_transaction_actions.await.into_generator();
+        let commit_info_action = self
+            .generate_commit_info_with_channel(channel, kernel_commit_info)
+            .await;
         let protocol_action = protocol
-            .map(|protocol| create_row(engine, LOG_PROTOCOL_SCHEMA.clone(), protocol.clone()))
+            .map_async(|protocol| {
+                create_row_with_channel(channel, LOG_PROTOCOL_SCHEMA.clone(), protocol.clone())
+            })
+            .await
             .transpose()?;
+        let protocol_action = protocol_action.into_generator();
         let metadata_action = metadata
-            .map(|metadata| create_row(engine, LOG_METADATA_SCHEMA.clone(), metadata.clone()))
+            .map_async(|metadata| {
+                create_row_with_channel(channel, LOG_METADATA_SCHEMA.clone(), metadata.clone())
+            })
+            .await
             .transpose()?;
+        let metadata_action = metadata_action.into_generator();
 
-        let (add_actions, row_tracking_domain_metadata) =
-            self.generate_adds(engine, commit_version)?;
+        let (add_actions, row_tracking_domain_metadata) = self
+            .generate_adds_with_channel(channel, commit_version)
+            .await?;
 
-        let dm_changes =
-            self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
-        let domain_metadata_actions = (!dm_changes.is_empty()).then(|| {
+        let dm_changes = self
+            .generate_domain_metadata_actions_with_channel(channel, row_tracking_domain_metadata)
+            .await?;
+        let domain_metadata_actions = (!dm_changes.is_empty()).then_async(async || {
             let rows = dm_changes.iter().map(|dm| vec![dm.clone().into()]);
-            engine
-                .evaluation_handler()
+            channel
                 .create_many(LOG_DOMAIN_METADATA_SCHEMA.clone(), Vec::from_iter(rows))
+                .await
         });
+        let domain_metadata_actions = domain_metadata_actions.await.into_generator();
 
-        let dv_update_actions = self.generate_dv_update_actions(engine)?;
+        let dv_update_actions = self
+            .generate_dv_update_actions_with_channel(channel)
+            .await?;
 
         let remove_files_metadata = self
             .staged_data_changes
             .remove_files_metadata
             .clone()
             .into_iter();
-        let remove_actions = self.generate_remove_actions(
-            engine,
+        let remove_actions = self.generate_remove_actions_with_channel(
+            channel,
             remove_files_metadata,
             false, /* has_dv_update_columns */
-        )?;
+        );
+        let remove_actions = remove_actions.await?;
 
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        let checkpoint_action =
-            self.generate_checkpoint_action(engine, commit_version, &dm_changes)?;
+        let checkpoint_action = self
+            .generate_checkpoint_action_with_channel(channel, commit_version, &dm_changes)
+            .await?;
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let checkpoint_action_data = checkpoint_action
             .clone()
-            .map(|action| action.into_engine_data(engine))
+            .map_async(|action| action.into_engine_data_with_channel(channel))
+            .await
             .transpose()?;
         #[cfg(not(feature = "adaptive-metadata-in-dev"))]
         let checkpoint_action_data: Option<Box<dyn EngineData>> = None;
+        let checkpoint_action_data = checkpoint_action_data.into_generator();
 
         // CommitInfo must precede all other actions.
         let actions = iter::once(commit_info_action)
+            .into_generator()
             .chain(protocol_action.map(Ok))
             .chain(metadata_action.map(Ok))
             .chain(checkpoint_action_data.map(Ok))
@@ -437,7 +486,7 @@ impl<STATE: 'static> Transaction<STATE, Imperative> {
             .chain(domain_metadata_actions);
 
         let filtered_actions = actions
-            .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected))
+            .map_ok(FilteredEngineData::with_all_rows_selected)
             .chain(remove_actions)
             .chain(dv_update_actions);
 
@@ -501,12 +550,27 @@ impl<STATE: 'static> Transaction<STATE, Imperative> {
     }
 
     /// Generates add actions and row tracking domain metadata for a commit.
-    #[instrument(name = "txn.gen_adds", skip_all, err)]
+    #[cfg(test)]
     fn generate_adds(
         &self,
         engine: &dyn Engine,
         commit_version: u64,
-    ) -> KernelResult<(EngineDataResultIterator, Option<RowTrackingDomainMetadata>)> {
+    ) -> KernelResult<(
+        impl KernelResultIterator<Box<dyn EngineData>>,
+        Option<RowTrackingDomainMetadata>,
+    )> {
+        let connector = EngineConnector::new(engine);
+        let workflow =
+            workflow!(|channel| self.generate_adds_with_channel(channel, commit_version));
+        connector.iterate_prepared_result_coroutine_with_companion(workflow, std::convert::identity)
+    }
+
+    #[instrument(name = "txn.gen_adds", skip_all, err)]
+    async fn generate_adds_with_channel(
+        &self,
+        channel: &Channel,
+        commit_version: u64,
+    ) -> KernelResult<(EngineDataResultGenerator, Option<RowTrackingDomainMetadata>)> {
         // Note: this does not require delta.enableRowTracking=true. "supported" is sufficient
         // for writers to assign row IDs.
         let assign_fresh_row_tracking_metadata = self
@@ -520,18 +584,18 @@ impl<STATE: 'static> Transaction<STATE, Imperative> {
             // nothing row-tracking-related needs to be written.
             let row_tracking_dm = (assign_fresh_row_tracking_metadata && self.is_create_table())
                 .then(RowTrackingDomainMetadata::initial);
-            return Ok((Box::new(iter::empty()), row_tracking_dm));
+            return Ok((empty().into_boxed(), row_tracking_dm));
         }
 
         let commit_version = version_as_i64(commit_version)?;
 
         if assign_fresh_row_tracking_metadata {
-            self.generate_adds_with_row_tracking(engine, commit_version)
+            self.generate_adds_with_row_tracking_with_channel(channel, commit_version)
+                .await
         } else {
             let add_files_metadata = self.staged_data_changes.add_files_metadata.clone();
-            let add_actions = build_add_actions(
-                engine,
-                add_files_metadata.into_iter().map(Ok),
+            let add_actions = build_add_actions_generator(
+                add_files_metadata.into_iter().map(Ok).into_generator(),
                 false, // no row tracking
                 self.data_change,
             )?;
@@ -546,17 +610,18 @@ impl<STATE: 'static> Transaction<STATE, Imperative> {
     /// non-overlapping `baseRowId` ranges in a second pass. The initial high water mark is read
     /// from the snapshot for existing tables, or defaults to -1 for create-table (no prior log
     /// to read from).
-    fn generate_adds_with_row_tracking(
+    async fn generate_adds_with_row_tracking_with_channel(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         commit_version: i64,
-    ) -> KernelResult<(EngineDataResultIterator, Option<RowTrackingDomainMetadata>)> {
+    ) -> KernelResult<(EngineDataResultGenerator, Option<RowTrackingDomainMetadata>)> {
         let row_id_high_water_mark = if self.is_create_table() {
             None
         } else {
             self.read_snapshot()?
                 .reader()
-                .get_row_tracking_high_water_mark(engine)?
+                .get_row_tracking_high_water_mark_with_channel(channel)
+                .await?
         };
 
         // Assign base row IDs starting from the current high water mark.
@@ -583,9 +648,8 @@ impl<STATE: 'static> Transaction<STATE, Imperative> {
                     )
                 });
 
-        let add_actions = build_add_actions(
-            engine,
-            extended_add_files,
+        let add_actions = build_add_actions_generator(
+            extended_add_files.into_generator(),
             true, // row tracking
             self.data_change,
         )?;
@@ -610,24 +674,24 @@ impl<STATE: 'static> Transaction<STATE, Imperative> {
     ///
     /// # Parameters
     ///
-    /// - `engine`: The engine used for expression evaluation
+    /// - `channel`: The channel used for expression evaluation
     /// - `remove_files_metadata`: Iterator over scan file metadata to transform into Remove actions
     /// - `has_dv_update_columns`: Whether `remove_files_metadata` contains the temporary columns
     ///   added for a deletion vector update
     ///
     /// # Returns
     ///
-    /// An iterator of FilteredEngineData containing Remove actions in the log schema format.
+    /// A generator of FilteredEngineData containing Remove actions in the log schema format.
     ///
     /// [`remove_files`]: Transaction::remove_files
     /// [`update_deletion_vectors`]: Transaction::update_deletion_vectors
     #[instrument(name = "txn.gen_removes", skip_all, err)]
-    fn generate_remove_actions<T>(
+    async fn generate_remove_actions_with_channel<T>(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         remove_files_metadata: T,
         has_dv_update_columns: bool,
-    ) -> KernelResult<impl KernelResultIterator<FilteredEngineData> + use<STATE, T>>
+    ) -> KernelResult<impl KernelResultGenerator<FilteredEngineData> + 'static + use<STATE, T>>
     where
         T: Iterator<Item = Arc<FilteredEngineData>> + Send + 'static,
     {
@@ -640,7 +704,6 @@ impl<STATE: 'static> Transaction<STATE, Imperative> {
         }
 
         let target_schema = schema_with_all_fields_nullable(&LOG_REMOVE_SCHEMA);
-        let evaluation_handler = engine.evaluation_handler();
         // TODO(#3263): `remove_files_metadata` may contain `stats_parsed` and
         // `partitionValues_parsed`; provide its full schema to both evaluators.
         let input_schema = if has_dv_update_columns {
@@ -658,7 +721,7 @@ impl<STATE: 'static> Transaction<STATE, Imperative> {
         // true (see `Remove` and `build_remove_struct_patch`).
         let adaptive_metadata_enabled = self.is_adaptive_metadata_enabled();
 
-        let make_eval = |coalesce_stats_with_parsed: bool| {
+        let make_eval = |coalesce_stats_with_parsed: bool| -> KernelResult<_> {
             let columns_to_drop: Vec<_> = columns_to_drop.iter().map(String::as_str).collect();
             let patch = build_remove_struct_patch(
                 self.commit_timestamp,
@@ -668,11 +731,11 @@ impl<STATE: 'static> Transaction<STATE, Imperative> {
                 adaptive_metadata_enabled,
             )?;
             let expr = Arc::new(Expression::struct_from([Expression::struct_patch(patch)?]));
-            evaluation_handler.new_expression_evaluator(
+            Ok(channel.create_expression_evaluator(
                 input_schema.clone(),
                 expr,
                 target_schema.clone().into(),
-            )
+            ))
         };
 
         // Build two evaluators: one for the common case where scan files do not include a
@@ -680,23 +743,28 @@ impl<STATE: 'static> Transaction<STATE, Imperative> {
         // The stats_parsed evaluator coalesces stats with ToJson(stats_parsed) to handle the
         // case where stats is null (e.g., on V2 checkpoints with writeStatsAsJson=false) and
         // then drops the stats_parsed column.
-        let base_eval = make_eval(false /* coalesce_stats_with_parsed */)?;
-        let stats_parsed_eval = make_eval(true /* coalesce_stats_with_parsed */)?;
+        let base_eval = make_eval(false /* coalesce_stats_with_parsed */)?.await?;
+        let stats_parsed_eval = make_eval(true /* coalesce_stats_with_parsed */)?.await?;
         let stats_parsed_col = column_name!(STATS_PARSED_NAME);
 
-        Ok(remove_files_metadata.map(move |file_metadata_batch| {
+        let remove_files_metadata = remove_files_metadata.into_generator();
+        let result = map_async!(remove_files_metadata, async move |channel, batch| {
+            let file_metadata_batch = batch;
             let data = file_metadata_batch.data();
             let evaluator = if data.has_field(&stats_parsed_col) {
                 &stats_parsed_eval
             } else {
                 &base_eval
             };
-            let updated_engine_data = evaluator.evaluate(data)?;
+            let updated_engine_data = channel
+                .evaluate_expression(evaluator, data.clone_data())
+                .await?;
             FilteredEngineData::try_new(
                 updated_engine_data,
                 file_metadata_batch.selection_vector().to_vec(),
             )
-        }))
+        });
+        Ok(result)
     }
 }
 
@@ -726,6 +794,7 @@ fn build_add_action_projection(
 
 /// Transforms add file metadata into commit-ready add actions by converting stats to JSON and
 /// setting the `dataChange` field.
+#[cfg(test)]
 fn build_add_actions<I, T>(
     engine: &dyn Engine,
     add_files_metadata: I,
@@ -736,9 +805,27 @@ where
     I: KernelResultIterator<T> + 'static,
     T: Deref<Target = dyn EngineData> + Send + 'static,
 {
-    let evaluation_handler = engine.evaluation_handler();
-    let mut last_evaluator: Option<((bool, bool), Arc<dyn ExpressionEvaluator>)> = None;
-    Ok(add_files_metadata.map(move |add_files_batch| {
+    let actions = build_add_actions_generator(
+        add_files_metadata.into_generator(),
+        row_tracking,
+        data_change,
+    )?;
+    Ok(EngineConnector::new(engine).iterate_result_coroutine(Coroutine::from_generator(actions)))
+}
+
+/// Transforms add file metadata into commit-ready add actions by converting stats to JSON and
+/// setting the `dataChange` field.
+fn build_add_actions_generator<I, T>(
+    add_files_metadata: I,
+    row_tracking: bool,
+    data_change: bool,
+) -> KernelResult<impl KernelResultGenerator<Box<dyn EngineData>> + use<I, T>>
+where
+    I: KernelResultGenerator<T> + 'static,
+    T: Deref<Target = dyn EngineData> + Send + 'static,
+{
+    let mut last_evaluator = None;
+    let result = map_async!(add_files_metadata, async move |channel, add_files_batch| {
         let add_files_batch = add_files_batch?;
         let optional_columns = (
             add_files_batch.has_field(&column_name!(TAGS_NAME)),
@@ -747,7 +834,9 @@ where
         if let Some((cached_columns, evaluator)) = &last_evaluator
             && *cached_columns == optional_columns
         {
-            return evaluator.evaluate(add_files_batch.deref());
+            return channel
+                .evaluate_expression(evaluator, add_files_batch.deref().clone_data())
+                .await;
         }
         let input_schema = add_files_schema_with(optional_columns.0, optional_columns.1);
         let input_schema = if row_tracking {
@@ -756,15 +845,19 @@ where
             input_schema.clone()
         };
         let (output_schema, adds_expr) = build_add_action_projection(&input_schema, data_change)?;
-        let adds_evaluator = evaluation_handler.new_expression_evaluator(
+        let adds_evaluator = channel.create_expression_evaluator(
             input_schema,
             Arc::new(adds_expr),
             as_log_add_schema(output_schema).into(),
-        )?;
-        let result = adds_evaluator.evaluate(add_files_batch.deref());
+        );
+        let adds_evaluator = adds_evaluator.await?;
+        let result = channel
+            .evaluate_expression(&adds_evaluator, add_files_batch.deref().clone_data())
+            .await;
         last_evaluator = Some((optional_columns, adds_evaluator));
         result
-    }))
+    });
+    Ok(result)
 }
 
 /// Builds the struct patch for converting scan row metadata into a Remove action.

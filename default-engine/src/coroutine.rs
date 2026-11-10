@@ -23,6 +23,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::coroutine::kernel::request::{
     ExpressionEvaluatorHandle, ForwardListing, PredicateEvaluatorHandle, ReadJsonFiles,
     ReadParquetFiles, WriteBytes, WriteJsonFile, WriteParquetFile, WriteParquetFiles,
@@ -210,6 +211,10 @@ impl AsyncEngineConnector {
                 reply.send(Box::pin(self.write_parquet_files(*operation)).await)
             }
             Request::WriteBytes(operation, reply) => reply.send(self.write_bytes(operation).await),
+            Request::Commit(commit, reply) => {
+                let workflow = FileSystemCommitter::commit_workflow(*commit);
+                reply.send(Box::pin(self.run_inner(workflow)).await)
+            }
         }
         Ok(())
     }
@@ -538,6 +543,7 @@ mod tests {
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::schema::{DataType, schema_ref};
+    use delta_kernel::transaction::create_table::create_table;
     use delta_kernel::{FileMeta, ParquetMultiFileWrite};
     use url::Url;
 
@@ -606,6 +612,18 @@ mod tests {
 
         let data = store.get(&Path::from("data")).await.unwrap().bytes().await;
         assert_eq!(data.unwrap(), Bytes::from_static(b"delta"));
+    }
+
+    #[tokio::test]
+    async fn commits_transaction_through_native_async_storage() {
+        let connector = AsyncEngineConnector::new(Arc::new(InMemory::new()));
+        let workflow =
+            create_table("memory:///", schema_ref! {}, "test-engine", true).build_workflow();
+        let transaction = connector.run(workflow).await.unwrap();
+
+        let result = connector.run(transaction.commit_workflow()).await.unwrap();
+
+        assert!(result.is_committed());
     }
 
     #[tokio::test]
