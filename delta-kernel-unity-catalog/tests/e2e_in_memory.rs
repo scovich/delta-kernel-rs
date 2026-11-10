@@ -3,22 +3,24 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray};
 use delta_kernel::commit_range::CommitRange;
+use delta_kernel::committer::CommitResponse;
+use delta_kernel::coroutine::{drive_workflow_async, kernel};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::path::LogPathFileType;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::{Engine, KernelError, Snapshot};
-use delta_kernel_default_engine::DefaultEngine;
+use delta_kernel::{Engine, KernelError, KernelResult, Snapshot};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use delta_kernel_default_engine::{AsyncEngineConnector, DefaultEngine};
 use delta_kernel_unity_catalog::{
-    UCCommitter, get_required_properties_for_disk, log_tail_from_commits,
+    UCCommitter, coroutine as uc, get_required_properties_for_disk, log_tail_from_commits,
     snapshot_builder_from_load_table,
 };
 use rstest::rstest;
 use test_utils::{insert_data_with, read_scan};
 use unity_catalog_delta_client_api::{
-    Commit, InMemoryUpdateTableClient, TableData, TableIdentifier,
+    Commit, InMemoryUpdateTableClient, TableData, TableIdentifier, UpdateTableClient,
 };
 
 // ============================================================================
@@ -40,6 +42,12 @@ struct TestSetup {
     /// Tests must bind this field (not ignore with `..` or `_`) to prevent the temp directory
     /// from being dropped and cleaned up before the test completes.
     _tmp_dir: tempfile::TempDir,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PublishDriver {
+    Engine,
+    Connector,
 }
 
 /// Copies test data to temp dir and loads snapshot at v2 with in-memory commits client.
@@ -117,6 +125,62 @@ fn uc_committer(
         TABLE_ID,
         TableIdentifier::new(TEST_CATALOG, TEST_SCHEMA, TEST_TABLE),
     )
+}
+
+async fn run_kernel<O: Send + 'static>(
+    connector: &AsyncEngineConnector,
+    committer: &UCCommitter<InMemoryUpdateTableClient>,
+    update_table_client: &Arc<InMemoryUpdateTableClient>,
+    workflow: kernel::Workflow<'_, O>,
+) -> KernelResult<O> {
+    Ok(drive_workflow_async!(workflow, |request| match request {
+        kernel::Request::Commit(commit, reply) => {
+            let workflow = committer.commit_workflow(*commit);
+            let result = drive_catalog_workflow(connector, update_table_client, workflow).await;
+            reply.send(result);
+        }
+        kernel::Request::RequireCatalogCommitter(reply) => reply.send(Ok(())),
+        kernel::Request::Publish(metadata, reply) => {
+            reply.send(connector.run(committer.publish_workflow(metadata)).await);
+        }
+        request => connector.respond(request).await?,
+    }))
+}
+
+async fn drive_catalog_workflow(
+    connector: &AsyncEngineConnector,
+    update_table_client: &Arc<InMemoryUpdateTableClient>,
+    workflow: uc::CommitWorkflow<'_>,
+) -> KernelResult<CommitResponse> {
+    Ok(drive_workflow_async!(workflow, |request| {
+        serve_catalog(connector, update_table_client, request).await?;
+    }))
+}
+
+async fn serve_catalog(
+    connector: &AsyncEngineConnector,
+    update_table_client: &Arc<InMemoryUpdateTableClient>,
+    request: uc::Request,
+) -> KernelResult<()> {
+    match request {
+        uc::Request::WriteJson(operation, reply) => {
+            connector
+                .respond(kernel::Request::WriteJson(operation, reply))
+                .await
+        }
+        uc::Request::Head(url, reply) => connector.respond(kernel::Request::Head(url, reply)).await,
+        uc::Request::UpdateTable(target, request, reply) => {
+            let result = update_table_client
+                .update_table(&target, request)
+                .await
+                .map_err(|e| KernelError::Generic(format!("UC update_table error: {e}")));
+            reply.send(result);
+            Ok(())
+        }
+        uc::Request::WriteDeclarative(..) => Err(KernelError::internal_error(
+            "imperative commit requested a declarative JSON write",
+        )),
+    }
 }
 
 /// Commits an empty transaction and returns the post-commit snapshot.
@@ -397,8 +461,11 @@ async fn test_insert_without_publish_hits_limit() -> Result<(), TestError> {
     Ok(())
 }
 
+#[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_checkpoint_after_publish() -> Result<(), TestError> {
+async fn test_checkpoint_after_publish(
+    #[values(PublishDriver::Engine, PublishDriver::Connector)] driver: PublishDriver,
+) -> Result<(), TestError> {
     let TestSetup {
         update_table_client,
         engine,
@@ -407,9 +474,36 @@ async fn test_checkpoint_after_publish() -> Result<(), TestError> {
         _tmp_dir,
     } = setup().await?;
 
-    commit(&snapshot, &update_table_client, &engine)?
-        .publish(&engine, &uc_committer(&update_table_client))?
-        .checkpoint(&engine, None)?;
+    let txn = snapshot
+        .clone()
+        .update_table(UpdateTableOperation::Write, "test-engine", true)
+        .build(&engine)?;
+    let committer = uc_committer(&update_table_client);
+    let published = match driver {
+        PublishDriver::Engine => txn
+            .commit(&engine, &committer)?
+            .unwrap_post_commit_snapshot()
+            .publish(&engine, &committer)?,
+        PublishDriver::Connector => {
+            let connector = engine.async_connector();
+            let snapshot = run_kernel(
+                &connector,
+                &committer,
+                &update_table_client,
+                txn.commit_workflow(),
+            )
+            .await?
+            .unwrap_post_commit_snapshot();
+            run_kernel(
+                &connector,
+                &committer,
+                &update_table_client,
+                snapshot.publish_workflow(),
+            )
+            .await?
+        }
+    };
+    published.checkpoint(&engine, None)?;
 
     // Load a fresh snapshot and verify checkpoint was written
     let snapshot = Snapshot::builder_for(table_uri)

@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::coroutine::kernel::request::{
-    ExpressionEvaluatorHandle, ForwardListing, PredicateEvaluatorHandle, ReadJsonFiles,
+    CopyAtomic, ExpressionEvaluatorHandle, ForwardListing, PredicateEvaluatorHandle, ReadJsonFiles,
     ReadParquetFiles, WriteBytes, WriteJsonFile, WriteParquetFile, WriteParquetFiles,
     WriteParquetFilesResult,
 };
@@ -38,8 +38,8 @@ use delta_kernel::coroutine::{
 use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
 use delta_kernel::engine::arrow_utils::to_json_bytes;
 use delta_kernel::metrics::{
-    emit_json_read_completed, emit_parquet_read_completed, emit_storage_list_completed,
-    emit_storage_read_completed,
+    emit_json_read_completed, emit_parquet_read_completed, emit_storage_copy_completed,
+    emit_storage_list_completed, emit_storage_read_completed,
 };
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::object_store::path::Path;
@@ -51,7 +51,7 @@ use futures::stream::BoxStream;
 use futures::{Stream, StreamExt as _};
 use tokio_util::sync::CancellationToken;
 
-use crate::filesystem::{head_impl, list_from_impl, put_impl, read_files_impl};
+use crate::filesystem::{copy_atomic_impl, head_impl, list_from_impl, put_impl, read_files_impl};
 use crate::json::{read_json_files_impl, write_json_file_impl};
 use crate::parquet::{
     ParquetBatchSource, read_parquet_files_impl, read_parquet_footer_impl, write_parquet_file_impl,
@@ -217,6 +217,12 @@ impl AsyncEngineConnector {
                 reply.send(Box::pin(self.write_parquet_files(*operation)).await)
             }
             Request::WriteBytes(operation, reply) => reply.send(self.write_bytes(operation).await),
+            Request::CopyAtomic(operation, reply) => {
+                let start = Instant::now();
+                let result = self.copy_atomic(operation).await;
+                emit_storage_copy_completed(start.elapsed());
+                reply.send(result)
+            }
             Request::Commit(commit, reply) => {
                 let workflow = FileSystemCommitter::commit_workflow(*commit);
                 reply.send(Box::pin(self.run_inner(workflow)).await)
@@ -299,6 +305,12 @@ impl AsyncEngineConnector {
         let path = Path::from_url_path(operation.url.path())?;
         let store = Arc::clone(&self.object_store);
         put_impl(store, path, operation.data, operation.overwrite).await
+    }
+
+    async fn copy_atomic(&self, operation: CopyAtomic) -> KernelResult<()> {
+        let source = Path::from_url_path(operation.source.path())?;
+        let destination = Path::from_url_path(operation.destination.path())?;
+        copy_atomic_impl(Arc::clone(&self.object_store), source, destination).await
     }
 
     async fn read_small_file(&self, file: FileSlice) -> KernelResult<Option<Bytes>> {
@@ -551,7 +563,7 @@ mod tests {
     };
     use delta_kernel::coroutine::kernel::request::{ForwardListing, ListingBounds};
     use delta_kernel::coroutine::kernel::{
-        ChannelExt as _, StaticCoroutine, WorkflowStep, static_workflow,
+        ChannelExt as _, StaticCoroutine, WorkflowStep, static_workflow, workflow,
     };
     use delta_kernel::expressions::{col, lit};
     use delta_kernel::object_store::ObjectStoreExt as _;
@@ -628,6 +640,26 @@ mod tests {
 
         let data = store.get(&Path::from("data")).await.unwrap().bytes().await;
         assert_eq!(data.unwrap(), Bytes::from_static(b"delta"));
+    }
+
+    #[tokio::test]
+    async fn copies_through_native_async_storage_and_rejects_existing_destination() {
+        let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
+        store
+            .put(&Path::from("data"), Bytes::from_static(b"delta").into())
+            .await
+            .unwrap();
+        let connector = AsyncEngineConnector::new(Arc::clone(&store));
+        let source = &Url::parse("memory:///data").unwrap();
+        let destination = &Url::parse("memory:///copy").unwrap();
+        let copy = || workflow!(|channel| channel.copy_atomic(source, destination));
+
+        connector.run(copy()).await.unwrap();
+        let error = connector.run(copy()).await.unwrap_err();
+
+        let data = store.get(&Path::from("copy")).await.unwrap().bytes().await;
+        assert_eq!(data.unwrap(), Bytes::from_static(b"delta"));
+        assert!(matches!(error, KernelError::FileAlreadyExists(_)));
     }
 
     #[tokio::test]

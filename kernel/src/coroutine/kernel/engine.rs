@@ -196,6 +196,7 @@ impl ConnectorRespond for EngineConnector {
             Request::ReadSmallFile(..) => self.storage_connector().respond(request)?,
             Request::Head(..) => self.storage_connector().respond(request)?,
             Request::WriteBytes(..) => self.storage_connector().respond(request)?,
+            Request::CopyAtomic(..) => self.storage_connector().respond(request)?,
             Request::ReadParquetFooter(file, reply) => {
                 complete(reply, self.parquet.read_parquet_footer(&file))?
             }
@@ -484,6 +485,7 @@ impl ConnectorRespond for PlanExecutorConnector<'_> {
             | Request::WriteParquet(..)
             | Request::WriteParquetFiles(..)
             | Request::WriteBytes(..)
+            | Request::CopyAtomic(..)
             | Request::Commit(..)
             | Request::RequireCatalogCommitter(..)
             | Request::Publish(..) => Err(KernelError::internal_error(
@@ -510,6 +512,11 @@ impl ConnectorRespond for StorageConnector<'_> {
             Request::WriteBytes(operation, reply) => {
                 let storage = self.storage;
                 let result = storage.put(&operation.url, operation.data, operation.overwrite);
+                complete(reply, result)
+            }
+            Request::CopyAtomic(operation, reply) => {
+                let storage = self.storage;
+                let result = storage.copy_atomic(&operation.source, &operation.destination);
                 complete(reply, result)
             }
             Request::ReadJson(_) => Err(KernelError::internal_error(

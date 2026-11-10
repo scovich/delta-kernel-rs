@@ -16,10 +16,10 @@ use url::Url;
 #[cfg(feature = "declarative-plans")]
 use super::PlanRequest;
 use super::request::{
-    CreateEngineData, CreateExpressionEvaluator, CreatePredicateEvaluator, EvaluateExpression,
-    EvaluatePredicate, ExpressionEvaluatorHandle, ForwardListing, ListingBounds,
-    PredicateEvaluatorHandle, ReadJsonFiles, ReadParquetFiles, WriteBytes, WriteJsonFile,
-    WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
+    CopyAtomic, CreateEngineData, CreateExpressionEvaluator, CreatePredicateEvaluator,
+    EvaluateExpression, EvaluatePredicate, ExpressionEvaluatorHandle, ForwardListing,
+    ListingBounds, PredicateEvaluatorHandle, ReadJsonFiles, ReadParquetFiles, WriteBytes,
+    WriteJsonFile, WriteParquetFile, WriteParquetFiles, WriteParquetFilesResult,
 };
 use super::{Request, StaticCoroutine};
 use crate::committer::{Commit, CommitResponse, PublishMetadata};
@@ -264,6 +264,13 @@ pub(crate) trait ChannelExt: ChannelExchange<Request> {
     fn write_bytes(&self, url: &Url, data: Bytes, overwrite: bool) -> impl KernelFuture<()> {
         let operation = WriteBytes::new(url.clone(), data, overwrite);
         self.exchange(operation, Request::WriteBytes)
+    }
+
+    /// Atomically copies `source` to a new `destination`.
+    #[cfg_attr(not(feature = "internal-api"), expect(dead_code))]
+    fn copy_atomic(&self, source: &Url, destination: &Url) -> impl KernelFuture<()> {
+        let operation = CopyAtomic::new(source.clone(), destination.clone());
+        self.exchange(operation, Request::CopyAtomic)
     }
 
     /// Delegates a prepared transaction to the connector's committer.
