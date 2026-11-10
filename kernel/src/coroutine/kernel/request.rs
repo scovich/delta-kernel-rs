@@ -62,6 +62,9 @@ pub enum Request {
     WriteParquetFiles(Box<WriteParquetFiles>, Reply<WriteParquetFilesResult>),
     /// Write one complete object.
     WriteBytes(WriteBytes, Reply<()>),
+    /// Copy one immutable object to a new destination. The connector must fail with
+    /// [`crate::KernelError::FileAlreadyExists`] if the destination already exists.
+    CopyAtomic(CopyAtomic, Reply<()>),
     /// Commit one prepared transaction through a connector-selected committer.
     Commit(Box<Commit>, Reply<CommitResponse>),
     /// Verifies that the connector selected a catalog committer.
@@ -269,4 +272,13 @@ pub struct WriteBytes {
     /// Whether an existing destination may be overwritten. If not, an existing destination fails
     /// with [`crate::KernelError::FileAlreadyExists`].
     pub overwrite: bool,
+}
+
+/// Atomically copies one immutable object to a destination that must not already exist.
+#[derive(Constructor)]
+pub struct CopyAtomic {
+    /// Existing source object.
+    pub source: Url,
+    /// New destination object.
+    pub destination: Url,
 }

@@ -1,5 +1,7 @@
 //! Kernel-side helpers for catalog-managed Delta tables in Unity Catalog.
 
+pub mod coroutine;
+
 mod committer;
 mod constants;
 mod errors;
