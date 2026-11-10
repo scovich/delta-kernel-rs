@@ -24,7 +24,8 @@ use crate::checkpoint::{
 use crate::clustering::{CLUSTERING_DOMAIN_NAME, ClusteringColumnInfo, parse_clustering_columns};
 use crate::committer::{Committer, PublishMetadata};
 use crate::coroutine::kernel::{
-    Channel, StaticWorkflow, Workflow, run_workflow_with_engine, static_workflow, workflow,
+    Channel, ChannelExt as _, StaticWorkflow, Workflow, drive_with_committer,
+    run_workflow_with_engine, static_workflow, workflow,
 };
 use crate::crc::{
     Crc, CrcDelta, DomainMetadataState, FileSizeHistogram, FileStats, SetTransactionState,
@@ -1902,11 +1903,23 @@ impl Snapshot {
     /// # See Also
     ///
     /// - [`Committer::publish`]
-    #[instrument(parent = &self.span, name = "snap.publish", skip_all, err)]
     pub fn publish(
         self: &SnapshotRef,
         engine: &dyn Engine,
         committer: &dyn Committer,
+    ) -> KernelResult<SnapshotRef> {
+        drive_with_committer(engine, self.publish_workflow(), committer)
+    }
+
+    /// Returns a lazy workflow that publishes this snapshot's catalog commits.
+    pub fn publish_workflow<'a>(self: &'a SnapshotRef) -> Workflow<'a, SnapshotRef> {
+        workflow!(|channel| self.publish_with_channel(channel))
+    }
+
+    #[instrument(parent = &self.span, name = "snap.publish", skip_all, err)]
+    async fn publish_with_channel(
+        self: &SnapshotRef,
+        channel: &Channel,
     ) -> KernelResult<SnapshotRef> {
         let unpublished_catalog_commits = self.log_segment().get_unpublished_catalog_commits()?;
 
@@ -1931,17 +1944,12 @@ impl Snapshot {
             )
         );
 
-        require!(
-            committer.is_catalog_committer(),
-            KernelError::generic(
-                "There are catalog commits that need publishing, but the committer is not a catalog committer.",
-            )
-        );
+        channel.require_catalog_committer().await?;
 
         let publish_metadata =
             PublishMetadata::try_new(self.version(), unpublished_catalog_commits)?;
 
-        committer.publish(engine, publish_metadata)?;
+        channel.publish(publish_metadata).await?;
 
         Ok(Arc::new(Snapshot::new_with_crc(
             self.log_segment().new_as_published()?,

@@ -215,6 +215,16 @@ impl AsyncEngineConnector {
                 let workflow = FileSystemCommitter::commit_workflow(*commit);
                 reply.send(Box::pin(self.run_inner(workflow)).await)
             }
+            Request::RequireCatalogCommitter(..) => {
+                return Err(KernelError::unsupported(
+                    "Default async connector does not handle catalog commits",
+                ));
+            }
+            Request::Publish(..) => {
+                return Err(KernelError::unsupported(
+                    "Default async connector does not publish catalog commits",
+                ));
+            }
         }
         Ok(())
     }
