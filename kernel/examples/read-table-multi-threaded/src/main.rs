@@ -37,9 +37,10 @@ struct Cli {
     metadata: bool,
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     env_logger::init();
-    match try_main() {
+    match try_main().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             println!("{e:#?}");
@@ -74,13 +75,15 @@ struct ScanState {
     logical_schema: SchemaRef,
 }
 
-fn try_main() -> KernelResult<()> {
+async fn try_main() -> KernelResult<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Read", "read", "");
 
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
     println!("Reading {url}");
     let engine = common::get_engine(&url, &cli.location_args)?;
-    let snapshot = Snapshot::builder_for(url).build(&engine)?;
+    let connector = engine.async_connector();
+    let workflow = Snapshot::builder_for(url).build_workflow();
+    let snapshot = connector.run(workflow).await?;
     let Some(scan) = common::get_scan(snapshot, &cli.scan_args)? else {
         return Ok(());
     };

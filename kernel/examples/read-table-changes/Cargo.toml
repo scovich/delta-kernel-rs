@@ -24,3 +24,4 @@ delta_kernel = { path = "../../../kernel", features = [
 ] }
 delta_kernel_default_engine = { path = "../../../default-engine", features = ["rustls"] }
 itertools = "0.14"
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
