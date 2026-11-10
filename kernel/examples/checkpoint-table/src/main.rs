@@ -72,14 +72,17 @@ async fn try_main() -> delta_kernel::Result<()> {
     let engine = DefaultEngineBuilder::new(store)
         .with_task_executor(executor)
         .build();
-    let snapshot = Snapshot::builder_for(url).build(&engine)?;
+    let connector = engine.async_connector();
+    let workflow = Snapshot::builder_for(url).build_workflow();
+    let snapshot = connector.run(workflow).await?;
 
     if cli.unsafe_i_know_what_im_doing {
-        snapshot.checkpoint(&engine, None)?;
+        connector.run(snapshot.checkpoint_workflow(None)).await?;
         println!("Table checkpointed");
     } else {
         // first we create a checkpoint writer
-        let writer = snapshot.create_checkpoint_writer(&engine)?;
+        let workflow = snapshot.create_checkpoint_writer_workflow();
+        let writer = connector.run(workflow).await?;
 
         // this tells us the path where we should write the checkpoint file
         let checkpoint_path = writer.checkpoint_path()?;
