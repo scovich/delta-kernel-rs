@@ -251,16 +251,11 @@ impl<C: UpdateTableClient> UCCommitter<C> {
             Err(e) => Err(DeltaError::Generic(format!("UC update_table error: {e}"))),
         }
     }
-}
 
-impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
-    /// Commit the given `actions` to the delta table in UC.
-    ///
-    /// For version 0 (table creation), the committer writes `000.json` directly to the published
-    /// commit path; the caller finalizes the table in UC via the create-table API. For version >=
-    /// 1, connectors should publish staged commits to the delta log immediately after writing;
-    /// UC expects to be informed of the last known published version during commit.
-    fn commit(&self, engine: &dyn Engine, commit: KernelCommit) -> KernelResult<CommitResponse> {
+    fn commit_impl(&self, engine: &dyn Engine, commit: KernelCommit) -> KernelResult<CommitResponse>
+    where
+        C: 'static,
+    {
         let (commit_metadata, actions) = commit.try_into_engine_parts(engine, true)?;
         if commit_metadata.version() == 0 {
             return self.commit_version_0(&commit_metadata, |path| {
@@ -283,12 +278,15 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
     }
 
     #[cfg(feature = "declarative-plans")]
-    fn commit_declarative(
+    fn commit_declarative_impl(
         &self,
         executor: &dyn ScopedPlanExecutor,
         actions: Box<dyn Iterator<Item = RelationRef> + '_>,
         commit_metadata: CommitMetadata,
-    ) -> KernelResult<CommitResponse> {
+    ) -> KernelResult<CommitResponse>
+    where
+        C: 'static,
+    {
         if commit_metadata.version() == 0 {
             return self.commit_version_0(&commit_metadata, |path| {
                 write_commit_json_declarative(executor, actions, path.clone())
@@ -299,11 +297,11 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
         })
     }
 
-    fn is_catalog_committer(&self) -> bool {
-        true
-    }
-
-    fn publish(&self, engine: &dyn Engine, publish_metadata: PublishMetadata) -> KernelResult<()> {
+    fn publish_impl(
+        &self,
+        engine: &dyn Engine,
+        publish_metadata: PublishMetadata,
+    ) -> KernelResult<()> {
         if publish_metadata.commits_to_publish().is_empty() {
             return Ok(());
         }
@@ -319,6 +317,36 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
         }
 
         Ok(())
+    }
+}
+
+impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
+    /// Commit the given `actions` to the delta table in UC.
+    ///
+    /// For version 0 (table creation), the committer writes `000.json` directly to the published
+    /// commit path; the caller finalizes the table in UC via the create-table API. For version >=
+    /// 1, connectors should publish staged commits to the delta log immediately after writing;
+    /// UC expects to be informed of the last known published version during commit.
+    fn commit(&self, engine: &dyn Engine, commit: KernelCommit) -> KernelResult<CommitResponse> {
+        self.commit_impl(engine, commit)
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    fn commit_declarative(
+        &self,
+        executor: &dyn ScopedPlanExecutor,
+        actions: Box<dyn Iterator<Item = RelationRef> + '_>,
+        commit_metadata: CommitMetadata,
+    ) -> KernelResult<CommitResponse> {
+        self.commit_declarative_impl(executor, actions, commit_metadata)
+    }
+
+    fn is_catalog_committer(&self) -> bool {
+        true
+    }
+
+    fn publish(&self, engine: &dyn Engine, publish_metadata: PublishMetadata) -> KernelResult<()> {
+        self.publish_impl(engine, publish_metadata)
     }
 }
 
