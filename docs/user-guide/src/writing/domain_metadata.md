@@ -115,8 +115,9 @@ handles this gracefully during commit.
 
 To read domain metadata from a table, call `get_domain_metadata()` on a
 `SnapshotReader`, obtained with `snapshot.reader()`. These reads are synchronous and may block
-on storage I/O. Use `.with_cancellation_token(token)` on the reader to scope related reads to
-an operation; without it, reads retain your engine's normal cancellation and timeout behavior.
+on storage I/O. Use `get_domain_metadata_with_cancellation(domain, engine, Some(token))` to scope
+a read to an operation; the plain method retains your engine's normal cancellation and timeout
+behavior.
 
 > [!TIP]
 > Reading domain data avoids log replay when the snapshot's CRC state can answer the query.

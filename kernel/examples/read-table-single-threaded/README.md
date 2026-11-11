@@ -4,7 +4,8 @@ Read Table Single-Threaded
 # About
 This example shows a program that reads a table using a single thread. It uses the "all-in-one"
 `Scan::execute` method, which simplifies reading, but does not allow for distributing the work of
-reading the table.
+reading the table. Snapshot construction runs through the default engine's `AsyncEngineConnector`;
+the scan itself runs through the `Engine`.
 
 `Scan::execute` returns batches of data along with a deletion vector mask. The data is in arrow
 format, since we're using the default client, which uses arrow. We therefore

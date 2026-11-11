@@ -25,6 +25,9 @@ the default handlers for everything else.
 Many of the `Engine` handlers take or return `EngineData`. See [EngineData](engine_data.md) for more
 information about this type.
 
+If your connector runs its own I/O, you can drive Kernel's operations directly instead of
+implementing handlers. See [Driving connector workflows](./driving_workflows.md).
+
 ## StorageHandler
 
 `StorageHandler` provides file system operations. The kernel calls this to list and read
@@ -32,9 +35,15 @@ files (as bytes) from storage.
 
 ```rust,ignore
 pub trait StorageHandler {
-    fn list_from(&self, path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>>;
+    fn list_from(
+        &self,
+        path: &Url,
+        end: Option<&Url>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>>;
 
     fn read_files(&self, files: Vec<FileSlice>) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>>;
+
+    fn read_small_file(&self, file: FileSlice) -> KernelResult<Option<Bytes>>;
 
     fn copy_atomic(&self, src: &Url, dest: &Url) -> KernelResult<()>;
 
@@ -48,7 +57,8 @@ pub trait StorageHandler {
 
 - **`list_from`**: Results must be sorted lexicographically by path. If the path ends with
   `/`, list all files in that directory. Otherwise, list files lexicographically greater than
-  the given path in the same directory.
+  the given path in the same directory. When `end` is `Some`, every yielded location must sort
+  strictly before it; compare URL strings. Stream errors pass through and don't end the stream.
 
 - **`copy_atomic`**: Must fail with `KernelError::FileAlreadyExists` if the destination exists.
   This is used for commit publishing in catalog-managed tables.
@@ -60,6 +70,9 @@ pub trait StorageHandler {
 
 - **`read_files`**: Each `FileSlice` is a `(Url, Option<Range<u64>>)`. When the range is
   `None`, read the entire file.
+
+- **`read_small_file`**: Reads one file, or one `Range`, into memory. The default delegates to
+  `read_files`; override it if your storage has a cheaper single-object read.
 
 ### Default implementation
 
@@ -134,9 +147,21 @@ pub trait ParquetHandler {
         data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
     ) -> KernelResult<FileSize>;
 
+    fn write_parquet_files(
+        &self,
+        write: ParquetMultiFileWrite,
+        data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
+    ) -> KernelResult<Vec<(Url, FileSize)>>;
+
     fn read_parquet_footer(&self, file: &FileMeta) -> KernelResult<ParquetFooter>;
 }
 ```
+
+`write_parquet_files` writes one stream to zero or more files whose names satisfy the directory,
+prefix, and suffix of `ParquetMultiFileWrite`, using `new_file_url()` for unique names. It returns
+each file's URL and exact byte size in input order, and must consume the whole stream.
+`preferred_rows_per_file` is advisory. The default writes one file through `write_parquet_file` and
+writes none for an empty stream; override it to choose file boundaries.
 
 ### Key contracts for `read_parquet_files`
 
@@ -181,8 +206,8 @@ projection, predicate pushdown, metadata columns, and field-ID-based column matc
 
 ## Cancellation-aware reads
 
-When a caller attaches a `CancellationToken` to a snapshot builder, metadata reader, or scan (see
-[Attaching a token](../concepts/engine_trait.md#attaching-a-token)), Kernel threads it down to the
+When a caller passes a `CancellationToken` to a `*_with_cancellation` call (see
+[Passing a token](../concepts/engine_trait.md#passing-a-token)), Kernel threads it down to the
 Engine through cancellation-aware variants of the relevant `StorageHandler`, `JsonHandler`, and
 `ParquetHandler` methods. Their names end in `_with_cancellation`.
 

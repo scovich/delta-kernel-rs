@@ -4,7 +4,8 @@ The `Engine` trait is the integration point between Delta Kernel and your connec
 implements the Delta protocol and gives you scan and write APIs, but it needs help with the
 mechanics: listing files, reading and writing JSON and Parquet, and evaluating expressions for
 data skipping and logical-to-physical transformations. Kernel never does any of this directly.
-Instead, it calls into the `Engine` trait, which your connector implements.
+It either calls into the `Engine` trait, which your connector implements, or posts a request to a
+driver you own (see [Driving connector workflows](../connector/driving_workflows.md)).
 
 This matters because it lets Kernel stay format-agnostic and runtime-agnostic. You control
 how I/O happens, what columnar format you use, and how expressions are evaluated.
@@ -38,8 +39,9 @@ write commit and checkpoint files.
 
 | Method | Purpose |
 |--------|---------|
-| `list_from(path)` | List files lexicographically after `path` in the same directory |
+| `list_from(path, end)` | List files after `path` and strictly before the optional `end` |
 | `read_files(files)` | Read byte ranges from one or more files |
+| `read_small_file(file)` | Read one whole file or byte range into memory (optional to override) |
 | `copy_atomic(src, dst)` | Atomically copy a file (used for publishing commits) |
 | `put(path, data, overwrite)` | Write raw bytes to a path (fails if `overwrite` is false and file exists) |
 | `head(path)` | Get file metadata (size, modification time) without reading content |
@@ -69,6 +71,7 @@ checkpoint sidecars) and for reading data files during scans.
 | `read_parquet_files(files, schema, predicate)` | Read Parquet files into `EngineData` |
 | `read_parquet_files_with_cancellation(files, schema, predicate, token)` | As above, but a cooperative engine can abandon the read when `token` fires — see [Cancellation](#cancellation) |
 | `write_parquet_file(url, data)` | Write a stream of `EngineData` batches as a single Parquet file at the given URL |
+| `write_parquet_files(write, data)` | Write a stream to zero or more connector-named Parquet files and return each URL and exact byte size |
 | `read_parquet_footer(file)` | Read file footer metadata (schema, field IDs) without reading data |
 | `read_parquet_footer_with_cancellation(file, token)` | As above, but a cooperative engine can abandon the footer read when `token` fires — see [Cancellation](#cancellation) |
 
@@ -80,13 +83,14 @@ column matching for column mapping.
 Reading the Delta log for a large table can touch many commit and checkpoint files, and a
 connector often wants to abandon that work when the request behind it goes away — a cancelled
 query, a dropped RPC, a closed session. Kernel supports this cooperatively through an optional
-[`CancellationToken`] that a caller attaches to a snapshot builder, snapshot metadata reader,
-or scan.
+[`CancellationToken`] that you pass to a single call.
 
-#### Attaching a token
+#### Passing a token
 
-Attach the token separately to each operation whose storage reads you want to cancel. A metadata
-reader does not inherit the token used to build its `Snapshot`.
+Pass the token to each call whose storage reads you want to cancel, through its
+`*_with_cancellation` sibling. Kernel stores the token nowhere: not on the builder, the snapshot,
+the reader, or the scan. Workflow entry points take no token; see
+[Cancellation](../connector/driving_workflows.md#cancellation).
 
 ```rust,no_run
 # extern crate delta_kernel;
@@ -109,6 +113,8 @@ let metadata = scan.scan_metadata_with_cancellation(engine, Some(token))?;
 # Ok(())
 # }
 ```
+
+Passing `None` leaves your engine's own cancellation behavior unchanged.
 
 `SnapshotReader` getters remain synchronous and may block. The token applies to handler-backed
 I/O, so a getter may return metadata already held by the `Snapshot` without checking cancellation.
@@ -209,7 +215,7 @@ fully functional engine with sensible defaults.
 
 ### The TaskExecutor trait
 
-`DefaultEngine` uses asynchronous I/O internally, but Kernel's public APIs are synchronous.
+`DefaultEngine` uses asynchronous I/O internally, but the `Engine`-based Kernel APIs are synchronous.
 The `TaskExecutor` trait bridges this gap by defining how async work gets scheduled and
 awaited. It has four methods:
 

@@ -4,7 +4,8 @@ Read Table Multi-Threaded
 # About
 This example shows a program that reads a table using multiple threads. This shows the use of the
 `scan_metadata`, `global_scan_state`, and `visit_scan_files` methods, that can be used to partition work
-to either multiple threads, or workers (in the case of a distributed engine).
+to either multiple threads, or workers (in the case of a distributed engine). Snapshot construction
+runs through the default engine's `AsyncEngineConnector`; the scan itself runs through the `Engine`.
 
 You can run this example from anywhere in this repository by running `cargo run -p read-table-multi-threaded -- [args]` or by navigating to this directory and running `cargo run -- [args]`.
 
