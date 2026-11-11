@@ -312,6 +312,72 @@ struct ListingAccumulator {
 }
 
 impl ListingAccumulator {
+    fn accept_fs_file(&mut self, file: ParsedLogPath, log_tail_start_version: Option<Version>) {
+        // Track max published commit version from ALL filesystem Commit files, including those
+        // that will be skipped because log_tail takes precedence.
+        if matches!(file.file_type, LogPathFileType::Commit) {
+            self.output.max_published_version =
+                self.output.max_published_version.max(Some(file.version));
+        }
+
+        // Skip filesystem commits at versions covered by the log_tail (the log_tail is
+        // authoritative for commits). Non-commit files are always kept.
+        if file.is_commit()
+            && log_tail_start_version.is_some_and(|tail_start| file.version >= tail_start)
+        {
+            return;
+        }
+
+        self.maybe_flush_and_advance(file.version);
+        self.process_file(file);
+    }
+
+    fn finish(
+        mut self,
+        log_tail: Vec<ParsedLogPath>,
+        start_version: Version,
+        end: Version,
+    ) -> LogSegmentFiles {
+        // Process log_tail entries after the filesystem listing because log_tail commits start at
+        // log_tail_start_version and are in ascending version order; they always extend (or overlap
+        // with, but supersede) the filesystem-listed commits. Processing them after the filesystem
+        // listing maintains ascending version order throughout, which is required by the checkpoint
+        // grouping logic. The filesystem phase already skipped commits at log_tail versions, so
+        // there's no duplication here.
+        //
+        // log_tail entries at versions before a checkpoint may still be included here -
+        // LogSegment::try_new is the safeguard that filters those out unconditionally
+        let filtered_log_tail = log_tail
+            .into_iter()
+            .filter(|entry| entry.version >= start_version && entry.version <= end);
+        for file in filtered_log_tail {
+            // Track max published version for published commits from the log_tail
+            if matches!(file.file_type, LogPathFileType::Commit) {
+                self.output.max_published_version =
+                    self.output.max_published_version.max(Some(file.version));
+            }
+
+            self.maybe_flush_and_advance(file.version);
+            self.process_file(file);
+        }
+
+        // Flush the final group
+        if let Some(gv) = self.group_version {
+            self.select_checkpoint_for_group(gv);
+        }
+
+        // Since ascending_commit_files is cleared when a checkpoint is adopted, a non-empty list
+        // contains only commits after the most recent adopted checkpoint. The last element is the
+        // highest version commit overall, so we update latest_commit_file to it. If it's empty,
+        // we keep the value set at the checkpoint (if a commit existed at the checkpoint version),
+        // or remains None.
+        if let Some(commit_file) = self.output.ascending_commit_files.last() {
+            self.output.latest_commit_file = Some(commit_file.clone());
+        }
+
+        self.output
+    }
+
     fn process_file(&mut self, file: ParsedLogPath) {
         if !should_process_log_file(&file) {
             return;
@@ -449,65 +515,10 @@ impl LogSegmentFiles {
         // range, because non-commit files (CRC, checkpoints, compactions) only exist on the
         // filesystem — the log_tail only provides commit files.
         for file_result in fs_files {
-            let file = file_result?;
-
-            // Track max published commit version from ALL filesystem Commit files,
-            // including those that will be skipped because log_tail takes precedence.
-            if matches!(file.file_type, LogPathFileType::Commit) {
-                acc.output.max_published_version =
-                    acc.output.max_published_version.max(Some(file.version));
-            }
-
-            // Skip filesystem commits at versions covered by the log_tail (the log_tail
-            // is authoritative for commits). Non-commit files are always kept.
-            if file.is_commit()
-                && log_tail_start_version.is_some_and(|tail_start| file.version >= tail_start)
-            {
-                continue;
-            }
-
-            acc.maybe_flush_and_advance(file.version);
-            acc.process_file(file);
+            acc.accept_fs_file(file_result?, log_tail_start_version);
         }
 
-        // Phase 2: Process log_tail entries. We do this after Phase 1 because log_tail commits
-        // start at log_tail_start_version and are in ascending version order — they always extend
-        // (or overlap with, but supersede) the filesystem-listed commits. Processing them after
-        // Phase 1 maintains ascending version order throughout, which is required by the checkpoint
-        // grouping logic. Note that Phase 1 already skipped filesystem commits at log_tail
-        // versions, so there's no duplication here.
-        //
-        // log_tail entries at versions before a checkpoint may still be included
-        // here - LogSegment::try_new is the safeguard that filters those out unconditionally
-        let filtered_log_tail = log_tail
-            .into_iter()
-            .filter(|entry| entry.version >= start_version && entry.version <= end);
-        for file in filtered_log_tail {
-            // Track max published version for published commits from the log_tail
-            if matches!(file.file_type, LogPathFileType::Commit) {
-                acc.output.max_published_version =
-                    acc.output.max_published_version.max(Some(file.version));
-            }
-
-            acc.maybe_flush_and_advance(file.version);
-            acc.process_file(file);
-        }
-
-        // Flush the final group
-        if let Some(gv) = acc.group_version {
-            acc.select_checkpoint_for_group(gv);
-        }
-
-        // Since ascending_commit_files is cleared when a checkpoint is adopted, a non-empty list
-        // contains only commits after the most recent adopted checkpoint. The last element is the
-        // highest version commit overall, so we update latest_commit_file to it. If it's empty,
-        // we keep the value set at the checkpoint (if a commit existed at the checkpoint version),
-        // or remains None.
-        if let Some(commit_file) = acc.output.ascending_commit_files.last() {
-            acc.output.latest_commit_file = Some(commit_file.clone());
-        }
-
-        Ok(acc.output)
+        Ok(acc.finish(log_tail, start_version, end))
     }
 
     pub(crate) fn ascending_commit_files(&self) -> &Vec<ParsedLogPath> {
