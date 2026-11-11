@@ -129,7 +129,7 @@ async fn append_with_generated_columns(
     // 1. Start the transaction.
     let mut txn = snapshot
         .update_table(UpdateTableOperation::Write, "my-app/1.0", /* data_change */ true)
-        .build(engine, Box::new(FileSystemCommitter::new()))?;
+        .build(engine)?;
 
     // 2. Discover the generated columns and compile each one before writing anything.
     let mut generations = Vec::new();
@@ -171,7 +171,7 @@ async fn append_with_generated_columns(
     }
 
     // 5. Commit every file.
-    txn.commit(engine)
+    txn.commit(engine, &FileSystemCommitter)
 }
 ```
 

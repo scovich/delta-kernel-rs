@@ -45,9 +45,10 @@ This method handles everything in one call: reads the log, reconciles actions, w
 checkpoint Parquet file, and updates the `_last_checkpoint` hint file.
 
 > [!NOTE]
-> `checkpoint()` calls `ParquetHandler::write_parquet_file` to write the checkpoint and
-> `StorageHandler::head` to retrieve its metadata. The `DefaultEngine` implements both.
-> If you use a custom engine, make sure it provides working implementations of both.
+> `checkpoint()` calls `ParquetHandler::write_parquet_file` to write the checkpoint and, for V2
+> checkpoints with sidecars, `ParquetHandler::write_parquet_files` to write the sidecars. It then
+> calls `StorageHandler::head` to retrieve file metadata. The `DefaultEngine` implements these
+> methods. If you use a custom engine, make sure it provides working implementations.
 
 ## After a commit
 
@@ -55,7 +56,7 @@ The most common time to checkpoint is right after a successful commit. The post-
 snapshot gives you a checkpoint-ready `SnapshotRef`:
 
 ```rust,ignore
-let committed = match txn.commit(&engine)? {
+let committed = match txn.commit(&engine, &FileSystemCommitter)? {
     CommitResult::Committed(c) => c,
     _ => panic!("unexpected result"),
 };
@@ -144,7 +145,7 @@ The typical pattern is to check `commits_since_checkpoint` against the table's
 `delta.checkpointInterval` property and checkpoint when the threshold is reached:
 
 ```rust,ignore
-let committed = match txn.commit(&engine)? {
+let committed = match txn.commit(&engine, &FileSystemCommitter)? {
     CommitResult::Committed(c) => c,
     _ => panic!("unexpected result"),
 };

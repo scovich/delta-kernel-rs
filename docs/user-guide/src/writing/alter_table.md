@@ -77,8 +77,8 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let result = snapshot
     .update_table(UpdateTableOperation::AlterTable, "my-app/1.0", /* data_change */ false)
     .add_column(StructField::nullable("country", DataType::STRING))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
-    .commit(&engine)?;
+    .build(&engine)?
+    .commit(&engine, &FileSystemCommitter)?;
 
 match result {
     CommitResult::Committed(committed) => {
@@ -127,8 +127,8 @@ let result = snapshot
     .update_table(UpdateTableOperation::AlterTable, "my-app/1.0", /* data_change */ false)
     .add_column(StructField::nullable("country", DataType::STRING))
     .add_column(StructField::nullable("postal_code", DataType::STRING))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
-    .commit(&engine)?;
+    .build(&engine)?
+    .commit(&engine, &FileSystemCommitter)?;
 ```
 
 Building an `UpdateTableOperation::AlterTable` transaction without adding a schema operation returns an
@@ -146,7 +146,7 @@ during `build()`, so the transaction's `WriteState` uses the evolved schema.
 let mut transaction = snapshot
     .update_table(UpdateTableOperation::Write, "my-app/1.0", /* data_change */ true)
     .add_column(StructField::nullable("country", DataType::STRING))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    .build(&engine)?;
 
 let write_state = transaction.write_state()?;
 let write_context = write_state.write_context_builder().build()?;

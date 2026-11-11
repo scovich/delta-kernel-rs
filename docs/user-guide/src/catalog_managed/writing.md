@@ -48,25 +48,18 @@ let snapshot = Snapshot::builder_for(path)
 
 ## Phase 2: Create a transaction and commit
 
-To begin a write, create a transaction with your catalog's `Committer`, add files, and
-call `commit()`:
+To begin a write, build a transaction, add files, and call `commit()` with your catalog's
+`Committer`:
 
 ```rust,ignore
-// build() moves the Box<dyn Committer> into the Transaction, and commit()
-// consumes the Transaction, so the boxed committer is gone by the time you need
-// to publish. Construct a second committer for publish() in Phase 3 and clone
-// any catalog-client state you need to keep in scope across both calls.
-let committer = Box::new(MyCatalogCommitter::new(
-    catalog_client.clone(),
-    table_id.clone(),
-));
+let committer = MyCatalogCommitter::new(catalog_client.clone(), table_id.clone());
 let mut txn = snapshot
     .update_table(
         UpdateTableOperation::Custom("INSERT".to_string()),
         "my-app/1.0",
         /* data_change */ true,
     )
-    .build(&engine, committer)?;
+    .build(&engine)?;
 
 // Drive your Parquet writer from the write context, then hand the resulting
 // add-file metadata batch to the transaction. See the
@@ -81,10 +74,13 @@ txn.add_files(add_metadata);
 
 // Commit the transaction. Kernel invokes committer.commit() internally; Phase 3
 // handles the result.
-let commit_result = txn.commit(&engine)?;
+let commit_result = txn.commit(&engine, &committer)?;
 ```
 
-The `?` on `txn.commit(&engine)?` only propagates non-recoverable errors. Successful
+`commit()` only borrows the committer, so the same instance publishes in Phase 3 and retries a
+conflict without a rebuild.
+
+The `?` on `txn.commit(&engine, &committer)?` only propagates non-recoverable errors. Successful
 commits, conflicts, and retryable I/O errors arrive as the three variants of
 `CommitResult` in the match below. Everything else (auth errors, catalog protocol
 errors, etc.) bubbles out directly.
@@ -94,15 +90,15 @@ When `txn.commit()` runs, Kernel:
 1. Assembles the actions: a leading `CommitInfo`, any Protocol/Metadata updates
    this transaction makes (absent on steady-state appends), and Add/Remove file
    actions.
-2. Verifies that a catalog committer is being used. Kernel rejects `FileSystemCommitter`
-   for catalog-managed tables.
-3. Calls `committer.commit(engine, actions, commit_metadata)`.
+2. Builds a `Commit` and passes it to `committer.commit(engine, commit)`.
 
 Your committer then:
 
-1. Writes the actions to `_staged_commits/<version>.<uuid>.json`.
-2. Calls the catalog API to ratify the staged commit.
-3. Returns `CommitResponse::Committed` or `CommitResponse::Conflict`.
+1. Unpacks the `Commit` with `try_into_engine_parts`, which rejects a committer whose catalog
+   flag doesn't match the table, such as `FileSystemCommitter` on a catalog-managed table.
+2. Writes the actions to `_staged_commits/<version>.<uuid>.json`.
+3. Calls the catalog API to ratify the staged commit.
+4. Returns `CommitResponse::Committed` or `CommitResponse::Conflict`.
 
 ## Phase 3: Handle the result
 
@@ -124,25 +120,19 @@ match commit_result {
             .post_commit_snapshot()
             .ok_or_else(|| KernelError::generic("missing post-commit snapshot"))?;
 
-        // commit() consumed the Box<dyn Committer> from Phase 2. publish() only
-        // needs &dyn Committer, so construct a fresh instance here. This moves
-        // catalog_client and table_id; clone them if you need them for a retry
-        // loop around the whole write.
-        let publish_committer =
-            MyCatalogCommitter::new(catalog_client, table_id);
-
-        // Proceed to publish (Phase 4).
-        let published_snapshot = post_commit.publish(&engine, &publish_committer)?;
+        // Proceed to publish (Phase 4). commit() only borrowed the committer.
+        let published_snapshot = post_commit.publish(&engine, &committer)?;
     }
     CommitResult::Conflicted(conflicted) => {
         // Another writer already committed at this version.
         // `conflicted.conflict_version()` returns the version this transaction
-        // attempted. Rebase onto the new table state and retry.
+        // attempted. Rebase onto the new table state and retry with the same committer.
     }
     CommitResult::Retryable(retryable) => {
         // Transient I/O error. `retryable.error` gives the underlying cause;
-        // `retryable.transaction` is the original transaction you can retry
-        // without rebasing. Kernel reaches this arm only for `KernelError::IOError`
+        // `retryable.transaction` is the original transaction: call
+        // `commit(&engine, &committer)` on it again without rebasing. Kernel
+        // reaches this arm only for `KernelError::IOError`
         // variants; return other error kinds as-is rather than disguising
         // them as IOError to force retry.
     }

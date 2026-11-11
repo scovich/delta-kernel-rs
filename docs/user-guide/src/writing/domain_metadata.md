@@ -43,9 +43,9 @@ let txn = snapshot
         "myConnector.settings".to_string(),
         r#"{"version": 1, "compress": true}"#.to_string(),
     )
-    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    .build(&engine)?;
 
-txn.commit(&engine)?;
+txn.commit(&engine, &FileSystemCommitter)?;
 # Ok(())
 # }
 ```
@@ -101,9 +101,9 @@ let txn = snapshot
         /* data_change */ false,
     )
     .with_domain_metadata_removed("myConnector.settings")
-    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    .build(&engine)?;
 
-txn.commit(&engine)?;
+txn.commit(&engine, &FileSystemCommitter)?;
 # Ok(())
 # }
 ```

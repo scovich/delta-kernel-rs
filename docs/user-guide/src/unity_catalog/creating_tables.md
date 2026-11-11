@@ -82,18 +82,18 @@ let engine = build_engine_with_credentials(&table_uri, &staging_info.storage_cre
 
 // Build the create-table transaction with the disk-bound properties. `UCCommitter::new` takes the
 // commit client plus the table's UC-assigned id and its three-part name.
-let committer = Box::new(UCCommitter::new(
+let committer = UCCommitter::new(
     update_client.clone(),
     table_id.clone(),
     TableIdentifier::new("main", "default", "my_table"),
-));
+);
 let create_txn = create_table(
     table_uri.as_str(), Arc::new(schema), "MyApp/1.0", /* data_change */ true,
 )
     .with_table_properties(disk_props)
-    .build(&engine, committer)?;
+    .build(&engine)?;
 
-let post_commit_snapshot = match create_txn.commit(&engine)? {
+let post_commit_snapshot = match create_txn.commit(&engine, &committer)? {
     CommitResult::Committed(committed) => committed
         .post_commit_snapshot()
         .cloned()
@@ -167,7 +167,7 @@ let create_txn = create_table(
 )
     .with_table_properties(disk_props)
     .with_data_layout(DataLayout::clustered(["region"]))
-    .build(&engine, committer)?;
+    .build(&engine)?;
 ```
 
 `build_uc_create_table_request` forwards the committed `delta.clustering` domain verbatim into the

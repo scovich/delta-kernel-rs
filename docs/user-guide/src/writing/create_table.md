@@ -29,8 +29,8 @@ let schema = Arc::new(StructType::try_new([
 ])?);
 
 create_table(url.as_str(), schema, "my-app/1.0", /* data_change */ true)
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
-    .commit(&engine)?;
+    .build(&engine)?
+    .commit(&engine, &FileSystemCommitter)?;
 # Ok(())
 # }
 ```
@@ -152,8 +152,8 @@ create_table(url.as_str(), schema, "my-app/1.0", /* data_change */ true)
         ("myapp.version", "2.0"),
         ("myapp.owner", "data-team"),
     ])
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
-    .commit(&engine)?;
+    .build(&engine)?
+    .commit(&engine, &FileSystemCommitter)?;
 # Ok(())
 # }
 ```
@@ -189,8 +189,8 @@ let schema = Arc::new(StructType::try_new([
 
 create_table(url.as_str(), schema, "my-app/1.0", /* data_change */ true)
     .with_data_layout(DataLayout::clustered(["region", "timestamp"]))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
-    .commit(&engine)?;
+    .build(&engine)?
+    .commit(&engine, &FileSystemCommitter)?;
 # Ok(())
 # }
 ```
@@ -246,8 +246,8 @@ let schema = Arc::new(StructType::try_new([
 
 create_table(url.as_str(), schema, "my-app/1.0", /* data_change */ true)
     .with_data_layout(DataLayout::partitioned(["year", "month"]))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
-    .commit(&engine)?;
+    .build(&engine)?
+    .commit(&engine, &FileSystemCommitter)?;
 # Ok(())
 # }
 ```
@@ -281,8 +281,7 @@ features may additionally materialize them into the data files; see
 
 ## The Committer
 
-The `build()` method takes a `Box<dyn Committer>` that controls how the commit is
-persisted:
+The `commit()` method takes a `&dyn Committer` that controls how the commit is persisted:
 
 - **`FileSystemCommitter`**: For standalone filesystem-based tables. Writes commit files
   directly to `_delta_log/` using atomic put-if-absent. This is the default for most use
@@ -297,7 +296,7 @@ persisted:
 `commit()` returns a `CommitResult`:
 
 ```rust,ignore
-match txn.commit(&engine)? {
+match txn.commit(&engine, &FileSystemCommitter)? {
     CommitResult::Committed(committed) => {
         println!("Created table at version {}", committed.commit_version());
     }

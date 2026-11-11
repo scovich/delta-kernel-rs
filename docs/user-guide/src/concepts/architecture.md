@@ -160,13 +160,13 @@ let mut txn = snapshot                              // Arc<Snapshot>
         "my-app/1.0",
         /* data_change */ true,
     )
-    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    .build(&engine)?;
 
 // Write Parquet files, then register their metadata.
 txn.add_files(file_metadata);
 
 // Commit atomically
-match txn.commit(&engine)? {
+match txn.commit(&engine, &FileSystemCommitter)? {
     CommitResult::Committed(c) => println!("v{}", c.commit_version()),
     CommitResult::Conflicted(_) => { /* handle conflict */ }
     CommitResult::Retryable(_) => { /* retry */ }
@@ -232,9 +232,10 @@ the kernel never touches raw bytes. It works purely with metadata and delegates 
 
 3. COMMIT (kernel + committer)
    The kernel assembles the commit actions (CommitInfo, Add files,
-   etc.) and hands them to the Committer. For filesystem tables,
-   the Committer writes a JSON delta file atomically. For
-   catalog-managed tables, it goes through the catalog.
+   etc.) and hands them to the Committer you passed to commit().
+   For filesystem tables, the Committer writes a JSON delta file
+   atomically. For catalog-managed tables, it goes through the
+   catalog.
 
 4. HANDLE RESULT
    CommittedTransaction: success.
