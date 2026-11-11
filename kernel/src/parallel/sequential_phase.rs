@@ -72,7 +72,9 @@ pub(crate) struct SequentialPhase<C, M> {
     // The checkpoint manifest reader that will be used to read the checkpoint manifest files.
     // If the checkpoint is single-part, this will be Some(CheckpointManifestReader).
     checkpoint_manifest_phase: Option<M>,
-    // Whether the iterator has been fully exhausted
+    // Terminal sidecar output, populated when checkpoint_manifest_phase completes
+    checkpoint_manifest_output: Option<KernelResult<Vec<FileMeta>>>,
+    // Whether this phase has been fully exhausted
     is_finished: bool,
     // Checkpoint parts for potential parallel phase processing
     checkpoint_parts: Vec<FileMeta>,
@@ -133,6 +135,7 @@ impl SequentialPhase<Box<dyn KernelResultIterator<ActionsBatch>>, CheckpointMani
             processor,
             commit_phase,
             checkpoint_manifest_phase,
+            checkpoint_manifest_output: None,
             is_finished: false,
             checkpoint_parts,
         })
@@ -156,8 +159,8 @@ impl SequentialPhase<Box<dyn KernelResultIterator<ActionsBatch>>, CheckpointMani
             ));
         }
 
-        let parallel_files = match self.checkpoint_manifest_phase {
-            Some(manifest_reader) => manifest_reader.extract_sidecars()?,
+        let parallel_files = match self.checkpoint_manifest_output {
+            Some(sidecars) => sidecars?,
             None => {
                 let parts = self.checkpoint_parts;
                 require!(
@@ -183,21 +186,27 @@ impl SequentialPhase<Box<dyn KernelResultIterator<ActionsBatch>>, CheckpointMani
     }
 
     fn next_action(&mut self) -> Option<KernelResult<ActionsBatch>> {
-        let next = self
-            .commit_phase
-            .as_mut()
-            .and_then(|commit_phase| commit_phase.next())
-            .or_else(|| {
-                self.commit_phase = None;
-                self.checkpoint_manifest_phase.as_mut()?.next()
-            });
+        if let Some(commit_phase) = self.commit_phase.as_mut() {
+            match commit_phase.next() {
+                Some(result) => return Some(result),
+                None => self.commit_phase = None,
+            }
+        }
 
-        let Some(result) = next else {
-            self.is_finished = true;
-            return None;
-        };
+        if let Some(checkpoint_manifest_phase) = self.checkpoint_manifest_phase.as_mut() {
+            match checkpoint_manifest_phase.next() {
+                Some(result) => return Some(result),
+                None => {
+                    if let Some(checkpoint_manifest_phase) = self.checkpoint_manifest_phase.take() {
+                        self.checkpoint_manifest_output =
+                            Some(checkpoint_manifest_phase.extract_sidecars());
+                    }
+                }
+            }
+        }
 
-        Some(result)
+        self.is_finished = true;
+        None
     }
 
     fn advance(&mut self) -> Option<KernelResult<ScanMetadata>> {
