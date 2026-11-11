@@ -62,7 +62,8 @@ In general, you will want to depend on `delta-kernel-rs` by adding it as a depen
 module. The core kernel includes facilities for reading and writing delta tables, and allows the
 consumer to implement their own `Engine` trait in order to build engine-specific implementations of
 the various `Engine` APIs that the kernel relies on (e.g. implement an engine-specific
-`read_json_files()` using the native engine JSON reader). If you do not need a custom `Engine`,
+`read_json_files()` using the native engine JSON reader), or to drive the kernel's operations as
+workflows. If you do not need a custom `Engine`,
 add the `delta_kernel_default_engine` crate to get the default asynchronous `Engine` implementation
 built with [Arrow] and [Tokio].
 
@@ -148,7 +149,8 @@ projects.
 There are a few key concepts that will help in understanding kernel:
 
 1. The `Engine` trait encapsulates all the functionality an engine or connector needs to provide to
-   the Delta Kernel in order to read/write the Delta table.
+   the Delta Kernel in order to read/write the Delta table (or a connector can drive the kernel's
+   operations itself).
 2. The `DefaultEngine` is our default implementation of the above trait. It lives in
    `engine/default`, and provides a reference implementation for all `Engine`
    functionality. `DefaultEngine` uses [arrow](https://docs.rs/arrow/latest/arrow/) as its in-memory
@@ -160,11 +162,12 @@ There are a few key concepts that will help in understanding kernel:
 
 Some design principles which should be considered:
 
-- async should live only in the `Engine` implementation. The core kernel does not use async at
-  all. We do not wish to impose the need for an entire async runtime on an engine or connector. The
-  `DefaultEngine` _does_ use async quite heavily. It doesn't depend on a particular runtime however,
-  and implementations could provide an "executor" based on tokio, smol, async-std, or whatever might
-  be needed. Currently only a `tokio` based executor is provided.
+- async lives in the connector. Kernel's operations are runtime-neutral futures: they never spawn
+  tasks, pick a runtime, or perform I/O. When they need I/O they suspend and surface a typed
+  request to a connector-owned driver. The `Engine` trait is the synchronous compatibility surface
+  over the same logic. The core kernel has no async runtime dependency. The `DefaultEngine` _does_
+  use async quite heavily; implementations could provide an "executor" based on tokio, smol,
+  async-std, or whatever might be needed. Currently only a `tokio` based executor is provided.
 - Prefer builder style APIs over object oriented ones.
 - "Simple" set of default-features enabled to provide the basic functionality with the least
   necessary amount of dependencies possible. Putting more complex optimizations or APIs behind

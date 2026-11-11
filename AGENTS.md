@@ -5,7 +5,9 @@
 Delta-kernel-rs is a Rust library for building Delta Lake connectors. It encapsulates the
 Delta protocol so connectors can read and write Delta tables without understanding protocol
 internals. Kernel never does I/O directly: it defines _what_ to do via its APIs
-(`Snapshot`, `Scan`, `Transaction`) and delegates _how_ to the `Engine` trait.
+(`Snapshot`, `Scan`, `Transaction`) and delegates _how_ to the connector: either through the
+`Engine` trait, or by surfacing typed requests to a connector-owned driver (see the module docs of
+`kernel/src/coroutine/`).
 
 ## Documentation Ownership
 
@@ -145,10 +147,10 @@ Use `cargo metadata --no-deps` to discover current workspace package names. Read
   column mapping on/off) and asserting success vs. error.
 - Reuse helpers from `test_utils` and the integration-test fixtures instead of writing
   custom ones when possible. See **Common test helpers** below for a curated starter list.
-- **Committing in tests:** Use `txn.commit(engine)?.unwrap_committed()` to assert a
-  successful commit and get the `CommittedTransaction`. When you only need the resulting
-  snapshot, use `txn.commit(engine)?.unwrap_post_commit_snapshot()` to get the
-  `SnapshotRef` directly. Do NOT use `match` + `panic!` for either: both helpers provide a clear
+- **Committing in tests:** Use `txn.commit(engine, &FileSystemCommitter)?.unwrap_committed()` to
+  assert a successful commit and get the `CommittedTransaction`. When you only need the resulting
+  snapshot, use `txn.commit(engine, &FileSystemCommitter)?.unwrap_post_commit_snapshot()` to get
+  the `SnapshotRef` directly. Do NOT use `match` + `panic!` for either: both helpers provide a clear
   error message on failure. Available under `#[cfg(test)]` and the `test-utils` feature.
 - **Prefer snapshot/public API assertions over reading raw commit JSON.** Only read raw
   commit JSON when the data is inaccessible via public API (e.g., system domain metadata
@@ -183,9 +185,12 @@ This list is non-exhaustive: when in doubt, browse the source files directly
 
 **Handler access and overrides (from `delta_kernel::engine`, with `test-utils`)**
 
-- `PanicEngine`: assert that an operation requests no required engine handler.
+- `CountingEngine`: delegates to an inner engine and counts actual handler operations without
+  counting handler access. Use it to assert that a fast path avoids I/O or evaluation. An
+  `Engine`-based entry point fetches every handler once per drive, so a test engine that panics or
+  counts on handler accessors sees those calls even when no I/O follows.
 - `DelegatingEngine`: override selected handlers while delegating the rest to an inner engine.
-  See the types' rustdoc for override and executor selection behavior.
+  See the type's rustdoc for override and executor selection behavior.
 
 **Engine + table setup (from `test_utils`)**
 

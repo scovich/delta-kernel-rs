@@ -784,6 +784,12 @@ Snapshot hints live under `src/snapshot/hint/`, matching `kernel/src/snapshot/hi
 Snapshot builders live in `src/snapshot/builder.rs`; snapshot accessors live in `src/lib.rs`.
 FFI-specific ownership, conversion, and engine support code can use its own modules.
 
+FFI entry points that call a converted kernel operation build its `*_workflow` and drive it with
+`drive_kernel(extern_engine, workflow)` (`src/lib.rs`), or `drive_kernel_with_committer` when the
+workflow can post commit or publish requests. Both serve requests with the connector's `Engine`
+handlers, so the C ABI is unchanged. Rust-level kernel signatures change underneath without
+touching exported names.
+
 ## Key Files
 
 - `src/lib.rs` -- main FFI entry points and type definitions
@@ -864,10 +870,10 @@ complete file stats). `visit_file_size_histogram` exposes the optional variable-
 the same file stats: it invokes one callback with borrowed `i64` slices for bin boundaries, file
 counts, and total bytes; callers must copy values they retain after the callback.
 
-`snapshot_timestamp` uses a synchronous `SnapshotReader` and may read commit JSON when the
-In-Commit Timestamp is unavailable from retained CRC state. Domain-metadata and transaction-version
-FFI reads also use an unscoped reader, preserving the engine's cancellation and timeout behavior.
-The C API signatures do not expose reader state or a cancellation token.
+`snapshot_timestamp` drives `SnapshotReader::get_timestamp_workflow` through the engine and may
+read commit JSON when the In-Commit Timestamp is unavailable from retained CRC state.
+Domain-metadata and transaction-version FFI reads do the same. The C API signatures expose no
+cancellation token, so cancellation is whatever the engine's handlers provide.
 
 Domain-metadata reads live in `ffi/src/domain_metadata.rs`: `get_domain_metadata` /
 `visit_domain_metadata` for user domains, and `visit_clustering_columns`, which reports one
@@ -953,6 +959,13 @@ constructors likewise require engine info and `data_change`, with the operation 
 `CREATE TABLE`.
 
 `update_table_txn_commit()` and `create_table_txn_commit()` return a `Handle<ExclusiveCommittedTransaction>` that the caller can read via `committed_transaction_version` and `committed_transaction_post_commit_snapshot`, then must release with `free_committed_transaction`. The post-commit snapshot, when present, is a separate `SharedSnapshot` handle that must be freed with `free_snapshot`.
+
+The C API binds the committer when the builder is built (`update_table_txn_builder_build` binds
+`FileSystemCommitter`; `..._build_with_committer` consumes the caller's), but kernel transactions
+hold none. A transaction handle is therefore an `FfiTransaction`, which pairs the kernel
+`Transaction` with its `Box<dyn Committer>`; `update_table_txn_commit` and
+`create_table_txn_commit` drive `Transaction::commit_workflow` with `drive_kernel_with_committer`,
+which serves `Request::Commit` with that committer.
 
 Transaction identifiers can be added before build with the `*_txn_builder_with_transaction_id`
 setters, or after build with `update_table_txn_with_transaction_id` /
