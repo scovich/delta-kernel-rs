@@ -61,8 +61,8 @@ async fn main() -> KernelResult<()> {
     ])?);
 
     create_table(url.as_str(), schema.clone(), "quick-start/1.0", /* data_change */ true)
-        .build(&engine, Box::new(FileSystemCommitter::new()))?
-        .commit(&engine)?;
+        .build(&engine)?
+        .commit(&engine, &FileSystemCommitter)?;
     println!("Created table at {url}");
 
     // 2. Write data
@@ -74,7 +74,7 @@ async fn main() -> KernelResult<()> {
             "quick-start/1.0",
             /* data_change */ true,
         )
-        .build(&engine, Box::new(FileSystemCommitter::new()))?;
+        .build(&engine)?;
 
     // Build an Arrow RecordBatch
     let arrow_schema: delta_kernel::arrow::datatypes::Schema =
@@ -97,7 +97,7 @@ async fn main() -> KernelResult<()> {
     txn.add_files(file_metadata);
 
     // Commit
-    match txn.commit(&engine)? {
+    match txn.commit(&engine, &FileSystemCommitter)? {
         CommitResult::Committed(committed) => {
             println!("Committed version {}", committed.commit_version());
         }
@@ -135,8 +135,8 @@ let schema = Arc::new(StructType::try_new(vec![
 ])?);
 
 create_table(url.as_str(), schema.clone(), "quick-start/1.0", /* data_change */ true)
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
-    .commit(&engine)?;
+    .build(&engine)?
+    .commit(&engine, &FileSystemCommitter)?;
 ```
 
 `create_table` returns a builder. You provide:
@@ -144,11 +144,10 @@ create_table(url.as_str(), schema.clone(), "quick-start/1.0", /* data_change */ 
 - A schema (using kernel's `StructType`)
 - An engine info string (identifies your application)
 
-`.build()` takes the engine and a `Committer`. For local filesystem tables, use
-`FileSystemCommitter`. For catalog-managed tables, you provide your own committer.
+`.commit()` takes the engine and a `Committer`, and writes version 0 of the table (the initial
+Protocol and Metadata actions). For local filesystem tables, use `FileSystemCommitter`. For
+catalog-managed tables, you provide your own committer.
 [Catalog-Managed Tables](../catalog_managed/overview.md) covers that topic.
-
-`.commit()` writes version 0 of the table (the initial Protocol and Metadata actions).
 
 ### 2. Write data
 
@@ -162,7 +161,7 @@ let mut txn = snapshot
         "quick-start/1.0",
         /* data_change */ true,
     )
-    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    .build(&engine)?;
 ```
 
 **Build your data as an Arrow RecordBatch and wrap it:**
@@ -197,7 +196,7 @@ transaction needs. `add_files` registers that metadata with the transaction.
 
 **Commit:**
 ```rust,ignore
-match txn.commit(&engine)? {
+match txn.commit(&engine, &FileSystemCommitter)? {
     CommitResult::Committed(committed) => { /* success */ }
     CommitResult::Conflicted(_) => { /* another writer won */ }
     CommitResult::Retryable(retry) => { /* transient error, retry */ }

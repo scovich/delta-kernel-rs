@@ -109,7 +109,7 @@ async fn append_with_check_constraints(
     // 1. Start the transaction.
     let mut txn = snapshot
         .update_table(UpdateTableOperation::Write, "my-app/1.0", /* data_change */ true)
-        .build(engine, Box::new(FileSystemCommitter::new()))?;
+        .build(engine)?;
 
     // 2. Discover the constraints and compile each one before writing anything.
     let mut checks = Vec::new();
@@ -142,7 +142,7 @@ async fn append_with_check_constraints(
     }
 
     // 5. Commit every validated file.
-    txn.commit(engine)
+    txn.commit(engine, &FileSystemCommitter)
 }
 ```
 

@@ -97,17 +97,15 @@ reader does not inherit the token used to build its `Snapshot`.
 #     token: CancellationTokenRef,
 # ) -> KernelResult<()> {
 let snapshot = Snapshot::builder_for(table_root)
-    .with_cancellation_token(token.clone())
-    .build(engine)?;
+    .build_with_cancellation(engine, Some(token.clone()))?;
 
-let reader = snapshot.reader().with_cancellation_token(token.clone());
-let version = reader.get_app_id_version("my-app", engine)?;
+let reader = snapshot.reader();
+let version =
+    reader.get_app_id_version_with_cancellation("my-app", engine, Some(token.clone()))?;
 
-let scan = snapshot
-    .scan_builder()
-    .with_cancellation_token(token)
-    .build()?;
-# let _ = (version, scan);
+let scan = snapshot.scan_builder().build()?;
+let metadata = scan.scan_metadata_with_cancellation(engine, Some(token))?;
+# let _ = (version, metadata);
 # Ok(())
 # }
 ```

@@ -104,9 +104,9 @@ See [Creating UC Tables](./creating_tables.md) for the end-to-end creation
 flow and how these two utilities fit together.
 
 > [!NOTE]
-> `UCCommitter` requires a multi-threaded tokio runtime. The default Kernel
-> Engine uses tokio, so this is compatible. If you use a custom Engine, ensure
-> your runtime is multi-threaded.
+> `UCCommitter` requires a multi-threaded tokio runtime when you commit through the `Committer`
+> trait. The default Kernel Engine uses tokio, so this is compatible. If you use a custom Engine,
+> ensure your runtime is multi-threaded.
 
 ## How the crates map to catalog-managed concepts
 
@@ -137,8 +137,8 @@ connector reads or writes a UC-managed table.
  │  3. snapshot_builder_from_load_table(&resp)?.build(..)    │
  │  4. snapshot.update_table(                                │
  │       UpdateTableOperation::Write, engine_info, true)     │
- │       .build(&engine, Box::new(UCCommitter::new(...)))?   │
- │       .commit(&engine)?                                   │
+ │       .build(&engine)?                                    │
+ │       .commit(&engine, &UCCommitter::new(...))?           │
  └──────┬─────────────────────────┬──────────────────────────┘
         │                         │
         ▼                         ▼

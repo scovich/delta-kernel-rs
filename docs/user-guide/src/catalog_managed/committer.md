@@ -6,8 +6,10 @@ your catalog's staging and ratification logic. For filesystem-managed tables, th
 tables, you provide your own `Committer` that routes commits through your catalog.
 
 > [!WARNING]
-> Kernel rejects `FileSystemCommitter` on a catalog-managed table at `txn.commit()`
-> time. You must provide a catalog committer before commit runs.
+> A catalog-managed table needs a catalog committer. `FileSystemCommitter` rejects a
+> catalog-managed commit, and your committer must reject a path-based one: `Commit::try_into_parts`
+> and `try_into_engine_parts` make that check from the flag you pass. Pass the committer to
+> `txn.commit(&engine, &committer)`.
 
 Before reading this page, make sure you understand [Catalog-managed tables](./overview.md).
 
@@ -15,12 +17,7 @@ Before reading this page, make sure you understand [Catalog-managed tables](./ov
 
 ```rust,ignore
 pub trait Committer: Send {
-    fn commit(
-        &self,
-        engine: &dyn Engine,
-        actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
-        commit_metadata: CommitMetadata,
-    ) -> KernelResult<CommitResponse>;
+    fn commit(&self, engine: &dyn Engine, commit: Commit) -> KernelResult<CommitResponse>;
 
     fn is_catalog_committer(&self) -> bool;
 
@@ -36,15 +33,16 @@ The trait has three methods. Two (`commit()` and `publish()`) carry the real
 logic; the third (`is_catalog_committer()`) is a one-line method that returns a
 constant:
 
-1. **`commit()`** atomically commits the given actions at the version specified in
-   `CommitMetadata`. Returns `CommitResponse::Committed` on success or
-   `CommitResponse::Conflict { version }` if another writer already committed this
-   version.
+1. **`commit()`** receives an opaque `Commit`. Unpack it with
+   `try_into_engine_parts(engine, is_catalog_committer)`, which rejects a committer that doesn't
+   match the table and returns the `CommitMetadata` and the actions. Then atomically commit those
+   actions at the version in `CommitMetadata`. Return `CommitResponse::Committed` on success or
+   `CommitResponse::Conflict { version }` if another writer already committed this version.
 
-2. **`is_catalog_committer()`** returns `true` for catalog committers. Kernel checks
-   this flag on both commit and publish paths and enforces the pairing in both
-   directions: it rejects a `FileSystemCommitter` on a catalog-managed table, and
-   it rejects a catalog committer on a filesystem-managed table.
+2. **`is_catalog_committer()`** returns `true` for catalog committers. On commit,
+   `try_into_engine_parts` enforces the pairing in both directions, using the flag you pass it.
+   On publish, Kernel checks this method before calling `publish()` and rejects a non-catalog
+   committer on a catalog-managed table.
 
 3. **`publish()`** copies ratified catalog commits from `_staged_commits/` to the main
    `_delta_log/` directory as published delta files. Some catalogs publish
@@ -53,7 +51,8 @@ constant:
 
 ## CommitMetadata
 
-Kernel constructs `CommitMetadata` and passes it to your `commit()` method. Key methods:
+`try_into_engine_parts` returns the `CommitMetadata` that Kernel constructed for your `commit()`
+method. Key methods:
 
 ```rust,ignore
 impl CommitMetadata {
@@ -115,14 +114,10 @@ The typical implementation follows four steps. Steps 1 and 2 form the body of
 Write the actions to a staged commit file in `_staged_commits/`:
 
 ```rust,ignore
-fn commit(
-    &self,
-    engine: &dyn Engine,
-    actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
-    commit_metadata: CommitMetadata,
-) -> KernelResult<CommitResponse> {
-    // Write actions to _staged_commits/<version>.<uuid>.json. `actions` is
-    // already a Box<dyn KernelResultIterator<...>>, so pass it directly (do not re-box).
+fn commit(&self, engine: &dyn Engine, commit: Commit) -> KernelResult<CommitResponse> {
+    // Validate the pairing, then write actions to _staged_commits/<version>.<uuid>.json.
+    // `actions` is already a Box<dyn KernelResultIterator<...>>, so pass it directly.
+    let (commit_metadata, actions) = commit.try_into_engine_parts(engine, true)?;
     let staged_path = commit_metadata.staged_commit_path()?;
     let written_size = engine
         .json_handler()
@@ -217,8 +212,8 @@ catalog's client type and fill in the ratification logic:
 
 ```rust,ignore
 // Imports elided for brevity. In addition to the ones below, you will need
-// Committer, CommitMetadata, CommitResponse, PublishMetadata, KernelResult,
-// FilteredEngineData, and Engine from delta_kernel.
+// Commit, Committer, CommitResponse, PublishMetadata, KernelResult, and Engine from
+// delta_kernel.
 use delta_kernel::{KernelError, FileMeta};
 
 pub struct MyCatalogCommitter {
@@ -227,13 +222,9 @@ pub struct MyCatalogCommitter {
 }
 
 impl Committer for MyCatalogCommitter {
-    fn commit(
-        &self,
-        engine: &dyn Engine,
-        actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
-        commit_metadata: CommitMetadata,
-    ) -> KernelResult<CommitResponse> {
-        // 1. Stage: write actions to _staged_commits/
+    fn commit(&self, engine: &dyn Engine, commit: Commit) -> KernelResult<CommitResponse> {
+        // 1. Stage: validate the pairing, then write actions to _staged_commits/
+        let (commit_metadata, actions) = commit.try_into_engine_parts(engine, true)?;
         let staged_path = commit_metadata.staged_commit_path()?;
         let written_size = engine
             .json_handler()

@@ -43,7 +43,7 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 // 2. Create a transaction
 let mut txn = snapshot
     .update_table(UpdateTableOperation::Write, "my-app/1.0", /* data_change */ true)
-    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    .build(&engine)?;
 
 // 3. Create write state and bind a write context
 let write_state = txn.write_state()?;
@@ -73,7 +73,7 @@ let file_metadata = engine
 txn.add_files(file_metadata);
 
 // 6. Commit
-match txn.commit(&engine)? {
+match txn.commit(&engine, &FileSystemCommitter)? {
     CommitResult::Committed(committed) => {
         println!("Committed version {}", committed.commit_version());
     }
@@ -91,7 +91,7 @@ writing against:
 ```rust,ignore
 let mut txn = snapshot
     .update_table(UpdateTableOperation::Write, "my-app/1.0", /* data_change */ true)
-    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    .build(&engine)?;
 ```
 
 Pass the operation, connector name/version, and `data_change` to
@@ -218,10 +218,11 @@ You can call `add_files` multiple times to write multiple files in one transacti
 
 ## Committing
 
-`commit()` consumes the transaction and returns a `CommitResult`:
+`commit()` consumes the transaction, takes the `Committer` that persists it, and returns a
+`CommitResult`:
 
 ```rust,ignore
-match txn.commit(&engine)? {
+match txn.commit(&engine, &FileSystemCommitter)? {
     CommitResult::Committed(committed) => {
         println!("Committed version {}", committed.commit_version());
     }
@@ -251,7 +252,7 @@ let txn = snapshot
         /* data_change */ true,
     )
     .with_blind_append()
-    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    .build(&engine)?;
 ```
 
 Kernel records `isBlindAppend: true` in the commit's `commitInfo` action. This flag
@@ -288,7 +289,7 @@ let txn = snapshot
     )
     .with_operation_parameters([("mode", Some("Append")), ("predicate", None)])
     .with_operation_metrics([("numFiles", Some("1"))])
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build(&engine)?
     .with_commit_info(engine_commit_info, commit_info_schema);
 ```
 
@@ -322,7 +323,7 @@ A successful commit returns a `CommittedTransaction` with access to a post-commi
 snapshot and post-commit statistics:
 
 ```rust,ignore
-let committed = match txn.commit(&engine)? {
+let committed = match txn.commit(&engine, &FileSystemCommitter)? {
     CommitResult::Committed(c) => c,
     _ => panic!("unexpected result"),
 };

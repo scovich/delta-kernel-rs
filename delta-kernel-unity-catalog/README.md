@@ -16,7 +16,10 @@ It provides:
 
 - `UCCommitter`: kernel's `Committer` trait implemented against UC, so commits are staged and
   ratified through the catalog rather than written straight to the log, plus `publish()` to promote
-  ratified commits. Requires a multi-threaded tokio runtime.
+  ratified commits. The `Committer` path requires a multi-threaded tokio runtime. For
+  connector-driven execution, `commit_workflow()` posts
+  `delta_kernel_unity_catalog::coroutine::Request`s, which your driver serves, and
+  `publish_workflow()` posts kernel requests. See [Serve Unity Catalog commits] for a driver.
 - `snapshot_builder_from_load_table()` and `log_tail_from_commits()`: build a kernel snapshot from a
   `load_table` response, including commits UC knows about but has not yet published.
 - `get_required_properties_for_disk()` and `build_uc_create_table_request()`: the table-creation
@@ -29,3 +32,4 @@ See the [Unity Catalog integration guide] for the end-to-end read, write, and cr
 [`unity-catalog-delta-client-api`]: https://github.com/delta-io/delta-kernel-rs/tree/main/unity-catalog-delta-client-api
 [`unity-catalog-delta-rest-client`]: https://github.com/delta-io/delta-kernel-rs/tree/main/unity-catalog-delta-rest-client
 [Unity Catalog integration guide]: https://github.com/delta-io/delta-kernel-rs/blob/main/docs/user-guide/src/unity_catalog/overview.md
+[Serve Unity Catalog commits]: https://github.com/delta-io/delta-kernel-rs/blob/main/docs/user-guide/src/connector/driving_workflows.md#serve-unity-catalog-commits

@@ -54,7 +54,7 @@ if let Some(committed_version) = snapshot.reader().get_app_id_version(app_id, &e
 let txn = snapshot
     .update_table(UpdateTableOperation::StreamingUpdate, "my-app/1.0", /* data_change */ true)
     .with_transaction_id(app_id.to_string(), batch_version)
-    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    .build(&engine)?;
 
 // ... write data, add files, commit ...
 # Ok(())

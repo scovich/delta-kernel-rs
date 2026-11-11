@@ -50,7 +50,7 @@ let mut txn = snapshot
         "my-app/1.0",
         /* data_change */ true,
     )
-    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    .build(&engine)?;
 
 // Build the write state before iterating over partitions.
 let write_state = txn.write_state()?;
@@ -74,7 +74,7 @@ for (partition_values, batch) in partitions {
 }
 
 // Commit all partitions in a single transaction
-txn.commit(&engine)?;
+txn.commit(&engine, &FileSystemCommitter)?;
 # Ok(())
 # }
 ```

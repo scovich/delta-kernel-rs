@@ -74,23 +74,25 @@ use delta_kernel_unity_catalog::UCCommitter;
 use unity_catalog_delta_client_api::TableIdentifier;
 
 let table_id = resp.metadata.table_uuid.clone();
-let committer = Box::new(UCCommitter::new(
+let committer = UCCommitter::new(
     update_client.clone(),
     table_id.clone(),
     TableIdentifier::new("my_catalog", "my_schema", "my_table"),
-));
+);
 let mut txn = snapshot.clone()
     .update_table(
         UpdateTableOperation::Custom("INSERT".to_string()),
         "my-app/1.0",
         /* data_change */ true,
     )
-    .build(&engine, committer)?;
+    .build(&engine)?;
 ```
 
-`UCCommitter` requires a multi-threaded tokio runtime. The default Kernel
-engine already uses tokio, so this is compatible as long as you use the
-multi-threaded runtime (the default for `#[tokio::main]`).
+`UCCommitter::commit` through the `Committer` trait requires a multi-threaded tokio runtime,
+because it blocks on the UC client. The default Kernel engine already uses tokio, so this is
+compatible if you use the multi-threaded runtime (the default for `#[tokio::main]`).
+`UCCommitter::commit_workflow` has no such requirement: your driver serves its `UpdateTable`
+request.
 
 > [!WARNING]
 > `UCCommitter` validates that every commit targets a catalog-managed table
@@ -122,12 +124,12 @@ Parquet files and registering file metadata.
 
 ## Commit and handle the result
 
-Call `txn.commit()` to stage the commit and ratify it through UC.
+Call `txn.commit()` with the committer to stage the commit and ratify it through UC.
 
 ```rust,ignore
 use delta_kernel::transaction::CommitResult;
 
-match txn.commit(&engine)? {
+match txn.commit(&engine, &committer)? {
     CommitResult::Committed(committed) => {
         let version = committed.commit_version();
         let post_commit_snapshot = committed
@@ -179,18 +181,9 @@ normal delta file in `_delta_log/`. Without publishing, only catalog-aware
 readers can see the commit.
 
 ```rust,ignore
-use delta_kernel_unity_catalog::UCCommitter;
-use unity_catalog_delta_client_api::TableIdentifier;
-
-// Build a committer to drive publishing
-let committer: Box<dyn delta_kernel::committer::Committer> = Box::new(UCCommitter::new(
-    update_client.clone(),
-    table_id.clone(),
-    TableIdentifier::new("my_catalog", "my_schema", "my_table"),
-));
-
+// Reuse the committer from the commit step: `commit()` only borrowed it.
 let published_snapshot = post_commit_snapshot
-    .publish(&engine, committer.as_ref())?;
+    .publish(&engine, &committer)?;
 ```
 
 Publishing copies each staged commit from `_staged_commits/<version>.<uuid>.json`
@@ -286,18 +279,18 @@ let engine = build_engine_with_credentials(&table_uri, &creds)?;
 let snapshot = snapshot_builder_from_load_table(&resp)?.build(&engine)?;
 
 // 5. Create transaction with UCCommitter
-let committer = Box::new(UCCommitter::new(
+let committer = UCCommitter::new(
     update_client.clone(),
     table_id.clone(),
     TableIdentifier::new("my_catalog", "my_schema", "my_table"),
-));
+);
 let mut txn = snapshot.clone()
     .update_table(
         UpdateTableOperation::Custom("INSERT".to_string()),
         "my-app/1.0",
         /* data_change */ true,
     )
-    .build(&engine, committer)?;
+    .build(&engine)?;
 
 // 6. Write data
 let write_state = txn.write_state()?;
@@ -306,13 +299,7 @@ let write_context = write_state.write_context_builder().build()?;
 txn.add_files(file_metadata);
 
 // 7. Commit, publish, and checkpoint
-let committer_for_publish: Box<dyn delta_kernel::committer::Committer> = Box::new(UCCommitter::new(
-    update_client.clone(),
-    table_id.clone(),
-    TableIdentifier::new("my_catalog", "my_schema", "my_table"),
-));
-
-match txn.commit(&engine)? {
+match txn.commit(&engine, &committer)? {
     CommitResult::Committed(committed) => {
         let post_commit_snapshot = committed
             .post_commit_snapshot()
@@ -320,7 +307,7 @@ match txn.commit(&engine)? {
 
         // Publish staged commits to _delta_log/
         let published_snapshot = post_commit_snapshot
-            .publish(&engine, committer_for_publish.as_ref())?;
+            .publish(&engine, &committer)?;
 
         // Checkpoint the published snapshot
         published_snapshot.checkpoint(&engine, None)?;
