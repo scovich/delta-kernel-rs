@@ -227,14 +227,17 @@ impl CommitRange {
 
         let read_schema = Arc::new(StructType::try_new(actions.iter().map(action_to_field))?);
 
-        Ok(CommitActionsIterator {
-            engine,
+        let state = CommitActionState {
             table_root: self.table_root.clone(),
-            log_path_iter: self.commit_files.clone().into_iter(),
             commit_ordering: self.commit_ordering,
             read_schema,
             latest_protocol,
             latest_metadata,
+        };
+        Ok(CommitActionsIterator {
+            engine,
+            log_path_iter: self.commit_files.clone().into_iter(),
+            state,
         })
     }
 }
@@ -290,33 +293,41 @@ impl Iterator for CommitFileIterator {
     }
 }
 
-/// Iterator yielded by [`CommitRange::commits`]. Holds the iterator's accumulated
-/// `latest_protocol` / `latest_metadata` and
-/// constructs a fresh [`CommitAction`] for each commit, running per-commit protocol
-/// validation before yielding.
+/// Iterator yielded by [`CommitRange::commits`].
 pub(crate) struct CommitActionsIterator {
     engine: Arc<dyn Engine>,
-    table_root: Url,
     log_path_iter: std::vec::IntoIter<ParsedLogPath>,
+    state: CommitActionState,
+}
+
+/// State behind [`CommitRange::commits`]. Holds the accumulated
+/// `latest_protocol` / `latest_metadata` and constructs a fresh [`CommitAction`] for each
+/// commit, running per-commit protocol validation before yielding.
+pub(crate) struct CommitActionState {
+    table_root: Url,
     commit_ordering: CommitOrdering,
     read_schema: SchemaRef,
     latest_protocol: Option<Protocol>,
     latest_metadata: Option<Metadata>,
 }
 
-impl CommitActionsIterator {
-    /// Build and validate a `CommitAction` for `log_path` (seeded with the iterator's accumulated
-    /// state), then advance that state for the next commit.
+impl CommitActionState {
+    /// Build and validate a `CommitAction` for `log_path` (seeded with the accumulated state),
+    /// then advance that state for the next commit.
     ///
     /// Accumulated `(Protocol, Metadata)` only flows forward in ascending order. Walking backward
     /// can't reconstruct an earlier version's effective state, so descending resets it to `None`.
     /// Commits below the anchor are validated/timestamped best-effort against only their own
     /// actions. Another solution is to walk the commit in ascending then reversing in the
     /// [`CommitOrdering::DescendingOrder`] scenario.
-    fn try_advance(&mut self, log_path: ParsedLogPath) -> KernelResult<CommitAction> {
+    fn try_advance(
+        &mut self,
+        engine: &dyn Engine,
+        log_path: ParsedLogPath,
+    ) -> KernelResult<CommitAction> {
         let version = log_path.version;
         let commit_action = CommitAction::try_new(
-            self.engine.as_ref(),
+            engine,
             self.table_root.clone(),
             log_path,
             self.read_schema.clone(),
@@ -358,7 +369,7 @@ impl Iterator for CommitActionsIterator {
 
     fn next(&mut self) -> Option<Self::Item> {
         let log_path = self.log_path_iter.next()?;
-        Some(self.try_advance(log_path))
+        Some(self.state.try_advance(self.engine.as_ref(), log_path))
     }
 }
 
