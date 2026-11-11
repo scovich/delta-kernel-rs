@@ -5,7 +5,9 @@
 Delta-kernel-rs is a Rust library for building Delta Lake connectors. It encapsulates the
 Delta protocol so connectors can read and write Delta tables without understanding protocol
 internals. Kernel never does I/O directly: it defines _what_ to do via its APIs
-(`Snapshot`, `Scan`, `Transaction`) and delegates _how_ to the `Engine` trait.
+(`Snapshot`, `Scan`, `Transaction`) and delegates _how_ to the connector: either through the
+`Engine` trait, or by surfacing typed requests to a connector-owned driver (see "Connector-driven
+execution" below).
 
 Current capabilities include table reads with predicates, data skipping, deletion vectors,
 change data feed, incremental scans (`incremental_scan_builder`) and commit ranges, checkpoints
@@ -116,7 +118,8 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   cargo feature off, any table listing it is rejected; with it on, scans and CDF are supported
   but writes are still blocked.
 - `internal-api`: unstable APIs like `parallel_scan_metadata`. Items are marked with the
-  `#[internal_api]` proc macro attribute.
+  `#[internal_api]` proc macro attribute. Also exposes the coroutine `Channel`, `generator` and
+  `workflow!` machinery, for defining a custom request vocabulary.
 - `declarative-plans`: experimental declarative-plan IR (`kernel/src/plans/`) and the prost
   proto wire format mirroring it (`kernel/proto/`). Auto-enables `internal-api`, but not Arrow.
 - `vendored-protoc`: supplies `protoc` for `declarative-plans`; without it, set `PROTOC` to a
@@ -129,15 +132,16 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
 table at a specific version. From it you build a `Scan` (reads) or `Transaction` (writes).
 
 **Snapshot metadata:** `snapshot.reader()` creates a `SnapshotReader` for metadata getters that may
-read storage. Its optional token scopes synchronous, blocking reads without changing the shared
-snapshot or the connector's engine. In-memory getters remain on `Snapshot`.
+read storage. Getters are synchronous and may block; each has a `*_with_cancellation` sibling that
+takes a per-call token, and the reader stores none. In-memory getters remain on `Snapshot`.
 
 **Read path:** `Snapshot` -> `ScanBuilder` -> `Scan` -> data. Execution paths:
 `execute()` (simple), `scan_metadata()` (advanced/distributed),
 `parallel_scan_metadata()` (two-phase distributed log replay).
 
 
-**Write path:** `Snapshot` -> `UpdateTableTransactionBuilder` -> `Transaction` -> `commit()`.
+**Write path:** `Snapshot` -> `UpdateTableTransactionBuilder` -> `Transaction` ->
+`commit(engine, committer)`.
 `UpdateTableTransactionBuilder<MODE>` aliases `TransactionBuilder<UpdateTable, MODE>`; the
 create-table builder aliases `TransactionBuilder<CreateTable, MODE>`. The mode defaults to
 `Imperative`. Both entry points return imperative builders; with `declarative-plans`,
@@ -169,12 +173,27 @@ Writers configure transaction intent before `build()`, then call
 Kernel assembles commit actions, enforces protocol compliance, and delegates the atomic commit to a
 `Committer`.
 
+Builders and transactions hold no committer. `Transaction::commit(engine, &dyn Committer)` takes it
+per call and may be retried with the same committer; `Transaction::commit_workflow()` is
+committer-free, and the connector serving `Request::Commit` selects the committer.
+
 **Engine trait:** exposes `StorageHandler`, `JsonHandler`, `ParquetHandler`, and
 `EvaluationHandler`, plus an optional `PlanExecutor` under `declarative-plans`. Metrics use tracing
 layers rather than an engine handler. `DefaultEngine` lives in `default-engine/src/`.
 
+**Connector-driven execution:** kernel operations are `async` functions that post typed
+`Request`s through a `Channel` and await each `Reply` (`kernel/src/coroutine/`). A `Workflow`
+wraps one operation with a single output; a `Coroutine` also yields a stream. The connector owns
+the driver loop (`drive_workflow!`, `drive_workflow_async!`, `Workflow::advance`), so kernel needs
+no runtime. `DefaultEngine::async_connector()` returns the native `AsyncEngineConnector`. Every
+`fn foo(engine: &dyn Engine)` that does I/O is a shim: `run_workflow_with_engine!` drives
+`foo_with_channel` through `EngineConnector`, which serves requests with Engine handlers. Public
+entry points add `foo_workflow()`, and cancellation is a per-call `foo_with_cancellation(engine,
+token)` sibling, never stored state. See `CLAUDE/architecture.md`.
+
 **EngineData:** opaque columnar data interface. NEVER access `EngineData` columns
 directly: ALWAYS use the visitor pattern (`visit_rows` with typed `GetData` accessors).
+`EngineData` must be cheaply cloneable (`clone_data`).
 
 ## Testing
 
@@ -225,10 +244,10 @@ directly: ALWAYS use the visitor pattern (`visit_rows` with typed `GetData` acce
   column mapping on/off) and asserting success vs. error.
 - Reuse helpers from `test_utils` and the integration-test fixtures instead of writing
   custom ones when possible. See **Common test helpers** below for a curated starter list.
-- **Committing in tests:** Use `txn.commit(engine)?.unwrap_committed()` to assert a
-  successful commit and get the `CommittedTransaction`. When you only need the resulting
-  snapshot, use `txn.commit(engine)?.unwrap_post_commit_snapshot()` to get the
-  `SnapshotRef` directly. Do NOT use `match` + `panic!` for either: both helpers provide a clear
+- **Committing in tests:** Use `txn.commit(engine, &FileSystemCommitter)?.unwrap_committed()` to
+  assert a successful commit and get the `CommittedTransaction`. When you only need the resulting
+  snapshot, use `txn.commit(engine, &FileSystemCommitter)?.unwrap_post_commit_snapshot()` to get
+  the `SnapshotRef` directly. Do NOT use `match` + `panic!` for either: both helpers provide a clear
   error message on failure. Available under `#[cfg(test)]` and the `test-utils` feature.
 - **Prefer snapshot/public API assertions over reading raw commit JSON.** Only read raw
   commit JSON when the data is inaccessible via public API (e.g., system domain metadata
@@ -270,6 +289,10 @@ This list is non-exhaustive: when in doubt, browse the source files directly
 - `engine_store_setup(table_name, local_directory)`: returns
   `(store, engine, table_location)` when a test needs direct object-store access.
 - `setup_test_tables(...)`: multiple pre-built tables for read/scan tests.
+- `CountingEngine`: delegates to an inner engine and counts actual handler operations without
+  counting handler access. Use it to assert that a fast path avoids I/O or evaluation. The Engine
+  shim captures every handler once per drive, so a test engine that panics or counts on handler
+  accessors sees those calls even when no I/O follows.
 
 **Table creation in tests**
 

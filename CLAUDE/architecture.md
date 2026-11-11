@@ -8,17 +8,18 @@ Compute Engine (Spark, Flink, DuckDB, Polars, ...)
     -> Delta Kernel (snapshot loading, scan orchestration, write transaction coordination,
        log replay, data skipping, schema enforcement, predicate evaluation,
        physical-to-logical transforms, deletion vector handling, checkpointing)
-      -> Engine trait (abstraction for I/O and compute)
-        -> DefaultEngine (Arrow + object_store + Tokio) or custom engine
+      -> Engine trait, or a connector-owned driver (abstraction for I/O and compute)
+        -> DefaultEngine (Arrow + object_store + Tokio), AsyncEngineConnector, or a custom engine
           -> Storage (local FS, S3, GCS, Azure, HDFS, ...)
 ```
 
 Kernel handles the Delta protocol; connectors handle execution, distribution, and data flow.
-Kernel never does I/O directly: it delegates all I/O to the Engine trait. Kernel also leaves
-columnar memory representation and I/O scheduling to the connector and engine. For example, during
-log replay or checkpoint writes, kernel receives opaque `EngineData` batches, inspects them via the
-visitor pattern, updates a selection vector, and hands them back to the engine: it never
-deserializes the full batch into in-memory structs.
+Kernel never does I/O directly: every I/O step is either a call to an Engine handler (through the
+Engine shim) or a request that a connector-owned driver serves (see "Connector-driven execution").
+Kernel also leaves columnar memory representation and I/O scheduling to the connector and
+engine. For example, during log replay or checkpoint writes, kernel receives opaque `EngineData`
+batches, inspects them via the visitor pattern, updates a selection vector, and hands them back to
+the engine: it never deserializes the full batch into in-memory structs.
 
 ## Error Handling
 
@@ -76,12 +77,10 @@ typed hint through a callback; connectors must copy any state retained after the
    (`kernel/src/log_segment/`) and resolve Protocol and Metadata through CRC state or log replay.
    Domain metadata is resolved lazily from CRC state or log replay when queried. Snapshot-hint
    builds validate and assemble the supplied state instead.
-   The snapshot builder binds its optional cancellation token through `CancellableEngine`, an owned
-   adapter over the existing engine handlers. Discovery, CRC reads/reconstruction, and imperative
-   replay inherit the build token. `CancellableEngine` is crate-private; connectors configure
-   cancellation through the snapshot builder and pass their original engine.
-   Completed snapshots retain neither the adapter nor its token. Declarative plan execution
-   uses the original executor unchanged.
+   `SnapshotBuilder::build_with_cancellation(engine, token)` wraps the engine in the crate-private
+   `CancellableEngine` for that call only. Discovery, CRC reads/reconstruction, and imperative
+   replay inherit the token. The builder stores no token, and the snapshot retains neither the
+   adapter nor the token. Declarative plan execution uses the original executor unchanged.
 2. **Log replay** (`kernel/src/log_replay/`): file-action deduplication via
    `FileActionDeduplicator` and `LogReplayProcessor` trait (distinct from Protocol/Metadata
    replay above)
@@ -90,10 +89,10 @@ From a snapshot you can: read the schema and table properties, build a `Scan` to
 start a `Transaction` to write data, or create a checkpoint.
 
 Metadata getters that may read storage live on `SnapshotReader`, created with `snapshot.reader()`.
-The reader borrows the snapshot and optionally holds an operation token; each getter accepts the
-original engine and binds the token through a temporary private `CancellableEngine`. Getters are
-synchronous and may block on I/O, with or without a token. Cached results need not check cancellation.
-Separate readers keep their scopes independent without retaining an engine or changing the snapshot.
+The reader borrows the snapshot and holds no token. Each getter takes the original engine, and its
+`*_with_cancellation` sibling wraps that engine in a temporary private `CancellableEngine` for the
+call. Getters are synchronous and may block on I/O. Cached results need not check cancellation.
+`*_workflow` variants return a `Workflow` and take no token.
 
 ## Read Path
 
@@ -112,6 +111,11 @@ set), `data_skipping.rs` (rewrite predicates against min/max/nullCount stats and
   calls `transform_to_logical` / `DvInfo::get_selection_vector`
 - `scan.parallel_scan_metadata(engine)`: two-phase distributed log replay (requires the
   `internal-api` feature)
+
+Each path has a lazy `*_workflow` form (`scan_metadata_workflow()`, `execute_workflow()`,
+`parallel_scan_metadata_workflow()`) and, except `parallel_scan_metadata`, an
+`*_with_cancellation(engine, token)` form. A workflow whose output is a stream returns a
+`KernelResultGenerator`; pass it to `Coroutine::from_generator` to drive the stream.
 
 **Incremental read:** `Snapshot::incremental_scan_builder(base_version)` streams the file-action
 diff over `(base_version, target_version]`: live Adds as a `FilteredEngineData` iterator
@@ -156,22 +160,27 @@ directory. The transaction registers the resulting files, enforces protocol comp
 commit actions, and delegates the atomic commit to a `Committer`.
 
 **Data-write steps:**
-1. Configure an `UpdateTableTransactionBuilder` from a snapshot and build it with a `Committer`
-   (e.g. `FileSystemCommitter`)
+1. Configure an `UpdateTableTransactionBuilder` from a snapshot and `build(engine)` a
+   `Transaction`. Neither the builder nor the transaction holds a `Committer`.
 2. Call `txn.write_state()`, then use
    `WriteState::write_context_builder()` to bind partition values and build a `BoundWriteContext`.
    Distributed writers can encode the state and decode it on each worker before binding partition
    values.
 3. Write Parquet files (via engine), collect file metadata
 4. Register files via `txn.add_files(metadata)` and stage any removals or deletion-vector updates
-5. Commit: returns `CommitResult::Committed`, `Conflicted`, or `Retryable`
+5. Commit with `txn.commit(engine, &committer)` (e.g. `&FileSystemCommitter`), or run
+   `txn.commit_workflow()` and let the connector serving `Request::Commit` choose the committer.
+   Returns `CommitResult::Committed`, `Conflicted`, or `Retryable`. A retry may reuse the same
+   committer.
 
 - **Transaction** (`kernel/src/transaction/`): blind append writes, file removals, deletion-vector
   updates, table creation (including clustered tables via `DataLayout`), and limited schema
   evolution
 - **Committer** (`kernel/src/committer/`): commit coordination. `FileSystemCommitter` for
   filesystem tables (atomic put-if-absent to `_delta_log/`); custom `Committer` implementations
-  for catalog-managed tables (staging, ratifying, publishing).
+  for catalog-managed tables (staging, ratifying, publishing). `Committer::commit(engine, Commit)`
+  receives an opaque `Commit`; `Commit::try_into_parts` / `try_into_engine_parts` validate the
+  committer against the commit type and return `CommitMetadata` and the actions.
 
 ## Engine Trait System
 
@@ -180,19 +189,68 @@ handlers below and an optional `PlanExecutor` under the `declarative-plans` feat
 
 | Handler              | Purpose                          | Key Methods                                |
 |----------------------|----------------------------------|--------------------------------------------|
-| `StorageHandler`     | File system operations           | `list_from`, `read_files`, etc.            |
+| `StorageHandler`     | File system operations           | `list_from(path, end)`, `read_files`, etc. |
 | `JsonHandler`        | Delta log commit parsing/writing | `parse_json`, `read_json_files`            |
-| `ParquetHandler`     | Data file and checkpoint I/O     | `read_parquet_files`, `write_parquet_file`  |
+| `ParquetHandler`     | Data file and checkpoint I/O     | `read_parquet_files`, `write_parquet_file`, `write_parquet_files` |
 | `EvaluationHandler`  | Expression/predicate evaluation  | `new_expression_evaluator`, etc.           |
 
 Metrics are emitted as tracing events and collected by tracing layers. A `DefaultEngine` (Arrow +
 `object_store` + Tokio) lives in `default-engine/src/`. Custom engines only need to replace
 specific handlers: they can reuse defaults for the rest.
 
-`CancellableEngine` wraps storage, JSON, and Parquet handlers with a default read token. Ordinary
-handler calls inherit it; per-call tokens on cancellation-aware handler APIs override it. Parsing,
-writes, evaluation, and declarative execution pass through unchanged. HEAD checks the default token,
-without interrupting an active request; nested wrappers each perform this check.
+`CancellableEngine` wraps storage, JSON, and Parquet handlers with a default read token for the
+duration of one `*_with_cancellation` call. Ordinary handler calls inherit it; per-call tokens on
+cancellation-aware handler APIs override it. Parsing, writes, evaluation, and declarative
+execution pass through unchanged. HEAD checks the default token, without interrupting an active
+request; nested wrappers each perform this check.
+
+## Connector-driven execution (coroutines)
+
+Kernel's protocol logic is written once, as `async` functions over a `Channel`. The Engine trait
+is one driver of that logic; a connector can be another.
+
+**New-code convention.** New I/O goes through the `Channel`, and the Engine paths are shims over
+it. Write I/O-performing kernel code as `async fn foo_with_channel(channel: &Channel, ..)` using
+`ChannelExt` operations, and keep `foo(engine)` as a shim. Put `#[instrument]` on the
+`_with_channel` function so every path reports the same metrics. A new kind of connector work needs
+a `Request` variant and an arm in both `EngineConnector` and `AsyncEngineConnector`. Do not call
+`engine.*_handler()` from new kernel code.
+
+**Types** (`kernel/src/coroutine/`). A `Request` carries an operation payload and a single-use
+`Reply`; sending or dropping the reply (dropping yields `KernelError::RequestRejected`) wakes the
+awaiting operation. `Workflow<'a, P, O>` and `Coroutine<'a, P, Y, O>` own their channel and are
+advanced with `advance` (async) or `try_advance` (sync, `WouldBlock` if nothing is ready).
+`drive_workflow!` and `drive_workflow_async!` expand the one-request-at-a-time loop. Paged reads
+use `PageRequest::Prepare`/`Next` with an opaque `Cursor`. `coroutine/kernel/` fixes `P` to
+kernel's `Request` and defines `ChannelExt`, the typed operations (`list_directory`,
+`read_small_file`, `read_json_files`, `create_many`, `write_json_file`, ...). The Unity Catalog
+crate has its own vocabulary in `delta-kernel-unity-catalog/src/coroutine.rs`.
+
+**Conversion shape.** `fn foo(engine: &dyn Engine)` becomes a shim over
+`async fn foo_with_channel(channel: &Channel, ..)` via `run_workflow_with_engine!`. A `pub` entry
+point also gets `foo_workflow()`, built with `workflow!` (borrows) or `static_workflow!` (owns its
+inputs). A workflow whose output is a stream returns a `KernelResultGenerator`.
+
+**Drivers.** `EngineConnector` (`coroutine/kernel/engine.rs`) serves requests with Engine
+handlers. `drive_with_engine` and `drive_with_committer` build one, and `EngineConnector::new`
+captures every handler once per drive. `AsyncEngineConnector`
+(`default-engine/src/coroutine.rs`, `DefaultEngine::async_connector()`) serves requests with
+native `object_store` I/O, one request at a time, and handles `Request::Commit` with
+`FileSystemCommitter`; it rejects catalog commits and publishing.
+
+**Cancellation.** Cancellation is per call. `CancellableEngine` is how the Engine entry points
+honor a token. Workflows take no token: cancellation belongs to the driver. The Engine shim's
+`CancellationLatch` delivers the `KernelError::Cancelled` reply to the awaiting operation, keeps
+driving it to completion, and returns `Cancelled` at the end, so the operation's metric span ends
+with the error and reports its failure event. `AsyncEngineConnector` races the drive against its
+token and drops the workflow. The span that holds the operation's metric event then closes without
+the error event that turns a success event into its failure counterpart, so the operation reports
+its success metric event (a cancelled snapshot build reports `SnapshotBuildSuccess`). See the user
+guide's "Driving connector workflows" for the observable consequences.
+
+**Tracing.** Requests a driver serves run outside the operation's `#[instrument]` span (the span is
+entered only while the workflow is polled). `ReportGeneratorLayer` reads each metric span's own
+fields and never its parents, so kernel metrics are unaffected.
 
 ## EngineData Trait
 
@@ -205,8 +263,9 @@ type. (Unit tests using the default engine may legitimately downcast.)
 `DefaultEngine` uses `ArrowEngineData` (wrapping Arrow `RecordBatch`). Custom engines implement
 `EngineData` for their own columnar format.
 
-Key methods: `visit_rows`, `len`, `append_columns` (for partition value injection/column mapping),
-`apply_selection_vector` (for deletion vectors).
+Key methods: `visit_rows`, `len`, `clone_data` (a cheap clone that shares column buffers),
+`append_columns` (for partition value injection/column mapping), `apply_selection_vector` (for
+deletion vectors).
 
 **IMPORTANT:** Never assume that reading one file produces exactly one batch. Always iterate over
 all returned batches: the engine may split a single file across multiple batches.
@@ -224,6 +283,7 @@ all returned batches: the engine may split a single file across multiple batches
 - `kernel/src/partition/` -- partition value validation, serialization, Hive-style path
    encoding, URI encoding for `add.path`
 - `kernel/src/committer/`: `Committer` trait, `FileSystemCommitter`
+- `kernel/src/coroutine/`: `Workflow`, `Coroutine`, `Channel`, `Request`, Engine shim drivers
 - `kernel/src/log_segment/`: log file discovery, Protocol/Metadata replay
 - `kernel/src/log_replay/`: file-action deduplication, `LogReplayProcessor` trait
 - `kernel/src/log_reader/`: I/O layer for reading commit and checkpoint files
@@ -247,7 +307,8 @@ all returned batches: the engine may split a single file across multiple batches
 Tables whose commits go through a catalog (e.g. Unity Catalog) instead of direct filesystem
 writes. Kernel doesn't know about catalogs: the catalog client provides a log tail via
 `SnapshotBuilder::with_log_tail()`, caps the version via `with_max_catalog_version()`, and
-uses a custom `Committer` for staging/ratifying/publishing commits.
+supplies a custom `Committer` at commit time (`txn.commit(engine, &committer)`) and to
+`Snapshot::publish`; `UCCommitter` also offers `commit_workflow`/`publish_workflow`.
 
 The `UCCommitter` (in the `delta-kernel-unity-catalog` crate) is the reference implementation of a
 catalog committer for Unity Catalog. It writes version 0 directly to `_delta_log/`. For later
