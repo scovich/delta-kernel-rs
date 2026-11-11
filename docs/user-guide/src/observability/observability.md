@@ -25,8 +25,14 @@ tracing-subscriber Registry
     +-- EnvFilter, etc.
 ```
 
-This means metrics aren't tied to your `Engine`. You wire them up once, at
-process startup, alongside any other tracing layers you want.
+This means metrics aren't tied to your `Engine` or to how you drive Kernel.
+You wire them up once, at process startup, alongside any other tracing layers
+you want.
+
+Kernel's operation spans, such as `snap.checkpoint` and `txn.commit`, are entered only while
+Kernel runs the operation. When you [drive a workflow yourself](../connector/driving_workflows.md),
+the I/O you serve for it runs outside those spans, so a trace-tree exporter doesn't nest it under
+them. Metric events are unaffected: `ReportGeneratorLayer` reports each metric span on its own.
 
 ## Enabling metrics
 
@@ -171,7 +177,9 @@ The `scan_type` field tells you which scan execution path produced the event:
 | `ScanType::SequentialPhase` | The sequential phase of `Scan::parallel_scan_metadata()`. |
 | `ScanType::ParallelPhase` | The parallel phase of `Scan::parallel_scan_metadata()`. |
 
-For `parallel_scan_metadata`, `finish()` emits the sequential-phase event. If it
+For `parallel_scan_metadata`, completing the sequential phase (`finish()` on the
+iterator, or the final `advance` or `try_advance` of the `SequentialScanMetadata`
+coroutine) emits the sequential-phase event. If it
 returns parallel work, call `state.log_metrics()` exactly once after all workers
 complete to emit the parallel-phase event. Action counts and timings are phase-local;
 `peak_hash_set_size` is the whole-scan high-water mark and should not be combined.
@@ -180,7 +188,8 @@ Join the two events by `operation_id` to obtain whole-scan metrics.
 ### Storage and file I/O events
 
 These events track low-level I/O operations. The default storage, JSON, and
-Parquet handlers emit them automatically when the metrics layer is installed.
+Parquet handlers, and `AsyncEngineConnector`, emit them automatically when the
+metrics layer is installed.
 Unlike snapshot events, these don't carry an `operation_id` because a single
 storage call may serve multiple higher-level operations.
 
@@ -195,10 +204,11 @@ storage call may serve multiple higher-level operations.
 | `CrcReadFailure` | none | A CRC file read or parse failed. The caller falls back to log replay. |
 
 > [!NOTE]
-> If you implement a custom `JsonHandler` or `ParquetHandler`, call
-> `delta_kernel::metrics::emit_json_read_completed` or
-> `emit_parquet_read_completed` once per read call so connectors that install
-> the metrics layer still see those events from your handler.
+> If you implement a custom `JsonHandler` or `ParquetHandler`, or serve Kernel's requests
+> yourself, call the matching `delta_kernel::metrics::emit_*` function once per operation so
+> connectors that install the metrics layer still see the event: `emit_json_read_completed`,
+> `emit_parquet_read_completed`, `emit_storage_list_completed`, `emit_storage_read_completed`, and
+> `emit_storage_copy_completed`.
 
 ### Checksum write events
 

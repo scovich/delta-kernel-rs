@@ -115,8 +115,8 @@ The key principle: **Kernel handles the Delta protocol, your connector handles e
 ## The Engine trait: pluggable I/O and compute
 
 Kernel never does I/O directly. When it needs to list files, read Parquet, parse JSON, or
-evaluate expressions, it calls into the `Engine` trait. This is where you can plug in your
-engine's native implementations for maximum performance.
+evaluate expressions, it calls into the `Engine` trait, or posts a request to a driver you own.
+This is where you can plug in your engine's native implementations for maximum performance.
 
 Kernel provides a `DefaultEngine` (Arrow + `object_store` + Tokio). Many connectors
 start here and only replace specific handlers when they need better performance. See
@@ -135,6 +135,9 @@ You need a custom `Engine` when:
 
 To use different cloud storage (S3, Azure, GCS), you do not need a custom engine.
 `DefaultEngine` supports all `object_store` backends without modification.
+
+If you want to run Kernel's I/O on your own async runtime without implementing handlers, drive
+Kernel's operations as workflows. See [Driving connector workflows](./driving_workflows.md).
 
 ## Getting started
 
@@ -168,5 +171,6 @@ Building a connector typically involves these steps:
 
 - [Implementing the Engine trait](./implementing_engine.md): when and how to customize the
   Engine
+- [Driving connector workflows](./driving_workflows.md): running Kernel on your own runtime
 - [Building a scan](../reading/building_a_scan.md): the Kernel read API
 - [Appending data](../writing/append.md): the Kernel write API

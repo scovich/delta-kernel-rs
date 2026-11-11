@@ -8,6 +8,9 @@ The [`Engine` rustdoc] defines the current trait. Follow its links for every han
 parameters, return values, errors, and ordering requirements. This page focuses on implementation
 sequence and design choices.
 
+If your connector runs its own I/O, you can drive Kernel's operations directly instead of
+implementing handlers. See [Driving connector workflows](./driving_workflows.md).
+
 [`Engine` rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/trait.Engine.html
 
 ## Choose what to replace

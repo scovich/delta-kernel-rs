@@ -26,8 +26,8 @@ of `ScanMetadata` (the same type that `scan_metadata()` yields):
 
 ```rust,ignore
 use delta_kernel::scan::{
-    AfterSequentialScanMetadata, ParallelScanMetadata, ParallelState,
-    SequentialScanMetadata,
+    AfterSequentialScanMetadata, ParallelScanMetadataIterator, ParallelState,
+    SequentialScanMetadataIterator,
 };
 
 let scan = snapshot.scan_builder().build()?;
@@ -59,7 +59,7 @@ match sequential.finish()? {
 ## Parallel phase
 
 If `finish()` returns `Parallel`, partition the `files` across workers and create a
-`ParallelScanMetadata` iterator per partition:
+`ParallelScanMetadataIterator` per partition:
 
 ```rust,ignore
 AfterSequentialScanMetadata::Parallel { state, files } => {
@@ -68,7 +68,7 @@ AfterSequentialScanMetadata::Parallel { state, files } => {
 
     // Distribute files across workers (one file per worker, or batched)
     for file in files {
-        let parallel = ParallelScanMetadata::try_new(
+        let parallel = ParallelScanMetadataIterator::try_new(
             engine.clone(),
             state.clone(),
             vec![file],
@@ -81,9 +81,16 @@ AfterSequentialScanMetadata::Parallel { state, files } => {
 }
 ```
 
-Each `ParallelScanMetadata` reads its assigned checkpoint files and processes them through
+Each `ParallelScanMetadataIterator` reads its assigned checkpoint files and processes them through
 the shared `ParallelState`, which handles deduplication (filtering out files already seen in
 the sequential phase).
+
+A connector that drives Kernel itself uses the workflow forms.
+`Scan::parallel_scan_metadata_workflow()` returns the sequential phase as a
+`SequentialScanMetadata` coroutine whose terminal output is the `AfterSequentialScanMetadata`, and
+`ParallelState::scan_metadata_workflow(files)` returns a workflow whose output is a
+`ParallelScanMetadata` coroutine for one partition. See
+[Driving connector workflows](../connector/driving_workflows.md).
 
 ## Serializing state across the network
 
@@ -99,7 +106,7 @@ AfterSequentialScanMetadata::Parallel { state, files } => {
 
     // On each worker: reconstruct state from bytes and create a parallel iterator
     let state = Arc::new(ParallelState::from_bytes(engine.as_ref(), &serialized_bytes)?);
-    let parallel = ParallelScanMetadata::try_new(engine.clone(), state, my_files)?;
+    let parallel = ParallelScanMetadataIterator::try_new(engine.clone(), state, my_files)?;
 }
 ```
 

@@ -27,7 +27,8 @@ Before diving in, here are the key terms used throughout this guide:
   required handlers (`StorageHandler`, `ParquetHandler`, `JsonHandler`,
   `EvaluationHandler`) and one optional handler (`MetricsReporter`).
   A `DefaultEngine` is provided. Connectors can implement their own for better performance
-  with their native data formats and I/O.
+  with their native data formats and I/O. A connector can also skip the trait and drive Kernel's
+  operations itself; see [Driving connector workflows](../connector/driving_workflows.md).
 
 ## Layered design
 

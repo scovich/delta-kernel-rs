@@ -311,11 +311,10 @@ use the earlier instant, and nonexistent local times use the offset from before 
 
 Log replay for a large table can read many commit and checkpoint files before it yields a single
 `ScanMetadata`. If the request driving the scan goes away — a cancelled query, a dropped
-connection — you can tell Kernel to stop instead of reading to the end. Attach a
-`CancellationToken` to the scan with `with_cancellation_token`:
+connection — you can tell Kernel to stop instead of reading to the end. Pass a
+`CancellationToken` to `scan_metadata_with_cancellation`:
 
 ```rust,ignore
-use std::sync::Arc;
 use delta_kernel::CancellationTokenRef;
 
 // `token` is your connector's cancellation handle, implementing `CancellationToken`.
@@ -324,12 +323,9 @@ use delta_kernel::CancellationTokenRef;
 // Implementing the Engine Trait for how to build one.
 let token: CancellationTokenRef = my_request_token();
 
-let scan = snapshot
-    .scan_builder()
-    .with_cancellation_token(token)
-    .build()?;
+let scan = snapshot.scan_builder().build()?;
 
-for metadata in scan.scan_metadata(engine)? {
+for metadata in scan.scan_metadata_with_cancellation(engine, Some(token))? {
     let metadata = metadata?; // may yield Err(KernelError::Cancelled) if cancellation stops replay
     // ... process the batch ...
 }
@@ -344,10 +340,10 @@ Cancellation can race with successful completion. Work already initiated may com
 results may still be returned. If cancellation stops replay before completion, it surfaces as
 `KernelError::Cancelled` rather than a partial result that appears complete.
 
-Without a scan token, Kernel leaves I/O cancellation to your engine's handlers, and it does
-not check cancellation while consuming cached metadata passed to `scan_metadata_from`.
-[`parallel_scan_metadata()`](./parallel_scan_metadata.md) rejects a scan token; it doesn't provide
-end-to-end cancellation across its distributed phases.
+Without a token, Kernel leaves I/O cancellation to your engine's handlers.
+`execute_with_cancellation` covers log replay, data reads, and deletion-vector reads of
+`Scan::execute` in the same way. [`parallel_scan_metadata()`](./parallel_scan_metadata.md) has no
+cancellable variant: cancel its distributed phases through the engine or connector that runs them.
 
 ## What's next
 

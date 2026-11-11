@@ -49,6 +49,7 @@
 
 - [Overview](./connector/overview.md)
 - [Implementing the Engine Trait](./connector/implementing_engine.md)
+- [Driving Connector Workflows](./connector/driving_workflows.md)
 - [The EngineData Trait](./connector/engine_data.md)
 
 # Catalog-Managed Tables

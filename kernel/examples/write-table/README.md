@@ -8,6 +8,9 @@ This example shows how to write a Delta table using the default engine by:
 - Generating random Apache Arrow data for the table
 - Committing the transaction
 
+Snapshot loading, transaction building, and commits run through the default engine's
+`AsyncEngineConnector`.
+
 Note: As of July 2025, the Rust kernel does not officially expose APIs for creating tables. This example uses unofficial, internal APIs to create the table.
 
 Additional details about the example:

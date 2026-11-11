@@ -2,7 +2,9 @@
 
 The `Engine` trait separates Kernel's protocol logic from connector-provided I/O and computation.
 This boundary lets you use Kernel with different storage systems, columnar formats, and runtimes.
-The [`Engine` rustdoc] owns the exact trait and handler contracts.
+The [`Engine` rustdoc] owns the exact trait and handler contracts. A connector that serves Kernel's
+I/O itself can skip the trait and drive Kernel's operations as workflows. See
+[Driving connector workflows](../connector/driving_workflows.md).
 
 [`Engine` rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/trait.Engine.html
 
@@ -24,8 +26,9 @@ Engine capabilities
 Storage, columnar data, and expression runtime
 ```
 
-Kernel's public APIs stay synchronous and runtime-independent. An Engine can use asynchronous I/O
-internally, as the default engine does, without requiring every Kernel caller to adopt that runtime.
+The `Engine`-based Kernel APIs stay synchronous and runtime-independent. An Engine can use
+asynchronous I/O internally, as the default engine does, without requiring every Kernel caller to
+adopt that runtime.
 
 ## Capability boundaries
 
@@ -61,14 +64,17 @@ explains how that abstraction works.
 
 ## Cancellation
 
-A connector can attach a cancellation token to a snapshot builder, metadata reader, or scan so
-long-running reads stop when their caller goes away. Kernel carries that token to cancellation-aware
-storage, JSON, and Parquet operations.
+A connector can pass a cancellation token to a single call so long-running reads stop when their
+caller goes away. Kernel carries that token to cancellation-aware storage, JSON, and Parquet
+operations.
 
-### Attaching a token
+### Passing a token
 
-Attach the token separately to each operation whose storage reads you want to cancel. A metadata
-reader does not inherit the token used to build its `Snapshot`.
+Pass the token to each call whose storage reads you want to cancel, through its
+`*_with_cancellation` sibling. Kernel stores the token nowhere: not on the builder, the snapshot,
+the reader, or the scan. A metadata reader does not inherit the token used to build its `Snapshot`.
+Workflow entry points take no token. See
+[Cancellation](../connector/driving_workflows.md#cancellation).
 
 ```rust,no_run
 # extern crate delta_kernel;
@@ -91,6 +97,8 @@ let metadata = scan.scan_metadata_with_cancellation(engine, Some(token))?;
 # Ok(())
 # }
 ```
+
+Passing `None` leaves your engine's own cancellation behavior unchanged.
 
 `SnapshotReader` getters remain synchronous and may block. The token applies to handler-backed
 I/O, so a getter may return metadata already held by the `Snapshot` without checking cancellation.

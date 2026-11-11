@@ -273,6 +273,15 @@ impl Committer for MyCatalogCommitter {
 }
 ```
 
+## Connector-driven commits
+
+If your connector runs `Transaction::commit_workflow()`, Kernel posts `Request::Commit` and you
+choose the committer. `Commit::try_into_parts(is_catalog_committer)` returns the same metadata with
+the actions as a connector-driven stream. See
+[Driving connector workflows](../connector/driving_workflows.md), and
+[Serve Unity Catalog commits](../connector/driving_workflows.md#serve-unity-catalog-commits) for a
+complete Unity Catalog example.
+
 For a complete Unity Catalog implementation, see
 [Unity Catalog integration](../unity_catalog/overview.md).
 
