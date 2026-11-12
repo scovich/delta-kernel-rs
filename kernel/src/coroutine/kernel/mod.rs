@@ -37,7 +37,7 @@ pub(crate) use self::engine::{
     run_workflow_with_engine, run_workflow_with_storage,
 };
 pub use self::request::{PlanRequest, Request};
-use crate::KernelResult;
+use crate::{KernelError, KernelResult};
 
 #[cfg(feature = "internal-api")]
 pub mod channel;
@@ -48,10 +48,16 @@ pub(crate) mod engine;
 pub mod request;
 
 /// Kernel workflow that may borrow captured state.
-pub type Workflow<'a, O> = super::Workflow<'a, Request, O>;
+///
+/// `E` is the terminal error type: the top-level [`Error`](crate::Error) for an operation that can
+/// fail with a [`DeltaError`](crate::DeltaError), and [`KernelError`] otherwise.
+pub type Workflow<'a, O, E = KernelError> = super::Workflow<'a, Request, O, E>;
 
 /// Kernel workflow that owns all captured state.
-pub type StaticWorkflow<O> = super::StaticWorkflow<Request, O>;
+///
+/// `E` is the terminal error type: the top-level [`Error`](crate::Error) for an operation that can
+/// fail with a [`DeltaError`](crate::DeltaError), and [`KernelError`] otherwise.
+pub type StaticWorkflow<O, E = KernelError> = super::StaticWorkflow<Request, O, E>;
 
 /// Request or completion from a Kernel [`Workflow`].
 pub type WorkflowStep<O> = super::WorkflowStep<Request, O>;

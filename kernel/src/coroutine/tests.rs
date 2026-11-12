@@ -42,7 +42,7 @@ enum ReplyOutcome {
 fn static_workflow_and_coroutine_are_send() {
     fn assert_send<T: Send>(_: T) {}
 
-    let workflow =
+    let workflow: StaticWorkflow<Request, ()> =
         crate::coroutine::static_workflow!(Request, |_channel| std::future::ready(Ok(())));
     let coroutine: crate::coroutine::StaticCoroutine<Request, ()> =
         static_coroutine!(Request, |_channel| std::future::ready(Ok(())));

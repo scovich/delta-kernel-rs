@@ -24,7 +24,7 @@ use delta_kernel::history_manager::{
 use delta_kernel::object_store::ObjectStore;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{CheckpointWriteResult, LogSegmentStats, Snapshot, SnapshotRef};
-use delta_kernel::{Engine, EngineData, FileStats, KernelResult, Version};
+use delta_kernel::{Engine, EngineData, FileStats, KernelError, KernelResult, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::trace;
 use url::Url;
@@ -767,10 +767,10 @@ pub trait ExternEngine: Send + Sync {
 }
 
 /// Drives a Kernel workflow through the engine exposed by `extern_engine`.
-pub(crate) fn drive_kernel<O: Send + 'static>(
+pub(crate) fn drive_kernel<O: Send + 'static, E: From<KernelError>>(
     extern_engine: &dyn ExternEngine,
-    workflow: Workflow<'_, O>,
-) -> KernelResult<O> {
+    workflow: Workflow<'_, O, E>,
+) -> KernelResult<O, E> {
     drive_with_engine(extern_engine.engine().as_ref(), workflow)
 }
 

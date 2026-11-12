@@ -77,7 +77,10 @@ impl EngineConnector {
     }
 
     /// Drive an existing workflow through this connector.
-    pub(crate) fn drive<O>(&self, workflow: Workflow<'_, O>) -> KernelResult<O> {
+    pub(crate) fn drive<O, E: From<KernelError>>(
+        &self,
+        workflow: Workflow<'_, O, E>,
+    ) -> KernelResult<O, E> {
         drive_connector(self, workflow)
     }
 
@@ -234,10 +237,10 @@ where
 
 /// Drive `workflow` through `engine`.
 #[internal_api]
-pub(crate) fn drive_with_engine<O>(
+pub(crate) fn drive_with_engine<O, E: From<KernelError>>(
     engine: &dyn Engine,
-    workflow: Workflow<'_, O>,
-) -> KernelResult<O> {
+    workflow: Workflow<'_, O, E>,
+) -> KernelResult<O, E> {
     EngineConnector::new(engine).drive(workflow)
 }
 
@@ -434,15 +437,15 @@ trait ConnectorRespond {
     fn respond(&self, request: Request) -> KernelResult<()>;
 }
 
-fn drive_connector<O>(
+fn drive_connector<O, E: From<KernelError>>(
     connector: &impl ConnectorRespond,
-    workflow: Workflow<'_, O>,
-) -> KernelResult<O> {
+    workflow: Workflow<'_, O, E>,
+) -> KernelResult<O, E> {
     let mut cancellation = CancellationLatch::default();
     let output = drive_workflow!(workflow, |request| {
         cancellation.record(connector.respond(request))?
     });
-    cancellation.finish(output)
+    Ok(cancellation.finish(output)?)
 }
 
 impl EnginePagination<ForwardListing> for StorageConnector<'_> {

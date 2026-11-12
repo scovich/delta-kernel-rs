@@ -119,26 +119,32 @@ impl AsyncEngineConnector {
     /// Cancellation is owned entirely by this driver and is never delivered through a
     /// [`delta_kernel::coroutine::Reply`]. Because this API otherwise returns [`KernelResult`],
     /// driver cancellation is represented as [`KernelError::Cancelled`] at this outer boundary.
-    pub async fn run<O: Send + 'static>(&self, workflow: Workflow<'_, O>) -> KernelResult<O> {
+    pub async fn run<O: Send + 'static, E: From<KernelError>>(
+        &self,
+        workflow: Workflow<'_, O, E>,
+    ) -> KernelResult<O, E> {
         self.race_cancellation(self.run_inner(workflow)).await
     }
 
-    async fn run_inner<O: Send + 'static>(&self, workflow: Workflow<'_, O>) -> KernelResult<O> {
+    async fn run_inner<O: Send + 'static, E: From<KernelError>>(
+        &self,
+        workflow: Workflow<'_, O, E>,
+    ) -> KernelResult<O, E> {
         Ok(drive_workflow_async!(workflow, |request| {
             self.respond_inner(request).await?
         }))
     }
 
-    async fn race_cancellation<O>(
+    async fn race_cancellation<O, E: From<KernelError>>(
         &self,
-        drive: impl Future<Output = KernelResult<O>>,
-    ) -> KernelResult<O> {
+        drive: impl Future<Output = KernelResult<O, E>>,
+    ) -> KernelResult<O, E> {
         let Some(token) = &self.cancellation_token else {
             return drive.await;
         };
         tokio::select! {
             biased;
-            _ = token.cancelled() => Err(KernelError::Cancelled),
+            _ = token.cancelled() => Err(E::from(KernelError::Cancelled)),
             result = drive => result,
         }
     }

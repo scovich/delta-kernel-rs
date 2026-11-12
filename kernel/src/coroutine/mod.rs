@@ -92,6 +92,13 @@
 //! to advance a coroutine or workflow after its terminal step is a logic error. Synchronous
 //! `try_advance` returns [`KernelError::WouldBlock`] if Kernel suspends without producing a step,
 //! which can only happen if there are outstanding replies.
+//!
+//! Requests, generators, and coroutines fail with [`KernelError`]. A workflow ends in a terminal
+//! error type `E`, which defaults to [`KernelError`], and its drivers return `E`. An operation that
+//! can fail with a [`DeltaError`](crate::DeltaError) chooses the top-level [`Error`](crate::Error)
+//! instead, so that the driver's caller receives the `DeltaError`. `?` in the workflow body
+//! converts each request failure into [`Error::Kernel`](crate::Error::Kernel). Workflow mechanics
+//! and drivers convert their own failures, such as [`KernelError::WouldBlock`], the same way.
 
 use std::future::poll_fn;
 use std::pin::Pin;
@@ -112,14 +119,21 @@ use crate::{KernelError, KernelResult};
 /// The workflow owns its request channel. [`Self::advance`] and [`Self::try_advance`] return each
 /// request as [`WorkflowStep::Request`] and successful completion as [`WorkflowStep::Done`]. The
 /// `'a` lifetime covers any state borrowed by the operation; [`StaticWorkflow`] owns all captured
-/// state.
-pub struct Workflow<'a, P: Send + 'static, O> {
-    body: Option<Pin<Box<dyn KernelFuture<O> + 'a>>>,
+/// state. `E` is the terminal error type: the top-level [`Error`](crate::Error) for an operation
+/// that can fail with a [`DeltaError`](crate::DeltaError), and [`KernelError`] otherwise.
+pub struct Workflow<'a, P: Send + 'static, O, E = KernelError> {
+    body: Option<WorkflowFuture<'a, O, E>>,
     requests: Arc<Channel<P>>,
 }
 
+/// Type-erased future that runs a workflow body.
+type WorkflowFuture<'a, O, E> = Pin<Box<dyn Future<Output = KernelResult<O, E>> + Send + 'a>>;
+
 /// A workflow that owns all captured state.
-pub type StaticWorkflow<P, O> = Workflow<'static, P, O>;
+///
+/// `E` is the terminal error type: the top-level [`Error`](crate::Error) for an operation that can
+/// fail with a [`DeltaError`](crate::DeltaError), and [`KernelError`] otherwise.
+pub type StaticWorkflow<P, O, E = KernelError> = Workflow<'static, P, O, E>;
 
 /// Request or completion produced by advancing a [`Workflow`].
 // The request variant is the common case, and boxing `P` would add an allocation to every request.
@@ -131,7 +145,7 @@ pub enum WorkflowStep<P, O> {
     Done(O),
 }
 
-impl<P: Send + 'static, O> Workflow<'_, P, O> {
+impl<P: Send + 'static, O, E: From<KernelError>> Workflow<'_, P, O, E> {
     /// Tries to advance to the next request or completion without waiting.
     ///
     /// Polls the workflow once and returns with [`KernelError::WouldBlock`] if no next step is
@@ -140,10 +154,10 @@ impl<P: Send + 'static, O> Workflow<'_, P, O> {
     /// (or dropping the `Reply`) for previously received requests before calling this method again.
     ///
     /// Calling this method after receiving [`WorkflowStep::Done`] is a logic error.
-    pub fn try_advance(&mut self) -> KernelResult<WorkflowStep<P, O>> {
+    pub fn try_advance(&mut self) -> KernelResult<WorkflowStep<P, O>, E> {
         match self.poll_step(&mut noop_context()) {
             Poll::Ready(step) => step,
-            Poll::Pending => Err(KernelError::WouldBlock),
+            Poll::Pending => Err(E::from(KernelError::WouldBlock)),
         }
     }
 
@@ -152,15 +166,18 @@ impl<P: Send + 'static, O> Workflow<'_, P, O> {
     /// [`Reply::send`] (or drop them) to unblock the workflow.
     ///
     /// Calling this method after receiving [`WorkflowStep::Done`] is a logic error.
-    pub async fn advance(&mut self) -> KernelResult<WorkflowStep<P, O>> {
+    pub async fn advance(&mut self) -> KernelResult<WorkflowStep<P, O>, E> {
         poll_fn(|context| self.poll_step(context)).await
     }
 
-    fn poll_step(&mut self, context: &mut Context<'_>) -> Poll<KernelResult<WorkflowStep<P, O>>> {
+    fn poll_step(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<KernelResult<WorkflowStep<P, O>, E>> {
         let Some(body) = self.body.as_mut() else {
-            return Poll::Ready(Err(KernelError::internal_error(
+            return Poll::Ready(Err(E::from(KernelError::internal_error(
                 "workflow advanced after completion",
-            )));
+            ))));
         };
         // Reconcile ready replies before accepting queued offers. A request becomes visible to the
         // connector only when accepted, so polling first lets completed race branches cancel offers
@@ -310,11 +327,13 @@ impl<'a, P: Send + 'static, Y: Send + 'a, O: Send + 'static>
 /// Creates a workflow for a specific request vocabulary.
 ///
 /// The `|channel| future` form forwards one future as the workflow body. Use an explicit async
-/// closure for multi-step control flow.
+/// closure for multi-step control flow. A forwarded future keeps its error type, and an explicit
+/// async closure ends in [`KernelError`].
 #[internal_api]
 macro_rules! workflow {
     ($request:ty, |$channel:ident| $future:expr $(,)?) => {
-        $crate::coroutine::workflow!($request, async move |$channel| ($future).await)
+        $crate::coroutine::BodyFn::<_, $request, _, _>::new(async move |$channel| ($future).await)
+            .into_workflow_with($crate::coroutine::BodyFn::witness)
     };
     ($request:ty, $body:expr $(,)?) => {
         $crate::coroutine::BodyFn::<_, $request, _>::new($body)
@@ -325,11 +344,13 @@ macro_rules! workflow {
 /// Creates a workflow that owns all captured state.
 ///
 /// The `|channel| future` form forwards one future as the workflow body. Use an explicit async
-/// closure for multi-step control flow.
+/// closure for multi-step control flow. A forwarded future keeps its error type, and an explicit
+/// async closure ends in [`KernelError`].
 #[internal_api]
 macro_rules! static_workflow {
     ($request:ty, |$channel:ident| $future:expr $(,)?) => {
-        $crate::coroutine::static_workflow!($request, async move |$channel| ($future).await)
+        $crate::coroutine::BodyFn::<_, $request, _, _>::new(async move |$channel| ($future).await)
+            .into_workflow_with::<'static, _>($crate::coroutine::BodyFn::witness)
     };
     ($request:ty, $body:expr $(,)?) => {
         $crate::coroutine::BodyFn::<_, $request, _>::new($body)

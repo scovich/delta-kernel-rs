@@ -1,5 +1,6 @@
 //! Internal workflow construction and lifecycle instrumentation.
 
+use std::fmt::Display;
 use std::future::Future;
 use std::mem::ManuallyDrop;
 use std::ops::AsyncFnOnce;
@@ -9,21 +10,22 @@ use delta_kernel_derive::internal_api;
 use tracing::{Instrument as _, Span, error};
 
 use super::witness::invoke_witness;
-use super::{Channel, KernelFuture, Workflow};
-use crate::KernelResult;
+use super::{Channel, Workflow};
 use crate::utils::PhantomType;
+use crate::{KernelError, KernelResult};
 
 /// Hidden expansion state for [`workflow!`](super::workflow) and
 /// [`static_workflow!`](super::static_workflow).
 ///
 /// Stores an uninvoked async function and the current tracing span until the macro constructs a
-/// [`Workflow`]. This type is public only so exported macros can name it.
+/// [`Workflow`]. This type is public only so exported macros can name it. `E` is the terminal
+/// error type of the workflow that it constructs.
 #[doc(hidden)]
 #[internal_api]
-pub(crate) struct BodyFn<F, P, O> {
+pub(crate) struct BodyFn<F, P, O, E = KernelError> {
     body: F,
     span: Span,
-    _type_signature: PhantomType<(P, O)>,
+    _type_signature: PhantomType<(P, O, E)>,
 }
 
 // `Self::new` and `Self::witness` constrain `F` to be callable with a borrowed `Channel` of any
@@ -34,12 +36,12 @@ pub(crate) struct BodyFn<F, P, O> {
 // `Self::into_workflow_with` passes `self` and `Self::witness` through [`invoke_witness`], whose
 // doc comment explains why the witness must remain separate. The returned future is instrumented
 // with the captured span, and abandoning the workflow before completion reports a tracing error.
-impl<F, P: Send + 'static, O> BodyFn<F, P, O> {
+impl<F, P: Send + 'static, O, E> BodyFn<F, P, O, E> {
     /// Stores `body` without choosing its call-future proof path.
     #[internal_api]
     pub(crate) fn new(body: F) -> Self
     where
-        F: for<'channel> AsyncFnOnce(&'channel Channel<P>) -> KernelResult<O>,
+        F: for<'channel> AsyncFnOnce(&'channel Channel<P>) -> KernelResult<O, E>,
     {
         Self {
             body,
@@ -53,9 +55,9 @@ impl<F, P: Send + 'static, O> BodyFn<F, P, O> {
     pub(crate) fn into_workflow_with<'workflow, Fut>(
         self,
         witness: impl FnOnce(Self, Arc<Channel<P>>) -> Fut,
-    ) -> Workflow<'workflow, P, O>
+    ) -> Workflow<'workflow, P, O, E>
     where
-        Fut: KernelFuture<O> + 'workflow,
+        Fut: Future<Output = KernelResult<O, E>> + Send + 'workflow,
         P: 'workflow,
         O: 'workflow,
     {
@@ -68,9 +70,13 @@ impl<F, P: Send + 'static, O> BodyFn<F, P, O> {
 
     /// Runs the body while exposing its concrete future to [`Self::into_workflow_with`].
     #[internal_api]
-    pub(crate) fn witness(self, channel: Arc<Channel<P>>) -> impl Future<Output = KernelResult<O>>
+    pub(crate) fn witness(
+        self,
+        channel: Arc<Channel<P>>,
+    ) -> impl Future<Output = KernelResult<O, E>>
     where
-        F: for<'channel> AsyncFnOnce(&'channel Channel<P>) -> KernelResult<O>,
+        F: for<'channel> AsyncFnOnce(&'channel Channel<P>) -> KernelResult<O, E>,
+        E: Display,
     {
         let guard = WorkflowCompletionGuard;
         let future = async move {
