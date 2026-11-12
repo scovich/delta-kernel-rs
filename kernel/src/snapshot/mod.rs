@@ -1928,7 +1928,7 @@ mod tests {
     use crate::arrow::array::StringArray;
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::{Commit, CommitResponse, FileSystemCommitter};
-    use crate::engine::PanicEngine;
+    use crate::engine::CountingEngine;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -2060,9 +2060,10 @@ mod tests {
         let source = snapshot_with_staged_commits(max_published_version, crc_version, observed_crc);
         let original_segment = source.log_segment().clone();
         let committer = RecordingPublishCommitter::default();
+        let engine = CountingEngine::new(Arc::new(SyncEngine::new()));
 
         // WHEN: publish the remaining commits and return a snapshot with published paths.
-        let published = source.publish(&PanicEngine, &committer).unwrap();
+        let published = source.publish(&engine, &committer).unwrap();
 
         // THEN: request publication only for unpublished commits; keep version, metadata, and CRC.
         assert_eq!(*committer.calls.borrow(), expected_calls);
@@ -2116,9 +2117,10 @@ mod tests {
         assert_eq!(source.log_segment(), &original_segment);
 
         // Publishing the returned snapshot again must neither copy files nor create a new snapshot.
-        let repeated = published.publish(&PanicEngine, &committer).unwrap();
+        let repeated = published.publish(&engine, &committer).unwrap();
         assert!(Arc::ptr_eq(&published, &repeated));
         assert_eq!(*committer.calls.borrow(), expected_calls);
+        engine.assert_no_io();
     }
 
     /// At version 2, checkpoint 2 supplies all log actions, leaving `ascending_commit_files` empty.
@@ -2148,10 +2150,11 @@ mod tests {
             .unwrap(),
         );
         let original_segment = source.log_segment().clone();
+        let engine = CountingEngine::new(Arc::new(SyncEngine::new()));
 
         // WHEN: publish with nothing left in ascending_commit_files to copy.
         let result = source
-            .publish(&PanicEngine, &FileSystemCommitter::new())
+            .publish(&engine, &FileSystemCommitter::new())
             .unwrap();
 
         // THEN: replace latest_commit_file only if version 2 is known to be published.
@@ -2181,6 +2184,7 @@ mod tests {
             assert!(Arc::ptr_eq(&source, &result));
         }
         assert_eq!(source.log_segment(), &original_segment);
+        engine.assert_no_io();
     }
 
     #[test]
@@ -2192,16 +2196,17 @@ mod tests {
             fail_once: Cell::new(true),
             ..Default::default()
         };
+        let engine = CountingEngine::new(Arc::new(SyncEngine::new()));
 
         // WHEN: publication fails.
-        let result = source.publish(&PanicEngine, &committer);
+        let result = source.publish(&engine, &committer);
 
         // THEN: report the failure and leave the input snapshot unchanged.
         assert_result_error_with_message(result, "injected publication failure");
         assert_eq!(source.log_segment(), &original_segment);
 
         // WHEN: retry publication from the same input snapshot.
-        let result = source.publish(&PanicEngine, &committer).unwrap();
+        let result = source.publish(&engine, &committer).unwrap();
 
         // THEN: retry commit 2 and return published paths for both commits.
         assert_eq!(*committer.calls.borrow(), vec![vec![2], vec![2]]);
@@ -2215,6 +2220,7 @@ mod tests {
                 .all(|file| file.file_type == LogPathFileType::Commit)
         );
         assert_eq!(source.log_segment(), &original_segment);
+        engine.assert_no_io();
     }
 
     #[rstest]
@@ -2241,13 +2247,15 @@ mod tests {
         } else {
             &filesystem
         };
+        let engine = CountingEngine::new(Arc::new(SyncEngine::new()));
 
         // WHEN: attempt to publish the snapshot.
-        let result = source.publish(&PanicEngine, committer);
+        let result = source.publish(&engine, committer);
 
         // THEN: reject the unsupported table or committer before copying any files.
         assert_result_error_with_message(result, error);
         assert!(recording.calls.borrow().is_empty());
+        engine.assert_no_io();
     }
 
     #[rstest]
@@ -2270,13 +2278,15 @@ mod tests {
             files.pop();
         }
         let committer = RecordingPublishCommitter::default();
+        let engine = CountingEngine::new(Arc::new(SyncEngine::new()));
 
         // WHEN: attempt to publish with a missing version or missing final commit.
-        let result = source.publish(&PanicEngine, &committer);
+        let result = source.publish(&engine, &committer);
 
         // THEN: reject the incomplete commit list before calling the committer.
         assert_result_error_with_message(result, error);
         assert!(committer.calls.borrow().is_empty());
+        engine.assert_no_io();
     }
 
     #[test]
@@ -2293,14 +2303,16 @@ mod tests {
             .new_as_published(Some(2))
             .unwrap()
             .unwrap();
+        let engine = CountingEngine::new(Arc::new(SyncEngine::new()));
 
         // WHEN: call publish without any catalog commits to copy.
         let result = source
-            .publish(&PanicEngine, &FileSystemCommitter::new())
+            .publish(&engine, &FileSystemCommitter::new())
             .unwrap();
 
         // THEN: return the original snapshot.
         assert!(Arc::ptr_eq(&source, &result));
+        engine.assert_no_io();
     }
 
     /// Helper function to create a commitInfo action with optional ICT
