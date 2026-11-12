@@ -5,20 +5,20 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use delta_kernel::cancellation::CancellationTokenRef;
-use delta_kernel::expressions::{ExpressionRef, PredicateRef, Scalar};
+use url::Url;
+
+use crate::cancellation::CancellationTokenRef;
+use crate::engine::RelaxedCounter;
+use crate::expressions::{ExpressionRef, PredicateRef, Scalar};
 #[cfg(feature = "declarative-plans")]
-use delta_kernel::plans::{Operation, PlanExecutor, PlanResult};
-use delta_kernel::schema::{DataType, SchemaRef};
-use delta_kernel::{
+use crate::plans::{Operation, PlanExecutor, PlanResult};
+use crate::schema::{DataType, SchemaRef};
+use crate::{
     Engine, EngineData, EvaluationHandler, ExpressionEvaluator, FileDataReadResultIterator,
     FileMeta, FileSize, FileSlice, FilteredEngineData, JsonHandler, KernelResult,
     KernelResultIterator, ParquetFooter, ParquetHandler, ParquetMultiFileWrite, PredicateEvaluator,
     StorageHandler,
 };
-use url::Url;
-
-use crate::counting_reporter::RelaxedCounter;
 
 /// A handler decorator that counts each dereference to its inner handler.
 pub struct CountingHandler<T: ?Sized> {
@@ -328,6 +328,7 @@ impl ParquetHandler for CountingHandlers {
 }
 
 #[cfg(feature = "declarative-plans")]
+#[allow(clippy::expect_used)]
 impl PlanExecutor for CountingHandlers {
     fn execute_op(&self, op: Operation) -> KernelResult<PlanResult> {
         self.plans
@@ -346,14 +347,13 @@ impl PlanExecutor for CountingHandlers {
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::object_store::memory::InMemory;
-    use delta_kernel_default_engine::DefaultEngineBuilder;
-
     use super::*;
+    use crate::engine::sync::SyncEngine;
+    use crate::object_store::memory::InMemory;
 
     #[test]
     fn handler_access_does_not_count_as_an_operation() {
-        let inner = Arc::new(DefaultEngineBuilder::new(Arc::new(InMemory::new())).build());
+        let inner = Arc::new(SyncEngine::new());
         let engine = CountingEngine::new(inner);
 
         let _ = engine.evaluation_handler();
@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn handler_operation_increments_its_counter() {
-        let inner = Arc::new(DefaultEngineBuilder::new(Arc::new(InMemory::new())).build());
+        let inner = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
         let engine = CountingEngine::new(inner);
 
         let result = engine

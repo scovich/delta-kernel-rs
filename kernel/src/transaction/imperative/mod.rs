@@ -857,7 +857,6 @@ fn build_remove_struct_patch(
 mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use ::test_utils::get_column;
     use rstest::rstest;
@@ -870,11 +869,11 @@ mod tests {
     };
     use crate::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
     use crate::arrow::record_batch::RecordBatch;
-    use crate::engine::DelegatingEngine;
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
+    use crate::engine::{DelegatingEngine, RelaxedCounter};
     use crate::expressions::{ExpressionRef, MapData, PredicateRef, Scalar, StructData};
     use crate::scan::log_replay::PATH_NAME;
     use crate::schema::{MapType, column_name, schema};
@@ -942,7 +941,7 @@ mod tests {
 
     #[derive(Default)]
     struct CountingEvaluationHandler {
-        evaluators_created: AtomicUsize,
+        evaluators_created: RelaxedCounter,
     }
 
     impl EvaluationHandler for CountingEvaluationHandler {
@@ -952,7 +951,7 @@ mod tests {
             expression: ExpressionRef,
             output_type: DataType,
         ) -> KernelResult<Arc<dyn ExpressionEvaluator>> {
-            self.evaluators_created.fetch_add(1, Ordering::Relaxed);
+            self.evaluators_created.inc();
             ArrowEvaluationHandler.new_expression_evaluator(schema, expression, output_type)
         }
 
@@ -985,7 +984,7 @@ mod tests {
     fn test_add_action_evaluators_reused_for_repeated_schema(
         #[values(false, true)] row_tracking: bool,
         #[case] optional_columns: &[(bool, bool)],
-        #[case] max_evaluators: usize,
+        #[case] max_evaluators: u64,
     ) -> KernelResult<()> {
         let handler = Arc::new(CountingEvaluationHandler::default());
         let engine = DelegatingEngine::new(Arc::new(SyncEngine::new()))
@@ -1011,7 +1010,7 @@ mod tests {
             })
             .collect::<KernelResult<Vec<_>>>()?;
         let actions = build_add_actions(&engine, batches.into_iter().map(Ok), row_tracking, true)?;
-        assert_eq!(handler.evaluators_created.load(Ordering::Relaxed), 0);
+        assert_eq!(handler.evaluators_created.get(), 0);
         let actions = actions.collect::<KernelResult<Vec<_>>>()?;
         assert_eq!(actions.len(), optional_columns.len());
         for (action, &(tags, provider)) in actions.iter().zip(optional_columns) {
@@ -1025,7 +1024,7 @@ mod tests {
                 row_tracking
             );
         }
-        let created = handler.evaluators_created.load(Ordering::Relaxed);
+        let created = handler.evaluators_created.get();
         assert!(
             created <= max_evaluators,
             "created {created} evaluators for {} batches; expected at most {max_evaluators}",

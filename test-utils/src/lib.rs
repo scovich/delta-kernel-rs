@@ -1,7 +1,6 @@
 //! A number of utilities useful for testing that we want to use in multiple crates
 
 pub mod column_mapping_fixtures;
-pub mod counting_engine;
 pub mod counting_reporter;
 pub mod engine_contract;
 pub mod table_builder;
@@ -196,7 +195,6 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
 use std::sync::{Arc, Mutex};
 
-pub use counting_engine::{CountingEngine, CountingHandler, CountingHandlers};
 pub use counting_reporter::{
     CapturingReporter, CountingReporter, RelaxedCounter, SnapshotCompletionStatus,
     ensure_metrics_compatible_global_subscriber, install_thread_local_metrics_reporter,
@@ -222,6 +220,7 @@ use delta_kernel::committer::{
 use delta_kernel::engine::DelegatingEngine;
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow};
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
+pub use delta_kernel::engine::{CountingEngine, CountingHandler, CountingHandlers};
 use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::memory::InMemory;

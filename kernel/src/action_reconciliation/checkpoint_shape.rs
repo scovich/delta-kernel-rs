@@ -310,8 +310,6 @@ fn collect_single_sidecar(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use rstest::rstest;
 
     use super::*;
@@ -320,6 +318,7 @@ mod tests {
         ADD_NAME, CheckpointMetadata, MAX_VALUES, MIN_VALUES, NUM_RECORDS, SIDECAR_FILE_SCHEMA_TAG,
         STATS_PARSED, Sidecar,
     };
+    use crate::engine::RelaxedCounter;
     use crate::engine::sync::SyncEngine;
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
@@ -334,16 +333,16 @@ mod tests {
     /// Counts I/O operations and verifies that sidecar discovery queries filter out null paths.
     struct CountingExecutor {
         inner: SyncPlanExecutor,
-        query_scans: AtomicUsize,
-        footer_reads: AtomicUsize,
+        query_scans: RelaxedCounter,
+        footer_reads: RelaxedCounter,
     }
 
     impl CountingExecutor {
         fn new() -> Self {
             Self {
                 inner: SyncPlanExecutor::default(),
-                query_scans: AtomicUsize::new(0),
-                footer_reads: AtomicUsize::new(0),
+                query_scans: RelaxedCounter::default(),
+                footer_reads: RelaxedCounter::default(),
             }
         }
     }
@@ -357,10 +356,10 @@ mod tests {
                         _ => None,
                     });
                     assert_eq!(predicate, Some(&col!(SIDECAR_NAME, "path").is_not_null()));
-                    _ = self.query_scans.fetch_add(1, Ordering::Relaxed);
+                    self.query_scans.inc();
                 }
                 Operation::IoOperation(IoOperation::ParquetFooter { .. }) => {
-                    _ = self.footer_reads.fetch_add(1, Ordering::Relaxed)
+                    self.footer_reads.inc()
                 }
                 _ => {}
             }
@@ -537,7 +536,7 @@ mod tests {
     #[case::with_leaf_schema(true, 1)]
     fn fast_path_skips_checkpoint_drain_when_hint_lists_sidecars(
         #[case] needs_leaf_schema: bool,
-        #[case] expected_footer_reads: usize,
+        #[case] expected_footer_reads: u64,
     ) {
         let (_engine, snapshot, _tempdir) =
             load_test_table("v2-checkpoints-parquet-with-sidecars").unwrap();
@@ -552,12 +551,12 @@ mod tests {
 
         assert_eq!(shape.checkpoint_type, CheckpointType::Manifest);
         assert_eq!(
-            exec.query_scans.load(Ordering::Relaxed),
+            exec.query_scans.get(),
             0,
             "fast path must not drain the checkpoint sidecar column"
         );
         assert_eq!(
-            exec.footer_reads.load(Ordering::Relaxed),
+            exec.footer_reads.get(),
             expected_footer_reads,
             "fast path reads the sidecar footer only when its schema is needed"
         );
@@ -597,10 +596,7 @@ mod tests {
         let shape = CheckpointShape::try_new_with_leaf_schema(&exec, snapshot.as_ref()).unwrap();
 
         assert_eq!(shape.checkpoint_type, CheckpointType::Manifest);
-        assert!(
-            exec.query_scans.load(Ordering::Relaxed) >= 1,
-            "must drain, not fast-path"
-        );
+        assert!(exec.query_scans.get() >= 1, "must drain, not fast-path");
         assert_eq!(
             shape
                 .compatible_stats_parsed_schema(&probe_stats_schema())
@@ -655,7 +651,7 @@ mod tests {
         #[case] extension: &str,
         #[case] needs_leaf_schema: bool,
         #[case] expect_parsed: Option<bool>,
-        #[case] expected_footer_reads: usize,
+        #[case] expected_footer_reads: u64,
     ) {
         let segment = segment_with_empty_sidecars_hint(extension);
         let root = &segment.listed.checkpoint_parts[0].location;
@@ -688,14 +684,11 @@ mod tests {
             .and_then(|stats_schema| shape.compatible_stats_parsed_schema(stats_schema));
         assert_eq!(parsed_stats_schema.is_some(), expect_parsed == Some(true));
         assert_eq!(
-            exec.query_scans.load(Ordering::Relaxed),
+            exec.query_scans.get(),
             0,
             "empty-sidecars leaf must never drain the checkpoint"
         );
-        assert_eq!(
-            exec.footer_reads.load(Ordering::Relaxed),
-            expected_footer_reads
-        );
+        assert_eq!(exec.footer_reads.get(), expected_footer_reads);
     }
 
     /// Builds a segment whose applicable hint lists one sidecar and carries a `checkpointMetadata`
@@ -794,12 +787,12 @@ mod tests {
             assert_eq!(parsed_stats_schema, Some(&stats_schema));
         }
         assert_eq!(
-            exec.footer_reads.load(Ordering::Relaxed),
+            exec.footer_reads.get(),
             0,
             "sidecarFileSchema hint must skip the sidecar footer read"
         );
         assert_eq!(
-            exec.query_scans.load(Ordering::Relaxed),
+            exec.query_scans.get(),
             0,
             "the hint fast path must not drain the checkpoint"
         );
