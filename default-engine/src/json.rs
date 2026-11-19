@@ -27,6 +27,7 @@ use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt, ready};
 use url::Url;
 
+use crate::UrlExt;
 use crate::executor::TaskExecutor;
 
 #[derive(Debug)]
@@ -216,12 +217,17 @@ async fn open_json_file(
     batch_size: usize,
     file_meta: FileMeta,
 ) -> KernelResult<BoxStream<'static, KernelResult<RecordBatch>>> {
-    let path = Path::from_url_path(file_meta.location.path())?;
-    let result = store.get(&path).await?;
+    let payload = if file_meta.location.is_presigned() {
+        let bytes = reqwest::get(file_meta.location).await?.bytes().await?;
+        GetResultPayload::Stream(stream::iter([Ok(bytes)]).boxed())
+    } else {
+        let path = Path::from_url_path(file_meta.location.path())?;
+        store.get(&path).await?.payload
+    };
     let builder = ReaderBuilder::new(schema)
         .with_batch_size(batch_size)
         .with_coerce_primitive(true);
-    match result.payload {
+    match payload {
         GetResultPayload::File(file, _) => {
             let reader = builder.build(BufReader::new(file))?;
             let reader = futures::stream::iter(reader).map_err(KernelError::from);
@@ -303,6 +309,8 @@ mod tests {
     use serde_json::json;
     use test_utils::engine_contract::test_json_handler_file_path_contract;
     use tracing::info;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
     use crate::executor::tokio::{TokioBackgroundExecutor, TokioMultiThreadExecutor};
@@ -631,6 +639,45 @@ mod tests {
         assert_eq!(data.len(), 2);
         assert_eq!(data[0].num_rows(), 2);
         assert_eq!(data[1].num_rows(), 2);
+    }
+
+    #[tokio::test]
+    async fn read_json_files_fetches_presigned_url_instead_of_store_key() {
+        let url_path = "/_delta_log/00000000000000000001.json";
+        let content = r#"{"val": 1}"#;
+
+        // HTTP and HTTPS select the same presigned-URL branch; HTTP avoids local TLS setup.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(url_path))
+            .and(query_param("X-Amz-Signature", "test-signature"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(content))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut url = Url::parse(&format!("{}{url_path}", server.uri())).unwrap();
+        url.query_pairs_mut()
+            .append_pair("X-Amz-Signature", "test-signature");
+
+        // Different content at the URL path's store key exposes a read that skips the server.
+        let store = Arc::new(InMemory::new());
+        let decoy_key = Path::from(url_path);
+        store.put(&decoy_key, r#"{"val": 2}"#.into()).await.unwrap();
+
+        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let files = [FileMeta::new(url, 0, content.len() as u64)];
+        let physical_schema = schema_ref! { nullable "val": INTEGER };
+        let data: Vec<RecordBatch> = handler
+            .read_json_files(&files, physical_schema, None)
+            .unwrap()
+            .map_ok(into_record_batch)
+            .try_collect()
+            .unwrap();
+
+        assert_eq!(data.len(), 1);
+        let values: &Int32Array = data[0].column(0).as_primitive();
+        assert_eq!(values, &Int32Array::from(vec![1]));
+        server.verify().await;
     }
 
     #[tokio::test]
